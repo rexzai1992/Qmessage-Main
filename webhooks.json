@@ -1,0 +1,9 @@
+{
+  "default": {
+    "url": "http://localhost:4000/webhook",
+    "events": [
+      "message",
+      "status"
+    ]
+  }
+}

@@ -1,0 +1,73 @@
+{
+  "flows": [
+    {
+      "id": "flow-1769842032651",
+      "name": "New Flow",
+      "triggers": [
+        "Hi"
+      ],
+      "nodes": [
+        {
+          "id": "node-start",
+          "type": "START",
+          "position": {
+            "x": 100,
+            "y": 100
+          },
+          "nextId": "node-1769842035884"
+        },
+        {
+          "id": "node-1769842035884",
+          "type": "MESSAGE",
+          "content": "Hiii",
+          "options": [],
+          "position": {
+            "x": 109.44668468482553,
+            "y": 243.76668908243084
+          },
+          "nextId": "node-1769842049287"
+        },
+        {
+          "id": "node-1769842049287",
+          "type": "QUESTION",
+          "content": "MAKAN MANA",
+          "options": [
+            "View Menu",
+            "Support"
+          ],
+          "position": {
+            "x": 38.52741693451122,
+            "y": 403.7486780399238
+          },
+          "connections": {
+            "Support": "node-1769842066051",
+            "View Menu": "node-1769842068701"
+          }
+        },
+        {
+          "id": "node-1769842066051",
+          "type": "MESSAGE",
+          "content": "h2",
+          "options": [],
+          "position": {
+            "x": 403.3878333861758,
+            "y": 519.6118717560008
+          },
+          "nextId": ""
+        },
+        {
+          "id": "node-1769842068701",
+          "type": "MESSAGE",
+          "content": "h1",
+          "options": [],
+          "position": {
+            "x": 356.527302218576,
+            "y": 367.4135031068849
+          },
+          "nextId": ""
+        }
+      ]
+    }
+  ],
+  "idleEnabled": false
+}

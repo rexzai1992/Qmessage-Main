@@ -1,0 +1,17 @@
+
+version: '3.8'
+
+services:
+  wsbarly:
+    build: .
+    container_name: wsbarly_app
+    ports:
+      - "3001:3001"
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+    volumes:
+      # PERSISTENCE:
+      # All application data (profiles, sessions, history) is now stored in /app/data
+      # Mapping this volume ensures data survives container updates.
+      - ./app_data:/app/data
