@@ -670,11 +670,14 @@ const nodeTypes = {
                 >
                     <option value="">Select workflow</option>
                     {workflowOptions.map((wf: any) => (
-                        <option key={`${props.id}-wf-${wf.id}`} value={wf.id}>
-                            {wf.name || wf.id}
+                        <option key={`${props.id}-wf-${wf.id}`} value={wf.id} disabled={Boolean(wf?.isCurrent)}>
+                            {(wf.name || wf.id) + (wf?.isCurrent ? ' (current)' : '')}
                         </option>
                     ))}
                 </select>
+                <p className="mt-2 text-[10px] text-[#54656f] font-bold uppercase tracking-wider">
+                    Current workflow is listed but disabled to avoid self-trigger loops.
+                </p>
                 <Handle type="source" position={Position.Bottom} className="w-3 h-3 bg-indigo-600 border-2 border-white" />
             </div>
         );

@@ -162,16 +162,6 @@ export default function WebhookView({
     });
     const [reminderLoading, setReminderLoading] = useState(false);
     const [reminderSaving, setReminderSaving] = useState(false);
-    const [fallbackConfig, setFallbackConfig] = useState<{
-        text: string;
-        limit: number | '';
-    }>({
-        text: '',
-        limit: 3
-    });
-    const [fallbackLoading, setFallbackLoading] = useState(false);
-    const [fallbackSaving, setFallbackSaving] = useState(false);
-    const [fallbackError, setFallbackError] = useState<string | null>(null);
     const [connectedBusinesses, setConnectedBusinesses] = useState<any[]>([]);
     const [connectedPaging, setConnectedPaging] = useState<any | null>(null);
     const [connectedLoading, setConnectedLoading] = useState(false);
@@ -249,7 +239,6 @@ export default function WebhookView({
         fetchWebhooks();
         fetchAutomation();
         fetchWindowReminder();
-        fetchFallbackSettings();
         if (isAdmin) {
             fetchConnectedBusinesses();
             fetchClientConnections();
@@ -859,76 +848,6 @@ export default function WebhookView({
                 }
             })
             .finally(() => setReminderSaving(false));
-    };
-
-    const fetchFallbackSettings = () => {
-        if (!sessionToken || !profileId) return;
-        setFallbackLoading(true);
-        setFallbackError(null);
-        fetch(`${SOCKET_URL}/api/company/fallback-settings?profileId=${profileId}`, {
-            headers: {
-                Authorization: `Bearer ${sessionToken}`
-            }
-        })
-            .then(async res => {
-                const text = await res.text();
-                try {
-                    return JSON.parse(text);
-                } catch {
-                    console.error('Fallback settings fetch failed:', text);
-                    return null;
-                }
-            })
-            .then(data => {
-                if (data?.success) {
-                    const cfg = data?.data || {};
-                    setFallbackConfig({
-                        text: typeof cfg.fallback_text === 'string' ? cfg.fallback_text : '',
-                        limit: typeof cfg.fallback_limit === 'number' ? cfg.fallback_limit : 3
-                    });
-                } else {
-                    setFallbackError(data?.error || 'Failed to load fallback settings');
-                }
-            })
-            .finally(() => setFallbackLoading(false));
-    };
-
-    const handleSaveFallbackSettings = () => {
-        if (!sessionToken) return;
-        setFallbackSaving(true);
-        setFallbackError(null);
-        const payload = {
-            fallback_text: fallbackConfig.text,
-            fallback_limit: fallbackConfig.limit === '' ? null : Number(fallbackConfig.limit)
-        };
-        fetch(`${SOCKET_URL}/api/company/fallback-settings`, {
-            method: 'POST',
-            headers: {
-                Authorization: `Bearer ${sessionToken}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                profileId,
-                ...payload
-            })
-        })
-            .then(async res => {
-                const text = await res.text();
-                try {
-                    return JSON.parse(text);
-                } catch {
-                    console.error('Fallback settings save failed:', text);
-                    return null;
-                }
-            })
-            .then(data => {
-                if (data?.success) {
-                    alert('Fallback settings saved.');
-                } else {
-                    setFallbackError(data?.error || 'Failed to save fallback settings');
-                }
-            })
-            .finally(() => setFallbackSaving(false));
     };
 
     const formatConnectedDate = (value?: string) => {
@@ -1617,71 +1536,6 @@ export default function WebhookView({
                             className="bg-[#00a884] hover:bg-[#008f6f] text-white px-5 py-3 rounded-2xl font-bold transition-all shadow-[0_8px_20px_rgba(0,168,132,0.2)] disabled:opacity-50"
                         >
                             {reminderSaving ? 'Saving…' : 'Save Window Reminder'}
-                        </button>
-                    </div>
-                </div>
-
-                {/* Global Fallback Settings */}
-                <div id="settings-fallback" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
-                    <div className="flex items-center justify-between mb-6">
-                        <div>
-                            <h3 className="text-xl text-[#111b21] font-bold">Fallback Message</h3>
-                            <p className="text-sm text-[#54656f] font-medium mt-1">
-                                Set the default reply when a user presses an invalid button.
-                            </p>
-                        </div>
-                        <button
-                            onClick={fetchFallbackSettings}
-                            className="text-xs font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-3 py-2 rounded-xl hover:bg-[#00a884]/5 transition-all"
-                        >
-                            Refresh
-                        </button>
-                    </div>
-
-                    {fallbackError && (
-                        <div className="mb-4 bg-rose-50 border border-rose-200 text-rose-700 rounded-2xl px-4 py-3 text-sm font-medium">
-                            {fallbackError}
-                        </div>
-                    )}
-
-                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1] lg:col-span-2">
-                            <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Fallback Text</span>
-                            <textarea
-                                className="mt-3 w-full bg-white border border-[#eceff1] rounded-xl px-3 py-2 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884] h-24 resize-none"
-                                value={fallbackConfig.text}
-                                onChange={(e) => setFallbackConfig(prev => ({ ...prev, text: e.target.value }))}
-                                placeholder="Please choose one of the options above."
-                            />
-                            <p className="text-[11px] text-[#8696a0] mt-2">
-                                Leave empty to stop sending fallback replies.
-                            </p>
-                        </div>
-
-                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1]">
-                            <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Max Times</span>
-                            <input
-                                type="number"
-                                min={0}
-                                className="mt-3 w-full bg-white border border-[#eceff1] rounded-xl px-3 py-2 text-sm font-bold text-[#111b21] focus:outline-none focus:border-[#00a884]"
-                                value={fallbackConfig.limit}
-                                onChange={(e) => {
-                                    const next = e.target.value === '' ? '' : Number(e.target.value);
-                                    setFallbackConfig(prev => ({ ...prev, limit: next }));
-                                }}
-                                placeholder="3"
-                            />
-                            <p className="text-[11px] text-[#8696a0] mt-2">Set to <code className="font-mono">0</code> for unlimited replies.</p>
-                        </div>
-                    </div>
-
-                    <div className="mt-6 flex items-center justify-end gap-3">
-                        <button
-                            onClick={handleSaveFallbackSettings}
-                            disabled={fallbackSaving || fallbackLoading}
-                            className="bg-[#00a884] hover:bg-[#008f6f] text-white px-5 py-3 rounded-2xl font-bold transition-all shadow-[0_8px_20px_rgba(0,168,132,0.2)] disabled:opacity-50"
-                        >
-                            {fallbackSaving ? 'Saving…' : 'Save Fallback Settings'}
                         </button>
                     </div>
                 </div>

@@ -156,6 +156,7 @@ export function registerFlowRoutes(app: Express, ctx: any) {
                     data: {
                         totals: { messages_total: 0, messages_sent: 0, workflow_runs: 0, expired_messages: 0 },
                         per_day: [],
+                        per_staff: [],
                         tags: Array.from(allTags).sort()
                     }
                 })
@@ -172,7 +173,7 @@ export function registerFlowRoutes(app: Express, ctx: any) {
                     const chunk = userIds.slice(i, i + chunkSize)
                     const { data, error } = await supabase
                         .from('messages')
-                        .select('user_id, direction, created_at, workflow_state')
+                        .select('user_id, direction, created_at, workflow_state, content')
                         .in('user_id', chunk)
                         .gte('created_at', fromIso)
                         .lte('created_at', toIso)
@@ -196,6 +197,61 @@ export function registerFlowRoutes(app: Express, ctx: any) {
             }
 
             const perDayMap = new Map<string, { total: number; inbound: number; sent: number }>()
+            const staffMap = new Map<
+                string,
+                {
+                    user_id: string
+                    name: string
+                    color: string | null
+                    sent: number
+                    workflow_runs: number
+                    expired_messages: number
+                    contacts: Set<string>
+                    inbound_contacts: Set<string>
+                    replied_contacts: Set<string>
+                }
+            >()
+
+            const readAgent = (content: any): { user_id: string; name: string; color: string | null } | null => {
+                const candidate = content?.agent || content?.payload?.agent
+                if (!candidate || typeof candidate !== 'object') return null
+                const userIdRaw = typeof candidate.user_id === 'string'
+                    ? candidate.user_id
+                    : typeof candidate.userId === 'string'
+                        ? candidate.userId
+                        : ''
+                const userId = userIdRaw.trim()
+                if (!userId) return null
+                const nameRaw = typeof candidate.name === 'string' ? candidate.name.trim() : ''
+                const colorRaw = typeof candidate.color === 'string' ? candidate.color.trim() : ''
+                return {
+                    user_id: userId,
+                    name: nameRaw || userId,
+                    color: colorRaw || null
+                }
+            }
+
+            const ensureStaffRow = (agent: { user_id: string; name: string; color: string | null }) => {
+                const existing = staffMap.get(agent.user_id)
+                if (existing) {
+                    if (!existing.name && agent.name) existing.name = agent.name
+                    if (!existing.color && agent.color) existing.color = agent.color
+                    return existing
+                }
+                const created = {
+                    user_id: agent.user_id,
+                    name: agent.name || agent.user_id,
+                    color: agent.color,
+                    sent: 0,
+                    workflow_runs: 0,
+                    expired_messages: 0,
+                    contacts: new Set<string>(),
+                    inbound_contacts: new Set<string>(),
+                    replied_contacts: new Set<string>()
+                }
+                staffMap.set(agent.user_id, created)
+                return created
+            }
 
             messagesInRange.forEach((msg: any) => {
                 const createdAt = new Date(msg.created_at)
@@ -210,10 +266,20 @@ export function registerFlowRoutes(app: Express, ctx: any) {
                 if (msg.direction === 'out') totals.messages_sent += 1
 
                 if (msg.direction === 'out') {
+                    const agent = readAgent(msg.content)
+                    if (agent) {
+                        const staff = ensureStaffRow(agent)
+                        staff.sent += 1
+                        if (msg.user_id) staff.contacts.add(String(msg.user_id))
+                    }
                     const wfId = msg.workflow_state?.workflow_id || msg.workflow_state?.workflowId
                     const stepIndex = Number(msg.workflow_state?.step_index)
                     if (wfId && (!Number.isFinite(stepIndex) || stepIndex <= 1)) {
                         totals.workflow_runs += 1
+                        if (agent) {
+                            const staff = ensureStaffRow(agent)
+                            staff.workflow_runs += 1
+                        }
                     }
                 }
             })
@@ -235,8 +301,23 @@ export function registerFlowRoutes(app: Express, ctx: any) {
                 const inboundTimes = inboundMap.get(msg.user_id) || []
                 const lower = outTs - WINDOW_MS
                 const idx = lowerBound(inboundTimes, lower)
-                if (idx >= inboundTimes.length || inboundTimes[idx] > outTs) {
+                const hasWindowReplyCandidate = idx < inboundTimes.length && inboundTimes[idx] <= outTs
+                if (!hasWindowReplyCandidate) {
                     totals.expired_messages += 1
+                }
+
+                const agent = readAgent(msg.content)
+                if (!agent) return
+                const staff = ensureStaffRow(agent)
+
+                const upToNowIdx = lowerBound(inboundTimes, outTs + 1) - 1
+                if (upToNowIdx >= 0 && msg.user_id) {
+                    staff.inbound_contacts.add(String(msg.user_id))
+                }
+                if (hasWindowReplyCandidate && msg.user_id) {
+                    staff.replied_contacts.add(String(msg.user_id))
+                } else {
+                    staff.expired_messages += 1
                 }
             })
 
@@ -249,11 +330,35 @@ export function registerFlowRoutes(app: Express, ctx: any) {
                     sent: row.sent
                 }))
 
+            const per_staff = Array.from(staffMap.values())
+                .map((row) => {
+                    const inboundContacts = row.inbound_contacts.size
+                    const repliedContacts = row.replied_contacts.size
+                    const replyRate = inboundContacts > 0 ? (repliedContacts / inboundContacts) * 100 : 0
+                    return {
+                        user_id: row.user_id,
+                        name: row.name || row.user_id,
+                        color: row.color,
+                        sent: row.sent,
+                        workflow_runs: row.workflow_runs,
+                        expired_messages: row.expired_messages,
+                        contacts_messaged: row.contacts.size,
+                        inbound_contacts: inboundContacts,
+                        replied_contacts: repliedContacts,
+                        reply_rate: Number(replyRate.toFixed(1))
+                    }
+                })
+                .sort((a, b) => {
+                    if (b.sent !== a.sent) return b.sent - a.sent
+                    return a.name.localeCompare(b.name)
+                })
+
             return res.json({
                 success: true,
                 data: {
                     totals,
                     per_day,
+                    per_staff,
                     tags: Array.from(allTags).sort()
                 }
             })

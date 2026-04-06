@@ -173,7 +173,10 @@ export default function ChatflowView({
                                                     tagOptions={workflowTagOptions}
                                                     variableOptions={workflowVariableOptions}
                                                     staffOptions={teamUsers}
-                                                    workflowOptions={workflowTriggerOptions.filter((option) => option.id !== wf.id)}
+                                                    workflowOptions={workflowTriggerOptions.map((option) => ({
+                                                        ...option,
+                                                        isCurrent: option.id === wf.id
+                                                    }))}
                                                     templateOptions={workflowTemplateOptions}
                                                     onSave={(nextFlow: any) => {
                                                         const { actions } = buildActionsFromBuilder(nextFlow);

@@ -16,6 +16,7 @@ import {
     Check,
     CheckCheck,
     CircleDashed,
+    BarChart3,
     Filter,
     User,
     ArrowLeft,
@@ -245,6 +246,40 @@ type ContactMeta = {
     templateAttributes?: ContactTemplateAttribute[];
 };
 
+type AnalyticsTotals = {
+    messages_total: number;
+    messages_sent: number;
+    workflow_runs: number;
+    expired_messages: number;
+};
+
+type AnalyticsPerDayRow = {
+    date: string;
+    total: number;
+    inbound: number;
+    sent: number;
+};
+
+type AnalyticsStaffRow = {
+    user_id: string;
+    name: string;
+    color: string | null;
+    sent: number;
+    workflow_runs: number;
+    expired_messages: number;
+    contacts_messaged: number;
+    inbound_contacts: number;
+    replied_contacts: number;
+    reply_rate: number;
+};
+
+type AnalyticsPayload = {
+    totals: AnalyticsTotals;
+    per_day: AnalyticsPerDayRow[];
+    per_staff: AnalyticsStaffRow[];
+    tags: string[];
+};
+
 type MessageVirtualRow =
     | { kind: 'date'; id: string; label: string }
     | { kind: 'message'; id: string; msg: Message };
@@ -417,6 +452,76 @@ const findTemplateComponent = (components: any[] | undefined, type: string): any
     return components.find((component) => normalizeTemplateComponentType(component?.type) === normalized) || null;
 };
 
+const toSafeAnalyticsCount = (value: unknown): number => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return 0;
+    return Math.max(0, Math.floor(parsed));
+};
+
+const toSafeAnalyticsRate = (value: unknown): number => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return 0;
+    return Math.max(0, Math.min(100, parsed));
+};
+
+const normalizeAnalyticsPayload = (payload: any): AnalyticsPayload => {
+    const perDay: AnalyticsPerDayRow[] = Array.isArray(payload?.per_day)
+        ? payload.per_day.map((row: any) => ({
+            date: typeof row?.date === 'string' ? row.date : '',
+            total: toSafeAnalyticsCount(row?.total),
+            inbound: toSafeAnalyticsCount(row?.inbound),
+            sent: toSafeAnalyticsCount(row?.sent)
+        })).filter((row: AnalyticsPerDayRow) => Boolean(row.date))
+        : [];
+
+    const perDayTotals = perDay.reduce(
+        (acc, row) => ({
+            total: acc.total + row.total,
+            sent: acc.sent + row.sent
+        }),
+        { total: 0, sent: 0 }
+    );
+    const perStaff: AnalyticsStaffRow[] = Array.isArray(payload?.per_staff)
+        ? payload.per_staff
+            .map((row: any) => ({
+                user_id: typeof row?.user_id === 'string' ? row.user_id : '',
+                name: typeof row?.name === 'string' ? row.name : '',
+                color: typeof row?.color === 'string' ? row.color : null,
+                sent: toSafeAnalyticsCount(row?.sent),
+                workflow_runs: toSafeAnalyticsCount(row?.workflow_runs),
+                expired_messages: toSafeAnalyticsCount(row?.expired_messages),
+                contacts_messaged: toSafeAnalyticsCount(row?.contacts_messaged),
+                inbound_contacts: toSafeAnalyticsCount(row?.inbound_contacts),
+                replied_contacts: toSafeAnalyticsCount(row?.replied_contacts),
+                reply_rate: toSafeAnalyticsRate(row?.reply_rate)
+            }))
+            .filter((row: AnalyticsStaffRow) => Boolean(row.user_id))
+        : [];
+    const totalsRaw = payload?.totals || {};
+    const messagesTotal = toSafeAnalyticsCount(totalsRaw.messages_total ?? perDayTotals.total);
+    const messagesSent = toSafeAnalyticsCount(totalsRaw.messages_sent ?? perDayTotals.sent);
+
+    return {
+        totals: {
+            messages_total: messagesTotal,
+            messages_sent: messagesSent,
+            workflow_runs: toSafeAnalyticsCount(totalsRaw.workflow_runs),
+            expired_messages: toSafeAnalyticsCount(totalsRaw.expired_messages)
+        },
+        per_day: perDay,
+        per_staff: perStaff,
+        tags: Array.isArray(payload?.tags)
+            ? payload.tags.map((tag: unknown) => (typeof tag === 'string' ? tag.trim() : '')).filter(Boolean)
+            : []
+    };
+};
+
+const formatAnalyticsDateShort = (value: string): string => {
+    const parsed = new Date(`${value}T00:00:00`);
+    if (Number.isNaN(parsed.getTime())) return value;
+    return parsed.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+};
+
 
 export default function App() {
     // Auth State
@@ -475,7 +580,7 @@ export default function App() {
     });
     const [analyticsEnd, setAnalyticsEnd] = useState(() => new Date().toISOString().slice(0, 10));
     const [analyticsTag, setAnalyticsTag] = useState('');
-    const [analyticsData, setAnalyticsData] = useState<any | null>(null);
+    const [analyticsData, setAnalyticsData] = useState<AnalyticsPayload | null>(null);
     const [analyticsLoading, setAnalyticsLoading] = useState(false);
     const [analyticsError, setAnalyticsError] = useState<string | null>(null);
     const [quickReplies, setQuickReplies] = useState<QuickReply[]>([]);
@@ -575,7 +680,6 @@ export default function App() {
             items: [
                 { id: 'settings-conversational', label: 'Conversational Components' },
                 { id: 'settings-reminder', label: '24h Window Reminder' },
-                { id: 'settings-fallback', label: 'Fallback Message' },
                 { id: 'settings-quick-replies', label: 'Quick Replies' }
             ]
         },
@@ -1195,7 +1299,7 @@ export default function App() {
             })
             .then(data => {
                 if (data?.success) {
-                    setAnalyticsData(data.data || null);
+                    setAnalyticsData(normalizeAnalyticsPayload(data.data || {}));
                 } else {
                     setAnalyticsError(data?.error || 'Failed to load analytics');
                 }
@@ -1205,6 +1309,47 @@ export default function App() {
             })
             .finally(() => setAnalyticsLoading(false));
     }, [activeProfileId, analyticsStart, analyticsEnd, analyticsTag]);
+
+    const analyticsRows = useMemo<AnalyticsPerDayRow[]>(() => analyticsData?.per_day || [], [analyticsData]);
+    const analyticsStaffRows = useMemo<AnalyticsStaffRow[]>(() => analyticsData?.per_staff || [], [analyticsData]);
+
+    const analyticsInsights = useMemo(() => {
+        const totals: AnalyticsTotals = analyticsData?.totals || {
+            messages_total: 0,
+            messages_sent: 0,
+            workflow_runs: 0,
+            expired_messages: 0
+        };
+        const inboundFromRows = analyticsRows.reduce((sum, row) => sum + toSafeAnalyticsCount(row.inbound), 0);
+        const fallbackInbound = Math.max(0, toSafeAnalyticsCount(totals.messages_total) - toSafeAnalyticsCount(totals.messages_sent));
+        const inboundCount = inboundFromRows > 0 ? inboundFromRows : fallbackInbound;
+        const activeDays = analyticsRows.length;
+        const averagePerActiveDay = activeDays > 0 ? totals.messages_total / activeDays : 0;
+        const peakDay = analyticsRows.reduce<AnalyticsPerDayRow | null>((best, row) => {
+            if (!best || row.total > best.total) return row;
+            return best;
+        }, null);
+        const dailyMax = Math.max(1, ...analyticsRows.map((row) => row.total));
+        const responseRate = inboundCount > 0 ? (totals.messages_sent / inboundCount) * 100 : 0;
+        const expiredRate = totals.messages_sent > 0 ? (totals.expired_messages / totals.messages_sent) * 100 : 0;
+        const workflowStartRate = totals.messages_sent > 0 ? (totals.workflow_runs / totals.messages_sent) * 100 : 0;
+        const sentShare = totals.messages_total > 0 ? Math.min(1, totals.messages_sent / totals.messages_total) : 0;
+        const inboundShare = Math.max(0, 1 - sentShare);
+
+        return {
+            totals,
+            inboundCount,
+            activeDays,
+            averagePerActiveDay,
+            peakDay,
+            dailyMax,
+            responseRate,
+            expiredRate,
+            workflowStartRate,
+            sentShare,
+            inboundShare
+        };
+    }, [analyticsData, analyticsRows]);
 
     const normalizeQuickReplyShortcut = useCallback((value: string) => {
         if (!value) return '';
@@ -3186,12 +3331,11 @@ export default function App() {
         beta?: boolean;
     }> = [
             { id: 'team-inbox', label: 'Team Inbox', icon: MessageSquare },
+            { id: 'automations', label: 'Automation', icon: Workflow },
             { id: 'broadcast', label: 'Broadcast', icon: Send },
-            { id: 'chatbots', label: 'Chatbots', icon: Bot },
+            { id: 'chatbots', label: 'Chatbot', icon: Bot },
             { id: 'contacts', label: 'Contacts', icon: Users },
-            { id: 'ads', label: 'Ads', icon: CircleDashed, beta: true },
-            { id: 'automations', label: 'Automations', icon: Workflow },
-            { id: 'more', label: 'Analytics', icon: CircleDashed }
+            { id: 'more', label: 'Analytic', icon: BarChart3 }
         ];
 
     const activeWorkspaceLabel = workspaceTabs.find(tab => tab.id === workspaceSection)?.label || 'Workspace';
@@ -3245,11 +3389,17 @@ export default function App() {
                         <nav className="flex items-center gap-1 overflow-x-auto whitespace-nowrap custom-scrollbar">
                             {workspaceTabs.map((tab) => {
                                 const Icon = tab.icon;
-                                const active = workspaceSection === tab.id;
+                                const active = tab.id === 'more' ? showAnalytics : workspaceSection === tab.id;
                                 return (
                                     <button
                                         key={tab.id}
-                                        onClick={() => setWorkspaceSection(tab.id)}
+                                        onClick={() => {
+                                            if (tab.id === 'more') {
+                                                openAnalyticsFromMore();
+                                                return;
+                                            }
+                                            setWorkspaceSection(tab.id);
+                                        }}
                                         className={`px-3 py-2 rounded-xl text-[16px] font-bold transition-all flex items-center gap-2 ${active ? 'text-[#00a884] bg-[#00a884]/10' : 'text-[#4a4a4a] hover:bg-[#f0f2f5]'}`}
                                     >
                                         <Icon className="w-4 h-4" />
@@ -3265,12 +3415,6 @@ export default function App() {
                         </nav>
                     </div>
                     <div className="hidden md:flex items-center gap-3">
-                        <button
-                            onClick={() => setWorkspaceSection('more')}
-                            className="w-10 h-10 rounded-full bg-[#f3f4f6] text-[#6b7280] flex items-center justify-center"
-                        >
-                            <CircleDashed className="w-5 h-5" />
-                        </button>
                         <button
                             onClick={openSettingsFromMore}
                             className="w-10 h-10 rounded-full bg-[#f3f4f6] text-[#6b7280] flex items-center justify-center"
@@ -4634,54 +4778,235 @@ export default function App() {
                             )}
                         </div>
 
-                        <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
+                        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-6 gap-6 mb-8">
                             <div className="bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
                                 <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-2">Total Messages</div>
-                                <div className="text-3xl font-black text-[#111b21]">{analyticsData?.totals?.messages_total ?? 0}</div>
+                                <div className="text-3xl font-black text-[#111b21]">{analyticsInsights.totals.messages_total}</div>
+                            </div>
+                            <div className="bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                                <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-2">Inbound Messages</div>
+                                <div className="text-3xl font-black text-[#4f9cf9]">{analyticsInsights.inboundCount}</div>
                             </div>
                             <div className="bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
                                 <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-2">Messages Sent</div>
-                                <div className="text-3xl font-black text-[#00a884]">{analyticsData?.totals?.messages_sent ?? 0}</div>
+                                <div className="text-3xl font-black text-[#00a884]">{analyticsInsights.totals.messages_sent}</div>
                             </div>
                             <div className="bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
                                 <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-2">Workflow Runs</div>
-                                <div className="text-3xl font-black text-[#111b21]">{analyticsData?.totals?.workflow_runs ?? 0}</div>
+                                <div className="text-3xl font-black text-[#111b21]">{analyticsInsights.totals.workflow_runs}</div>
                             </div>
                             <div className="bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
-                                <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-2">Expired Messages</div>
-                                <div className="text-3xl font-black text-rose-600">{analyticsData?.totals?.expired_messages ?? 0}</div>
+                                <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-2">Response Rate</div>
+                                <div className="text-3xl font-black text-[#111b21]">{analyticsInsights.responseRate.toFixed(1)}%</div>
+                                <div className="text-[11px] text-[#8696a0] mt-1">Sent vs inbound</div>
+                            </div>
+                            <div className="bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                                <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-2">Expired Rate</div>
+                                <div className="text-3xl font-black text-rose-600">{analyticsInsights.expiredRate.toFixed(1)}%</div>
+                                <div className="text-[11px] text-[#8696a0] mt-1">Expired over sent</div>
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 mb-8">
+                            <div className="xl:col-span-2 bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-5">
+                                    <div>
+                                        <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest">Chart</div>
+                                        <h3 className="text-lg font-bold text-[#111b21] mt-1">Daily Message Volume</h3>
+                                    </div>
+                                    <div className="flex items-center gap-4 text-[11px] text-[#54656f] font-bold">
+                                        <span className="flex items-center gap-2">
+                                            <span className="w-2.5 h-2.5 rounded-full bg-[#4f9cf9]" />
+                                            Inbound
+                                        </span>
+                                        <span className="flex items-center gap-2">
+                                            <span className="w-2.5 h-2.5 rounded-full bg-[#00a884]" />
+                                            Sent
+                                        </span>
+                                    </div>
+                                </div>
+
+                                {analyticsRows.length === 0 ? (
+                                    <div className="h-64 rounded-2xl border border-dashed border-[#d4dbe0] flex items-center justify-center text-sm text-[#8696a0]">
+                                        No analytics data for this range.
+                                    </div>
+                                ) : (
+                                    <>
+                                        <div className="h-64 rounded-2xl border border-[#edf1f4] bg-[#fcfdfd] p-4 overflow-x-auto">
+                                            <div className="min-w-[720px] h-full flex items-end gap-2">
+                                                {analyticsRows.map((row: AnalyticsPerDayRow) => {
+                                                    const total = Math.max(0, row.total);
+                                                    const inbound = Math.min(total, Math.max(0, row.inbound));
+                                                    const sent = Math.min(total, Math.max(0, row.sent));
+                                                    const barHeight = Math.max(8, Math.round((total / analyticsInsights.dailyMax) * 100));
+                                                    const inboundHeight = total > 0 ? (inbound / total) * 100 : 0;
+                                                    const sentHeight = total > 0 ? (sent / total) * 100 : 0;
+                                                    return (
+                                                        <div
+                                                            key={row.date}
+                                                            className="w-[24px] sm:w-[28px] shrink-0 h-full flex flex-col justify-end items-center gap-2"
+                                                            title={`${row.date}: total ${total}, inbound ${inbound}, sent ${sent}`}
+                                                        >
+                                                            <div
+                                                                className="relative w-full rounded-t-[10px] bg-[#e9eef1] overflow-hidden transition-all hover:scale-[1.03]"
+                                                                style={{ height: `${barHeight}%` }}
+                                                            >
+                                                                {inbound > 0 && (
+                                                                    <span
+                                                                        className="absolute bottom-0 left-0 right-0 bg-[#4f9cf9]"
+                                                                        style={{ height: `${inboundHeight}%` }}
+                                                                    />
+                                                                )}
+                                                                {sent > 0 && (
+                                                                    <span
+                                                                        className="absolute top-0 left-0 right-0 bg-[#00a884]"
+                                                                        style={{ height: `${sentHeight}%` }}
+                                                                    />
+                                                                )}
+                                                            </div>
+                                                            <span className="text-[10px] font-bold text-[#6a7b87]">{formatAnalyticsDateShort(row.date)}</span>
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                        </div>
+                                        <div className="mt-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 text-xs text-[#6a7b87] font-medium">
+                                            <span>
+                                                Peak day: {analyticsInsights.peakDay ? `${analyticsInsights.peakDay.date} (${analyticsInsights.peakDay.total})` : 'n/a'}
+                                            </span>
+                                            <span>Average per active day: {analyticsInsights.averagePerActiveDay.toFixed(1)}</span>
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+
+                            <div className="bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                                <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest">Chart</div>
+                                <h3 className="text-lg font-bold text-[#111b21] mt-1">Inbound vs Sent Share</h3>
+                                <div className="mt-5 flex items-center justify-center">
+                                    <div
+                                        className="w-40 h-40 rounded-full flex items-center justify-center"
+                                        style={{
+                                            background: `conic-gradient(#00a884 0 ${Math.round(analyticsInsights.sentShare * 100)}%, #4f9cf9 ${Math.round(analyticsInsights.sentShare * 100)}% 100%)`
+                                        }}
+                                    >
+                                        <div className="w-[102px] h-[102px] rounded-full bg-white border border-[#edf1f4] flex flex-col items-center justify-center">
+                                            <span className="text-[10px] uppercase tracking-widest text-[#6a7b87] font-black">Sent</span>
+                                            <span className="text-2xl font-black text-[#111b21]">{Math.round(analyticsInsights.sentShare * 100)}%</span>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="mt-6 space-y-3">
+                                    <div className="flex items-center justify-between text-sm">
+                                        <span className="text-[#54656f] font-medium">Inbound</span>
+                                        <span className="font-bold text-[#4f9cf9]">
+                                            {analyticsInsights.inboundCount} ({Math.round(analyticsInsights.inboundShare * 100)}%)
+                                        </span>
+                                    </div>
+                                    <div className="flex items-center justify-between text-sm">
+                                        <span className="text-[#54656f] font-medium">Sent</span>
+                                        <span className="font-bold text-[#00a884]">
+                                            {analyticsInsights.totals.messages_sent} ({Math.round(analyticsInsights.sentShare * 100)}%)
+                                        </span>
+                                    </div>
+                                </div>
+                                <div className="mt-6 p-4 rounded-2xl border border-[#edf1f4] bg-[#f8fafb]">
+                                    <div className="text-[10px] uppercase tracking-widest font-black text-[#6a7b87]">Insight</div>
+                                    <p className="text-sm text-[#42535f] mt-2 leading-relaxed">
+                                        Workflow starts are {analyticsInsights.workflowStartRate.toFixed(1)}% of outbound traffic in this range.
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="bg-white rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] overflow-hidden mb-8">
+                            <div className="px-6 py-4 border-b border-[#eceff1] bg-[#fcfdfd] flex items-center justify-between">
+                                <h3 className="text-sm font-bold text-[#111b21]">Staff Reply Performance</h3>
+                                <span className="text-[11px] font-bold uppercase tracking-widest text-[#6a7b87]">{analyticsStaffRows.length} staff</span>
+                            </div>
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-left">
+                                    <thead className="bg-[#fcfdfd] text-[#54656f] text-[10px] uppercase font-black tracking-widest border-b border-[#eceff1]">
+                                        <tr>
+                                            <th className="px-6 py-4">Staff</th>
+                                            <th className="px-6 py-4">Sent</th>
+                                            <th className="px-6 py-4">Reply Rate</th>
+                                            <th className="px-6 py-4">Replied / Inbound</th>
+                                            <th className="px-6 py-4">Contacts</th>
+                                            <th className="px-6 py-4">Workflow Runs</th>
+                                            <th className="px-6 py-4">Expired</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-[#f0f2f5]">
+                                        {analyticsStaffRows.length === 0 ? (
+                                            <tr>
+                                                <td className="px-6 py-6 text-sm text-[#8696a0]" colSpan={7}>
+                                                    No staff analytics for this range yet.
+                                                </td>
+                                            </tr>
+                                        ) : (
+                                            analyticsStaffRows.map((row: AnalyticsStaffRow) => (
+                                                <tr key={row.user_id} className="hover:bg-[#f8f9fa] transition-all">
+                                                    <td className="px-6 py-4 text-sm font-bold text-[#111b21]">
+                                                        <span className="inline-flex items-center gap-2">
+                                                            <span
+                                                                className="w-2.5 h-2.5 rounded-full border border-white shadow-[0_0_0_1px_rgba(17,27,33,0.08)]"
+                                                                style={{ backgroundColor: row.color || '#6b7280' }}
+                                                            />
+                                                            {row.name || row.user_id}
+                                                        </span>
+                                                    </td>
+                                                    <td className="px-6 py-4 text-sm text-[#54656f] font-medium">{row.sent}</td>
+                                                    <td className="px-6 py-4 text-sm font-bold text-[#111b21]">{row.reply_rate.toFixed(1)}%</td>
+                                                    <td className="px-6 py-4 text-sm text-[#54656f] font-medium">
+                                                        {row.replied_contacts} / {row.inbound_contacts}
+                                                    </td>
+                                                    <td className="px-6 py-4 text-sm text-[#54656f] font-medium">{row.contacts_messaged}</td>
+                                                    <td className="px-6 py-4 text-sm text-[#54656f] font-medium">{row.workflow_runs}</td>
+                                                    <td className="px-6 py-4 text-sm font-medium text-rose-700">{row.expired_messages}</td>
+                                                </tr>
+                                            ))
+                                        )}
+                                    </tbody>
+                                </table>
                             </div>
                         </div>
 
                         <div className="bg-white rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] overflow-hidden">
-                            <table className="w-full text-left">
-                                <thead className="bg-[#fcfdfd] text-[#54656f] text-[10px] uppercase font-black tracking-widest border-b border-[#eceff1]">
-                                    <tr>
-                                        <th className="px-6 py-4">Date</th>
-                                        <th className="px-6 py-4">Total Messages</th>
-                                        <th className="px-6 py-4">Inbound</th>
-                                        <th className="px-6 py-4">Sent</th>
-                                    </tr>
-                                </thead>
-                                <tbody className="divide-y divide-[#f0f2f5]">
-                                    {(analyticsData?.per_day || []).length === 0 ? (
+                            <div className="px-6 py-4 border-b border-[#eceff1] bg-[#fcfdfd] flex items-center justify-between">
+                                <h3 className="text-sm font-bold text-[#111b21]">Daily Breakdown</h3>
+                                <span className="text-[11px] font-bold uppercase tracking-widest text-[#6a7b87]">{analyticsRows.length} days</span>
+                            </div>
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-left">
+                                    <thead className="bg-[#fcfdfd] text-[#54656f] text-[10px] uppercase font-black tracking-widest border-b border-[#eceff1]">
                                         <tr>
-                                            <td className="px-6 py-6 text-sm text-[#8696a0]" colSpan={4}>
-                                                No analytics data for this range.
-                                            </td>
+                                            <th className="px-6 py-4">Date</th>
+                                            <th className="px-6 py-4">Total Messages</th>
+                                            <th className="px-6 py-4">Inbound</th>
+                                            <th className="px-6 py-4">Sent</th>
                                         </tr>
-                                    ) : (
-                                        (analyticsData?.per_day || []).map((row: any) => (
-                                            <tr key={row.date} className="hover:bg-[#f8f9fa] transition-all">
-                                                <td className="px-6 py-4 text-sm font-bold text-[#111b21]">{row.date}</td>
-                                                <td className="px-6 py-4 text-sm text-[#54656f] font-medium">{row.total}</td>
-                                                <td className="px-6 py-4 text-sm text-[#54656f] font-medium">{row.inbound}</td>
-                                                <td className="px-6 py-4 text-sm text-[#54656f] font-medium">{row.sent}</td>
+                                    </thead>
+                                    <tbody className="divide-y divide-[#f0f2f5]">
+                                        {analyticsRows.length === 0 ? (
+                                            <tr>
+                                                <td className="px-6 py-6 text-sm text-[#8696a0]" colSpan={4}>
+                                                    No analytics data for this range.
+                                                </td>
                                             </tr>
-                                        ))
-                                    )}
-                                </tbody>
-                            </table>
+                                        ) : (
+                                            analyticsRows.map((row: AnalyticsPerDayRow) => (
+                                                <tr key={row.date} className="hover:bg-[#f8f9fa] transition-all">
+                                                    <td className="px-6 py-4 text-sm font-bold text-[#111b21]">{row.date}</td>
+                                                    <td className="px-6 py-4 text-sm text-[#54656f] font-medium">{row.total}</td>
+                                                    <td className="px-6 py-4 text-sm text-[#54656f] font-medium">{row.inbound}</td>
+                                                    <td className="px-6 py-4 text-sm text-[#54656f] font-medium">{row.sent}</td>
+                                                </tr>
+                                            ))
+                                        )}
+                                    </tbody>
+                                </table>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -4847,6 +5172,9 @@ export default function App() {
             ) : workspaceSection === 'automations' ? (
                 <AutomationsView
                     workflows={automationWorkflows}
+                    profileId={activeProfileId}
+                    sessionToken={session?.access_token || null}
+                    apiBaseUrl={SOCKET_URL}
                     onOpenBuilder={openAutomationBuilder}
                     onCreateWorkflow={handleCreateAutomation}
                     onToggleWorkflowEnabled={handleToggleAutomationEnabled}

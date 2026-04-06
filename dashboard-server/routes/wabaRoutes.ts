@@ -5,6 +5,8 @@ const COMMAND_NAME_MAX_LENGTH = 32
 const COMMAND_DESCRIPTION_MAX_LENGTH = 256
 const COMMAND_NAME_REGEX = /^[a-z0-9_-]+$/
 const EMOJI_REGEX = /\p{Extended_Pictographic}/u
+const SCHEDULED_BROADCAST_MAX_RECIPIENTS = 500
+const SCHEDULED_BROADCAST_TICK_MS = 30_000
 
 type ConversationalCommand = {
     command_name: string
@@ -143,6 +145,41 @@ function parsePreverifiedIdsInput(value: any): string[] {
     }
 
     return Array.from(out)
+}
+
+function parseScheduledRecipientsInput(value: any): string[] {
+    const deduped = new Set<string>()
+
+    const push = (entry: any) => {
+        const text = typeof entry === 'string' ? entry.trim() : ''
+        if (!text) return
+        deduped.add(text)
+    }
+
+    if (Array.isArray(value)) {
+        value.forEach((entry) => push(entry))
+    } else if (typeof value === 'string') {
+        const trimmed = value.trim()
+        if (!trimmed) return []
+        trimmed
+            .split(/[\n,;]+/)
+            .map((item) => item.trim())
+            .filter(Boolean)
+            .forEach((item) => push(item))
+    }
+
+    return Array.from(deduped)
+}
+
+function formatScheduledBroadcastError(value: any): string {
+    if (!value) return 'Unknown error'
+    if (typeof value === 'string') return value
+    if (typeof value?.message === 'string' && value.message.trim()) return value.message.trim()
+    try {
+        return JSON.stringify(value)
+    } catch {
+        return String(value)
+    }
 }
 
 export function registerWabaRoutes(app: Express, ctx: any) {
@@ -1726,6 +1763,353 @@ app.post('/api/waba/marketing-messages/send', async (req: any, res: any) => {
         })
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message })
+    }
+})
+
+const scheduledBroadcastInFlightIds = new Set<string>()
+let scheduledBroadcastTickRunning = false
+let scheduledBroadcastMissingTableLogged = false
+
+const normalizeScheduledBroadcastStatus = (value: any): 'scheduled' | 'processing' | 'sent' | 'partial' | 'failed' | 'cancelled' => {
+    const raw = typeof value === 'string' ? value.trim().toLowerCase() : ''
+    if (raw === 'processing') return 'processing'
+    if (raw === 'sent') return 'sent'
+    if (raw === 'partial') return 'partial'
+    if (raw === 'failed') return 'failed'
+    if (raw === 'cancelled') return 'cancelled'
+    return 'scheduled'
+}
+
+const shapeScheduledBroadcastRow = (row: any) => {
+    const recipients = Array.isArray(row?.recipients) ? row.recipients : []
+    return {
+        id: String(row?.id || ''),
+        profile_id: typeof row?.profile_id === 'string' ? row.profile_id : '',
+        company_id: typeof row?.company_id === 'string' ? row.company_id : '',
+        name: typeof row?.name === 'string' ? row.name : '',
+        template_name: typeof row?.template_name === 'string' ? row.template_name : '',
+        language: typeof row?.language === 'string' ? row.language : 'en_US',
+        components: Array.isArray(row?.components) ? row.components : [],
+        recipients,
+        recipient_count: recipients.length,
+        scheduled_at: typeof row?.scheduled_at === 'string' ? row.scheduled_at : null,
+        status: normalizeScheduledBroadcastStatus(row?.status),
+        created_at: typeof row?.created_at === 'string' ? row.created_at : null,
+        updated_at: typeof row?.updated_at === 'string' ? row.updated_at : null,
+        processed_at: typeof row?.processed_at === 'string' ? row.processed_at : null,
+        sent_count: Number.isFinite(Number(row?.sent_count)) ? Number(row.sent_count) : 0,
+        failed_count: Number.isFinite(Number(row?.failed_count)) ? Number(row.failed_count) : 0,
+        last_error: typeof row?.last_error === 'string' ? row.last_error : null
+    }
+}
+
+async function runScheduledBroadcastTick() {
+    if (scheduledBroadcastTickRunning) return
+    scheduledBroadcastTickRunning = true
+    try {
+        const nowIso = new Date().toISOString()
+        const { data: dueRows, error: dueError } = await supabase
+            .from('scheduled_broadcasts')
+            .select('id, company_id, profile_id, name, template_name, language, components, recipients, scheduled_at, status')
+            .eq('status', 'scheduled')
+            .lte('scheduled_at', nowIso)
+            .order('scheduled_at', { ascending: true })
+            .limit(8)
+
+        if (dueError) {
+            const maybeMissingRelation = String(dueError?.code || '') === '42P01' || /does not exist/i.test(String(dueError?.message || ''))
+            if (maybeMissingRelation) {
+                if (!scheduledBroadcastMissingTableLogged) {
+                    scheduledBroadcastMissingTableLogged = true
+                    console.warn('[ScheduledBroadcasts] Table public.scheduled_broadcasts not found. Run migrations to enable this feature.')
+                }
+                return
+            }
+            console.warn('[ScheduledBroadcasts] Failed to fetch due jobs:', dueError.message)
+            return
+        }
+
+        scheduledBroadcastMissingTableLogged = false
+        if (!Array.isArray(dueRows) || dueRows.length === 0) return
+
+        for (const row of dueRows) {
+            const jobId = typeof row?.id === 'string' ? row.id : ''
+            if (!jobId || scheduledBroadcastInFlightIds.has(jobId)) continue
+
+            scheduledBroadcastInFlightIds.add(jobId)
+            try {
+                const claimedAt = new Date().toISOString()
+                const { data: claimed, error: claimError } = await supabase
+                    .from('scheduled_broadcasts')
+                    .update({
+                        status: 'processing',
+                        updated_at: claimedAt,
+                        last_error: null
+                    })
+                    .eq('id', jobId)
+                    .eq('status', 'scheduled')
+                    .select('id, company_id, profile_id, template_name, language, components, recipients')
+                    .maybeSingle()
+
+                if (claimError) {
+                    console.warn(`[ScheduledBroadcasts] Failed to claim job ${jobId}:`, claimError.message)
+                    continue
+                }
+                if (!claimed?.id) continue
+
+                const companyId = typeof claimed.company_id === 'string' ? claimed.company_id : ''
+                const profileId = typeof claimed.profile_id === 'string' ? claimed.profile_id : ''
+                const templateName = trimText(claimed.template_name)
+                const language = trimText(claimed.language) || 'en_US'
+                const components = Array.isArray(claimed.components) ? claimed.components : []
+
+                const rawRecipients = parseScheduledRecipientsInput(claimed.recipients)
+                const recipients = Array.from(
+                    new Set(
+                        rawRecipients
+                            .map((entry) => normalizePhoneNumber(entry))
+                            .filter(Boolean)
+                    )
+                )
+
+                let sentCount = 0
+                let failedCount = 0
+                let firstError = ''
+
+                if (!companyId || !profileId) {
+                    firstError = 'Missing company_id or profile_id on scheduled broadcast.'
+                    failedCount = recipients.length || 1
+                } else if (!templateName) {
+                    firstError = 'Template name is missing.'
+                    failedCount = recipients.length || 1
+                } else if (recipients.length === 0) {
+                    firstError = 'No valid recipients found.'
+                    failedCount = 1
+                } else {
+                    const componentErrors = validateTemplateSendComponents(components)
+                    if (componentErrors.length > 0) {
+                        firstError = componentErrors[0] || 'Invalid template components.'
+                        failedCount = recipients.length
+                    } else {
+                        const client = await wabaRegistry.getClientByProfile(profileId)
+                        if (!client) {
+                            firstError = 'WABA not configured for this profile.'
+                            failedCount = recipients.length
+                        } else {
+                            for (const phoneNumber of recipients) {
+                                try {
+                                    const user = await findOrCreateUser(companyId, phoneNumber)
+                                    if (!user?.id) {
+                                        failedCount += 1
+                                        if (!firstError) firstError = `Failed to resolve user for ${phoneNumber}`
+                                        continue
+                                    }
+
+                                    await sendWhatsAppMessage({
+                                        client,
+                                        userId: user.id,
+                                        to: phoneNumber,
+                                        type: 'template',
+                                        content: {
+                                            name: templateName,
+                                            language,
+                                            components
+                                        },
+                                        workflowState: null
+                                    })
+                                    sentCount += 1
+                                } catch (sendError: any) {
+                                    failedCount += 1
+                                    if (!firstError) {
+                                        firstError = `Failed to send ${phoneNumber}: ${formatScheduledBroadcastError(sendError)}`
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                const finalStatus = sentCount > 0
+                    ? (failedCount > 0 ? 'partial' : 'sent')
+                    : 'failed'
+
+                await supabase
+                    .from('scheduled_broadcasts')
+                    .update({
+                        status: finalStatus,
+                        sent_count: sentCount,
+                        failed_count: failedCount,
+                        processed_at: new Date().toISOString(),
+                        updated_at: new Date().toISOString(),
+                        last_error: firstError || null
+                    })
+                    .eq('id', jobId)
+            } catch (error: any) {
+                const message = formatScheduledBroadcastError(error)
+                console.warn(`[ScheduledBroadcasts] Job ${jobId} failed:`, message)
+                await supabase
+                    .from('scheduled_broadcasts')
+                    .update({
+                        status: 'failed',
+                        failed_count: 1,
+                        processed_at: new Date().toISOString(),
+                        updated_at: new Date().toISOString(),
+                        last_error: message
+                    })
+                    .eq('id', jobId)
+            } finally {
+                scheduledBroadcastInFlightIds.delete(jobId)
+            }
+        }
+    } finally {
+        scheduledBroadcastTickRunning = false
+    }
+}
+
+setInterval(() => {
+    runScheduledBroadcastTick().catch((error) => {
+        console.warn('[ScheduledBroadcasts] tick failed:', formatScheduledBroadcastError(error))
+    })
+}, SCHEDULED_BROADCAST_TICK_MS)
+runScheduledBroadcastTick().catch((error) => {
+    console.warn('[ScheduledBroadcasts] initial run failed:', formatScheduledBroadcastError(error))
+})
+
+app.get('/api/waba/scheduled-broadcasts', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const { data, error } = await supabase
+            .from('scheduled_broadcasts')
+            .select('id, company_id, profile_id, name, template_name, language, components, recipients, scheduled_at, status, created_at, updated_at, processed_at, sent_count, failed_count, last_error')
+            .eq('company_id', access.companyId)
+            .eq('profile_id', access.profileId)
+            .order('scheduled_at', { ascending: true })
+            .limit(200)
+
+        if (error) {
+            return res.status(500).json({ success: false, error: error.message })
+        }
+
+        const rows = Array.isArray(data) ? data.map((row: any) => shapeScheduledBroadcastRow(row)) : []
+        res.json({ success: true, data: rows })
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error?.message || 'Failed to load scheduled broadcasts' })
+    }
+})
+
+app.post('/api/waba/scheduled-broadcasts', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const templateName = readTrimmed(req.body?.template_name || req.body?.templateName)
+        const language = readTrimmed(req.body?.language || req.body?.languageCode || req.body?.language_code) || 'en_US'
+        const scheduleName = readTrimmed(req.body?.name || req.body?.campaignName || req.body?.campaign_name)
+        const scheduledAtRaw = readTrimmed(req.body?.scheduled_at || req.body?.scheduledAt)
+        const scheduledAt = scheduledAtRaw ? new Date(scheduledAtRaw) : null
+        const scheduledAtIso = scheduledAt && !Number.isNaN(scheduledAt.getTime()) ? scheduledAt.toISOString() : ''
+
+        if (!templateName) {
+            return res.status(400).json({ success: false, error: 'template_name/templateName is required' })
+        }
+        if (!scheduledAtIso) {
+            return res.status(400).json({ success: false, error: 'scheduled_at/scheduledAt must be a valid datetime' })
+        }
+        if (scheduledAt!.getTime() < Date.now() - 5000) {
+            return res.status(400).json({ success: false, error: 'scheduled_at must be in the future' })
+        }
+
+        const inputRecipients = parseScheduledRecipientsInput(req.body?.recipients)
+        const normalizedRecipients = Array.from(
+            new Set(
+                inputRecipients
+                    .map((entry) => normalizePhoneNumber(entry))
+                    .filter(Boolean)
+            )
+        )
+        if (normalizedRecipients.length === 0) {
+            return res.status(400).json({ success: false, error: 'Provide at least one valid recipient number' })
+        }
+        if (normalizedRecipients.length > SCHEDULED_BROADCAST_MAX_RECIPIENTS) {
+            return res.status(400).json({
+                success: false,
+                error: `Maximum ${SCHEDULED_BROADCAST_MAX_RECIPIENTS} recipients are allowed per scheduled broadcast`
+            })
+        }
+
+        const componentsInput = Array.isArray(req.body?.components)
+            ? req.body.components
+            : buildTemplateSendComponents(req.body || {})
+        const componentErrors = validateTemplateSendComponents(componentsInput)
+        if (componentErrors.length > 0) {
+            return res.status(400).json({ success: false, error: 'Invalid template components', details: componentErrors })
+        }
+
+        const { data, error } = await supabase
+            .from('scheduled_broadcasts')
+            .insert({
+                company_id: access.companyId,
+                profile_id: access.profileId,
+                name: scheduleName || templateName,
+                template_name: templateName,
+                language,
+                components: componentsInput,
+                recipients: normalizedRecipients,
+                scheduled_at: scheduledAtIso,
+                status: 'scheduled',
+                created_by: access.user?.id || null,
+                sent_count: 0,
+                failed_count: 0,
+                last_error: null
+            })
+            .select('id, company_id, profile_id, name, template_name, language, components, recipients, scheduled_at, status, created_at, updated_at, processed_at, sent_count, failed_count, last_error')
+            .maybeSingle()
+
+        if (error) {
+            return res.status(500).json({ success: false, error: error.message })
+        }
+
+        const row = data ? shapeScheduledBroadcastRow(data) : null
+        res.json({ success: true, data: row })
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error?.message || 'Failed to create scheduled broadcast' })
+    }
+})
+
+app.delete('/api/waba/scheduled-broadcasts/:id', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+        const id = readTrimmed(req.params?.id)
+        if (!id) {
+            return res.status(400).json({ success: false, error: 'id is required' })
+        }
+
+        const { data, error } = await supabase
+            .from('scheduled_broadcasts')
+            .update({
+                status: 'cancelled',
+                updated_at: new Date().toISOString()
+            })
+            .eq('id', id)
+            .eq('company_id', access.companyId)
+            .eq('profile_id', access.profileId)
+            .eq('status', 'scheduled')
+            .select('id, company_id, profile_id, name, template_name, language, components, recipients, scheduled_at, status, created_at, updated_at, processed_at, sent_count, failed_count, last_error')
+            .maybeSingle()
+
+        if (error) {
+            return res.status(500).json({ success: false, error: error.message })
+        }
+        if (!data) {
+            return res.status(404).json({ success: false, error: 'Scheduled broadcast not found or already processed' })
+        }
+
+        res.json({ success: true, data: shapeScheduledBroadcastRow(data) })
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error?.message || 'Failed to cancel scheduled broadcast' })
     }
 })
 

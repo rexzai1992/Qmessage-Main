@@ -76,7 +76,7 @@ function resolveRoute(
 }
 
 const MAX_BUTTONS = 3
-const DEFAULT_FALLBACK_TEXT = process.env.WORKFLOW_FALLBACK_TEXT || 'Please choose one of the options above.'
+const DEFAULT_FALLBACK_TEXT = process.env.WORKFLOW_FALLBACK_TEXT || 'automation not in setting'
 const DEFAULT_FALLBACK_LIMIT = (() => {
     const raw = process.env.WORKFLOW_FALLBACK_LIMIT
     if (raw === undefined || raw === null || raw === '') return 3

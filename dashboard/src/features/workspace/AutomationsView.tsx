@@ -3,6 +3,9 @@ import { Check, Copy, Plus, Workflow } from 'lucide-react';
 
 type AutomationsViewProps = {
     workflows: any[];
+    profileId: string | null;
+    sessionToken: string | null;
+    apiBaseUrl: string;
     onOpenBuilder: (workflowId: string | null) => void;
     onCreateWorkflow: () => void;
     onToggleWorkflowEnabled: (workflowId: string, nextEnabled: boolean) => void;
@@ -11,12 +14,26 @@ type AutomationsViewProps = {
 
 export default function AutomationsView({
     workflows,
+    profileId,
+    sessionToken,
+    apiBaseUrl,
     onOpenBuilder,
     onCreateWorkflow,
     onToggleWorkflowEnabled,
     onCopyWorkflow
 }: AutomationsViewProps) {
     const lastActionAtRef = React.useRef(0);
+    const [fallbackConfig, setFallbackConfig] = React.useState<{
+        text: string;
+        limit: number | '';
+    }>({
+        text: '',
+        limit: 3
+    });
+    const [fallbackLoading, setFallbackLoading] = React.useState(false);
+    const [fallbackSaving, setFallbackSaving] = React.useState(false);
+    const [fallbackError, setFallbackError] = React.useState<string | null>(null);
+    const [fallbackNotice, setFallbackNotice] = React.useState<string | null>(null);
 
     const getWorkflowId = (value: unknown): string => {
         if (typeof value === 'string') return value.trim();
@@ -40,6 +57,84 @@ export default function AutomationsView({
         onMouseDown: () => runOncePerTap(fn),
         onTouchStart: () => runOncePerTap(fn)
     });
+
+    const canManageFallback = Boolean(profileId && sessionToken);
+
+    const fetchFallbackSettings = React.useCallback(() => {
+        if (!profileId || !sessionToken) return;
+        setFallbackLoading(true);
+        setFallbackError(null);
+        setFallbackNotice(null);
+        fetch(`${apiBaseUrl}/api/company/fallback-settings?profileId=${encodeURIComponent(profileId)}`, {
+            headers: {
+                Authorization: `Bearer ${sessionToken}`
+            }
+        })
+            .then(async res => {
+                const text = await res.text();
+                try {
+                    return JSON.parse(text);
+                } catch {
+                    console.error('Fallback settings fetch failed:', text);
+                    return null;
+                }
+            })
+            .then(data => {
+                if (data?.success) {
+                    const cfg = data?.data || {};
+                    setFallbackConfig({
+                        text: typeof cfg.fallback_text === 'string' ? cfg.fallback_text : '',
+                        limit: typeof cfg.fallback_limit === 'number' ? cfg.fallback_limit : 3
+                    });
+                } else {
+                    setFallbackError(data?.error || 'Failed to load fallback settings');
+                }
+            })
+            .finally(() => setFallbackLoading(false));
+    }, [apiBaseUrl, profileId, sessionToken]);
+
+    const handleSaveFallbackSettings = React.useCallback(() => {
+        if (!profileId || !sessionToken) return;
+        setFallbackSaving(true);
+        setFallbackError(null);
+        setFallbackNotice(null);
+        const payload = {
+            fallback_text: fallbackConfig.text,
+            fallback_limit: fallbackConfig.limit === '' ? null : Number(fallbackConfig.limit)
+        };
+        fetch(`${apiBaseUrl}/api/company/fallback-settings`, {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${sessionToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                profileId,
+                ...payload
+            })
+        })
+            .then(async res => {
+                const text = await res.text();
+                try {
+                    return JSON.parse(text);
+                } catch {
+                    console.error('Fallback settings save failed:', text);
+                    return null;
+                }
+            })
+            .then(data => {
+                if (data?.success) {
+                    setFallbackNotice('Fallback settings saved.');
+                } else {
+                    setFallbackError(data?.error || 'Failed to save fallback settings');
+                }
+            })
+            .finally(() => setFallbackSaving(false));
+    }, [apiBaseUrl, fallbackConfig.limit, fallbackConfig.text, profileId, sessionToken]);
+
+    React.useEffect(() => {
+        fetchFallbackSettings();
+    }, [fetchFallbackSettings]);
 
     const handleOpenWorkflowBuilder = () => {
         const hasAnyWorkflow = workflows.some((wf: any) => Boolean(getWorkflowId(wf?.id)));
@@ -81,6 +176,88 @@ export default function AutomationsView({
                                 Open Workflow Builder
                             </button>
                         </div>
+                    </div>
+                </div>
+
+                <div className="bg-white border border-[#e6ebef] rounded-2xl p-4 md:p-5">
+                    <div className="flex items-center justify-between gap-3">
+                        <div>
+                            <h3 className="text-base md:text-lg font-semibold text-[#111b21] tracking-tight">Fallback Message</h3>
+                            <p className="text-[11px] text-[#54656f] mt-1">
+                                Default reply when users press an invalid button or option.
+                            </p>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={fetchFallbackSettings}
+                            disabled={!canManageFallback || fallbackLoading}
+                            className="h-8 px-3 rounded-lg border border-[#d8dee4] bg-white text-[#1f2a33] text-[10px] font-semibold uppercase tracking-wide hover:bg-[#f7f9fb] transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                        >
+                            {fallbackLoading ? 'Refreshing…' : 'Refresh'}
+                        </button>
+                    </div>
+
+                    {!canManageFallback && (
+                        <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-700">
+                            Select a profile and make sure you are logged in to manage fallback settings.
+                        </div>
+                    )}
+
+                    {fallbackError && (
+                        <div className="mt-4 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-[11px] text-rose-700">
+                            {fallbackError}
+                        </div>
+                    )}
+
+                    {fallbackNotice && (
+                        <div className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-[11px] text-emerald-700">
+                            {fallbackNotice}
+                        </div>
+                    )}
+
+                    <div className="mt-4 grid grid-cols-1 lg:grid-cols-3 gap-4">
+                        <div className="lg:col-span-2">
+                            <label className="text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">Fallback Text</label>
+                            <textarea
+                                className="mt-2 w-full min-h-[92px] bg-[#f8f9fa] border border-[#dfe6eb] rounded-xl px-3 py-2 text-sm text-[#111b21] focus:outline-none focus:border-[#00a884] disabled:opacity-70"
+                                value={fallbackConfig.text}
+                                onChange={(e) => setFallbackConfig(prev => ({ ...prev, text: e.target.value }))}
+                                placeholder="automation not in setting"
+                                disabled={!canManageFallback || fallbackLoading || fallbackSaving}
+                            />
+                            <p className="text-[11px] text-[#7a8b97] mt-2">
+                                Leave empty to stop sending fallback replies.
+                            </p>
+                        </div>
+                        <div>
+                            <label className="text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">Max Times</label>
+                            <input
+                                type="number"
+                                min={0}
+                                className="mt-2 w-full bg-[#f8f9fa] border border-[#dfe6eb] rounded-xl px-3 py-2 text-sm font-semibold text-[#111b21] focus:outline-none focus:border-[#00a884] disabled:opacity-70"
+                                value={fallbackConfig.limit}
+                                onChange={(e) => {
+                                    const next = e.target.value === '' ? '' : Number(e.target.value);
+                                    setFallbackConfig(prev => ({ ...prev, limit: next }));
+                                }}
+                                placeholder="3"
+                                disabled={!canManageFallback || fallbackLoading || fallbackSaving}
+                            />
+                            <p className="text-[11px] text-[#7a8b97] mt-2">
+                                Set to <code className="font-mono">0</code> for unlimited replies.
+                            </p>
+                        </div>
+                    </div>
+
+                    <div className="mt-4 flex justify-end">
+                        <button
+                            type="button"
+                            onClick={handleSaveFallbackSettings}
+                            disabled={!canManageFallback || fallbackLoading || fallbackSaving}
+                            className="h-8 px-3 rounded-lg bg-[#00a884] text-white text-[10px] font-semibold uppercase tracking-wide hover:bg-[#008f6f] transition-all inline-flex items-center gap-1 disabled:opacity-60 disabled:cursor-not-allowed"
+                        >
+                            {fallbackSaving ? 'Saving…' : 'Save Fallback Settings'}
+                        </button>
                     </div>
                 </div>
 
