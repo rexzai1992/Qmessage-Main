@@ -1,4 +1,14 @@
 import type { Express } from 'express'
+import {
+    assertCompanyAssetKey,
+    createDownloadUrl,
+    createUploadUrl,
+    getMaxUploadBytes,
+    isAllowedMimeType,
+    isR2Configured,
+    normalizeMediaMessageType,
+    normalizeUploadPurpose
+} from '../../src/services/r2-storage'
 
 const UI_FEATURE_KEYS = new Set([
     'team-inbox',
@@ -12,6 +22,8 @@ const UI_FEATURE_KEYS = new Set([
 
 const UI_HIDDEN_FEATURES_MISSING_MESSAGE =
     'UI controls are not initialized. Run migration 20260407_company_ui_hidden_features.sql.'
+const QUICK_REPLIES_MEDIA_MISSING_MESSAGE =
+    'Quick reply media fields are not initialized. Run migrations 20260408_quick_replies_media_support.sql and 20260408_quick_replies_r2_storage.sql.'
 
 function normalizeUiFeatureKey(value: unknown): string {
     if (typeof value !== 'string') return ''
@@ -59,6 +71,21 @@ function isUiHiddenFeaturesMissingError(error: any): boolean {
     return code === '42703' && message.includes('ui_hidden_features')
 }
 
+function isQuickRepliesMediaColumnsMissingError(error: any): boolean {
+    const code = typeof error?.code === 'string' ? error.code.trim().toUpperCase() : ''
+    const message = String(error?.message || '').toLowerCase()
+    if (code !== '42703') return false
+    return (
+        message.includes('message_type')
+        || message.includes('media_url')
+        || message.includes('media_filename')
+        || message.includes('media_storage')
+        || message.includes('media_asset_key')
+        || message.includes('media_mime_type')
+        || message.includes('media_size_bytes')
+    )
+}
+
 export function registerCompanyRoutes(app: Express, ctx: any) {
     const {
         requireSupabaseUserMiddleware,
@@ -85,6 +112,13 @@ app.get('/api/company/fallback-settings', requireSupabaseUserMiddleware, async (
             .maybeSingle()
 
         if (error) {
+            if (isQuickRepliesMediaColumnsMissingError(error)) {
+                return res.status(503).json({
+                    success: false,
+                    code: 'QUICK_REPLIES_MEDIA_MISSING',
+                    error: QUICK_REPLIES_MEDIA_MISSING_MESSAGE
+                })
+            }
             return res.status(500).json({ success: false, error: error.message })
         }
 
@@ -126,6 +160,13 @@ app.post('/api/company/fallback-settings', requireSupabaseUserMiddleware, async 
             .eq('id', access.companyId)
 
         if (error) {
+            if (isQuickRepliesMediaColumnsMissingError(error)) {
+                return res.status(503).json({
+                    success: false,
+                    code: 'QUICK_REPLIES_MEDIA_MISSING',
+                    error: QUICK_REPLIES_MEDIA_MISSING_MESSAGE
+                })
+            }
             return res.status(500).json({ success: false, error: error.message })
         }
 
@@ -176,6 +217,67 @@ app.get('/api/company/ui-controls', requireSupabaseUserMiddleware, async (req: a
     }
 })
 
+app.post('/api/company/media/upload-url', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        if (!isR2Configured()) {
+            return res.status(503).json({ success: false, error: 'R2 storage is not configured on this server.' })
+        }
+
+        const purpose = normalizeUploadPurpose(req.body?.purpose)
+        const messageType = normalizeMediaMessageType(req.body?.messageType)
+        const fileName = readTrimmed(req.body?.fileName || '')
+        const mimeType = readTrimmed(req.body?.mimeType || '').toLowerCase()
+        const sizeBytes = Number(req.body?.sizeBytes)
+
+        if (!purpose) {
+            return res.status(400).json({ success: false, error: 'purpose must be quick_reply or chat_message.' })
+        }
+        if (!messageType) {
+            return res.status(400).json({ success: false, error: 'messageType must be image, video, or document.' })
+        }
+        if (!fileName) {
+            return res.status(400).json({ success: false, error: 'fileName is required.' })
+        }
+        if (!mimeType || !isAllowedMimeType(messageType, mimeType)) {
+            return res.status(400).json({ success: false, error: `Invalid MIME type for ${messageType}.` })
+        }
+        if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) {
+            return res.status(400).json({ success: false, error: 'sizeBytes must be a positive number.' })
+        }
+
+        const maxBytes = getMaxUploadBytes(messageType)
+        if (maxBytes > 0 && sizeBytes > maxBytes) {
+            return res.status(413).json({
+                success: false,
+                error: `File too large for ${messageType}. Max ${maxBytes} bytes.`,
+                maxBytes
+            })
+        }
+
+        const upload = await createUploadUrl({
+            companyId: access.companyId,
+            purpose,
+            messageType,
+            fileName,
+            mimeType,
+            sizeBytes
+        })
+
+        return res.json({
+            success: true,
+            data: {
+                ...upload,
+                maxBytes
+            }
+        })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error.message })
+    }
+})
+
 const normalizeQuickReplyShortcut = (value: unknown): string => {
     if (typeof value !== 'string') return ''
     const trimmed = value.trim()
@@ -183,6 +285,42 @@ const normalizeQuickReplyShortcut = (value: unknown): string => {
     const withoutSlash = trimmed.replace(/^\/+/, '')
     const token = withoutSlash.split(/\s+/)[0]
     return token.toLowerCase()
+}
+
+const QUICK_REPLY_MESSAGE_TYPES = new Set(['text', 'image', 'video', 'document'])
+
+const normalizeQuickReplyMessageType = (value: unknown): 'text' | 'image' | 'video' | 'document' => {
+    const normalized = typeof value === 'string' ? value.trim().toLowerCase() : ''
+    if (normalized === 'image' || normalized === 'video' || normalized === 'document') return normalized
+    return 'text'
+}
+
+const normalizeQuickReplyText = (value: unknown): string =>
+    typeof value === 'string' ? value.trim() : ''
+
+const normalizeQuickReplyMediaUrl = (value: unknown): string =>
+    typeof value === 'string' ? value.trim() : ''
+
+const normalizeQuickReplyMediaFilename = (value: unknown): string =>
+    typeof value === 'string' ? value.trim() : ''
+
+const normalizeQuickReplyMediaStorage = (value: unknown): 'external' | 'r2' => {
+    const normalized = typeof value === 'string' ? value.trim().toLowerCase() : ''
+    if (normalized === 'r2') return 'r2'
+    return 'external'
+}
+
+const normalizeQuickReplyMediaAssetKey = (value: unknown): string =>
+    typeof value === 'string' ? value.trim() : ''
+
+const normalizeQuickReplyMediaMimeType = (value: unknown): string =>
+    typeof value === 'string' ? value.trim().toLowerCase() : ''
+
+const normalizeQuickReplyMediaSizeBytes = (value: unknown): number | null => {
+    const parsed = Number(value)
+    if (!Number.isFinite(parsed)) return null
+    const normalized = Math.max(0, Math.floor(parsed))
+    return normalized || null
 }
 
 // Configure quick replies (company-level)
@@ -193,15 +331,49 @@ app.get('/api/company/quick-replies', requireSupabaseUserMiddleware, async (req:
 
         const { data, error } = await supabase
             .from('quick_replies')
-            .select('id, shortcut, text, created_at, updated_at')
+            .select('id, shortcut, text, message_type, media_url, media_filename, media_storage, media_asset_key, media_mime_type, media_size_bytes, created_at, updated_at')
             .eq('company_id', access.companyId)
             .order('shortcut', { ascending: true })
 
         if (error) {
+            if (isQuickRepliesMediaColumnsMissingError(error)) {
+                return res.status(503).json({
+                    success: false,
+                    code: 'QUICK_REPLIES_MEDIA_MISSING',
+                    error: QUICK_REPLIES_MEDIA_MISSING_MESSAGE
+                })
+            }
             return res.status(500).json({ success: false, error: error.message })
         }
 
-        res.json({ success: true, data: data || [] })
+        const normalized = await Promise.all((data || []).map(async (row: any) => {
+            const messageType = normalizeQuickReplyMessageType(row?.message_type)
+            const mediaAssetKey = normalizeQuickReplyMediaAssetKey(row?.media_asset_key)
+            const mediaStorage = mediaAssetKey ? 'r2' : normalizeQuickReplyMediaStorage(row?.media_storage)
+            let mediaUrl = normalizeQuickReplyMediaUrl(row?.media_url)
+            if (messageType !== 'text' && mediaStorage === 'r2' && mediaAssetKey && isR2Configured()) {
+                try {
+                    mediaUrl = await createDownloadUrl({
+                        companyId: access.companyId,
+                        assetKey: mediaAssetKey
+                    })
+                } catch {
+                    mediaUrl = ''
+                }
+            }
+            return {
+                ...row,
+                message_type: messageType,
+                media_storage: mediaStorage,
+                media_asset_key: mediaAssetKey || null,
+                media_url: mediaUrl,
+                media_mime_type: normalizeQuickReplyMediaMimeType(row?.media_mime_type) || null,
+                media_size_bytes: normalizeQuickReplyMediaSizeBytes(row?.media_size_bytes),
+                media_filename: normalizeQuickReplyMediaFilename(row?.media_filename)
+            }
+        }))
+
+        res.json({ success: true, data: normalized })
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message })
     }
@@ -218,16 +390,58 @@ app.post('/api/company/quick-replies', requireSupabaseUserMiddleware, async (req
         }
 
         const seen = new Set<string>()
-        const cleaned: Array<{ shortcut: string; text: string }> = []
+        const cleaned: Array<{
+            shortcut: string
+            text: string
+            message_type: 'text' | 'image' | 'video' | 'document'
+            media_storage: 'external' | 'r2'
+            media_url: string | null
+            media_asset_key: string | null
+            media_mime_type: string | null
+            media_size_bytes: number | null
+            media_filename: string | null
+        }> = []
         rawItems.forEach((item: any) => {
             const shortcut = normalizeQuickReplyShortcut(item?.shortcut)
-            const text = typeof item?.text === 'string' ? item.text.trim() : ''
-            if (!shortcut || !text) return
+            const text = normalizeQuickReplyText(item?.text)
+            const messageType = normalizeQuickReplyMessageType(item?.message_type)
+            const requestedStorage = normalizeQuickReplyMediaStorage(item?.media_storage)
+            const mediaUrl = normalizeQuickReplyMediaUrl(item?.media_url)
+            const mediaAssetKeyRaw = normalizeQuickReplyMediaAssetKey(item?.media_asset_key)
+            const mediaMimeType = normalizeQuickReplyMediaMimeType(item?.media_mime_type)
+            const mediaSizeBytes = normalizeQuickReplyMediaSizeBytes(item?.media_size_bytes)
+            const mediaFilename = normalizeQuickReplyMediaFilename(item?.media_filename)
+            const mediaStorage: 'external' | 'r2' = mediaAssetKeyRaw ? 'r2' : requestedStorage
+            let mediaAssetKey = ''
+            if (!shortcut) return
+            if (!QUICK_REPLY_MESSAGE_TYPES.has(messageType)) return
             if (seen.has(shortcut)) {
                 return
             }
+            if (messageType === 'text') {
+                if (!text) return
+            } else if (mediaStorage === 'r2') {
+                if (!mediaAssetKeyRaw) return
+                try {
+                    mediaAssetKey = assertCompanyAssetKey(access.companyId, mediaAssetKeyRaw)
+                } catch {
+                    return
+                }
+            } else if (!mediaUrl) {
+                return
+            }
             seen.add(shortcut)
-            cleaned.push({ shortcut, text })
+            cleaned.push({
+                shortcut,
+                text,
+                message_type: messageType,
+                media_storage: messageType === 'text' ? 'external' : mediaStorage,
+                media_url: messageType === 'text' || mediaStorage === 'r2' ? null : mediaUrl,
+                media_asset_key: messageType === 'text' || mediaStorage !== 'r2' ? null : mediaAssetKey,
+                media_mime_type: messageType === 'text' || mediaStorage !== 'r2' ? null : (mediaMimeType || null),
+                media_size_bytes: messageType === 'text' || mediaStorage !== 'r2' ? null : mediaSizeBytes,
+                media_filename: messageType === 'document' && mediaFilename ? mediaFilename : null
+            })
         })
 
         const { error: deleteError } = await supabase
@@ -246,25 +460,73 @@ app.post('/api/company/quick-replies', requireSupabaseUserMiddleware, async (req
                     company_id: access.companyId,
                     shortcut: item.shortcut,
                     text: item.text,
+                    message_type: item.message_type,
+                    media_storage: item.media_storage,
+                    media_url: item.media_url,
+                    media_asset_key: item.media_asset_key,
+                    media_mime_type: item.media_mime_type,
+                    media_size_bytes: item.media_size_bytes,
+                    media_filename: item.media_filename,
                     updated_at: new Date().toISOString()
                 })))
 
             if (insertError) {
+                if (isQuickRepliesMediaColumnsMissingError(insertError)) {
+                    return res.status(503).json({
+                        success: false,
+                        code: 'QUICK_REPLIES_MEDIA_MISSING',
+                        error: QUICK_REPLIES_MEDIA_MISSING_MESSAGE
+                    })
+                }
                 return res.status(500).json({ success: false, error: insertError.message })
             }
         }
 
         const { data, error } = await supabase
             .from('quick_replies')
-            .select('id, shortcut, text, created_at, updated_at')
+            .select('id, shortcut, text, message_type, media_url, media_filename, media_storage, media_asset_key, media_mime_type, media_size_bytes, created_at, updated_at')
             .eq('company_id', access.companyId)
             .order('shortcut', { ascending: true })
 
         if (error) {
+            if (isQuickRepliesMediaColumnsMissingError(error)) {
+                return res.status(503).json({
+                    success: false,
+                    code: 'QUICK_REPLIES_MEDIA_MISSING',
+                    error: QUICK_REPLIES_MEDIA_MISSING_MESSAGE
+                })
+            }
             return res.status(500).json({ success: false, error: error.message })
         }
 
-        res.json({ success: true, data: data || [] })
+        const normalized = await Promise.all((data || []).map(async (row: any) => {
+            const messageType = normalizeQuickReplyMessageType(row?.message_type)
+            const mediaAssetKey = normalizeQuickReplyMediaAssetKey(row?.media_asset_key)
+            const mediaStorage = mediaAssetKey ? 'r2' : normalizeQuickReplyMediaStorage(row?.media_storage)
+            let mediaUrl = normalizeQuickReplyMediaUrl(row?.media_url)
+            if (messageType !== 'text' && mediaStorage === 'r2' && mediaAssetKey && isR2Configured()) {
+                try {
+                    mediaUrl = await createDownloadUrl({
+                        companyId: access.companyId,
+                        assetKey: mediaAssetKey
+                    })
+                } catch {
+                    mediaUrl = ''
+                }
+            }
+            return {
+                ...row,
+                message_type: messageType,
+                media_storage: mediaStorage,
+                media_asset_key: mediaAssetKey || null,
+                media_url: mediaUrl,
+                media_mime_type: normalizeQuickReplyMediaMimeType(row?.media_mime_type) || null,
+                media_size_bytes: normalizeQuickReplyMediaSizeBytes(row?.media_size_bytes),
+                media_filename: normalizeQuickReplyMediaFilename(row?.media_filename)
+            }
+        }))
+
+        res.json({ success: true, data: normalized })
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message })
     }

@@ -1,4 +1,5 @@
 import type { Server } from 'socket.io'
+import { createDownloadUrl } from '../../src/services/r2-storage'
 
 export function registerSocketHandlers(io: Server, ctx: any) {
     const {
@@ -168,7 +169,59 @@ io.on('connection', async (socket) => {
         }
     }
 
-    socket.emit('profiles.update', userProfiles || [])
+    socket.emit('profiles.update', await enrichProfilesWithConnectionStatus(userProfiles || []))
+
+    const resolveConfiguredProfileForCompany = async (requestedProfileId: unknown): Promise<{
+        profileId: string
+        companyId: string
+        client: any
+    } | null> => {
+        const requested =
+            typeof requestedProfileId === 'string'
+                ? requestedProfileId.trim()
+                : ''
+
+        if (requested) {
+            const requestedClient = await wabaRegistry.getClientByProfile(requested)
+            if (requestedClient) {
+                const requestedConfig = await wabaRegistry.getConfigByProfile(requested)
+                const requestedCompanyId = await resolveCompanyId(requestedConfig?.companyId || requested)
+                if (requestedCompanyId && requestedCompanyId === companyId) {
+                    return {
+                        profileId: requested,
+                        companyId: requestedCompanyId,
+                        client: requestedClient
+                    }
+                }
+            }
+        }
+
+        const activeProfiles = await wabaRegistry.getProfileIds()
+        for (const candidateProfileId of activeProfiles) {
+            const candidateConfig = await wabaRegistry.getConfigByProfile(candidateProfileId)
+            const candidateCompanyId = await resolveCompanyId(candidateConfig?.companyId || candidateProfileId)
+            if (!candidateCompanyId || candidateCompanyId !== companyId) continue
+
+            const candidateClient = await wabaRegistry.getClientByProfile(candidateProfileId)
+            if (!candidateClient) continue
+
+            return {
+                profileId: candidateProfileId,
+                companyId: candidateCompanyId,
+                client: candidateClient
+            }
+        }
+
+        return null
+    }
+
+    async function enrichProfilesWithConnectionStatus(items: any[]) {
+        const activeProfileIds = new Set(await wabaRegistry.getProfileIds())
+        return (Array.isArray(items) ? items : []).map((profile: any) => ({
+            ...profile,
+            status: activeProfileIds.has(profile?.id) ? 'open' : 'close'
+        }))
+    }
 
     socket.on('switchProfile', async (profileId) => {
         if (!profileId) return
@@ -209,8 +262,9 @@ io.on('connection', async (socket) => {
                     }
                 ])
             )
-            const syntheticMessages = messages
-                .map(msg => recordToSyntheticMessage(msg, userMap))
+            const syntheticMessages = (await Promise.all(
+                messages.map((msg) => recordToSyntheticMessage(msg, userMap, profileCompanyId))
+            ))
                 .filter(Boolean)
                 .reverse()
 
@@ -220,7 +274,7 @@ io.on('connection', async (socket) => {
         // Reset unread for this profile when switched to
         await supabase.from('profiles').update({ unreadCount: 0 }).eq('id', profileId).eq('company_id', currentCompanyId)
         const { data: refreshed } = await supabase.from('profiles').select('*').eq('company_id', currentCompanyId).order('created_at', { ascending: true })
-        io.to(getCompanyRoom(currentCompanyId)).emit('profiles.update', refreshed || [])
+        io.to(getCompanyRoom(currentCompanyId)).emit('profiles.update', await enrichProfilesWithConnectionStatus(refreshed || []))
     })
 
     // Lightweight refresh without resetting unread counts
@@ -250,8 +304,9 @@ io.on('connection', async (socket) => {
                 }
             ])
         )
-        const syntheticMessages = messages
-            .map(msg => recordToSyntheticMessage(msg, userMap))
+        const syntheticMessages = (await Promise.all(
+            messages.map((msg) => recordToSyntheticMessage(msg, userMap, companyId))
+        ))
             .filter(Boolean)
             .reverse()
 
@@ -540,7 +595,7 @@ io.on('connection', async (socket) => {
 
         console.log(`[${userId}] Profile saved to DB, refreshing list...`)
         const { data: refreshed } = await supabase.from('profiles').select('*').eq('company_id', currentCompanyId).order('created_at', { ascending: true })
-        io.to(getCompanyRoom(currentCompanyId)).emit('profiles.update', refreshed)
+        io.to(getCompanyRoom(currentCompanyId)).emit('profiles.update', await enrichProfilesWithConnectionStatus(refreshed || []))
 
         console.log(`[${userId}] Profile ${id} created. WABA config required to activate.`)
         socket.emit('profile.added', id)
@@ -550,7 +605,7 @@ io.on('connection', async (socket) => {
         const currentCompanyId = socket.data.companyId || companyId
         await supabase.from('profiles').update({ name }).eq('id', profileId).eq('company_id', currentCompanyId)
         const { data: refreshed } = await supabase.from('profiles').select('*').eq('company_id', currentCompanyId).order('created_at', { ascending: true })
-        io.to(getCompanyRoom(currentCompanyId)).emit('profiles.update', refreshed)
+        io.to(getCompanyRoom(currentCompanyId)).emit('profiles.update', await enrichProfilesWithConnectionStatus(refreshed || []))
     })
 
     socket.on('deleteProfile', async (profileId: string) => {
@@ -567,7 +622,7 @@ io.on('connection', async (socket) => {
         if (fs.existsSync(resolvePath(`sessions_${profileId}.json`))) fs.unlinkSync(resolvePath(`sessions_${profileId}.json`))
 
         const { data: refreshed } = await supabase.from('profiles').select('*').eq('company_id', currentCompanyId).order('created_at', { ascending: true })
-        io.to(getCompanyRoom(currentCompanyId)).emit('profiles.update', refreshed || [])
+        io.to(getCompanyRoom(currentCompanyId)).emit('profiles.update', await enrichProfilesWithConnectionStatus(refreshed || []))
     })
 
     socket.on('logout', async (profileId) => {
@@ -592,21 +647,17 @@ io.on('connection', async (socket) => {
         }
         if (!jid.includes('@')) jid = `${jid}@s.whatsapp.net`
         try {
-            const client = await wabaRegistry.getClientByProfile(profileId)
-            if (!client) {
+            const resolvedProfile = await resolveConfiguredProfileForCompany(profileId)
+            if (!resolvedProfile) {
                 socket.emit('profile.error', { message: 'WABA not configured for this profile.' })
                 if (typeof ack === 'function') ack({ success: false, error: 'WABA not configured for this profile.' })
                 return
             }
-            const config = await wabaRegistry.getConfigByProfile(profileId)
-            const companyId = await resolveCompanyId(config?.companyId || profileId)
-            if (!companyId) {
-                socket.emit('profile.error', { message: 'Company not found.' })
-                if (typeof ack === 'function') ack({ success: false, error: 'Company not found.' })
-                return
-            }
+            profileId = resolvedProfile.profileId
+            const client = resolvedProfile.client
+            const resolvedCompanyId = resolvedProfile.companyId
             const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
-            const user = await findOrCreateUser(companyId, phoneNumber)
+            const user = await findOrCreateUser(resolvedCompanyId, phoneNumber)
             if (!user) {
                 socket.emit('profile.error', { message: 'Failed to resolve user.' })
                 if (typeof ack === 'function') ack({ success: false, error: 'Failed to resolve user.' })
@@ -616,12 +667,21 @@ io.on('connection', async (socket) => {
             const messageText = typeof text === 'string' ? text.trim() : ''
             const mediaType = typeof media?.type === 'string' ? media.type.toLowerCase() : ''
             const mediaUrl = typeof media?.url === 'string' ? media.url.trim() : ''
+            const mediaAssetKey = typeof media?.assetKey === 'string' ? media.assetKey.trim() : ''
             const mediaFilename = typeof media?.filename === 'string' ? media.filename.trim() : ''
+            let mediaLink = mediaUrl
+            if ((mediaType === 'image' || mediaType === 'video' || mediaType === 'document') && mediaAssetKey) {
+                mediaLink = await createDownloadUrl({
+                    companyId: resolvedCompanyId,
+                    assetKey: mediaAssetKey
+                })
+            }
             const normalizedMedia =
-                (mediaType === 'image' || mediaType === 'video' || mediaType === 'document') && mediaUrl
+                (mediaType === 'image' || mediaType === 'video' || mediaType === 'document') && mediaLink
                     ? {
                         type: mediaType,
-                        link: mediaUrl,
+                        link: mediaLink,
+                        ...(mediaAssetKey ? { assetKey: mediaAssetKey } : {}),
                         ...(mediaType === 'document' && mediaFilename ? { filename: mediaFilename } : {})
                     }
                     : null
@@ -647,6 +707,7 @@ io.on('connection', async (socket) => {
                     data: {
                         messageId: sent?.messageId || null,
                         jid: `${phoneNumber}@s.whatsapp.net`,
+                        profileId,
                         clientTempId: typeof clientTempId === 'string' ? clientTempId : null
                     }
                 })
@@ -657,7 +718,7 @@ io.on('connection', async (socket) => {
                 color: actor.color
             })
             if (assigned) {
-                io.to(getCompanyRoom(companyId)).emit('contacts.update', {
+                io.to(getCompanyRoom(resolvedCompanyId)).emit('contacts.update', {
                     profileId,
                     contacts: [{ ...buildContactPayload(assigned), id: `${phoneNumber}@s.whatsapp.net` }]
                 })
@@ -678,22 +739,19 @@ io.on('connection', async (socket) => {
         }
 
         try {
-            const client = await wabaRegistry.getClientByProfile(profileId)
-            if (!client) {
+            const resolvedProfile = await resolveConfiguredProfileForCompany(profileId)
+            if (!resolvedProfile) {
                 socket.emit('profile.error', { message: 'WABA not configured for this profile.' })
                 return
             }
-            const config = await wabaRegistry.getConfigByProfile(profileId)
-            const companyId = await resolveCompanyId(config?.companyId || profileId)
-            if (!companyId) {
-                socket.emit('profile.error', { message: 'Company not found.' })
-                return
-            }
+            profileId = resolvedProfile.profileId
+            const client = resolvedProfile.client
+            const resolvedCompanyId = resolvedProfile.companyId
 
             const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
             const result = await workflowEngine.startWorkflow(
                 {
-                    companyId,
+                    companyId: resolvedCompanyId,
                     profileId,
                     client,
                     phoneNumber,
@@ -719,19 +777,16 @@ io.on('connection', async (socket) => {
         if (!jid.includes('@')) jid = `${jid}@s.whatsapp.net`
 
         try {
-            const client = await wabaRegistry.getClientByProfile(profileId)
-            if (!client) {
+            const resolvedProfile = await resolveConfiguredProfileForCompany(profileId)
+            if (!resolvedProfile) {
                 socket.emit('profile.error', { message: 'WABA not configured for this profile.' })
                 return
             }
-            const config = await wabaRegistry.getConfigByProfile(profileId)
-            const companyId = await resolveCompanyId(config?.companyId || profileId)
-            if (!companyId) {
-                socket.emit('profile.error', { message: 'Company not found.' })
-                return
-            }
+            profileId = resolvedProfile.profileId
+            const client = resolvedProfile.client
+            const resolvedCompanyId = resolvedProfile.companyId
             const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
-            const user = await findOrCreateUser(companyId, phoneNumber)
+            const user = await findOrCreateUser(resolvedCompanyId, phoneNumber)
             if (!user) {
                 socket.emit('profile.error', { message: 'Failed to resolve user.' })
                 return
@@ -764,7 +819,7 @@ io.on('connection', async (socket) => {
                 color: actor.color
             })
             if (assigned) {
-                io.to(getCompanyRoom(companyId)).emit('contacts.update', {
+                io.to(getCompanyRoom(resolvedCompanyId)).emit('contacts.update', {
                     profileId,
                     contacts: [{ ...buildContactPayload(assigned), id: `${phoneNumber}@s.whatsapp.net` }]
                 })
@@ -777,11 +832,12 @@ io.on('connection', async (socket) => {
     socket.on('downloadMedia', async (data) => {
         const { profileId, message } = data
         try {
-            const client = await wabaRegistry.getClientByProfile(profileId)
-            if (!client) {
+            const resolvedProfile = await resolveConfiguredProfileForCompany(profileId)
+            if (!resolvedProfile) {
                 socket.emit('profile.error', { message: 'WABA not configured for this profile.' })
                 return
             }
+            const client = resolvedProfile.client
 
             const mediaId =
                 message?.message?.imageMessage?.mediaId ||

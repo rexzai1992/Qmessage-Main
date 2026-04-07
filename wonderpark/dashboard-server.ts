@@ -17,6 +17,7 @@ import type { WabaInboundMessage, WabaStatus, WabaConfig } from '../src/waba/typ
 import { resolveCompanyId, findOrCreateUser, getMessagesForUsers, getUsersForCompany, insertMessage, getUserByPhone, deleteMessagesForUser, normalizePhoneNumber, updateMessageStatusByMessageId, updateUserName, setUserTags, getUsersWithExpiringWindow, updateUserWindowReminder, activateUserCtaFreeWindow, getUserById, assignUserToAgentIfUnassigned, setUserAssignee, hasHumanTakeover, setUserHumanTakeover, setUserTemplateAttributes } from '../src/services/wa-store'
 import type { MessageRecord, User as WaStoreUser } from '../src/services/wa-store'
 import { sendWhatsAppMessage } from '../src/services/whatsapp'
+import { createDownloadUrl, isR2Configured } from '../src/services/r2-storage'
 import { WorkflowEngine } from '../src/workflow/engine'
 import { encryptToken, decryptToken, getTokenEncryptionKey } from '../src/services/token-vault'
 import { exchangeCodeForToken, exchangeForLongLivedToken, fetchBusinesses, fetchOwnedWabaAccounts, fetchClientWabaAccounts, fetchPhoneNumbers, subscribeWabaApp, createSystemUserToken, unsubscribeWabaApp, fetchClientBusinessId, fetchBusinessIntegrationSystemUserToken } from '../src/services/meta-graph'
@@ -3829,9 +3830,10 @@ function buildSyntheticMessage(inbound: WabaInboundMessage) {
     return { syntheticMsg, remoteJid, text }
 }
 
-function recordToSyntheticMessage(
+async function recordToSyntheticMessage(
     record: MessageRecord,
-    userMap: Map<string, { phone: string; name?: string | null }>
+    userMap: Map<string, { phone: string; name?: string | null }>,
+    companyId?: string
 ) {
     const info = userMap.get(record.user_id)
     const cleanPhone = normalizePhoneNumber(info?.phone || '')
@@ -3841,6 +3843,28 @@ function recordToSyntheticMessage(
     const timestamp = Math.floor(new Date(record.created_at).getTime() / 1000)
     const content = record.content || {}
     const type = content.type || content.payload?.type || 'text'
+    const mediaAssetKey =
+        typeof content.media_asset_key === 'string' && content.media_asset_key.trim()
+            ? content.media_asset_key.trim()
+            : typeof content.payload?.media?.assetKey === 'string'
+                ? content.payload.media.assetKey.trim()
+                : ''
+    let signedMediaUrl = ''
+    if (
+        mediaAssetKey
+        && companyId
+        && (type === 'image' || type === 'video' || type === 'document')
+        && isR2Configured()
+    ) {
+        try {
+            signedMediaUrl = await createDownloadUrl({
+                companyId,
+                assetKey: mediaAssetKey
+            })
+        } catch {
+            signedMediaUrl = ''
+        }
+    }
 
     const message: any = {}
 
@@ -3893,7 +3917,8 @@ function recordToSyntheticMessage(
         message.imageMessage = {
             caption: content.caption,
             mediaId: content.media_id,
-            url: content.image_url || content.payload?.media?.link || content.payload?.image_url
+            assetKey: mediaAssetKey || undefined,
+            url: signedMediaUrl || content.image_url || content.payload?.media?.link || content.payload?.image_url
         }
     } else if (type === 'document') {
         message.documentMessage = {
@@ -3902,7 +3927,8 @@ function recordToSyntheticMessage(
             fileLength: content.file_size,
             mediaId: content.media_id,
             mimetype: content.mimetype || content.payload?.mimetype,
-            url: content.document_url || content.payload?.media?.link || content.payload?.document_url
+            assetKey: mediaAssetKey || undefined,
+            url: signedMediaUrl || content.document_url || content.payload?.media?.link || content.payload?.document_url
         }
     } else if (type === 'audio') {
         message.audioMessage = {
@@ -3912,7 +3938,8 @@ function recordToSyntheticMessage(
         message.videoMessage = {
             caption: content.caption,
             mediaId: content.media_id,
-            url: content.video_url || content.payload?.media?.link || content.payload?.video_url
+            assetKey: mediaAssetKey || undefined,
+            url: signedMediaUrl || content.video_url || content.payload?.media?.link || content.payload?.video_url
         }
     } else {
         message.conversation = content.text || type

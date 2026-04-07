@@ -28,18 +28,21 @@ function normalizeButtons(buttons: Array<{ id: string; title: string }> = []) {
 type OutboundInlineMedia = {
     type: 'image' | 'video' | 'document'
     link: string
+    assetKey?: string
     filename?: string
 }
 
 function normalizeInlineMedia(raw: any): OutboundInlineMedia | null {
     const type = typeof raw?.type === 'string' ? raw.type.toLowerCase() : ''
     const link = typeof raw?.link === 'string' ? raw.link.trim() : ''
+    const assetKey = typeof raw?.assetKey === 'string' ? raw.assetKey.trim() : ''
     if (!link) return null
     if (type !== 'image' && type !== 'video' && type !== 'document') return null
     const filename = typeof raw?.filename === 'string' ? raw.filename.trim() : ''
     return {
         type,
         link,
+        ...(assetKey ? { assetKey } : {}),
         ...(type === 'document' && filename ? { filename } : {})
     }
 }
@@ -165,6 +168,9 @@ export async function sendWhatsAppMessage(input: SendMessageInput) {
         agent: messageActor
     }
     if (inlineMedia) {
+        if (inlineMedia.assetKey) {
+            persistedContent.media_asset_key = inlineMedia.assetKey
+        }
         if (inlineMedia.type === 'image') {
             persistedContent.image_url = inlineMedia.link
             persistedContent.caption = content.text || ''

@@ -136,6 +136,7 @@ export default function WebhookView({
     onSaveQuickReplies
 }: WebhookViewProps) {
     const [webhooks, setWebhooks] = useState<any[]>([]);
+    const [webhookError, setWebhookError] = useState<string | null>(null);
     const [newUrl, setNewUrl] = useState('');
     const [newEvents, setNewEvents] = useState<string[]>(['message_received']);
     const [loading, setLoading] = useState(false);
@@ -626,6 +627,7 @@ export default function WebhookView({
 
     const fetchWebhooks = () => {
         if (!sessionToken || !profileId) return;
+        setWebhookError(null);
         fetch(`${SOCKET_URL}/addon/admin/webhooks?profileId=${profileId}`, {
             headers: {
                 Authorization: `Bearer ${sessionToken}`
@@ -641,13 +643,23 @@ export default function WebhookView({
                 }
             })
             .then(data => {
-                if (data?.success) setWebhooks(data.data || []);
+                if (data?.success) {
+                    setWebhooks(data.data || []);
+                    return;
+                }
+                setWebhooks([]);
+                setWebhookError(data?.error || 'Failed to load webhooks');
+            })
+            .catch(error => {
+                setWebhooks([]);
+                setWebhookError(error?.message || 'Failed to load webhooks');
             });
     };
 
     const handleAddWebhook = () => {
         if (!sessionToken || !newUrl) return;
         setLoading(true);
+        setWebhookError(null);
         fetch(`${SOCKET_URL}/addon/admin/webhooks`, {
             method: 'POST',
             headers: {
@@ -662,23 +674,35 @@ export default function WebhookView({
         })
             .then(async res => {
                 const text = await res.text();
+                let parsed: any = null;
                 try {
-                    return JSON.parse(text);
+                    parsed = JSON.parse(text);
                 } catch {
                     console.error('Add webhook failed:', text);
-                    return null;
+                    throw new Error('Failed to save webhook');
                 }
+
+                if (!res.ok || !parsed?.success) {
+                    throw new Error(parsed?.error || 'Failed to save webhook');
+                }
+
+                return parsed;
             })
             .then(() => {
                 setLoading(false);
                 setNewUrl('');
                 fetchWebhooks();
+            })
+            .catch((error: any) => {
+                setLoading(false);
+                setWebhookError(error?.message || 'Failed to save webhook');
             });
     };
 
     const handleDeleteWebhook = (url: string) => {
         if (!sessionToken) return;
         if (!confirm('Delete webhook?')) return;
+        setWebhookError(null);
         fetch(`${SOCKET_URL}/addon/admin/webhooks`, {
             method: 'DELETE',
             headers: {
@@ -692,14 +716,24 @@ export default function WebhookView({
         })
             .then(async res => {
                 const text = await res.text();
+                let parsed: any = null;
                 try {
-                    return JSON.parse(text);
+                    parsed = JSON.parse(text);
                 } catch {
                     console.error('Delete webhook failed:', text);
-                    return null;
+                    throw new Error('Failed to delete webhook');
                 }
+
+                if (!res.ok || !parsed?.success) {
+                    throw new Error(parsed?.error || 'Failed to delete webhook');
+                }
+
+                return parsed;
             })
-            .then(() => fetchWebhooks());
+            .then(() => fetchWebhooks())
+            .catch((error: any) => {
+                setWebhookError(error?.message || 'Failed to delete webhook');
+            });
     };
 
     const fetchAutomation = () => {
@@ -1231,7 +1265,13 @@ export default function WebhookView({
                 {/* Webhooks Section */}
                 <div id="settings-webhooks" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
                     <h3 className="text-xl mb-2 text-[#111b21] font-bold">Outgoing Webhooks</h3>
-                    <p className="text-sm text-[#54656f] mb-8 font-medium">Configure endpoints to receive real-time updates from this profile.</p>
+                    <p className="text-sm text-[#54656f] mb-2 font-medium">Configure endpoints to receive real-time updates from this profile.</p>
+                    <p className="text-xs text-[#8696a0] mb-6 font-semibold">Active profile: {profileId}</p>
+                    {webhookError && (
+                        <div className="mb-6 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 font-semibold">
+                            {webhookError}
+                        </div>
+                    )}
 
                     <div className="space-y-4 mb-8">
                         {webhooks.length === 0 && (

@@ -6,6 +6,7 @@ import { resolvePath } from '../config'
 
 const CONFIG_FILE = resolvePath('addon_webhooks.json')
 const QUEUE_FILE = resolvePath('addon_webhook_queue.json')
+const LEGACY_CONFIG_FILE = resolvePath('webhooks.json')
 
 export class WebhookService {
     private configs: Record<string, WebhookConfig[]> = {}
@@ -25,13 +26,63 @@ export class WebhookService {
     }
 
     private loadConfig() {
+        let loadedConfig: Record<string, WebhookConfig[]> = {}
+
         if (fs.existsSync(CONFIG_FILE)) {
             try {
-                this.configs = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'))
+                loadedConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8')) || {}
             } catch (e) {
                 console.error('Failed to load webhook config', e)
-                this.configs = {}
+                loadedConfig = {}
             }
+        }
+
+        const legacyConfig = this.loadLegacyConfig()
+        let changed = false
+
+        for (const [profileId, hooks] of Object.entries(legacyConfig)) {
+            const existingHooks = loadedConfig[profileId]
+            if (!Array.isArray(existingHooks) || existingHooks.length === 0) {
+                loadedConfig[profileId] = hooks
+                changed = true
+            }
+        }
+
+        this.configs = loadedConfig
+
+        if (changed && Object.keys(this.configs).length > 0) {
+            this.saveConfig()
+        }
+    }
+
+    private loadLegacyConfig(): Record<string, WebhookConfig[]> {
+        if (!fs.existsSync(LEGACY_CONFIG_FILE)) return {}
+
+        try {
+            const parsed = JSON.parse(fs.readFileSync(LEGACY_CONFIG_FILE, 'utf-8')) || {}
+            const migrated: Record<string, WebhookConfig[]> = {}
+
+            for (const [profileId, value] of Object.entries(parsed)) {
+                const legacy = value as { url?: unknown; events?: unknown }
+                const url = typeof legacy?.url === 'string' ? legacy.url.trim() : ''
+                if (!url) continue
+
+                const rawEvents = Array.isArray(legacy?.events) ? legacy.events : ['message', 'status']
+                const events = rawEvents
+                    .map(event => (typeof event === 'string' ? event.trim() : ''))
+                    .filter(Boolean)
+
+                migrated[profileId] = [{
+                    url,
+                    events: events.length > 0 ? events : ['message', 'status'],
+                    enabled: true
+                }]
+            }
+
+            return migrated
+        } catch (error) {
+            console.error('Failed to load legacy webhook config', error)
+            return {}
         }
     }
 
@@ -70,24 +121,54 @@ export class WebhookService {
         }
     }
 
+    private hasProfileHooks(profileId: string): boolean {
+        return Array.isArray(this.configs[profileId]) && this.configs[profileId].length > 0
+    }
+
+    private resolveReadProfile(profileId: string): string {
+        if (this.hasProfileHooks(profileId)) return profileId
+        if (profileId !== 'default' && this.hasProfileHooks('default')) return 'default'
+        return profileId
+    }
+
+    private resolveWriteProfile(profileId: string): string {
+        if (profileId === 'default') return 'default'
+        if (this.hasProfileHooks(profileId)) return profileId
+        if (this.hasProfileHooks('default')) return 'default'
+        return profileId
+    }
+
     public getWebhooks(profileId: string) {
-        return this.configs[profileId] || []
+        const sourceProfile = this.resolveReadProfile(profileId)
+        return this.configs[sourceProfile] || []
     }
 
     public addWebhook(profileId: string, config: WebhookConfig) {
-        if (!this.configs[profileId]) this.configs[profileId] = []
-        this.configs[profileId].push(config)
+        const targetProfile = this.resolveWriteProfile(profileId)
+        if (!this.configs[targetProfile]) this.configs[targetProfile] = []
+
+        const existingIndex = this.configs[targetProfile].findIndex(item => item.url === config.url)
+        if (existingIndex >= 0) {
+            this.configs[targetProfile][existingIndex] = {
+                ...this.configs[targetProfile][existingIndex],
+                ...config
+            }
+        } else {
+            this.configs[targetProfile].push(config)
+        }
         this.saveConfig()
     }
 
     public removeWebhook(profileId: string, url: string) {
-        if (!this.configs[profileId]) return
-        this.configs[profileId] = this.configs[profileId].filter(w => w.url !== url)
+        const targetProfile = this.resolveWriteProfile(profileId)
+        if (!this.configs[targetProfile]) return
+        this.configs[targetProfile] = this.configs[targetProfile].filter(w => w.url !== url)
         this.saveConfig()
     }
 
     public trigger(profileId: string, eventName: string, data: any) {
-        const hooks = this.configs[profileId] || []
+        const sourceProfile = this.resolveReadProfile(profileId)
+        const hooks = this.configs[sourceProfile] || []
         // Fast filter
         const relevantHooks = hooks.filter(h => h.enabled && h.events.includes(eventName))
 

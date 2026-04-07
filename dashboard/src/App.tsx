@@ -71,6 +71,7 @@ import {
     textColor,
     withHexAlpha
 } from './features/chat/utils';
+import { uploadFileToCompanyStorage } from './features/media/uploadToCompanyStorage';
 
 
 const SOCKET_URL = getSocketUrl();
@@ -150,6 +151,13 @@ interface QuickReply {
     id?: string;
     shortcut: string;
     text: string;
+    message_type?: 'text' | 'image' | 'video' | 'document';
+    media_storage?: 'external' | 'r2';
+    media_asset_key?: string;
+    media_mime_type?: string;
+    media_size_bytes?: number | null;
+    media_url?: string;
+    media_filename?: string;
 }
 
 type TeamUserLite = {
@@ -560,7 +568,12 @@ export default function App() {
     const [messageText, setMessageText] = useState('');
     const [composerMediaType, setComposerMediaType] = useState<'none' | 'image' | 'video' | 'document'>('none');
     const [composerMediaUrl, setComposerMediaUrl] = useState('');
+    const [composerMediaAssetKey, setComposerMediaAssetKey] = useState('');
+    const [composerMediaMimeType, setComposerMediaMimeType] = useState('');
+    const [composerMediaSizeBytes, setComposerMediaSizeBytes] = useState<number | null>(null);
     const [composerMediaFilename, setComposerMediaFilename] = useState('');
+    const [composerMediaUploading, setComposerMediaUploading] = useState(false);
+    const [composerMediaError, setComposerMediaError] = useState<string | null>(null);
     const [showMediaComposer, setShowMediaComposer] = useState(false);
     const [templateName, setTemplateName] = useState('');
     const [templateLanguage, setTemplateLanguage] = useState('en_US');
@@ -666,6 +679,7 @@ export default function App() {
     const menuRef = useRef<HTMLDivElement>(null);
     const profileMenuRef = useRef<HTMLDivElement>(null);
     const messageInputRef = useRef<HTMLTextAreaElement>(null);
+    const composerFileInputRef = useRef<HTMLInputElement>(null);
     const activeProfileIdRef = useRef<string | null>(null);
     const lastRecoverAtRef = useRef(0);
     const lastInboundRef = useRef<number | null>(null);
@@ -696,7 +710,6 @@ export default function App() {
         {
             group: 'Automation',
             items: [
-                { id: 'settings-conversational', label: 'Conversational Components' },
                 { id: 'settings-reminder', label: '24h Window Reminder' },
                 { id: 'settings-quick-replies', label: 'Quick Replies' }
             ]
@@ -1400,6 +1413,66 @@ export default function App() {
         return token.toLowerCase();
     }, []);
 
+    const normalizeQuickReplyMessageType = useCallback((value: unknown): 'text' | 'image' | 'video' | 'document' => {
+        const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+        if (normalized === 'image' || normalized === 'video' || normalized === 'document') return normalized;
+        return 'text';
+    }, []);
+
+    const normalizeQuickReplyMediaUrl = useCallback((value: unknown) => {
+        return typeof value === 'string' ? value.trim() : '';
+    }, []);
+
+    const normalizeQuickReplyMediaStorage = useCallback((value: unknown): 'external' | 'r2' => {
+        const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+        if (normalized === 'r2') return 'r2';
+        return 'external';
+    }, []);
+
+    const normalizeQuickReplyMediaAssetKey = useCallback((value: unknown) => {
+        return typeof value === 'string' ? value.trim() : '';
+    }, []);
+
+    const normalizeQuickReplyMediaMimeType = useCallback((value: unknown) => {
+        return typeof value === 'string' ? value.trim().toLowerCase() : '';
+    }, []);
+
+    const normalizeQuickReplyMediaSizeBytes = useCallback((value: unknown): number | null => {
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed)) return null;
+        return Math.max(0, Math.floor(parsed)) || null;
+    }, []);
+
+    const normalizeQuickReplyMediaFilename = useCallback((value: unknown) => {
+        return typeof value === 'string' ? value.trim() : '';
+    }, []);
+
+    const normalizeQuickReplyRecord = useCallback((item: any): QuickReply => {
+        const message_type = normalizeQuickReplyMessageType(item?.message_type);
+        const media_asset_key = normalizeQuickReplyMediaAssetKey(item?.media_asset_key);
+        const media_storage = media_asset_key ? 'r2' : normalizeQuickReplyMediaStorage(item?.media_storage);
+        return {
+            id: typeof item?.id === 'string' ? item.id : undefined,
+            shortcut: typeof item?.shortcut === 'string' ? item.shortcut : '',
+            text: typeof item?.text === 'string' ? item.text : '',
+            message_type,
+            media_storage,
+            media_asset_key,
+            media_mime_type: normalizeQuickReplyMediaMimeType(item?.media_mime_type),
+            media_size_bytes: normalizeQuickReplyMediaSizeBytes(item?.media_size_bytes),
+            media_url: normalizeQuickReplyMediaUrl(item?.media_url),
+            media_filename: message_type === 'document' ? normalizeQuickReplyMediaFilename(item?.media_filename) : ''
+        };
+    }, [
+        normalizeQuickReplyMediaAssetKey,
+        normalizeQuickReplyMediaFilename,
+        normalizeQuickReplyMediaMimeType,
+        normalizeQuickReplyMediaSizeBytes,
+        normalizeQuickReplyMediaStorage,
+        normalizeQuickReplyMediaUrl,
+        normalizeQuickReplyMessageType
+    ]);
+
     const fetchQuickReplies = useCallback(() => {
         if (!activeProfileId || !session?.access_token) {
             setQuickReplies([]);
@@ -1423,7 +1496,7 @@ export default function App() {
             })
             .then(data => {
                 if (data?.success) {
-                    setQuickReplies(Array.isArray(data.data) ? data.data : []);
+                    setQuickReplies(Array.isArray(data.data) ? data.data.map((item: any) => normalizeQuickReplyRecord(item)) : []);
                 } else if (data?.error) {
                     setQuickRepliesError(data.error);
                 }
@@ -1432,7 +1505,7 @@ export default function App() {
                 setQuickRepliesError(err?.message || 'Failed to load quick replies');
             })
             .finally(() => setQuickRepliesLoading(false));
-    }, [activeProfileId, session?.access_token]);
+    }, [activeProfileId, normalizeQuickReplyRecord, session?.access_token]);
 
     const saveQuickReplies = useCallback(async (items: QuickReply[]) => {
         if (!activeProfileId || !session?.access_token) return;
@@ -1440,19 +1513,54 @@ export default function App() {
         setQuickRepliesError(null);
 
         const seen = new Set<string>();
-        const cleaned: Array<{ shortcut: string; text: string }> = [];
+        const cleaned: Array<{
+            shortcut: string;
+            text: string;
+            message_type: 'text' | 'image' | 'video' | 'document';
+            media_storage: 'external' | 'r2';
+            media_asset_key: string | null;
+            media_mime_type: string | null;
+            media_size_bytes: number | null;
+            media_url: string | null;
+            media_filename: string | null;
+        }> = [];
 
         for (const item of items) {
             const shortcut = normalizeQuickReplyShortcut(item.shortcut);
             const text = typeof item.text === 'string' ? item.text.trim() : '';
-            if (!shortcut || !text) continue;
+            const messageType = normalizeQuickReplyMessageType(item.message_type);
+            const mediaStorage = normalizeQuickReplyMediaStorage(item.media_storage);
+            const mediaAssetKey = normalizeQuickReplyMediaAssetKey(item.media_asset_key);
+            const resolvedMediaStorage: 'external' | 'r2' = mediaAssetKey ? 'r2' : mediaStorage;
+            const mediaMimeType = normalizeQuickReplyMediaMimeType(item.media_mime_type);
+            const mediaSizeBytes = normalizeQuickReplyMediaSizeBytes(item.media_size_bytes);
+            const mediaUrl = normalizeQuickReplyMediaUrl(item.media_url);
+            const mediaFilename = normalizeQuickReplyMediaFilename(item.media_filename);
+            if (!shortcut) continue;
             if (seen.has(shortcut)) {
                 setQuickRepliesError(`Duplicate shortcut: /${shortcut}`);
                 setQuickRepliesSaving(false);
                 return;
             }
+            if (messageType === 'text') {
+                if (!text) continue;
+            } else if (resolvedMediaStorage === 'r2') {
+                if (!mediaAssetKey) continue;
+            } else if (!mediaUrl) {
+                continue;
+            }
             seen.add(shortcut);
-            cleaned.push({ shortcut, text });
+            cleaned.push({
+                shortcut,
+                text,
+                message_type: messageType,
+                media_storage: messageType === 'text' ? 'external' : resolvedMediaStorage,
+                media_asset_key: messageType === 'text' || resolvedMediaStorage !== 'r2' ? null : mediaAssetKey,
+                media_mime_type: messageType === 'text' || resolvedMediaStorage !== 'r2' ? null : (mediaMimeType || null),
+                media_size_bytes: messageType === 'text' || resolvedMediaStorage !== 'r2' ? null : mediaSizeBytes,
+                media_url: messageType === 'text' || resolvedMediaStorage === 'r2' ? null : mediaUrl,
+                media_filename: messageType === 'document' && mediaFilename ? mediaFilename : null
+            });
         }
 
         try {
@@ -1475,13 +1583,25 @@ export default function App() {
                 setQuickRepliesError(data?.error || 'Failed to save quick replies');
                 return;
             }
-            setQuickReplies(Array.isArray(data.data) ? data.data : []);
+            setQuickReplies(Array.isArray(data.data) ? data.data.map((item: any) => normalizeQuickReplyRecord(item)) : []);
         } catch (err: any) {
             setQuickRepliesError(err?.message || 'Failed to save quick replies');
         } finally {
             setQuickRepliesSaving(false);
         }
-    }, [activeProfileId, normalizeQuickReplyShortcut, session?.access_token]);
+    }, [
+        activeProfileId,
+        normalizeQuickReplyMediaFilename,
+        normalizeQuickReplyMediaAssetKey,
+        normalizeQuickReplyMediaMimeType,
+        normalizeQuickReplyMediaSizeBytes,
+        normalizeQuickReplyMediaStorage,
+        normalizeQuickReplyMediaUrl,
+        normalizeQuickReplyMessageType,
+        normalizeQuickReplyRecord,
+        normalizeQuickReplyShortcut,
+        session?.access_token
+    ]);
 
     const normalizeHiddenFeatureList = useCallback((value: unknown): string[] => {
         const allowed = new Set([
@@ -1609,8 +1729,16 @@ export default function App() {
         if (!activeProfileId || !selectedChatId) {
             setMessageText('');
             setComposerMediaType('none');
-            setComposerMediaUrl('');
+            setComposerMediaUrl((prev) => {
+                if (prev.startsWith('blob:')) URL.revokeObjectURL(prev);
+                return '';
+            });
+            setComposerMediaAssetKey('');
+            setComposerMediaMimeType('');
+            setComposerMediaSizeBytes(null);
             setComposerMediaFilename('');
+            setComposerMediaError(null);
+            setComposerMediaUploading(false);
             setShowMediaComposer(false);
             return;
         }
@@ -1619,8 +1747,16 @@ export default function App() {
             if (!key) {
                 setMessageText('');
                 setComposerMediaType('none');
-                setComposerMediaUrl('');
+                setComposerMediaUrl((prev) => {
+                    if (prev.startsWith('blob:')) URL.revokeObjectURL(prev);
+                    return '';
+                });
+                setComposerMediaAssetKey('');
+                setComposerMediaMimeType('');
+                setComposerMediaSizeBytes(null);
                 setComposerMediaFilename('');
+                setComposerMediaError(null);
+                setComposerMediaUploading(false);
                 setShowMediaComposer(false);
                 return;
             }
@@ -1905,7 +2041,8 @@ export default function App() {
         console.log('Connecting socket with token', session.access_token.substring(0, 10));
         setProfilesLoaded(false);
         const newSocket = io(SOCKET_URL, {
-            auth: { token: session.access_token }
+            auth: { token: session.access_token },
+            transports: ['websocket', 'polling']
         });
         setSocket(newSocket);
 
@@ -1925,9 +2062,14 @@ export default function App() {
                 return;
             }
 
-            // Keep current selection if still valid; otherwise pick persisted profile, then first.
+            // Prefer configured/open profiles whenever available.
             const current = activeProfileIdRef.current;
-            if (current && list.some((p: any) => p.id === current)) return;
+            const openProfiles = list.filter((p: any) => p?.status === 'open');
+            const hasOpenProfiles = openProfiles.length > 0;
+            if (current) {
+                const currentProfile = list.find((p: any) => p.id === current);
+                if (currentProfile && (!hasOpenProfiles || currentProfile?.status === 'open')) return;
+            }
 
             let persisted: string | null = null;
             try {
@@ -1935,7 +2077,11 @@ export default function App() {
             } catch {
                 persisted = null;
             }
-            const next = (persisted && list.find((p: any) => p.id === persisted)) || list[0];
+            const persistedProfile =
+                persisted
+                    ? list.find((p: any) => p.id === persisted && (!hasOpenProfiles || p?.status === 'open'))
+                    : null;
+            const next = persistedProfile || (hasOpenProfiles ? openProfiles[0] : list[0]);
             if (next?.id) setActiveProfileId(next.id);
         });
 
@@ -2549,6 +2695,14 @@ export default function App() {
             .sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
     }, [allMessages, selectedChatId]);
 
+    const activeProfileStatus = useMemo<'open' | 'close' | 'unknown'>(() => {
+        if (!activeProfileId) return 'close';
+        const profile = profiles.find((item: any) => item?.id === activeProfileId);
+        const status = typeof profile?.status === 'string' ? profile.status.toLowerCase() : '';
+        if (!status) return 'unknown';
+        return status === 'open' ? 'open' : 'close';
+    }, [profiles, activeProfileId]);
+
     const selectedWorkflowMemory = useMemo(() => {
         let vars: Record<string, string> = {};
         let qaHistory: Array<{ key: string; question: string; answer: string; at: string }> = [];
@@ -2734,7 +2888,8 @@ export default function App() {
             : null;
     const ctaFreeWindowOpen = ctaFreeWindowRemainingMs !== null && ctaFreeWindowRemainingMs > 0;
     const canSendText = windowOpen && !forceTemplateMode;
-    const hasComposerMedia = composerMediaType !== 'none' && composerMediaUrl.trim().length > 0;
+    const hasComposerMedia = composerMediaType !== 'none'
+        && (composerMediaAssetKey.trim().length > 0 || composerMediaUrl.trim().length > 0);
     const quickReplyQuery = useMemo(() => {
         const trimmed = messageText.trim();
         if (!trimmed.startsWith('/')) return null;
@@ -2845,9 +3000,127 @@ export default function App() {
         selectedTemplateBody
     ]);
 
+    const inferComposerMediaType = useCallback((file: File): 'image' | 'video' | 'document' => {
+        const mimeType = (file.type || '').toLowerCase();
+        if (mimeType.startsWith('image/')) return 'image';
+        if (mimeType.startsWith('video/')) return 'video';
+        return 'document';
+    }, []);
+
+    const resetComposerMedia = useCallback((nextType: 'none' | 'image' | 'video' | 'document' = 'none') => {
+        setComposerMediaUrl((prev) => {
+            if (typeof prev === 'string' && prev.startsWith('blob:')) {
+                URL.revokeObjectURL(prev);
+            }
+            return '';
+        });
+        setComposerMediaAssetKey('');
+        setComposerMediaMimeType('');
+        setComposerMediaSizeBytes(null);
+        setComposerMediaFilename('');
+        setComposerMediaError(null);
+        setComposerMediaUploading(false);
+        setComposerMediaType(nextType);
+        if (nextType === 'none') {
+            setShowMediaComposer(false);
+        }
+    }, []);
+
+    useEffect(() => {
+        return () => {
+            if (composerMediaUrl.startsWith('blob:')) {
+                URL.revokeObjectURL(composerMediaUrl);
+            }
+        };
+    }, [composerMediaUrl]);
+
+    const uploadComposerMediaFile = useCallback(async (file: File, requestedType: 'image' | 'video' | 'document') => {
+        if (!activeProfileId || !session?.access_token) {
+            setComposerMediaError('Select a profile and login before uploading media.');
+            return;
+        }
+        setShowMediaComposer(true);
+        setComposerMediaType(requestedType);
+        setComposerMediaUploading(true);
+        setComposerMediaError(null);
+        try {
+            const uploaded = await uploadFileToCompanyStorage({
+                apiBaseUrl: SOCKET_URL,
+                profileId: activeProfileId,
+                sessionToken: session.access_token,
+                purpose: 'chat_message',
+                messageType: requestedType,
+                file
+            });
+            const previewUrl = URL.createObjectURL(file);
+            setComposerMediaUrl((prev) => {
+                if (prev.startsWith('blob:')) {
+                    URL.revokeObjectURL(prev);
+                }
+                return previewUrl;
+            });
+            setComposerMediaAssetKey(uploaded.assetKey);
+            setComposerMediaMimeType(uploaded.mimeType);
+            setComposerMediaSizeBytes(uploaded.sizeBytes);
+            setComposerMediaFilename(requestedType === 'document' ? (uploaded.fileName || 'document') : '');
+        } catch (error: any) {
+            setComposerMediaError(error?.message || 'Upload failed.');
+            setComposerMediaAssetKey('');
+            setComposerMediaMimeType('');
+            setComposerMediaSizeBytes(null);
+        } finally {
+            setComposerMediaUploading(false);
+        }
+    }, [activeProfileId, session?.access_token]);
+
+    const handleComposerMediaInputChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+        const file = event.target.files?.[0] || null;
+        event.target.value = '';
+        if (!file) return;
+        const messageType =
+            composerMediaType === 'image' || composerMediaType === 'video' || composerMediaType === 'document'
+                ? composerMediaType
+                : inferComposerMediaType(file);
+        void uploadComposerMediaFile(file, messageType);
+    }, [composerMediaType, inferComposerMediaType, uploadComposerMediaFile]);
+
+    const openComposerMediaPicker = useCallback((messageType: 'image' | 'video' | 'document') => {
+        setShowMediaComposer(true);
+        if (composerMediaType !== messageType) {
+            resetComposerMedia(messageType);
+        } else {
+            setComposerMediaError(null);
+            setComposerMediaType(messageType);
+        }
+        requestAnimationFrame(() => {
+            composerFileInputRef.current?.click();
+        });
+    }, [composerMediaType, resetComposerMedia]);
+
     const handleQuickReplyPick = (item: QuickReply) => {
         const text = typeof item.text === 'string' ? item.text.trim() : '';
-        if (!text) return;
+        const quickReplyType = normalizeQuickReplyMessageType(item.message_type);
+        const mediaUrl = normalizeQuickReplyMediaUrl(item.media_url);
+        const mediaStorage = normalizeQuickReplyMediaStorage(item.media_storage);
+        const mediaAssetKey = normalizeQuickReplyMediaAssetKey(item.media_asset_key);
+        const mediaMimeType = normalizeQuickReplyMediaMimeType(item.media_mime_type);
+        const mediaSizeBytes = normalizeQuickReplyMediaSizeBytes(item.media_size_bytes);
+        const mediaFilename = normalizeQuickReplyMediaFilename(item.media_filename);
+        if (!text && quickReplyType === 'text') return;
+
+        if (quickReplyType === 'text' || (!mediaUrl && !mediaAssetKey)) {
+            resetComposerMedia('none');
+        } else {
+            setComposerMediaType(quickReplyType);
+            setComposerMediaUrl(mediaUrl);
+            setComposerMediaAssetKey(mediaStorage === 'r2' ? mediaAssetKey : '');
+            setComposerMediaMimeType(mediaMimeType);
+            setComposerMediaSizeBytes(mediaSizeBytes);
+            setComposerMediaFilename(quickReplyType === 'document' ? (mediaFilename || 'document') : '');
+            setComposerMediaError(null);
+            setShowMediaComposer(true);
+        }
+
         setMessageTextWithDraft(text);
         requestAnimationFrame(() => {
             if (!messageInputRef.current) return;
@@ -2866,7 +3139,7 @@ export default function App() {
 
     const buildOutgoingPayloadFromMessage = useCallback((msg: Message): {
         text: string;
-        media?: { type: 'image' | 'video' | 'document'; url: string; filename?: string };
+        media?: { type: 'image' | 'video' | 'document'; url?: string; assetKey?: string; filename?: string };
     } | null => {
         if (!msg?.key?.fromMe) return null;
         const text =
@@ -2876,22 +3149,47 @@ export default function App() {
                     ? msg.message.extendedTextMessage.text.trim()
                     : '';
         const imageUrl = typeof msg?.message?.imageMessage?.url === 'string' ? msg.message.imageMessage.url.trim() : '';
-        if (imageUrl) {
-            return { text, media: { type: 'image', url: imageUrl } };
+        const imageAssetKey = typeof msg?.message?.imageMessage?.assetKey === 'string' ? msg.message.imageMessage.assetKey.trim() : '';
+        if (imageUrl || imageAssetKey) {
+            return {
+                text,
+                media: {
+                    type: 'image',
+                    ...(imageUrl ? { url: imageUrl } : {}),
+                    ...(imageAssetKey ? { assetKey: imageAssetKey } : {})
+                }
+            };
         }
         const videoUrl = typeof msg?.message?.videoMessage?.url === 'string' ? msg.message.videoMessage.url.trim() : '';
-        if (videoUrl) {
-            return { text, media: { type: 'video', url: videoUrl } };
+        const videoAssetKey = typeof msg?.message?.videoMessage?.assetKey === 'string' ? msg.message.videoMessage.assetKey.trim() : '';
+        if (videoUrl || videoAssetKey) {
+            return {
+                text,
+                media: {
+                    type: 'video',
+                    ...(videoUrl ? { url: videoUrl } : {}),
+                    ...(videoAssetKey ? { assetKey: videoAssetKey } : {})
+                }
+            };
         }
         const documentUrl = typeof msg?.message?.documentMessage?.url === 'string' ? msg.message.documentMessage.url.trim() : '';
-        if (documentUrl) {
+        const documentAssetKey =
+            typeof msg?.message?.documentMessage?.assetKey === 'string'
+                ? msg.message.documentMessage.assetKey.trim()
+                : '';
+        if (documentUrl || documentAssetKey) {
             const filename =
                 typeof msg?.message?.documentMessage?.fileName === 'string'
                     ? msg.message.documentMessage.fileName.trim()
                     : '';
             return {
                 text,
-                media: { type: 'document', url: documentUrl, ...(filename ? { filename } : {}) }
+                media: {
+                    type: 'document',
+                    ...(documentUrl ? { url: documentUrl } : {}),
+                    ...(documentAssetKey ? { assetKey: documentAssetKey } : {}),
+                    ...(filename ? { filename } : {})
+                }
             };
         }
         if (!text) return null;
@@ -2958,16 +3256,19 @@ export default function App() {
 
     const handleSendMessage = () => {
         if (!socket || !activeProfileId || !selectedChatId) return;
+        if (composerMediaUploading) return;
         const outgoingText = messageText.trim();
         const mediaUrl = composerMediaUrl.trim();
+        const mediaAssetKey = composerMediaAssetKey.trim();
         const mediaType = composerMediaType;
         const mediaFilename = composerMediaFilename.trim();
         const tempMessageId = `tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const sendMedia =
-            (mediaType === 'image' || mediaType === 'video' || mediaType === 'document') && mediaUrl
+            (mediaType === 'image' || mediaType === 'video' || mediaType === 'document') && (mediaUrl || mediaAssetKey)
                 ? {
                     type: mediaType,
-                    url: mediaUrl,
+                    ...(mediaUrl ? { url: mediaUrl } : {}),
+                    ...(mediaAssetKey ? { assetKey: mediaAssetKey } : {}),
                     ...(mediaType === 'document' && mediaFilename ? { filename: mediaFilename } : {})
                 }
                 : null;
@@ -3014,6 +3315,7 @@ export default function App() {
                         ...(outgoingText ? { conversation: outgoingText } : {}),
                         imageMessage: {
                             caption: outgoingText,
+                            assetKey: sendMedia.assetKey,
                             url: sendMedia.url
                         }
                     };
@@ -3023,6 +3325,7 @@ export default function App() {
                         ...(outgoingText ? { conversation: outgoingText } : {}),
                         videoMessage: {
                             caption: outgoingText,
+                            assetKey: sendMedia.assetKey,
                             url: sendMedia.url
                         }
                     };
@@ -3031,6 +3334,7 @@ export default function App() {
                     ...(outgoingText ? { conversation: outgoingText } : {}),
                     documentMessage: {
                         caption: outgoingText,
+                        assetKey: sendMedia.assetKey,
                         fileName: sendMedia.filename || 'document',
                         url: sendMedia.url
                     }
@@ -3047,10 +3351,7 @@ export default function App() {
         setAllMessages(prev => [tempMsg, ...prev]);
         persistDraft('', activeProfileId, selectedChatId);
         setMessageText('');
-        setComposerMediaType('none');
-        setComposerMediaUrl('');
-        setComposerMediaFilename('');
-        setShowMediaComposer(false);
+        resetComposerMedia('none');
     };
 
     const openSettingsFromMore = useCallback(() => {
@@ -3806,7 +4107,7 @@ export default function App() {
                                 </div>
                             )}
                         </div>
-                    ) : connectionStatus !== 'open' ? (
+                    ) : activeProfileStatus === 'close' ? (
                         <div className="p-6 flex flex-col items-center justify-center h-full text-center">
                             <div className="bg-white p-6 rounded-2xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] max-w-md">
                                 <ShieldCheck className="w-10 h-10 text-[#00a884] mx-auto mb-4" />
@@ -3814,6 +4115,16 @@ export default function App() {
                                 <p className="text-sm text-[#54656f] leading-relaxed">
                                     Add your Meta Cloud API credentials in Supabase `waba_configs` and enable the config.
                                     Once saved, refresh the page and the profile will show as connected.
+                                </p>
+                            </div>
+                        </div>
+                    ) : connectionStatus !== 'open' ? (
+                        <div className="p-6 flex flex-col items-center justify-center h-full text-center">
+                            <div className="bg-white p-6 rounded-2xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] max-w-md">
+                                <CircleDashed className="w-10 h-10 text-[#00a884] mx-auto mb-4 animate-spin" />
+                                <p className="text-[#111b21] font-bold mb-2">Connecting to WABA...</p>
+                                <p className="text-sm text-[#54656f] leading-relaxed">
+                                    Waiting for live connection. If this takes more than a few seconds, refresh the page.
                                 </p>
                             </div>
                         </div>
@@ -4380,10 +4691,7 @@ export default function App() {
                             </button>
                             <button
                                 type="button"
-                                onClick={() => {
-                                    setComposerMediaType('image');
-                                    setShowMediaComposer(true);
-                                }}
+                                onClick={() => openComposerMediaPicker('image')}
                                 className={`p-1.5 rounded-lg transition-all cursor-pointer ${composerMediaType === 'image' && showMediaComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
                                 title="Attach image"
                             >
@@ -4391,10 +4699,7 @@ export default function App() {
                             </button>
                             <button
                                 type="button"
-                                onClick={() => {
-                                    setComposerMediaType('document');
-                                    setShowMediaComposer(true);
-                                }}
+                                onClick={() => openComposerMediaPicker('document')}
                                 className={`p-1.5 rounded-lg transition-all cursor-pointer ${composerMediaType === 'document' && showMediaComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
                                 title="Attach document"
                             >
@@ -4402,10 +4707,7 @@ export default function App() {
                             </button>
                             <button
                                 type="button"
-                                onClick={() => {
-                                    setComposerMediaType('video');
-                                    setShowMediaComposer(true);
-                                }}
+                                onClick={() => openComposerMediaPicker('video')}
                                 className={`p-1.5 rounded-lg transition-all cursor-pointer ${composerMediaType === 'video' && showMediaComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
                                 title="Attach video"
                             >
@@ -4437,9 +4739,22 @@ export default function App() {
                                                 onClick={() => handleQuickReplyPick(item)}
                                                 className="w-full text-left px-4 py-3 hover:bg-[#f6f8f9] transition-all border-b border-[#f1f3f4] last:border-b-0"
                                             >
-                                                <div className="text-xs font-bold uppercase tracking-widest text-[#00a884]">/{normalizeQuickReplyShortcut(item.shortcut)}</div>
+                                                <div className="flex items-center justify-between gap-2">
+                                                    <div className="text-xs font-bold uppercase tracking-widest text-[#00a884]">/{normalizeQuickReplyShortcut(item.shortcut)}</div>
+                                                    {normalizeQuickReplyMessageType(item.message_type) !== 'text' && (
+                                                        <span className="text-[10px] font-semibold uppercase tracking-wide text-[#4b5c68] bg-[#eef2f5] px-2 py-0.5 rounded-full">
+                                                            {normalizeQuickReplyMessageType(item.message_type)}
+                                                        </span>
+                                                    )}
+                                                </div>
                                                 <div className="text-sm text-[#111b21] mt-1 max-h-10 overflow-hidden">
-                                                    {item.text}
+                                                    {(() => {
+                                                        const type = normalizeQuickReplyMessageType(item.message_type);
+                                                        const text = typeof item.text === 'string' ? item.text.trim() : '';
+                                                        if (text) return text;
+                                                        if (type === 'text') return '';
+                                                        return `Media quick reply (${type})`;
+                                                    })()}
                                                 </div>
                                             </button>
                                         ))
@@ -4452,34 +4767,37 @@ export default function App() {
                                         <div className="text-[11px] font-bold uppercase tracking-widest text-[#54656f]">Attach Media</div>
                                         <button
                                             type="button"
-                                            onClick={() => {
-                                                setShowMediaComposer(false);
-                                                setComposerMediaType('none');
-                                                setComposerMediaUrl('');
-                                                setComposerMediaFilename('');
-                                            }}
+                                            onClick={() => resetComposerMedia('none')}
                                             className="text-[#8696a0] hover:text-rose-500"
                                         >
                                             <X className="w-4 h-4" />
                                         </button>
                                     </div>
-                                    <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                                    <input
+                                        ref={composerFileInputRef}
+                                        type="file"
+                                        accept={composerMediaType === 'image' ? 'image/*' : composerMediaType === 'video' ? 'video/*' : '*/*'}
+                                        className="hidden"
+                                        onChange={handleComposerMediaInputChange}
+                                    />
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
                                         <select
                                             value={composerMediaType}
-                                            onChange={(e) => setComposerMediaType(e.target.value as any)}
+                                            onChange={(e) => resetComposerMedia(e.target.value as 'image' | 'video' | 'document')}
                                             className="bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-xs font-bold text-[#111b21] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20"
                                         >
                                             <option value="image">Image</option>
                                             <option value="video">Video</option>
                                             <option value="document">Document</option>
                                         </select>
-                                        <input
-                                            type="text"
-                                            placeholder="Public media URL (https://...)"
-                                            value={composerMediaUrl}
-                                            onChange={(e) => setComposerMediaUrl(e.target.value)}
-                                            className="md:col-span-2 bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-xs font-mono text-[#111b21] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20"
-                                        />
+                                        <button
+                                            type="button"
+                                            onClick={() => composerFileInputRef.current?.click()}
+                                            disabled={composerMediaUploading}
+                                            className="h-9 rounded-xl bg-[#00a884] text-white text-xs font-bold hover:bg-[#008f6f] transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                                        >
+                                            {composerMediaUploading ? 'Uploading…' : 'Upload File'}
+                                        </button>
                                     </div>
                                     {composerMediaType === 'document' && (
                                         <input
@@ -4489,6 +4807,17 @@ export default function App() {
                                             onChange={(e) => setComposerMediaFilename(e.target.value)}
                                             className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-xs font-medium text-[#111b21] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20"
                                         />
+                                    )}
+                                    {composerMediaError && (
+                                        <div className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-[11px] text-rose-700">
+                                            {composerMediaError}
+                                        </div>
+                                    )}
+                                    {!composerMediaError && hasComposerMedia && (
+                                        <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-[11px] text-emerald-700">
+                                            Media ready to send.
+                                            {composerMediaSizeBytes ? ` (${Math.ceil(composerMediaSizeBytes / 1024)} KB)` : ''}
+                                        </div>
                                     )}
                                     <p className="text-[11px] text-[#6b7280]">
                                         Text + media will be sent in one message.
@@ -4522,7 +4851,11 @@ export default function App() {
                                     rows={1}
                                     className={`w-full border border-[#eceff1] rounded-lg px-3 py-2.5 text-[14px] leading-5 resize-y min-h-[44px] max-h-[132px] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20 placeholder:text-[#54656f]/50 ${canSendText ? 'bg-white text-[#111b21]' : 'bg-[#f8f9fa] text-[#9ca3af] cursor-not-allowed'}`}
                                 />
-                            {hasComposerMedia && (
+                            {composerMediaUploading ? (
+                                <div className="mt-1 text-[11px] font-bold text-[#54656f]">
+                                    Uploading attachment…
+                                </div>
+                            ) : hasComposerMedia && (
                                 <div className="mt-1 text-[11px] font-bold text-[#00a884]">
                                     Attachment ready: {composerMediaType}
                                 </div>
@@ -5541,7 +5874,7 @@ export default function App() {
                     onCreateWorkflow={handleCreateAutomation}
                     onToggleWorkflowEnabled={handleToggleAutomationEnabled}
                     onCopyWorkflow={handleCopyAutomation}
-                    onOpenSettingsSection={openSettingsSection}
+                    onQuickRepliesUpdated={fetchQuickReplies}
                     onSaveWorkflowTrigger={handleSaveWorkflowTrigger}
                 />
             ) : workspaceSection === 'chatbots' ? (
