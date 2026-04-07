@@ -334,7 +334,13 @@ export default function BroadcastTemplatesList({
                     <div className="border border-[#e5e7eb] rounded-xl overflow-hidden min-h-[520px]">
                         <div className="max-h-[70vh] overflow-y-auto custom-scrollbar">
                             {loading ? (
-                                <div className="px-4 py-4 text-sm text-[#6b7280]">Loading templates...</div>
+                                <div className="px-4 py-4 animate-pulse space-y-3">
+                                    <div className="h-10 rounded-xl bg-[#eef2f5]" />
+                                    <div className="h-10 rounded-xl bg-[#eef2f5]" />
+                                    <div className="h-10 rounded-xl bg-[#eef2f5]" />
+                                    <div className="h-10 rounded-xl bg-[#eef2f5]" />
+                                    <div className="h-10 rounded-xl bg-[#eef2f5]" />
+                                </div>
                             ) : error ? (
                                 <div className="px-4 py-4 text-sm text-rose-700 bg-rose-50 border-b border-rose-200">{error}</div>
                             ) : filteredItems.length === 0 ? (

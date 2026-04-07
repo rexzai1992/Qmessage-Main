@@ -64,6 +64,7 @@ export function registerFlowRoutes(app: Express, ctx: any) {
             const toUpsert = payload.map((wf: any) => {
                 const workflowName = typeof wf?.name === 'string' ? wf.name.trim() : ''
                 const workflowEnabled = wf?.enabled !== false
+                const runOnNewChat = wf?.run_on_new_chat === true || wf?.runOnNewChat === true
                 const nextBuilder =
                     wf?.builder && typeof wf.builder === 'object' && !Array.isArray(wf.builder)
                         ? {
@@ -81,6 +82,7 @@ export function registerFlowRoutes(app: Express, ctx: any) {
                     company_id: companyId,
                     name: workflowName,
                     trigger_keyword: wf.trigger_keyword || wf.triggerKeyword || '',
+                    run_on_new_chat: runOnNewChat,
                     actions: wf.actions || [],
                     builder: nextBuilder,
                     enabled: workflowEnabled
@@ -91,11 +93,13 @@ export function registerFlowRoutes(app: Express, ctx: any) {
 
             const missingEnabledColumn = error && isMissingColumnInSchemaCache(error, 'enabled')
             const missingNameColumn = error && isMissingColumnInSchemaCache(error, 'name')
-            if (error && (missingEnabledColumn || missingNameColumn)) {
+            const missingRunOnNewChatColumn = error && isMissingColumnInSchemaCache(error, 'run_on_new_chat')
+            if (error && (missingEnabledColumn || missingNameColumn || missingRunOnNewChatColumn)) {
                 const withoutEnabled = toUpsert.map((workflow: any) => {
                     const next = { ...workflow }
                     if (missingEnabledColumn) delete next.enabled
                     if (missingNameColumn) delete next.name
+                    if (missingRunOnNewChatColumn) delete next.run_on_new_chat
                     return next
                 })
                 const retry = await supabase.from('workflows').upsert(withoutEnabled, { onConflict: 'id' })

@@ -41,6 +41,32 @@ const slugifyButtonId = (label: string, index: number) => {
     return base || `option_${index + 1}`;
 };
 
+const normalizeChoiceId = (value: unknown) => {
+    if (typeof value !== 'string') return '';
+    return value
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_]+/g, '_')
+        .replace(/^_+|_+$/g, '');
+};
+
+const ensureUniqueChoiceId = (
+    preferredValue: unknown,
+    fallbackIndex: number,
+    usedIds: Set<string>
+) => {
+    const fallback = slugifyButtonId('', fallbackIndex);
+    const base = normalizeChoiceId(preferredValue) || fallback;
+    let next = base;
+    let suffix = 2;
+    while (usedIds.has(next)) {
+        next = `${base}_${suffix}`;
+        suffix += 1;
+    }
+    usedIds.add(next);
+    return next;
+};
+
 const getNodeNextIds = (node: any) => {
     if (!node) return [];
     if (node.type === 'QUESTION' || node.type === 'LIST' || node.type === 'CONDITION') {
@@ -187,10 +213,12 @@ const buildActionsFromBuilder = (builder: any) => {
             if (options.length > 3) {
                 warnings.push(`Buttons node ${nodeId} supports max 3 choices. Extra choices were trimmed.`);
             }
-            const buttons = limitedOptions.map((opt: string, idx: number) => ({
-                id: slugifyButtonId(opt, idx),
-                title: opt || `Option ${idx + 1}`
-            }));
+            const usedButtonIds = new Set<string>();
+            const buttons = limitedOptions.map((opt: string, idx: number) => {
+                const title = opt || `Option ${idx + 1}`;
+                const id = ensureUniqueChoiceId(slugifyButtonId(title, idx), idx, usedButtonIds);
+                return { id, title };
+            });
             const actionIndex = actions.length;
             const action: any = {
                 type: 'send_buttons',
@@ -210,6 +238,7 @@ const buildActionsFromBuilder = (builder: any) => {
             const sections = Array.isArray(node.sections) ? node.sections : [];
             const normalizedSections: Array<{ title?: string; rows: Array<{ id: string; title: string; description?: string }> }> = [];
             const rowsMeta: Array<{ id: string; title: string; handleId: string }> = [];
+            const usedRowIds = new Set<string>();
             let globalRowIndex = 0;
             let trimmedRows = 0;
 
@@ -227,8 +256,10 @@ const buildActionsFromBuilder = (builder: any) => {
                     })
                     .map(({ row, rowIdx }: any) => {
                         const rowTitle = row?.title || `Option ${globalRowIndex + 1}`;
-                        let rowId = row?.id || slugifyButtonId(rowTitle, globalRowIndex);
-                        if (!rowId) rowId = `option_${globalRowIndex + 1}`;
+                        const preferredRowId = (typeof row?.id === 'string' && row.id.trim())
+                            ? row.id
+                            : slugifyButtonId(rowTitle, globalRowIndex);
+                        const rowId = ensureUniqueChoiceId(preferredRowId, globalRowIndex, usedRowIds);
                         const handleId = `row-${sectionIdx}-${rowIdx}`;
                         rowsMeta.push({ id: rowId, title: rowTitle, handleId });
                         globalRowIndex += 1;

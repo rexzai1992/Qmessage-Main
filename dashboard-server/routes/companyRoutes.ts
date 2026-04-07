@@ -1,5 +1,64 @@
 import type { Express } from 'express'
 
+const UI_FEATURE_KEYS = new Set([
+    'team-inbox',
+    'automations',
+    'broadcast',
+    'chatbots',
+    'contacts',
+    'analytics',
+    'settings'
+])
+
+const UI_HIDDEN_FEATURES_MISSING_MESSAGE =
+    'UI controls are not initialized. Run migration 20260407_company_ui_hidden_features.sql.'
+
+function normalizeUiFeatureKey(value: unknown): string {
+    if (typeof value !== 'string') return ''
+    const normalized = value.trim().toLowerCase().replace(/\s+/g, '-')
+    return UI_FEATURE_KEYS.has(normalized) ? normalized : ''
+}
+
+function sanitizeUiHiddenFeatures(value: unknown): string[] {
+    const unique = new Set<string>()
+    const push = (entry: unknown) => {
+        const normalized = normalizeUiFeatureKey(entry)
+        if (normalized) unique.add(normalized)
+    }
+
+    if (Array.isArray(value)) {
+        value.forEach((entry) => push(entry))
+        return Array.from(unique)
+    }
+
+    if (typeof value === 'string') {
+        const trimmed = value.trim()
+        if (!trimmed) return []
+        try {
+            const parsed = JSON.parse(trimmed)
+            if (Array.isArray(parsed)) {
+                parsed.forEach((entry) => push(entry))
+                return Array.from(unique)
+            }
+        } catch {
+            // fall through to CSV parsing
+        }
+        trimmed
+            .split(/[,\n;]/g)
+            .map((entry) => entry.trim())
+            .filter(Boolean)
+            .forEach((entry) => push(entry))
+    }
+
+    return Array.from(unique)
+}
+
+function isUiHiddenFeaturesMissingError(error: any): boolean {
+    const code = typeof error?.code === 'string' ? error.code.trim().toUpperCase() : ''
+    const message = String(error?.message || '').toLowerCase()
+    return code === '42703' && message.includes('ui_hidden_features')
+}
+
 export function registerCompanyRoutes(app: Express, ctx: any) {
     const {
         requireSupabaseUserMiddleware,
@@ -76,6 +135,44 @@ app.post('/api/company/fallback-settings', requireSupabaseUserMiddleware, async 
         })
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message })
+    }
+})
+
+app.get('/api/company/ui-controls', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    try {
+        const access = await resolveCompanyAccess(req, res, 'agent')
+        if (!access) return
+
+        const { data, error } = await supabase
+            .from('company')
+            .select('id, ui_hidden_features')
+            .eq('id', access.companyId)
+            .maybeSingle()
+
+        if (error) {
+            if (isUiHiddenFeaturesMissingError(error)) {
+                return res.status(503).json({
+                    success: false,
+                    code: 'UI_CONTROLS_MISSING',
+                    error: UI_HIDDEN_FEATURES_MISSING_MESSAGE
+                })
+            }
+            return res.status(500).json({ success: false, error: error.message })
+        }
+
+        if (!data) {
+            return res.status(404).json({ success: false, error: 'Company profile not found' })
+        }
+
+        return res.json({
+            success: true,
+            data: {
+                company_id: data.id || access.companyId,
+                hidden_features: sanitizeUiHiddenFeatures((data as any).ui_hidden_features)
+            }
+        })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error.message })
     }
 })
 

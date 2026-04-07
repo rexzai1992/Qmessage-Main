@@ -3,6 +3,7 @@ import type { Server } from 'socket.io'
 export function registerSocketHandlers(io: Server, ctx: any) {
     const {
         supabase,
+        supabaseAuth,
         getHostnameFromHeaders,
         resolveCompanyIdFromHostname,
         normalizeCompanyId,
@@ -46,7 +47,7 @@ io.use(async (socket, next) => {
         const token = (socket.handshake.auth as any).token
         if (!token) return next(new Error('Authentication error: Token missing'))
 
-        const { data: { user }, error } = await supabase.auth.getUser(token)
+        const { data: { user }, error } = await supabaseAuth.auth.getUser(token)
         if (error || !user) return next(new Error('Authentication error: Invalid session'))
 
         const requestHostname = getHostnameFromHeaders(socket.handshake.headers || {})

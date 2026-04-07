@@ -1752,8 +1752,12 @@ export default function WebhookView({
                             <tbody className="divide-y divide-[#f0f2f5]">
                                 {teamLoading ? (
                                     <tr>
-                                        <td className="px-4 py-4 text-sm text-[#8696a0]" colSpan={5}>
-                                            Loading team users...
+                                        <td className="px-4 py-4" colSpan={5}>
+                                            <div className="animate-pulse space-y-2">
+                                                <div className="h-10 rounded-xl bg-[#eef2f5]" />
+                                                <div className="h-10 rounded-xl bg-[#eef2f5]" />
+                                                <div className="h-10 rounded-xl bg-[#eef2f5]" />
+                                            </div>
                                         </td>
                                     </tr>
                                 ) : teamUsers.length === 0 ? (
@@ -1884,8 +1888,12 @@ export default function WebhookView({
                                 <tbody className="divide-y divide-[#f0f2f5]">
                                     {clientLoading ? (
                                         <tr>
-                                            <td className="px-6 py-6 text-sm text-[#8696a0]" colSpan={7}>
-                                                Loading connected clients...
+                                            <td className="px-6 py-6" colSpan={7}>
+                                                <div className="animate-pulse space-y-2">
+                                                    <div className="h-10 rounded-xl bg-[#eef2f5]" />
+                                                    <div className="h-10 rounded-xl bg-[#eef2f5]" />
+                                                    <div className="h-10 rounded-xl bg-[#eef2f5]" />
+                                                </div>
                                             </td>
                                         </tr>
                                     ) : clientConnections.length === 0 ? (
@@ -2006,8 +2014,12 @@ export default function WebhookView({
                             <tbody className="divide-y divide-[#f0f2f5]">
                                 {connectedLoading ? (
                                     <tr>
-                                        <td className="px-6 py-6 text-sm text-[#8696a0]" colSpan={5}>
-                                            Loading connected businesses...
+                                        <td className="px-6 py-6" colSpan={5}>
+                                            <div className="animate-pulse space-y-2">
+                                                <div className="h-10 rounded-xl bg-[#eef2f5]" />
+                                                <div className="h-10 rounded-xl bg-[#eef2f5]" />
+                                                <div className="h-10 rounded-xl bg-[#eef2f5]" />
+                                            </div>
                                         </td>
                                     </tr>
                                 ) : connectedBusinesses.length === 0 ? (

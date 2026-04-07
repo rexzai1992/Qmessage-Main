@@ -87,7 +87,14 @@ export default function SettingsView({
                     </div>
                 </aside>
                 <div className="flex-1 overflow-y-auto">
-                    <Suspense fallback={<div className="p-8 text-sm text-[#54656f]">Loading settings…</div>}>
+                    <Suspense fallback={
+                        <div className="p-6 md:p-8 animate-pulse space-y-4">
+                            <div className="h-4 w-40 rounded bg-[#e8edf1]" />
+                            <div className="h-24 rounded-2xl bg-white border border-[#eceff1]" />
+                            <div className="h-24 rounded-2xl bg-white border border-[#eceff1]" />
+                            <div className="h-24 rounded-2xl bg-white border border-[#eceff1]" />
+                        </div>
+                    }>
                         <WebhookViewComponent
                             profileId={profileId}
                             sessionToken={sessionToken}

@@ -47,6 +47,18 @@ export default function ChatflowView({
     workflowTemplateOptions
 }: ChatflowViewProps) {
     const flowFallbackCacheRef = React.useRef<Record<string, any>>({});
+    const latestWorkflowsRef = React.useRef(workflows);
+    const latestWorkflowDraftsRef = React.useRef(workflowDrafts);
+    const flowSaveHandlerRef = React.useRef<(() => any) | null>(null);
+
+    React.useEffect(() => {
+        latestWorkflowsRef.current = workflows;
+    }, [workflows]);
+
+    React.useEffect(() => {
+        latestWorkflowDraftsRef.current = workflowDrafts;
+    }, [workflowDrafts]);
+
     const getWorkflowFlow = React.useCallback((wf: any) => {
         if (wf?.builder && Array.isArray(wf.builder.nodes)) {
             flowFallbackCacheRef.current[wf.id] = wf.builder;
@@ -58,6 +70,45 @@ export default function ChatflowView({
         flowFallbackCacheRef.current[wf.id] = built;
         return built;
     }, [buildBuilderFromActions]);
+
+    const syncVisualFlowToDrafts = React.useCallback((workflowId: string, nextFlow: any) => {
+        const { actions } = buildActionsFromBuilder(nextFlow);
+        flowFallbackCacheRef.current[workflowId] = nextFlow;
+        const nextWorkflows = latestWorkflowsRef.current.map((item) =>
+            item.id === workflowId ? { ...item, actions, builder: nextFlow } : item
+        );
+        const nextDrafts = {
+            ...latestWorkflowDraftsRef.current,
+            [workflowId]: JSON.stringify(actions, null, 2)
+        };
+        latestWorkflowsRef.current = nextWorkflows;
+        latestWorkflowDraftsRef.current = nextDrafts;
+        setWorkflows(nextWorkflows);
+        setWorkflowDrafts(nextDrafts);
+        return { nextWorkflows, nextDrafts };
+    }, [buildActionsFromBuilder, setWorkflowDrafts, setWorkflows]);
+
+    const registerFlowSaveHandler = React.useCallback((handler: (() => any) | null) => {
+        flowSaveHandlerRef.current = handler;
+    }, []);
+
+    const handleSaveEverything = React.useCallback(() => {
+        let nextWorkflows = latestWorkflowsRef.current;
+        let nextDrafts = latestWorkflowDraftsRef.current;
+
+        if (workflowEditorMode === 'visual' && selectedWorkflowId) {
+            const getCurrentFlow = flowSaveHandlerRef.current;
+            const nextFlow = getCurrentFlow ? getCurrentFlow() : null;
+            if (nextFlow) {
+                const synced = syncVisualFlowToDrafts(selectedWorkflowId, nextFlow);
+                nextWorkflows = synced.nextWorkflows;
+                nextDrafts = synced.nextDrafts;
+            }
+        }
+
+        onSaveWorkflows(nextWorkflows, nextDrafts);
+    }, [onSaveWorkflows, selectedWorkflowId, syncVisualFlowToDrafts, workflowEditorMode]);
+
     if (!open) return null;
 
     return (
@@ -75,10 +126,10 @@ export default function ChatflowView({
                         Back to Automations
                     </button>
                     <button
-                        onClick={() => onSaveWorkflows(workflows)}
+                        onClick={handleSaveEverything}
                         className="bg-[#00a884] hover:bg-[#008f6f] text-white px-5 py-2.5 rounded-xl font-bold flex items-center gap-2 transition-colors shadow-sm"
                     >
-                        <Save className="w-4 h-4" /> Save Workflows
+                        <Save className="w-4 h-4" /> Save Everything
                     </button>
                 </div>
             </header>
@@ -112,36 +163,6 @@ export default function ChatflowView({
                                             </span>
                                         </div>
                                     </div>
-                                    <div className="flex flex-col gap-2">
-                                        <label className="text-xs font-bold text-[#54656f] uppercase tracking-wider">Workflow Name</label>
-                                        <input
-                                            className="bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-4 py-3 text-[#111b21] text-sm font-bold focus:outline-none focus:border-[#00a884]"
-                                            value={typeof wf?.name === 'string' ? wf.name : ''}
-                                            onChange={(e) => {
-                                                const val = e.target.value;
-                                                setWorkflows(prev => prev.map(item => item.id === wf.id ? { ...item, name: val } : item));
-                                            }}
-                                            placeholder="Enter workflow name"
-                                        />
-                                        <span className="text-[11px] text-[#8696a0]">
-                                            This name appears in the automation list.
-                                        </span>
-                                    </div>
-                                    <div className="flex flex-col gap-2">
-                                        <label className="text-xs font-bold text-[#54656f] uppercase tracking-wider">Trigger Keyword</label>
-                                        <input
-                                            className="bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-4 py-3 text-[#111b21] text-sm font-bold focus:outline-none focus:border-[#00a884]"
-                                            value={wf.trigger_keyword || ''}
-                                            onChange={(e) => {
-                                                const val = e.target.value;
-                                                setWorkflows(prev => prev.map(item => item.id === wf.id ? { ...item, trigger_keyword: val } : item));
-                                            }}
-                                            placeholder="e.g. hai"
-                                        />
-                                        <span className="text-[11px] text-[#8696a0]">
-                                            Tip: use <code className="font-mono">first_message</code> to trigger on a user's first inbound message.
-                                        </span>
-                                    </div>
                                     <div className="flex items-center gap-3 flex-wrap">
                                         <button
                                             onClick={() => setWorkflowEditorMode('visual')}
@@ -167,7 +188,14 @@ export default function ChatflowView({
                                     </div>
                                     {workflowEditorMode === 'visual' ? (
                                         <div className="border border-[#eceff1] rounded-2xl overflow-hidden bg-white min-h-[560px] h-[70vh]">
-                                            <Suspense fallback={<div className="h-full flex items-center justify-center text-sm text-[#54656f]">Loading flow editor…</div>}>
+                                            <Suspense fallback={
+                                                <div className="h-full p-6 animate-pulse space-y-4 bg-[#f8f9fa]">
+                                                    <div className="h-8 w-48 rounded-xl bg-[#e8edf1]" />
+                                                    <div className="h-20 rounded-2xl bg-white border border-[#eceff1]" />
+                                                    <div className="h-20 rounded-2xl bg-white border border-[#eceff1]" />
+                                                    <div className="h-[280px] rounded-2xl bg-white border border-[#eceff1]" />
+                                                </div>
+                                            }>
                                                 <FlowCanvasComponent
                                                     flow={getWorkflowFlow(wf)}
                                                     tagOptions={workflowTagOptions}
@@ -178,16 +206,9 @@ export default function ChatflowView({
                                                         isCurrent: option.id === wf.id
                                                     }))}
                                                     templateOptions={workflowTemplateOptions}
+                                                    registerSaveHandler={registerFlowSaveHandler}
                                                     onSave={(nextFlow: any) => {
-                                                        const { actions } = buildActionsFromBuilder(nextFlow);
-                                                        flowFallbackCacheRef.current[wf.id] = nextFlow;
-                                                        const nextWorkflows = workflows.map(item =>
-                                                            item.id === wf.id ? { ...item, actions, builder: nextFlow } : item
-                                                        );
-                                                        const nextDrafts = { ...workflowDrafts, [wf.id]: JSON.stringify(actions, null, 2) };
-                                                        setWorkflows(nextWorkflows);
-                                                        setWorkflowDrafts(nextDrafts);
-                                                        onSaveWorkflows(nextWorkflows, nextDrafts);
+                                                        syncVisualFlowToDrafts(wf.id, nextFlow);
                                                     }}
                                                 />
                                             </Suspense>
@@ -230,6 +251,7 @@ export default function ChatflowView({
                                     id,
                                     name: '',
                                     trigger_keyword: '',
+                                    run_on_new_chat: false,
                                     enabled: false,
                                     actions,
                                     builder: buildBuilderFromActions(actions, id)

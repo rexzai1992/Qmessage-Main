@@ -15,10 +15,10 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Install Node
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 20.x
 
@@ -27,10 +27,15 @@ jobs:
           corepack enable
           corepack prepare yarn@4.x --activate
 
+      - name: Rewrite GitHub SSH URLs to HTTPS
+        run: |
+          git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+
       - name: Install packages
         run: |
-          yarn install --immutable
-          yarn --cwd proto-extract install --immutable
+          yarn install
+          yarn --cwd proto-extract install
 
       - name: Update WAProto.proto
         id: wa_proto_info

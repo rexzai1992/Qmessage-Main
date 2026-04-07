@@ -31,7 +31,6 @@ import {
     CheckCircle2,
     Plus,
     Trash2,
-    Save,
     X,
     Link as LinkIcon
 } from 'lucide-react';
@@ -825,6 +824,7 @@ const nodeTypes = {
 type FlowCanvasProps = {
     flow: any
     onSave: (flow: any) => void
+    registerSaveHandler?: (handler: (() => any) | null) => void
     tagOptions?: string[]
     variableOptions?: string[]
     staffOptions?: Array<{ id: string; name: string; color?: string }>
@@ -835,6 +835,7 @@ type FlowCanvasProps = {
 export default function FlowCanvas({
     flow,
     onSave,
+    registerSaveHandler,
     tagOptions = [],
     variableOptions = [],
     staffOptions = [],
@@ -1002,9 +1003,11 @@ export default function FlowCanvas({
         }, eds));
     }, []);
 
-    const handleSave = useCallback(() => {
-        onSave(buildFlowPayload(nodesRef.current, edgesRef.current));
-    }, [onSave, buildFlowPayload]);
+    useEffect(() => {
+        if (!registerSaveHandler) return;
+        registerSaveHandler(() => buildFlowPayload(nodesRef.current, edgesRef.current));
+        return () => registerSaveHandler(null);
+    }, [registerSaveHandler, buildFlowPayload]);
 
     const addNode = (type: string) => {
         const id = `node-${Date.now()}`;
@@ -1102,14 +1105,6 @@ export default function FlowCanvas({
                     </button>
                     <button onClick={() => addNode('END')} className="w-full px-3 py-2.5 bg-white hover:bg-rose-50 text-rose-500 text-xs font-bold border border-rose-100 rounded-xl transition-all flex items-center gap-2">
                         <Square className="w-4 h-4" /> End
-                    </button>
-                </div>
-                <div className="p-3 border-t border-[#eceff1]">
-                    <button
-                        onClick={handleSave}
-                        className="w-full bg-[#111b21] hover:bg-[#202c33] text-white px-4 py-2.5 rounded-xl text-xs font-black transition-all flex items-center justify-center gap-2 uppercase tracking-widest"
-                    >
-                        <Save className="w-4 h-4" /> Save
                     </button>
                 </div>
             </aside>

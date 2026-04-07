@@ -296,6 +296,21 @@ const ONBOARDING_SETUP_DEFAULTS: Record<OnboardingFieldKey, string> = {
     verifyToken: ''
 };
 
+const UI_FEATURE_KEY_BY_WORKSPACE_SECTION: Record<
+    'team-inbox' | 'broadcast' | 'chatbots' | 'contacts' | 'ads' | 'automations' | 'more',
+    string
+> = {
+    'team-inbox': 'team-inbox',
+    'broadcast': 'broadcast',
+    'chatbots': 'chatbots',
+    'contacts': 'contacts',
+    'ads': 'ads',
+    'automations': 'automations',
+    'more': 'analytics'
+};
+
+const SETTINGS_UI_FEATURE_KEY = 'settings';
+
 const SYSTEM_CONTACT_TAGS = new Set(['human_takeover']);
 
 const normalizeContactTags = (value: unknown): string[] => {
@@ -541,6 +556,7 @@ export default function App() {
             return null;
         }
     });
+    const [chatOpenNonce, setChatOpenNonce] = useState(0);
     const [messageText, setMessageText] = useState('');
     const [composerMediaType, setComposerMediaType] = useState<'none' | 'image' | 'video' | 'document'>('none');
     const [composerMediaUrl, setComposerMediaUrl] = useState('');
@@ -619,6 +635,7 @@ export default function App() {
     const [workspaceSection, setWorkspaceSection] = useState<
         'team-inbox' | 'broadcast' | 'chatbots' | 'contacts' | 'ads' | 'automations' | 'more'
     >('team-inbox');
+    const [hiddenUiFeatures, setHiddenUiFeatures] = useState<string[]>([]);
     const [broadcastSection, setBroadcastSection] = useState<
         'template-library' | 'my-templates' | 'broadcast-history' | 'scheduled-broadcasts'
     >('template-library');
@@ -642,6 +659,7 @@ export default function App() {
     const [editingProfileName, setEditingProfileName] = useState('');
     const [isCreatingProfile, setIsCreatingProfile] = useState(false);
     const [workflows, setWorkflows] = useState<any[]>([]);
+    const [workflowsLoading, setWorkflowsLoading] = useState(false);
     const [selectedWorkflowId, setSelectedWorkflowId] = useState<string | null>(null);
     const [workflowDrafts, setWorkflowDrafts] = useState<Record<string, string>>({});
     const [workflowEditorMode, setWorkflowEditorMode] = useState<'visual' | 'json'>('visual');
@@ -697,6 +715,21 @@ export default function App() {
             ]
         }] : [])
     ];
+
+    const hiddenUiFeatureSet = useMemo(() => {
+        const next = new Set<string>();
+        hiddenUiFeatures.forEach((feature) => {
+            const normalized = typeof feature === 'string' ? feature.trim().toLowerCase() : '';
+            if (normalized) next.add(normalized);
+        });
+        return next;
+    }, [hiddenUiFeatures]);
+
+    const isUiFeatureHidden = useCallback((feature: string) => {
+        const normalized = typeof feature === 'string' ? feature.trim().toLowerCase() : '';
+        if (!normalized) return false;
+        return hiddenUiFeatureSet.has(normalized);
+    }, [hiddenUiFeatureSet]);
 
     const isWabaProviderAdmin = useMemo(() => {
         const userMeta: any = (session?.user?.user_metadata as any) || {};
@@ -825,6 +858,13 @@ export default function App() {
             element.scrollIntoView({ behavior: 'smooth', block: 'start' });
         }
     }, []);
+
+    const openSettingsSection = useCallback((id: string) => {
+        setActiveView('settings');
+        window.setTimeout(() => {
+            scrollToSettingsSection(id);
+        }, 120);
+    }, [scrollToSettingsSection]);
 
     const onboardingStorageKey = session?.user?.id
         ? `${ONBOARDING_TOUR_STORAGE_PREFIX}${ONBOARDING_TOUR_VERSION}:${session.user.id}`
@@ -1443,6 +1483,83 @@ export default function App() {
         }
     }, [activeProfileId, normalizeQuickReplyShortcut, session?.access_token]);
 
+    const normalizeHiddenFeatureList = useCallback((value: unknown): string[] => {
+        const allowed = new Set([
+            'team-inbox',
+            'automations',
+            'broadcast',
+            'chatbots',
+            'contacts',
+            'analytics',
+            'settings'
+        ]);
+        const unique = new Set<string>();
+        const push = (entry: unknown) => {
+            if (typeof entry !== 'string') return;
+            const normalized = entry.trim().toLowerCase();
+            if (!normalized || !allowed.has(normalized)) return;
+            unique.add(normalized);
+        };
+        if (Array.isArray(value)) {
+            value.forEach((entry) => push(entry));
+            return Array.from(unique);
+        }
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+            if (!trimmed) return [];
+            try {
+                const parsed = JSON.parse(trimmed);
+                if (Array.isArray(parsed)) {
+                    parsed.forEach((entry) => push(entry));
+                    return Array.from(unique);
+                }
+            } catch {
+                // fall through to CSV parsing
+            }
+            trimmed
+                .split(/[,\n;]/g)
+                .map((entry) => entry.trim())
+                .filter(Boolean)
+                .forEach((entry) => push(entry));
+            return Array.from(unique);
+        }
+        return [];
+    }, []);
+
+    const fetchUiControls = useCallback(async () => {
+        if (!session?.access_token) {
+            setHiddenUiFeatures([]);
+            return;
+        }
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/company/ui-controls`, {
+                headers: {
+                    Authorization: `Bearer ${session.access_token}`
+                }
+            });
+            const text = await res.text();
+            let data: any = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch {
+                data = null;
+            }
+
+            if (!res.ok || !data?.success) {
+                if (data?.code === 'UI_CONTROLS_MISSING') {
+                    setHiddenUiFeatures([]);
+                    return;
+                }
+                throw new Error(data?.error || 'Failed to load UI controls');
+            }
+
+            setHiddenUiFeatures(normalizeHiddenFeatureList(data?.data?.hidden_features));
+        } catch (error: any) {
+            console.warn('Failed to load company UI controls:', error?.message || error);
+            setHiddenUiFeatures([]);
+        }
+    }, [normalizeHiddenFeatureList, session?.access_token]);
+
     useEffect(() => {
         activeProfileIdRef.current = activeProfileId;
     }, [activeProfileId]);
@@ -1466,6 +1583,14 @@ export default function App() {
         }
         fetchQuickReplies();
     }, [activeProfileId, fetchQuickReplies]);
+
+    useEffect(() => {
+        if (!session?.access_token) {
+            setHiddenUiFeatures([]);
+            return;
+        }
+        fetchUiControls();
+    }, [fetchUiControls, session?.access_token]);
 
 
     useEffect(() => {
@@ -1601,6 +1726,34 @@ export default function App() {
     useEffect(() => {
         setAssignMenuContactId(null);
     }, [activeProfileId, workspaceSection]);
+
+    useEffect(() => {
+        const activeFeature = UI_FEATURE_KEY_BY_WORKSPACE_SECTION[workspaceSection];
+        if (!activeFeature || !isUiFeatureHidden(activeFeature)) return;
+
+        const candidateSections: Array<'team-inbox' | 'automations' | 'broadcast' | 'chatbots' | 'contacts' | 'more'> = [
+            'team-inbox',
+            'automations',
+            'broadcast',
+            'chatbots',
+            'contacts',
+            'more'
+        ];
+        const firstVisible = candidateSections.find((section) => !isUiFeatureHidden(UI_FEATURE_KEY_BY_WORKSPACE_SECTION[section]));
+        setWorkspaceSection(firstVisible || 'ads');
+    }, [isUiFeatureHidden, workspaceSection]);
+
+    useEffect(() => {
+        if (activeView !== 'settings') return;
+        if (!isUiFeatureHidden(SETTINGS_UI_FEATURE_KEY)) return;
+        setActiveView('dashboard');
+    }, [activeView, isUiFeatureHidden]);
+
+    useEffect(() => {
+        if (!showAnalytics) return;
+        if (!isUiFeatureHidden('analytics')) return;
+        setShowAnalytics(false);
+    }, [isUiFeatureHidden, showAnalytics]);
 
 
     const handleSignOut = async () => {
@@ -2004,24 +2157,28 @@ export default function App() {
 
     useEffect(() => {
         if (activeView !== 'chatflow' || !activeProfileId) return;
+        setWorkflowsLoading(true);
         fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`)
             .then(res => res.json())
             .then(data => {
                 const list = Array.isArray(data?.workflows) ? data.workflows : [];
                 applyWorkflowsFromServer(list);
             })
-            .catch(err => console.error('Failed to fetch workflows:', err));
+            .catch(err => console.error('Failed to fetch workflows:', err))
+            .finally(() => setWorkflowsLoading(false));
     }, [activeView, activeProfileId]);
 
     useEffect(() => {
         if (activeView !== 'dashboard' || !activeProfileId) return;
+        setWorkflowsLoading(true);
         fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`)
             .then(res => res.json())
             .then(data => {
                 const list = Array.isArray(data?.workflows) ? data.workflows : [];
                 applyWorkflowsFromServer(list);
             })
-            .catch(err => console.error('Failed to fetch workflows:', err));
+            .catch(err => console.error('Failed to fetch workflows:', err))
+            .finally(() => setWorkflowsLoading(false));
     }, [activeView, activeProfileId]);
 
     useEffect(() => {
@@ -2037,7 +2194,7 @@ export default function App() {
         try {
             if (!activeProfileId) {
                 alert('No active profile selected.');
-                return;
+                return false;
             }
             // Validate JSON drafts before saving
             const drafts = draftOverrides || workflowDrafts;
@@ -2085,8 +2242,10 @@ export default function App() {
             applyWorkflowsFromServer(list);
 
             showToast('Workflows saved', 'success');
+            return true;
         } catch (err: any) {
             showToast(err?.message || 'Failed to save workflows', 'error');
+            return false;
         }
     };
 
@@ -2478,13 +2637,24 @@ export default function App() {
     useEffect(() => {
         if (!selectedChatId) return;
         if (messageRows.length === 0) return;
-        requestAnimationFrame(() => {
+        let cancelled = false;
+        const timers: number[] = [];
+        const scrollToLatest = () => {
+            if (cancelled) return;
             messageListRef.current?.scrollToRow({
                 index: messageRows.length - 1,
                 align: 'end'
             });
-        });
-    }, [selectedChatId, messageRows.length, messageViewport.height]);
+        };
+        const run = () => requestAnimationFrame(scrollToLatest);
+        run();
+        timers.push(window.setTimeout(run, 60));
+        timers.push(window.setTimeout(run, 180));
+        return () => {
+            cancelled = true;
+            timers.forEach((timerId) => window.clearTimeout(timerId));
+        };
+    }, [selectedChatId, chatOpenNonce, messageRows.length, messageViewport.height]);
 
     useEffect(() => {
         if (!socket || !activeProfileId) return;
@@ -2694,6 +2864,98 @@ export default function App() {
         }
     }, [lastInboundMs]);
 
+    const buildOutgoingPayloadFromMessage = useCallback((msg: Message): {
+        text: string;
+        media?: { type: 'image' | 'video' | 'document'; url: string; filename?: string };
+    } | null => {
+        if (!msg?.key?.fromMe) return null;
+        const text =
+            typeof msg?.message?.conversation === 'string'
+                ? msg.message.conversation.trim()
+                : typeof msg?.message?.extendedTextMessage?.text === 'string'
+                    ? msg.message.extendedTextMessage.text.trim()
+                    : '';
+        const imageUrl = typeof msg?.message?.imageMessage?.url === 'string' ? msg.message.imageMessage.url.trim() : '';
+        if (imageUrl) {
+            return { text, media: { type: 'image', url: imageUrl } };
+        }
+        const videoUrl = typeof msg?.message?.videoMessage?.url === 'string' ? msg.message.videoMessage.url.trim() : '';
+        if (videoUrl) {
+            return { text, media: { type: 'video', url: videoUrl } };
+        }
+        const documentUrl = typeof msg?.message?.documentMessage?.url === 'string' ? msg.message.documentMessage.url.trim() : '';
+        if (documentUrl) {
+            const filename =
+                typeof msg?.message?.documentMessage?.fileName === 'string'
+                    ? msg.message.documentMessage.fileName.trim()
+                    : '';
+            return {
+                text,
+                media: { type: 'document', url: documentUrl, ...(filename ? { filename } : {}) }
+            };
+        }
+        if (!text) return null;
+        return { text };
+    }, []);
+
+    const handleResendMessage = useCallback((messageId: string) => {
+        if (!socket || !activeProfileId) return;
+        const failedMessage = allMessages.find((msg) => msg.key?.id === messageId);
+        if (!failedMessage || !failedMessage.key?.fromMe) return;
+        const payload = buildOutgoingPayloadFromMessage(failedMessage);
+        if (!payload) return;
+        const jid = typeof failedMessage.key?.remoteJid === 'string'
+            ? failedMessage.key.remoteJid
+            : (selectedChatId || '');
+        if (!jid) return;
+
+        const resendTempId = `tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        setAllMessages((prev) =>
+            prev.map((msg) =>
+                msg.key?.id === messageId
+                    ? {
+                        ...msg,
+                        key: { ...msg.key, id: resendTempId, remoteJid: jid },
+                        messageTimestamp: Math.floor(Date.now() / 1000),
+                        status: 'pending'
+                    }
+                    : msg
+            )
+        );
+
+        socket.emit(
+            'sendMessage',
+            {
+                profileId: activeProfileId,
+                jid,
+                text: payload.text,
+                ...(payload.media ? { media: payload.media } : {}),
+                clientTempId: resendTempId
+            },
+            (ack: any) => {
+                if (!ack?.success) {
+                    setAllMessages((prev) =>
+                        prev.map((msg) =>
+                            msg.key?.id === resendTempId
+                                ? { ...msg, status: 'failed' }
+                                : msg
+                        )
+                    );
+                    return;
+                }
+                const realMessageId = typeof ack?.data?.messageId === 'string' ? ack.data.messageId : '';
+                if (!realMessageId) return;
+                setAllMessages((prev) =>
+                    prev.map((msg) =>
+                        msg.key?.id === resendTempId
+                            ? { ...msg, key: { ...msg.key, id: realMessageId }, status: 'sent' }
+                            : msg
+                    )
+                );
+            }
+        );
+    }, [activeProfileId, allMessages, buildOutgoingPayloadFromMessage, selectedChatId, socket]);
+
     const handleSendMessage = () => {
         if (!socket || !activeProfileId || !selectedChatId) return;
         const outgoingText = messageText.trim();
@@ -2792,18 +3054,20 @@ export default function App() {
     };
 
     const openSettingsFromMore = useCallback(() => {
+        if (isUiFeatureHidden(SETTINGS_UI_FEATURE_KEY)) return;
         setWorkspaceSection('team-inbox');
         requestAnimationFrame(() => {
             setActiveView('settings');
         });
-    }, []);
+    }, [isUiFeatureHidden]);
 
     const openAnalyticsFromMore = useCallback(() => {
+        if (isUiFeatureHidden('analytics')) return;
         setWorkspaceSection('team-inbox');
         requestAnimationFrame(() => {
             setShowAnalytics(true);
         });
-    }, []);
+    }, [isUiFeatureHidden]);
 
     const handleToggleHumanTakeover = useCallback(async () => {
         if (!socket || !activeProfileId || !selectedChatId) return;
@@ -2854,6 +3118,7 @@ export default function App() {
             id,
             name: '',
             trigger_keyword: '',
+            run_on_new_chat: false,
             actions,
             enabled: false,
             builder: buildBuilderFromActions(actions, id)
@@ -2908,6 +3173,38 @@ export default function App() {
         setWorkspaceSection('team-inbox');
         setActiveView('chatflow');
     }, [automationWorkflows, handleCreateAutomation, selectedWorkflowId, showToast]);
+
+    const handleSaveWorkflowTrigger = useCallback(async (workflowId: string, triggerKeyword: string, runOnNewChat: boolean) => {
+        const normalizedId = workflowId.trim();
+        if (!normalizedId) {
+            throw new Error('Workflow is required.');
+        }
+        const target = automationWorkflows.find((workflow: any) => String(workflow?.id ?? '').trim() === normalizedId);
+        if (!target) {
+            throw new Error('Workflow not found.');
+        }
+
+        const normalizedTrigger = triggerKeyword.trim();
+        const nextWorkflows = automationWorkflows.map((workflow: any) =>
+            String(workflow?.id ?? '').trim() === normalizedId
+                ? { ...workflow, trigger_keyword: normalizedTrigger, run_on_new_chat: runOnNewChat }
+                : runOnNewChat
+                    ? { ...workflow, run_on_new_chat: false }
+                : workflow
+        );
+        const nextDrafts = { ...workflowDrafts };
+        nextWorkflows.forEach((workflow: any) => {
+            if (typeof nextDrafts[workflow.id] === 'string') return;
+            nextDrafts[workflow.id] = JSON.stringify(Array.isArray(workflow.actions) ? workflow.actions : [], null, 2);
+        });
+
+        setWorkflows(nextWorkflows);
+        setWorkflowDrafts(nextDrafts);
+        const saved = await handleSaveWorkflows(nextWorkflows, nextDrafts);
+        if (!saved) {
+            throw new Error('Failed to save trigger.');
+        }
+    }, [automationWorkflows, handleSaveWorkflows, workflowDrafts]);
 
     const handleToggleAutomationEnabled = useCallback((workflowId: string, nextEnabled: boolean) => {
         const targetWorkflow = automationWorkflows.find((workflow: any) => workflow.id === workflowId);
@@ -2990,6 +3287,7 @@ export default function App() {
             id: copiedId,
             name: copiedName,
             trigger_keyword: sourceTrigger,
+            run_on_new_chat: false,
             enabled: false,
             actions: copiedActions,
             builder: copiedBuilder
@@ -3254,13 +3552,18 @@ export default function App() {
         }
     };
 
+    const handleOpenChat = useCallback((chatId: string) => {
+        setSelectedChatId(chatId);
+        setChatOpenNonce((prev) => prev + 1);
+    }, []);
+
     const handleNewChat = () => {
         if (!newPhoneNumber.trim()) return;
         let cleanNumber = newPhoneNumber.replace(/\D/g, '');
         if (!cleanNumber.includes('@')) {
             cleanNumber = `${cleanNumber}@s.whatsapp.net`;
         }
-        setSelectedChatId(cleanNumber);
+        handleOpenChat(cleanNumber);
         setShowNewChatModal(false);
         setNewPhoneNumber('');
     };
@@ -3308,7 +3611,19 @@ export default function App() {
     );
 
     if (authChecking) {
-        return <div className="h-screen flex items-center justify-center bg-white text-[#111b21] text-xl font-light">Loading SaaS Infrastructure...</div>
+        return (
+            <div className="h-screen bg-[#f8f9fa] text-[#111b21] p-6 md:p-10">
+                <div className="animate-pulse max-w-5xl mx-auto space-y-6">
+                    <div className="h-10 w-64 rounded-xl bg-[#e8edf1]" />
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        <div className="h-28 rounded-2xl bg-white border border-[#eceff1]" />
+                        <div className="h-28 rounded-2xl bg-white border border-[#eceff1]" />
+                        <div className="h-28 rounded-2xl bg-white border border-[#eceff1]" />
+                    </div>
+                    <div className="h-[380px] rounded-3xl bg-white border border-[#eceff1]" />
+                </div>
+            </div>
+        );
     }
 
     if (!session) {
@@ -3324,7 +3639,7 @@ export default function App() {
         )
     }
 
-    const workspaceTabs: Array<{
+    const baseWorkspaceTabs: Array<{
         id: 'team-inbox' | 'broadcast' | 'chatbots' | 'contacts' | 'ads' | 'automations' | 'more';
         label: string;
         icon: React.ComponentType<{ className?: string }>;
@@ -3338,7 +3653,10 @@ export default function App() {
             { id: 'more', label: 'Analytic', icon: BarChart3 }
         ];
 
+    const workspaceTabs = baseWorkspaceTabs.filter((tab) => !isUiFeatureHidden(UI_FEATURE_KEY_BY_WORKSPACE_SECTION[tab.id]));
+
     const activeWorkspaceLabel = workspaceTabs.find(tab => tab.id === workspaceSection)?.label || 'Workspace';
+    const defaultWorkspaceSection = workspaceTabs[0]?.id || 'team-inbox';
     const broadcastNav: Array<{ id: 'template-library' | 'my-templates' | 'broadcast-history' | 'scheduled-broadcasts'; label: string }> = [
         { id: 'template-library', label: 'Create Template' },
         { id: 'my-templates', label: 'My Templates' },
@@ -3415,12 +3733,14 @@ export default function App() {
                         </nav>
                     </div>
                     <div className="hidden md:flex items-center gap-3">
-                        <button
-                            onClick={openSettingsFromMore}
-                            className="w-10 h-10 rounded-full bg-[#f3f4f6] text-[#6b7280] flex items-center justify-center"
-                        >
-                            <User className="w-5 h-5" />
-                        </button>
+                        {!isUiFeatureHidden(SETTINGS_UI_FEATURE_KEY) && (
+                            <button
+                                onClick={openSettingsFromMore}
+                                className="w-10 h-10 rounded-full bg-[#f3f4f6] text-[#6b7280] flex items-center justify-center"
+                            >
+                                <User className="w-5 h-5" />
+                            </button>
+                        )}
                     </div>
                 </div>
             </header>
@@ -3479,11 +3799,11 @@ export default function App() {
                                     )}
                                 </>
                             ) : (
-                                <>
-                                    <div className="w-10 h-10 rounded-full border-4 border-[#e5e7eb] border-t-[#00a884] animate-spin mb-4" />
-                                    <p className="text-[#111b21] font-bold mb-1">Loading profiles…</p>
-                                    <p className="text-sm text-[#8696a0]">Connecting to your workspace</p>
-                                </>
+                                <div className="w-full max-w-[240px] animate-pulse space-y-2">
+                                    <div className="h-4 rounded bg-[#e8edf1]" />
+                                    <div className="h-3 rounded bg-[#eef2f5] w-4/5 mx-auto" />
+                                    <div className="h-3 rounded bg-[#eef2f5] w-3/5 mx-auto" />
+                                </div>
                             )}
                         </div>
                     ) : connectionStatus !== 'open' ? (
@@ -3500,9 +3820,17 @@ export default function App() {
                     ) : (
                         <div className="h-full overflow-hidden" ref={chatListViewportRef}>
                             {loadingChats ? (
-                                <div className="h-full flex flex-col items-center justify-center text-sm text-[#8696a0] gap-3">
-                                    <div className="w-8 h-8 rounded-full border-4 border-[#e5e7eb] border-t-[#00a884] animate-spin" />
-                                    <span>Loading chats…</span>
+                                <div className="h-full p-3 animate-pulse space-y-3">
+                                    {Array.from({ length: 8 }).map((_, idx) => (
+                                        <div key={`chat-skeleton-${idx}`} className="flex items-center gap-3 px-2 py-2 rounded-xl border border-[#eef2f5] bg-white">
+                                            <div className="h-10 w-10 rounded-full bg-[#e8edf1]" />
+                                            <div className="flex-1 space-y-2">
+                                                <div className="h-3 w-1/3 rounded bg-[#e8edf1]" />
+                                                <div className="h-2.5 w-2/3 rounded bg-[#eef2f5]" />
+                                            </div>
+                                            <div className="h-2.5 w-10 rounded bg-[#eef2f5]" />
+                                        </div>
+                                    ))}
                                 </div>
                             ) : chatList.length === 0 ? (
                                 <div className="h-full flex items-center justify-center text-sm text-[#8696a0]">
@@ -3530,7 +3858,7 @@ export default function App() {
                                         return (
                                             <div style={style}>
                                                 <div
-                                                    onClick={() => setSelectedChatId(chat.id)}
+                                                    onClick={() => handleOpenChat(chat.id)}
                                                     className={`flex items-center px-3 py-2 cursor-pointer hover:bg-[#f5f6f6] transition-colors border-b border-[#fcfdfd] ${selectedChatId === chat.id ? 'bg-[#f0f2f5]' : ''}`}
                                                 >
                                                     <div className="w-12 h-12 rounded-full bg-[#f0f2f5] mr-3 flex-shrink-0 flex items-center justify-center border border-[#eceff1]">
@@ -3769,6 +4097,7 @@ export default function App() {
                                         const messageSenderColor = msg.workflowState ? '#2563eb' : (msg.agent?.color || '#6b7280');
                                         const buttons = Array.isArray(buttonsMessage?.buttons) ? buttonsMessage?.buttons : [];
                                         const listSections = Array.isArray(listMessage?.sections) ? listMessage?.sections : [];
+                                        const isFailedOutgoing = msg.key.fromMe && msg.status === 'failed';
 
                                         return (
                                             <div style={style} className="w-full px-1">
@@ -3776,10 +4105,14 @@ export default function App() {
                                                     <div className="max-w-[85%] flex flex-col">
                                                         <div className={`
                                                             px-3 py-1.5 rounded-xl text-[14px] shadow-[0_1px_0.5px_rgba(0,0,0,0.1)] relative mb-1 tracking-tight
-                                                            ${msg.key.fromMe ? 'bg-[#d9fdd3] text-[#111b21] rounded-tr-none' : 'bg-white text-[#111b21] rounded-tl-none'}
+                                                            ${msg.key.fromMe
+                                                            ? (isFailedOutgoing
+                                                                ? 'bg-[#fee2e2] border border-[#fecaca] text-[#7f1d1d] rounded-tr-none'
+                                                                : 'bg-[#d9fdd3] text-[#111b21] rounded-tr-none')
+                                                            : 'bg-white text-[#111b21] rounded-tl-none'}
                                                         `}>
                                                             {messageText && (
-                                                                <p className="leading-relaxed whitespace-pre-wrap break-words pr-14">
+                                                                <p className={`leading-relaxed whitespace-pre-wrap break-words ${isFailedOutgoing ? 'pr-28' : 'pr-14'}`}>
                                                                     {messageText}
                                                                 </p>
                                                             )}
@@ -3866,7 +4199,10 @@ export default function App() {
                                                                             />
                                                                         ) : (
                                                                             <div className="p-4 text-center" onClick={() => handleDownloadMedia(msg)}>
-                                                                                <p className="text-xs text-[#54656f] font-bold">Loading image…</p>
+                                                                                <div className="animate-pulse space-y-2 w-28">
+                                                                                    <div className="h-3 rounded bg-[#e8edf1]" />
+                                                                                    <div className="h-3 rounded bg-[#eef2f5]" />
+                                                                                </div>
                                                                             </div>
                                                                         );
                                                                     })()}
@@ -3909,7 +4245,10 @@ export default function App() {
                                                                                 />
                                                                             ) : (
                                                                                 <div className="p-4 text-center">
-                                                                                    <p className="text-xs text-[#54656f] font-bold">Loading image…</p>
+                                                                                    <div className="animate-pulse space-y-2 w-28">
+                                                                                        <div className="h-3 rounded bg-[#e8edf1]" />
+                                                                                        <div className="h-3 rounded bg-[#eef2f5]" />
+                                                                                    </div>
                                                                                 </div>
                                                                             )}
                                                                         </div>
@@ -3965,7 +4304,10 @@ export default function App() {
                                                                             />
                                                                         ) : (
                                                                             <div className="p-4 text-center" onClick={() => handleDownloadMedia(msg)}>
-                                                                                <p className="text-xs text-[#54656f] font-bold">Loading video…</p>
+                                                                                <div className="animate-pulse space-y-2 w-28">
+                                                                                    <div className="h-3 rounded bg-[#e8edf1]" />
+                                                                                    <div className="h-3 rounded bg-[#eef2f5]" />
+                                                                                </div>
                                                                             </div>
                                                                         )}
                                                                     </div>
@@ -3984,8 +4326,9 @@ export default function App() {
                                                                                 src={`data:${cacheEntry.mimetype};base64,${cacheEntry.data}`}
                                                                             />
                                                                         ) : (
-                                                                            <div className="text-xs text-[#54656f] font-bold">
-                                                                                Loading voice note…
+                                                                            <div className="animate-pulse space-y-2">
+                                                                                <div className="h-3 rounded bg-[#e8edf1]" />
+                                                                                <div className="h-3 rounded bg-[#eef2f5]" />
                                                                             </div>
                                                                         )}
                                                                     </div>
@@ -3997,6 +4340,19 @@ export default function App() {
                                                                     {msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }) : ''}
                                                                 </span>
                                                                 {renderMessageStatus(msg)}
+                                                                {isFailedOutgoing && (
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={(event) => {
+                                                                            event.stopPropagation();
+                                                                            if (!msg.key?.id) return;
+                                                                            handleResendMessage(msg.key.id);
+                                                                        }}
+                                                                        className="text-[10px] font-bold text-[#d93025] hover:underline"
+                                                                    >
+                                                                        Resend
+                                                                    </button>
+                                                                )}
                                                             </div>
                                                         </div>
                                                         {messageSenderName && (
@@ -4066,7 +4422,11 @@ export default function App() {
                             {canSendText && quickReplyQuery !== null && (
                                 <div className="absolute bottom-[58px] left-0 right-0 bg-white border border-[#eceff1] rounded-2xl shadow-xl z-20 max-h-56 overflow-y-auto">
                                     {quickRepliesLoading ? (
-                                        <div className="px-4 py-3 text-sm text-[#54656f]">Loading quick replies…</div>
+                                        <div className="px-3 py-3 animate-pulse space-y-2">
+                                            <div className="h-9 rounded-xl bg-[#eef2f5]" />
+                                            <div className="h-9 rounded-xl bg-[#eef2f5]" />
+                                            <div className="h-9 rounded-xl bg-[#eef2f5]" />
+                                        </div>
                                     ) : quickReplySuggestions.length === 0 ? (
                                         <div className="px-4 py-3 text-sm text-[#54656f]">No quick replies found.</div>
                                     ) : (
@@ -4597,9 +4957,10 @@ export default function App() {
                     <div className="absolute inset-x-0 bottom-0 h-1.5 bg-[#00a884] z-20" />
                     <div className="text-center relative z-10 px-6">
                         {loadingChats && (
-                            <div className="flex flex-col items-center gap-4 mb-10">
-                                <div className="w-10 h-10 rounded-full border-4 border-[#e5e7eb] border-t-[#00a884] animate-spin" />
-                                <div className="text-xs font-bold uppercase tracking-widest text-[#54656f]">Loading chats…</div>
+                            <div className="w-[280px] mx-auto mb-10 animate-pulse space-y-3">
+                                <div className="h-3 rounded bg-[#e8edf1]" />
+                                <div className="h-3 rounded bg-[#eef2f5] w-5/6 mx-auto" />
+                                <div className="h-3 rounded bg-[#eef2f5] w-3/4 mx-auto" />
                             </div>
                         )}
                         <div className="mb-12 flex justify-center scale-110">
@@ -5172,6 +5533,7 @@ export default function App() {
             ) : workspaceSection === 'automations' ? (
                 <AutomationsView
                     workflows={automationWorkflows}
+                    workflowsLoading={workflowsLoading}
                     profileId={activeProfileId}
                     sessionToken={session?.access_token || null}
                     apiBaseUrl={SOCKET_URL}
@@ -5179,6 +5541,8 @@ export default function App() {
                     onCreateWorkflow={handleCreateAutomation}
                     onToggleWorkflowEnabled={handleToggleAutomationEnabled}
                     onCopyWorkflow={handleCopyAutomation}
+                    onOpenSettingsSection={openSettingsSection}
+                    onSaveWorkflowTrigger={handleSaveWorkflowTrigger}
                 />
             ) : workspaceSection === 'chatbots' ? (
                 <ChatbotsView
@@ -5191,37 +5555,41 @@ export default function App() {
                     <div className="h-full p-6 overflow-y-auto custom-scrollbar">
                         <div className="max-w-3xl mx-auto space-y-4">
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                <button
-                                    type="button"
-                                    onClick={openSettingsFromMore}
-                                    className="text-left bg-white border border-[#eceff1] rounded-2xl p-5 hover:bg-[#f8f9fa] transition-all cursor-pointer pointer-events-auto"
-                                >
-                                    <div className="flex items-center gap-3 mb-2">
-                                        <div className="w-9 h-9 rounded-xl bg-[#00a884]/10 border border-[#00a884]/20 text-[#00a884] flex items-center justify-center">
-                                            <Settings className="w-5 h-5" />
+                                {!isUiFeatureHidden(SETTINGS_UI_FEATURE_KEY) && (
+                                    <button
+                                        type="button"
+                                        onClick={openSettingsFromMore}
+                                        className="text-left bg-white border border-[#eceff1] rounded-2xl p-5 hover:bg-[#f8f9fa] transition-all cursor-pointer pointer-events-auto"
+                                    >
+                                        <div className="flex items-center gap-3 mb-2">
+                                            <div className="w-9 h-9 rounded-xl bg-[#00a884]/10 border border-[#00a884]/20 text-[#00a884] flex items-center justify-center">
+                                                <Settings className="w-5 h-5" />
+                                            </div>
+                                            <div className="text-lg font-black text-[#111b21]">Settings</div>
                                         </div>
-                                        <div className="text-lg font-black text-[#111b21]">Settings</div>
-                                    </div>
-                                    <p className="text-sm text-[#54656f]">
-                                        Webhooks, onboarding, team users, and workspace configuration.
-                                    </p>
-                                </button>
+                                        <p className="text-sm text-[#54656f]">
+                                            Webhooks, onboarding, team users, and workspace configuration.
+                                        </p>
+                                    </button>
+                                )}
 
-                                <button
-                                    type="button"
-                                    onClick={openAnalyticsFromMore}
-                                    className="text-left bg-white border border-[#eceff1] rounded-2xl p-5 hover:bg-[#f8f9fa] transition-all cursor-pointer pointer-events-auto"
-                                >
-                                    <div className="flex items-center gap-3 mb-2">
-                                        <div className="w-9 h-9 rounded-xl bg-[#111b21]/5 border border-[#111b21]/10 text-[#111b21] flex items-center justify-center">
-                                            <CircleDashed className="w-5 h-5" />
+                                {!isUiFeatureHidden('analytics') && (
+                                    <button
+                                        type="button"
+                                        onClick={openAnalyticsFromMore}
+                                        className="text-left bg-white border border-[#eceff1] rounded-2xl p-5 hover:bg-[#f8f9fa] transition-all cursor-pointer pointer-events-auto"
+                                    >
+                                        <div className="flex items-center gap-3 mb-2">
+                                            <div className="w-9 h-9 rounded-xl bg-[#111b21]/5 border border-[#111b21]/10 text-[#111b21] flex items-center justify-center">
+                                                <CircleDashed className="w-5 h-5" />
+                                            </div>
+                                            <div className="text-lg font-black text-[#111b21]">Analytics</div>
                                         </div>
-                                        <div className="text-lg font-black text-[#111b21]">Analytics</div>
-                                    </div>
-                                    <p className="text-sm text-[#54656f]">
-                                        View message totals, workflow metrics, and date-based performance.
-                                    </p>
-                                </button>
+                                        <p className="text-sm text-[#54656f]">
+                                            View message totals, workflow metrics, and date-based performance.
+                                        </p>
+                                    </button>
+                                )}
                             </div>
                         </div>
                     </div>
@@ -5239,8 +5607,8 @@ export default function App() {
                         setAssignMenuContactId(prev => (prev === contactId ? null : contactId));
                     }}
                     onOpenChat={(contactId) => {
-                        setSelectedChatId(contactId);
-                        setWorkspaceSection('team-inbox');
+                        handleOpenChat(contactId);
+                        setWorkspaceSection(defaultWorkspaceSection);
                     }}
                 />
             ) : (
@@ -5249,13 +5617,13 @@ export default function App() {
                         <div className="w-full max-w-xl bg-white border border-[#eceff1] rounded-3xl p-8 shadow-[0_12px_40px_rgba(0,0,0,0.06)]">
                             <h2 className="text-2xl font-black text-[#111b21] mb-3">{activeWorkspaceLabel}</h2>
                             <p className="text-sm text-[#54656f] leading-relaxed mb-6">
-                                This section is not enabled yet. Open Team Inbox to continue using the current interface.
+                                This section is not enabled yet. Open an available workspace section to continue.
                             </p>
                             <button
-                                onClick={() => setWorkspaceSection('team-inbox')}
+                                onClick={() => setWorkspaceSection(defaultWorkspaceSection)}
                                 className="px-5 py-3 rounded-xl bg-[#00a884] text-white text-sm font-bold hover:bg-[#008f6f] transition-all"
                             >
-                                Open Team Inbox
+                                Open Workspace
                             </button>
                         </div>
                     </div>
@@ -5306,7 +5674,11 @@ export default function App() {
                             </button>
                             <div className="h-px bg-[#f0f2f5] my-2" />
                             {teamUsersLoading && teamUsers.length === 0 ? (
-                                <div className="px-3 py-3 text-[12px] text-[#9ca3af]">Loading staff…</div>
+                                <div className="px-3 py-3 animate-pulse space-y-2">
+                                    <div className="h-8 rounded-xl bg-[#eef2f5]" />
+                                    <div className="h-8 rounded-xl bg-[#eef2f5]" />
+                                    <div className="h-8 rounded-xl bg-[#eef2f5]" />
+                                </div>
                             ) : teamUsers.length === 0 ? (
                                 <div className="px-3 py-3 text-[12px] text-[#9ca3af]">No staff found</div>
                             ) : (

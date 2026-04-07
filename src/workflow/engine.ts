@@ -519,8 +519,21 @@ export class WorkflowEngine {
             workflowState: currentState
         })
 
-        // Human takeover can pause all automation while still storing inbound messages.
-        if (ctx.automationDisabled) {
+        const inboundAnswer = getInboundAnswer(ctx)
+        const canContinueAwaitingButtons =
+            Array.isArray(currentState?.awaiting_buttons) &&
+            currentState.awaiting_buttons.length > 0 &&
+            Boolean(ctx.buttonId)
+        const canContinueAwaitingInput = Boolean(currentState?.awaiting_input?.save_as && inboundAnswer)
+        const canContinueAwaitingConfirmation = Boolean(
+            currentState?.awaiting_confirmation?.fields?.length && inboundAnswer
+        )
+        const canContinueActiveWorkflow =
+            Boolean(currentState?.workflow_id) &&
+            (canContinueAwaitingButtons || canContinueAwaitingInput || canContinueAwaitingConfirmation)
+
+        // Human takeover pauses new automation while still allowing active workflow replies to complete.
+        if (ctx.automationDisabled && !canContinueActiveWorkflow) {
             if (inboundRecord?.id && currentState) {
                 await updateMessageWorkflowState(inboundRecord.id, currentState)
             }
@@ -876,6 +889,12 @@ export class WorkflowEngine {
                 if (key.length > bestLen) {
                     bestLen = key.length
                     triggered = wf
+                }
+            }
+            if (!triggered && isFirstMessage) {
+                const newChatWorkflow = workflows.find((wf: any) => wf?.run_on_new_chat === true)
+                if (newChatWorkflow) {
+                    triggered = newChatWorkflow
                 }
             }
             if (triggered) {
@@ -1278,20 +1297,52 @@ export class WorkflowEngine {
 
             if (action.type === 'send_list') {
                 state.step_index = index + 1
-                const sections = Array.isArray(action.sections)
-                    ? action.sections.map((section: any) => ({
-                        ...(section?.title ? { title: renderDynamicText(section.title, state, user, ctx) } : {}),
+                const usedRowIds = new Set<string>()
+                let rowGlobalIndex = 0
+                const rawSections = Array.isArray(action.sections) ? action.sections : []
+                const sections = rawSections.map((section: any, sectionIndex: number) => {
+                    const renderedTitle = section?.title
+                        ? renderDynamicText(section.title, state, user, ctx).trim()
+                        : ''
+                    const fallbackTitle = rawSections.length > 1 ? `Section ${sectionIndex + 1}` : 'Options'
+                    return {
+                        // Cloud API rejects some list payloads when section title is omitted.
+                        title: (renderedTitle || fallbackTitle).slice(0, 24),
                         rows: Array.isArray(section?.rows)
                             ? section.rows.map((row: any, rowIndex: number) => ({
-                                id: typeof row?.id === 'string' && row.id.trim() ? row.id.trim() : `row_${rowIndex + 1}`,
-                                title: renderDynamicText(row?.title || '', state, user, ctx),
-                                ...(row?.description
-                                    ? { description: renderDynamicText(row.description, state, user, ctx) }
-                                    : {})
+                                id: (() => {
+                                    const fallbackIndex = rowGlobalIndex
+                                    rowGlobalIndex += 1
+                                    const preferredId =
+                                        typeof row?.id === 'string' && row.id.trim()
+                                            ? row.id.trim()
+                                            : ''
+                                    const baseId =
+                                        normalizeChoiceKey(preferredId) ||
+                                        normalizeChoiceKey(row?.title || '') ||
+                                        `row_${fallbackIndex + 1}`
+                                    let nextId = baseId
+                                    let suffix = 2
+                                    while (usedRowIds.has(nextId)) {
+                                        nextId = `${baseId}_${suffix}`
+                                        suffix += 1
+                                    }
+                                    usedRowIds.add(nextId)
+                                    return nextId
+                                })(),
+                                title:
+                                    renderDynamicText(row?.title || '', state, user, ctx).trim() ||
+                                    `Option ${rowIndex + 1}`,
+                                ...(() => {
+                                    const renderedDescription = row?.description
+                                        ? renderDynamicText(row.description, state, user, ctx).trim()
+                                        : ''
+                                    return renderedDescription ? { description: renderedDescription } : {}
+                                })()
                             }))
                             : []
-                    }))
-                    : []
+                    }
+                })
                 const rowIds = extractListRowIds(sections)
                 state.awaiting_buttons = rowIds
                 state.awaiting_routes = action.routes
@@ -1307,8 +1358,8 @@ export class WorkflowEngine {
                         to: ctx.phoneNumber,
                         type: 'list',
                         content: {
-                            text: renderDynamicText(action.text, state, user, ctx),
-                            button_text: renderDynamicText(action.button_text, state, user, ctx),
+                            text: renderDynamicText(action.text, state, user, ctx).trim() || 'Please choose an option:',
+                            button_text: renderDynamicText(action.button_text, state, user, ctx).trim() || 'View options',
                             sections,
                             header,
                             footer: renderDynamicText(action.footer || '', state, user, ctx),

@@ -60,14 +60,22 @@ export default function AdminView({ socket }: { socket: Socket | null }) {
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-8 mb-10">
                     <div className="bg-white p-8 rounded-[32px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.03)]">
                         <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-3">Total Profiles</div>
-                        <div className="text-3xl font-black text-[#111b21]">{allProfiles.length}</div>
+                        {loading ? (
+                            <div className="h-9 w-20 rounded bg-[#eef2f5] animate-pulse" />
+                        ) : (
+                            <div className="text-3xl font-black text-[#111b21]">{allProfiles.length}</div>
+                        )}
                         <div className="text-[11px] text-[#aebac1] mt-2 font-medium">Provisioned in database</div>
                     </div>
                     <div className="bg-white p-8 rounded-[32px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.03)]">
                         <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-3">Active WABA Configs</div>
-                        <div className="text-3xl font-black text-[#00a884]">
-                            {allProfiles.filter(p => p.status === 'open').length}
-                        </div>
+                        {loading ? (
+                            <div className="h-9 w-20 rounded bg-[#eef2f5] animate-pulse" />
+                        ) : (
+                            <div className="text-3xl font-black text-[#00a884]">
+                                {allProfiles.filter(p => p.status === 'open').length}
+                            </div>
+                        )}
                         <div className="text-[11px] text-[#00a884]/60 mt-2 font-bold flex items-center gap-1">
                             <div className="w-1.5 h-1.5 bg-[#00a884] rounded-full animate-pulse" />
                             Cloud API configured
@@ -75,9 +83,13 @@ export default function AdminView({ socket }: { socket: Socket | null }) {
                     </div>
                     <div className="bg-white p-8 rounded-[32px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.03)]">
                         <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-3">Unique Entities</div>
-                        <div className="text-3xl font-black text-[#111b21]">
-                            {new Set(allProfiles.map(p => p.user_id)).size}
-                        </div>
+                        {loading ? (
+                            <div className="h-9 w-20 rounded bg-[#eef2f5] animate-pulse" />
+                        ) : (
+                            <div className="text-3xl font-black text-[#111b21]">
+                                {new Set(allProfiles.map(p => p.user_id)).size}
+                            </div>
+                        )}
                         <div className="text-[11px] text-[#aebac1] mt-2 font-medium">Verified corporate identities</div>
                     </div>
                 </div>
@@ -94,7 +106,13 @@ export default function AdminView({ socket }: { socket: Socket | null }) {
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-[#f0f2f5]">
-                            {filtered.map((p) => (
+                            {loading ? Array.from({ length: 6 }).map((_, idx) => (
+                                <tr key={`admin-skeleton-${idx}`} className="animate-pulse">
+                                    <td className="px-8 py-6" colSpan={5}>
+                                        <div className="h-10 rounded-xl bg-[#eef2f5]" />
+                                    </td>
+                                </tr>
+                            )) : filtered.map((p) => (
                                 <tr key={p.id} className="hover:bg-[#f8f9fa] transition-all group">
                                     <td className="px-8 py-6 text-sm">
                                         <div className="font-bold text-[#111b21]">{p.user_email || 'System Account'}</div>

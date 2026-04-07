@@ -34,7 +34,11 @@ export default function ContactsView({
                                 New contacts are auto-saved when messages are received or sent.
                             </p>
                             <p className="text-[11px] text-[#8696a0] mt-1">
-                                {teamUsersLoading ? 'Loading staff…' : `${teamUsers.length} staff available for assignment`}
+                                {teamUsersLoading ? (
+                                    <span className="inline-block animate-pulse h-3 w-32 rounded bg-[#eef2f5] align-middle" />
+                                ) : (
+                                    `${teamUsers.length} staff available for assignment`
+                                )}
                             </p>
                         </div>
                         <div className="w-full md:w-[360px] bg-[#f0f2f5] rounded-xl flex items-center px-4 py-2.5 focus-within:bg-white focus-within:ring-1 focus-within:ring-[#00a884]/20 transition-all">

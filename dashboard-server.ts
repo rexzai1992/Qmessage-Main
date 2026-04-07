@@ -10,7 +10,7 @@ import { createHash, randomBytes } from 'crypto'
 import type { Socket as NetSocket } from 'net'
 import * as addon from './src/addon'
 import { resolvePath } from './src/config'
-import { supabase } from './src/supabase'
+import { supabase, supabaseAuth } from './src/supabase'
 import { WabaRegistry } from './src/waba/registry'
 import { parseWabaWebhook, verifyWabaSignature } from './src/waba/webhook'
 import type { WabaInboundMessage, WabaStatus, WabaConfig } from './src/waba/types'
@@ -465,7 +465,7 @@ async function getSupabaseUserFromRequest(req: any, res: any) {
         return null
     }
 
-    const { data: { user }, error } = await supabase.auth.getUser(token)
+    const { data: { user }, error } = await supabaseAuth.auth.getUser(token)
     if (error || !user) {
         res.status(401).json({ success: false, error: 'Invalid or expired session' })
         return null
@@ -3153,7 +3153,7 @@ async function resolveWabaAdminAccess(req: any, res: any) {
         return null
     }
 
-    const { data: { user }, error } = await supabase.auth.getUser(token)
+    const { data: { user }, error } = await supabaseAuth.auth.getUser(token)
     if (error || !user) {
         res.status(401).json({ success: false, error: 'Invalid or expired session' })
         return null
@@ -3167,6 +3167,65 @@ async function resolveWabaAdminAccess(req: any, res: any) {
     return { user, token }
 }
 
+const UI_FEATURE_KEYS = new Set([
+    'team-inbox',
+    'automations',
+    'broadcast',
+    'chatbots',
+    'contacts',
+    'analytics',
+    'settings'
+])
+
+const UI_HIDDEN_FEATURES_MISSING_MESSAGE =
+    'UI controls are not initialized. Run migration 20260407_company_ui_hidden_features.sql.'
+
+function normalizeUiFeatureKey(value: unknown): string {
+    if (typeof value !== 'string') return ''
+    const normalized = value.trim().toLowerCase().replace(/\s+/g, '-')
+    return UI_FEATURE_KEYS.has(normalized) ? normalized : ''
+}
+
+function sanitizeUiHiddenFeatures(value: unknown): string[] {
+    const unique = new Set<string>()
+    const push = (entry: unknown) => {
+        const normalized = normalizeUiFeatureKey(entry)
+        if (normalized) unique.add(normalized)
+    }
+
+    if (Array.isArray(value)) {
+        value.forEach((entry) => push(entry))
+        return Array.from(unique)
+    }
+
+    if (typeof value === 'string') {
+        const trimmed = value.trim()
+        if (!trimmed) return []
+        try {
+            const parsed = JSON.parse(trimmed)
+            if (Array.isArray(parsed)) {
+                parsed.forEach((entry) => push(entry))
+                return Array.from(unique)
+            }
+        } catch {
+            // fall through to CSV parsing
+        }
+        trimmed
+            .split(/[,\n;]/g)
+            .map((entry) => entry.trim())
+            .filter(Boolean)
+            .forEach((entry) => push(entry))
+    }
+
+    return Array.from(unique)
+}
+
+function isUiHiddenFeaturesMissingError(error: any): boolean {
+    const code = typeof error?.code === 'string' ? error.code.trim().toUpperCase() : ''
+    const message = String(error?.message || '').toLowerCase()
+    return code === '42703' && message.includes('ui_hidden_features')
+}
+
 async function buildAdminSummaryPayload() {
     const { data: companies, error } = await supabase
         .from('company')
@@ -3178,38 +3237,119 @@ async function buildAdminSummaryPayload() {
     }
 
     const companyRows = companies || []
+    const activeProfileIds = new Set(await wabaRegistry.getProfileIds())
+    const hasServiceRole = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY)
+    const authUserEmailCache = new Map<string, string>()
+
+    const resolveAuthEmailByUserId = async (userId: string): Promise<string> => {
+        if (!userId) return ''
+        const cached = authUserEmailCache.get(userId)
+        if (cached !== undefined) return cached
+        if (!hasServiceRole) {
+            authUserEmailCache.set(userId, '')
+            return ''
+        }
+        try {
+            const { data, error: authError } = await supabase.auth.admin.getUserById(userId)
+            const email = !authError && data?.user?.email ? String(data.user.email) : ''
+            authUserEmailCache.set(userId, email)
+            return email
+        } catch {
+            authUserEmailCache.set(userId, '')
+            return ''
+        }
+    }
+
     const companyStats = await Promise.all(companyRows.map(async (company: any) => {
         const [
-            profilesCount,
+            profileRowsResult,
             usersCount,
             workflowsCount,
-            wabaCount,
-            wabaEnabledCount,
-            messagesCount
+            wabaRowsResult,
+            messagesCountResult
         ] = await Promise.all([
-            supabase.from('profiles').select('id', { count: 'exact', head: true }).eq('company_id', company.id),
+            supabase.from('profiles').select('id, name, user_id').eq('company_id', company.id),
             supabase.from('users').select('id', { count: 'exact', head: true }).eq('company_id', company.id),
             supabase.from('workflows').select('id', { count: 'exact', head: true }).eq('company_id', company.id),
-            supabase.from('waba_configs').select('profile_id', { count: 'exact', head: true }).eq('company_id', company.id),
-            supabase.from('waba_configs').select('profile_id', { count: 'exact', head: true }).eq('company_id', company.id).eq('enabled', true),
+            supabase.from('waba_configs').select('profile_id, phone_number_id, waba_id, enabled').eq('company_id', company.id),
             supabase
                 .from('messages')
                 .select('id, users!inner(company_id)', { count: 'exact', head: true })
                 .eq('users.company_id', company.id)
         ])
 
+        const problems: string[] = []
+        if (profileRowsResult.error) problems.push('Failed to read profiles')
+        if (usersCount.error) problems.push('Failed to read contacts')
+        if (workflowsCount.error) problems.push('Failed to read workflows')
+        if (wabaRowsResult.error) problems.push('Failed to read WABA configs')
+        if (messagesCountResult.error) problems.push('Failed to read messages')
+
+        const profileRows = Array.isArray(profileRowsResult.data) ? profileRowsResult.data : []
+        const wabaRows = Array.isArray(wabaRowsResult.data) ? wabaRowsResult.data : []
+        const enabledWabaRows = wabaRows.filter((row: any) => row?.enabled === true)
+
+        const profileById = new Map<string, any>()
+        profileRows.forEach((row: any) => {
+            const profileId = typeof row?.id === 'string' ? row.id.trim() : ''
+            if (!profileId) return
+            profileById.set(profileId, row)
+        })
+
+        const activeWabaUsers = await Promise.all(
+            enabledWabaRows
+                .filter((row: any) => typeof row?.profile_id === 'string' && row.profile_id.trim())
+                .map(async (row: any) => {
+                    const profileId = String(row.profile_id).trim()
+                    const profile = profileById.get(profileId) || {}
+                    const userId = typeof profile?.user_id === 'string' ? profile.user_id : ''
+                    const userEmail = userId ? await resolveAuthEmailByUserId(userId) : ''
+                    return {
+                        profile_id: profileId,
+                        profile_name: typeof profile?.name === 'string' && profile.name.trim() ? profile.name.trim() : profileId,
+                        user_id: userId || null,
+                        user_email: userEmail || null,
+                        phone_number_id: typeof row?.phone_number_id === 'string' ? row.phone_number_id : null,
+                        waba_id: typeof row?.waba_id === 'string' ? row.waba_id : null,
+                        active: activeProfileIds.has(profileId)
+                    }
+                })
+        )
+
+        const activeWabaConnections = activeWabaUsers.filter((entry: any) => entry.active).length
+        const profileCount = profileRows.length
+        const wabaCount = wabaRows.length
+        const wabaEnabledCount = enabledWabaRows.length
+        const contactsCount = usersCount.count || 0
+        const workflowsCountValue = workflowsCount.count || 0
+        const messagesCount = messagesCountResult.count || 0
+
+        if (profileCount === 0) problems.push('No profiles')
+        if (wabaEnabledCount === 0) {
+            problems.push('No enabled WABA config')
+        } else if (activeWabaConnections === 0) {
+            problems.push('Enabled WABA found but inactive')
+        }
+        if (workflowsCountValue > 0 && wabaEnabledCount === 0) {
+            problems.push('Workflows exist but WABA is not enabled')
+        }
+
         return {
             id: company.id,
             name: company.name,
             email: company.email,
             created_at: company.created_at,
+            ui_hidden_features: sanitizeUiHiddenFeatures(company?.ui_hidden_features),
+            active_waba_users: activeWabaUsers,
+            problems: Array.from(new Set(problems)),
             counts: {
-                profiles: profilesCount.count || 0,
-                contacts: usersCount.count || 0,
-                workflows: workflowsCount.count || 0,
-                waba_configs: wabaCount.count || 0,
-                waba_enabled: wabaEnabledCount.count || 0,
-                messages: messagesCount.count || 0
+                profiles: profileCount,
+                contacts: contactsCount,
+                workflows: workflowsCountValue,
+                waba_configs: wabaCount,
+                waba_enabled: wabaEnabledCount,
+                waba_active: activeWabaConnections,
+                messages: messagesCount
             }
         }
     }))
@@ -3222,10 +3362,11 @@ async function buildAdminSummaryPayload() {
             acc.workflows += row.counts.workflows
             acc.waba_configs += row.counts.waba_configs
             acc.waba_enabled += row.counts.waba_enabled
+            acc.waba_active += row.counts.waba_active
             acc.messages += row.counts.messages
             return acc
         },
-        { companies: 0, profiles: 0, contacts: 0, workflows: 0, waba_configs: 0, waba_enabled: 0, messages: 0 }
+        { companies: 0, profiles: 0, contacts: 0, workflows: 0, waba_configs: 0, waba_enabled: 0, waba_active: 0, messages: 0 }
     )
 
     return { totals, companies: companyStats }
@@ -3339,6 +3480,54 @@ app.get('/api/admin/summary', async (req: any, res: any) => {
     }
 })
 
+app.post('/api/admin/company-ui', async (req: any, res: any) => {
+    try {
+        const access = await resolveWabaAdminAccess(req, res)
+        if (!access) return
+
+        const companyId = normalizeCompanyId(req.body?.companyId || req.body?.company_id || '')
+        if (!companyId) {
+            return res.status(400).json({ success: false, error: 'companyId is required' })
+        }
+
+        const hiddenFeatures = sanitizeUiHiddenFeatures(req.body?.hiddenFeatures ?? req.body?.hidden_features ?? req.body?.ui_hidden_features)
+
+        const { data, error } = await supabase
+            .from('company')
+            .update({
+                ui_hidden_features: hiddenFeatures
+            })
+            .eq('id', companyId)
+            .select('id, ui_hidden_features')
+            .maybeSingle()
+
+        if (error) {
+            if (isUiHiddenFeaturesMissingError(error)) {
+                return res.status(503).json({
+                    success: false,
+                    code: 'UI_CONTROLS_MISSING',
+                    error: UI_HIDDEN_FEATURES_MISSING_MESSAGE
+                })
+            }
+            return res.status(500).json({ success: false, error: error.message })
+        }
+
+        if (!data) {
+            return res.status(404).json({ success: false, error: 'Company not found' })
+        }
+
+        return res.json({
+            success: true,
+            data: {
+                company_id: data.id,
+                hidden_features: sanitizeUiHiddenFeatures((data as any).ui_hidden_features)
+            }
+        })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error?.message || 'Failed to update UI controls' })
+    }
+})
+
 // Backward-compatible JSON endpoint
 app.get('/my', async (req: any, res: any) => {
     try {
@@ -3440,10 +3629,31 @@ app.get('/myadmin', (_req: any, res: any) => {
     th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
     .mono { font-family: Menlo, Consolas, monospace; }
     .right { text-align: right; }
-    .hidden { display: none; }
-    .title { margin: 0; font-size: 18px; font-weight: 700; }
-    .hint { color: var(--muted); font-size: 13px; }
-  </style>
+	    .hidden { display: none; }
+	    .title { margin: 0; font-size: 18px; font-weight: 700; }
+	    .hint { color: var(--muted); font-size: 13px; }
+	    .list-stack { display: grid; gap: 4px; min-width: 260px; }
+	    .tiny { font-size: 11px; color: #475467; }
+	    .pill {
+	      display: inline-flex;
+	      align-items: center;
+	      border: 1px solid #d7e5df;
+	      border-radius: 999px;
+	      padding: 2px 8px;
+	      background: #f4fbf8;
+	      color: #0f766e;
+	      font-size: 10px;
+	      font-weight: 700;
+	      margin-right: 6px;
+	    }
+	    .feature-grid { display: grid; grid-template-columns: repeat(2, minmax(96px, 1fr)); gap: 6px; min-width: 250px; }
+	    .feature-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: #344054; }
+	    .feature-chip input { width: 14px; height: 14px; margin: 0; }
+	    .problem-ok { color: #027a48; font-weight: 700; font-size: 11px; }
+	    .problem-bad { color: #b42318; font-size: 11px; display: block; margin-bottom: 2px; }
+	    .btn-save { background: #111b21; color: #fff; padding: 8px 10px; border-radius: 8px; font-size: 11px; }
+	    .btn-save:disabled { opacity: 0.65; cursor: not-allowed; }
+	  </style>
 </head>
 <body>
   <div class="wrap">
@@ -3472,24 +3682,29 @@ app.get('/myadmin', (_req: any, res: any) => {
       <div id="status" class="card status">Ready.</div>
       <div id="totals" class="card totals" style="display:none"></div>
 
-      <div class="card table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Company ID</th>
-              <th>Name</th>
-              <th>Email</th>
-              <th class="right">Profiles</th>
-              <th class="right">Contacts</th>
-              <th class="right">Workflows</th>
-              <th class="right">WABA</th>
-              <th class="right">WABA On</th>
-              <th class="right">Messages</th>
-              <th>Created</th>
-            </tr>
-          </thead>
-          <tbody id="companyRows"></tbody>
-        </table>
+	      <div class="card table-wrap">
+	        <table>
+	          <thead>
+	            <tr>
+	              <th>Company ID</th>
+	              <th>Name</th>
+	              <th>Email</th>
+	              <th class="right">Profiles</th>
+	              <th class="right">Contacts</th>
+	              <th class="right">Workflows</th>
+	              <th class="right">WABA</th>
+	              <th class="right">WABA On</th>
+	              <th class="right">WABA Active</th>
+	              <th class="right">Messages</th>
+	              <th>Active WABA Users</th>
+	              <th>UI Controls</th>
+	              <th>Problems</th>
+	              <th>Action</th>
+	              <th>Created</th>
+	            </tr>
+	          </thead>
+	          <tbody id="companyRows"></tbody>
+	        </table>
       </div>
     </div>
   </div>
@@ -3511,6 +3726,16 @@ app.get('/myadmin', (_req: any, res: any) => {
     const statusEl = document.getElementById('status');
     const totalsEl = document.getElementById('totals');
     const rowsEl = document.getElementById('companyRows');
+    const FEATURE_OPTIONS = [
+      { key: 'team-inbox', label: 'Team Inbox' },
+      { key: 'automations', label: 'Automation' },
+      { key: 'broadcast', label: 'Broadcast' },
+      { key: 'chatbots', label: 'Chatbot' },
+      { key: 'contacts', label: 'Contacts' },
+      { key: 'analytics', label: 'Analytics' },
+      { key: 'settings', label: 'Settings' }
+    ];
+    const FEATURE_KEYS = new Set(FEATURE_OPTIONS.map(function(item) { return item.key; }));
 
     function setStatus(message, isError) {
       statusEl.textContent = message;
@@ -3583,15 +3808,75 @@ app.get('/myadmin', (_req: any, res: any) => {
       return data.data || {};
     }
 
+    async function saveCompanyUi(companyId, hiddenFeatures) {
+      const creds = readStoredCreds();
+      if (!creds.token) {
+        throw new Error('Session expired. Please login again.');
+      }
+      const res = await fetch('/api/admin/company-ui', {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + creds.token,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          companyId: companyId,
+          hiddenFeatures: hiddenFeatures
+        })
+      });
+      const data = await res.json().catch(function() { return null; });
+      if (!res.ok || !data || !data.success) {
+        throw new Error((data && data.error) || 'Failed to save UI controls');
+      }
+      return (data.data && data.data.hidden_features) || [];
+    }
+
+    function normalizeHiddenFeatures(value) {
+      const output = [];
+      const seen = new Set();
+      const push = function(entry) {
+        const normalized = typeof entry === 'string' ? entry.trim().toLowerCase() : '';
+        if (!normalized || !FEATURE_KEYS.has(normalized) || seen.has(normalized)) return;
+        seen.add(normalized);
+        output.push(normalized);
+      };
+
+      if (Array.isArray(value)) {
+        value.forEach(push);
+        return output;
+      }
+
+      if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if (!trimmed) return output;
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (Array.isArray(parsed)) {
+            parsed.forEach(push);
+            return output;
+          }
+        } catch (_err) {
+          // continue to CSV parser
+        }
+        trimmed
+          .split(/[,\\n;]/g)
+          .map(function(entry) { return entry.trim(); })
+          .filter(Boolean)
+          .forEach(push);
+      }
+
+      return output;
+    }
+
     function renderTotals(totals) {
       totalsEl.innerHTML = '';
       totalsEl.style.display = 'grid';
-      const keys = ['companies', 'profiles', 'contacts', 'workflows', 'waba_configs', 'waba_enabled', 'messages'];
+      const keys = ['companies', 'profiles', 'contacts', 'workflows', 'waba_configs', 'waba_enabled', 'waba_active', 'messages'];
       keys.forEach(function(key) {
         const box = document.createElement('div');
         box.className = 'metric';
         const label = document.createElement('span');
-        label.textContent = key.replace('_', ' ');
+        label.textContent = key.replace(/_/g, ' ');
         const value = document.createElement('b');
         value.textContent = String(totals[key] || 0);
         box.appendChild(label);
@@ -3604,6 +3889,7 @@ app.get('/myadmin', (_req: any, res: any) => {
       rowsEl.innerHTML = '';
       companies.forEach(function(company) {
         const tr = document.createElement('tr');
+        const hiddenFeatures = normalizeHiddenFeatures(company.ui_hidden_features);
         const values = [
           { v: company.id, mono: true },
           { v: company.name || '-' },
@@ -3613,8 +3899,8 @@ app.get('/myadmin', (_req: any, res: any) => {
           { v: company.counts && company.counts.workflows, right: true },
           { v: company.counts && company.counts.waba_configs, right: true },
           { v: company.counts && company.counts.waba_enabled, right: true },
-          { v: company.counts && company.counts.messages, right: true },
-          { v: company.created_at ? new Date(company.created_at).toLocaleString() : '-' }
+          { v: company.counts && company.counts.waba_active, right: true },
+          { v: company.counts && company.counts.messages, right: true }
         ];
         values.forEach(function(item) {
           const td = document.createElement('td');
@@ -3623,6 +3909,100 @@ app.get('/myadmin', (_req: any, res: any) => {
           if (item.right) td.className = (td.className ? td.className + ' ' : '') + 'right';
           tr.appendChild(td);
         });
+
+        const activeUsers = Array.isArray(company.active_waba_users)
+          ? company.active_waba_users.filter(function(entry) { return entry && entry.active; })
+          : [];
+        const activeUsersTd = document.createElement('td');
+        if (activeUsers.length === 0) {
+          activeUsersTd.textContent = '-';
+        } else {
+          const stack = document.createElement('div');
+          stack.className = 'list-stack';
+          activeUsers.forEach(function(entry) {
+            const line = document.createElement('div');
+            line.className = 'tiny';
+            const profileName = entry.profile_name || entry.profile_id || '-';
+            const owner = entry.user_email || entry.user_id || 'unknown user';
+            const phone = entry.phone_number_id || '-';
+            line.textContent = profileName + ' | ' + owner + ' | ' + phone;
+            stack.appendChild(line);
+          });
+          activeUsersTd.appendChild(stack);
+        }
+        tr.appendChild(activeUsersTd);
+
+        const uiControlsTd = document.createElement('td');
+        const grid = document.createElement('div');
+        grid.className = 'feature-grid';
+        FEATURE_OPTIONS.forEach(function(feature) {
+          const label = document.createElement('label');
+          label.className = 'feature-chip';
+          const input = document.createElement('input');
+          input.type = 'checkbox';
+          input.checked = hiddenFeatures.indexOf(feature.key) !== -1;
+          input.setAttribute('data-company-id', String(company.id || ''));
+          input.setAttribute('data-feature', feature.key);
+          label.appendChild(input);
+          const text = document.createElement('span');
+          text.textContent = feature.label;
+          label.appendChild(text);
+          grid.appendChild(label);
+        });
+        uiControlsTd.appendChild(grid);
+        tr.appendChild(uiControlsTd);
+
+        const problemsTd = document.createElement('td');
+        const problems = Array.isArray(company.problems) ? company.problems : [];
+        if (problems.length === 0) {
+          const ok = document.createElement('span');
+          ok.className = 'problem-ok';
+          ok.textContent = 'OK';
+          problemsTd.appendChild(ok);
+        } else {
+          problems.forEach(function(problem) {
+            const line = document.createElement('span');
+            line.className = 'problem-bad';
+            line.textContent = String(problem || '');
+            problemsTd.appendChild(line);
+          });
+        }
+        tr.appendChild(problemsTd);
+
+        const actionTd = document.createElement('td');
+        const saveBtn = document.createElement('button');
+        saveBtn.type = 'button';
+        saveBtn.className = 'btn-save';
+        saveBtn.textContent = 'Save UI';
+        saveBtn.addEventListener('click', async function() {
+          if (!company.id) return;
+          const selected = [];
+          const selectors = tr.querySelectorAll('input[data-company-id="' + String(company.id) + '"][data-feature]');
+          selectors.forEach(function(node) {
+            if (node && node.checked) {
+              const featureKey = node.getAttribute('data-feature') || '';
+              if (FEATURE_KEYS.has(featureKey)) selected.push(featureKey);
+            }
+          });
+          saveBtn.disabled = true;
+          setStatus('Saving UI controls for ' + String(company.id) + '...', false);
+          try {
+            const saved = await saveCompanyUi(String(company.id), selected);
+            company.ui_hidden_features = normalizeHiddenFeatures(saved);
+            setStatus('Saved UI controls for ' + String(company.id) + '.', false);
+          } catch (err) {
+            setStatus(err && err.message ? err.message : 'Failed to save UI controls.', true);
+          } finally {
+            saveBtn.disabled = false;
+          }
+        });
+        actionTd.appendChild(saveBtn);
+        tr.appendChild(actionTd);
+
+        const createdTd = document.createElement('td');
+        createdTd.textContent = company.created_at ? new Date(company.created_at).toLocaleString() : '-';
+        tr.appendChild(createdTd);
+
         rowsEl.appendChild(tr);
       });
     }
@@ -4224,6 +4604,7 @@ async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
 
 registerSocketHandlers(io, {
     supabase,
+    supabaseAuth,
     getHostnameFromHeaders,
     resolveCompanyIdFromHostname,
     normalizeCompanyId,

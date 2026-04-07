@@ -289,7 +289,13 @@ export default function BroadcastView({
 
                 <main className="flex-1 overflow-hidden">
                     {broadcastSection === 'template-library' && (
-                        <Suspense fallback={<div className="p-8 text-sm text-[#54656f]">Loading template builder…</div>}>
+                        <Suspense fallback={
+                            <div className="p-6 md:p-8 animate-pulse space-y-4">
+                                <div className="h-4 w-44 rounded bg-[#e8edf1]" />
+                                <div className="h-28 rounded-2xl bg-white border border-[#eceff1]" />
+                                <div className="h-[380px] rounded-2xl bg-white border border-[#eceff1]" />
+                            </div>
+                        }>
                             <BroadcastTemplateBuilder
                                 profileId={activeProfileId || ''}
                                 sessionToken={sessionToken}
@@ -299,7 +305,13 @@ export default function BroadcastView({
                         </Suspense>
                     )}
                     {broadcastSection === 'my-templates' && (
-                        <Suspense fallback={<div className="p-8 text-sm text-[#54656f]">Loading templates…</div>}>
+                        <Suspense fallback={
+                            <div className="p-6 md:p-8 animate-pulse space-y-4">
+                                <div className="h-4 w-36 rounded bg-[#e8edf1]" />
+                                <div className="h-12 rounded-xl bg-white border border-[#eceff1]" />
+                                <div className="h-[420px] rounded-2xl bg-white border border-[#eceff1]" />
+                            </div>
+                        }>
                             <BroadcastTemplatesList
                                 profileId={activeProfileId || ''}
                                 sessionToken={sessionToken}
@@ -432,7 +444,11 @@ export default function BroadcastView({
                                             </div>
                                             <div className="max-h-[420px] overflow-y-auto custom-scrollbar">
                                                 {scheduledLoading ? (
-                                                    <div className="px-4 py-4 text-sm text-[#64748b]">Loading scheduled broadcasts...</div>
+                                                    <div className="px-4 py-4 animate-pulse space-y-3">
+                                                        <div className="h-14 rounded-xl bg-[#eef2f5]" />
+                                                        <div className="h-14 rounded-xl bg-[#eef2f5]" />
+                                                        <div className="h-14 rounded-xl bg-[#eef2f5]" />
+                                                    </div>
                                                 ) : sortedScheduledRows.length === 0 ? (
                                                     <div className="px-4 py-4 text-sm text-[#64748b]">No scheduled broadcasts yet.</div>
                                                 ) : (
