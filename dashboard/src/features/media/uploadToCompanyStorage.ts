@@ -1,5 +1,5 @@
 export type CompanyMediaMessageType = 'image' | 'video' | 'document'
-export type CompanyMediaUploadPurpose = 'quick_reply' | 'chat_message'
+export type CompanyMediaUploadPurpose = 'quick_reply' | 'chat_message' | 'app_logo'
 
 export type UploadedCompanyMedia = {
     assetKey: string
@@ -10,6 +10,26 @@ export type UploadedCompanyMedia = {
 
 function readTrimmed(value: unknown): string {
     return typeof value === 'string' ? value.trim() : ''
+}
+
+function readResponseErrorMessage(status: number, bodyText: string, fallback: string): string {
+    const trimmed = readTrimmed(bodyText)
+    if (!trimmed) return `${fallback} (HTTP ${status})`
+
+    try {
+        const parsed = JSON.parse(trimmed)
+        const apiError = readTrimmed((parsed as any)?.error)
+        if (apiError) return apiError
+    } catch {
+        // non-JSON body, continue with plain text checks
+    }
+
+    if (trimmed.includes('Cannot POST /api/company/media/upload-url')) {
+        return 'Upload route is missing on this server. Deploy/restart backend with latest code.'
+    }
+
+    const snippet = trimmed.replace(/\s+/g, ' ').slice(0, 180)
+    return snippet ? `${fallback} (HTTP ${status}): ${snippet}` : `${fallback} (HTTP ${status})`
 }
 
 export async function uploadFileToCompanyStorage(args: {
@@ -35,9 +55,19 @@ export async function uploadFileToCompanyStorage(args: {
             sizeBytes: file.size
         })
     })
-    const createData = await createRes.json().catch(() => null)
+    const createRawText = await createRes.text()
+    const createData = (() => {
+        try {
+            return createRawText ? JSON.parse(createRawText) : null
+        } catch {
+            return null
+        }
+    })()
     if (!createRes.ok || !createData?.success) {
-        throw new Error(createData?.error || 'Failed to create upload URL.')
+        throw new Error(
+            createData?.error
+                || readResponseErrorMessage(createRes.status, createRawText, 'Failed to create upload URL.')
+        )
     }
     const assetKey = readTrimmed(createData?.data?.assetKey)
     const uploadUrl = readTrimmed(createData?.data?.uploadUrl)
@@ -64,7 +94,8 @@ export async function uploadFileToCompanyStorage(args: {
         body: file
     })
     if (!uploadRes.ok) {
-        throw new Error('Upload to storage failed.')
+        const uploadRawText = await uploadRes.text().catch(() => '')
+        throw new Error(readResponseErrorMessage(uploadRes.status, uploadRawText, 'Upload to storage failed.'))
     }
 
     return {
@@ -74,4 +105,3 @@ export async function uploadFileToCompanyStorage(args: {
         fileName: file.name || `${messageType}-${Date.now()}`
     }
 }
-

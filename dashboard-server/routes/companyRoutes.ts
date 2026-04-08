@@ -24,6 +24,49 @@ const UI_HIDDEN_FEATURES_MISSING_MESSAGE =
     'UI controls are not initialized. Run migration 20260407_company_ui_hidden_features.sql.'
 const QUICK_REPLIES_MEDIA_MISSING_MESSAGE =
     'Quick reply media fields are not initialized. Run migrations 20260408_quick_replies_media_support.sql and 20260408_quick_replies_r2_storage.sql.'
+const APP_LOGO_FIELDS_MISSING_MESSAGE =
+    'App logo fields are not initialized. Run migration 20260408_company_app_logo_storage.sql.'
+const DEFAULT_APP_LOGO_MAX_BYTES = 2 * 1024 * 1024
+
+function parsePositiveInt(value: unknown, fallback: number): number {
+    const parsed = Number(value)
+    if (!Number.isFinite(parsed)) return fallback
+    const normalized = Math.floor(parsed)
+    if (normalized <= 0) return fallback
+    return normalized
+}
+
+function getAppLogoMaxBytes(): number {
+    const configured = parsePositiveInt(process.env.APP_LOGO_MAX_BYTES, DEFAULT_APP_LOGO_MAX_BYTES)
+    const imageMax = getMaxUploadBytes('image')
+    if (imageMax > 0) return Math.min(configured, imageMax)
+    return configured
+}
+
+function normalizeAppLogoStorage(value: unknown): 'none' | 'r2' {
+    const normalized = typeof value === 'string' ? value.trim().toLowerCase() : ''
+    if (normalized === 'r2') return 'r2'
+    return 'none'
+}
+
+function normalizeAppLogoAssetKey(value: unknown): string {
+    return typeof value === 'string' ? value.trim() : ''
+}
+
+function normalizeAppLogoMimeType(value: unknown): string {
+    return typeof value === 'string' ? value.trim().toLowerCase() : ''
+}
+
+function normalizeAppLogoFilename(value: unknown): string {
+    return typeof value === 'string' ? value.trim() : ''
+}
+
+function normalizeAppLogoSizeBytes(value: unknown): number | null {
+    const parsed = Number(value)
+    if (!Number.isFinite(parsed)) return null
+    const normalized = Math.max(0, Math.floor(parsed))
+    return normalized || null
+}
 
 function normalizeUiFeatureKey(value: unknown): string {
     if (typeof value !== 'string') return ''
@@ -84,6 +127,65 @@ function isQuickRepliesMediaColumnsMissingError(error: any): boolean {
         || message.includes('media_mime_type')
         || message.includes('media_size_bytes')
     )
+}
+
+function isAppLogoFieldsMissingError(error: any): boolean {
+    const code = typeof error?.code === 'string' ? error.code.trim().toUpperCase() : ''
+    const message = String(error?.message || '').toLowerCase()
+    if (code !== '42703') return false
+    return (
+        message.includes('app_logo_storage')
+        || message.includes('app_logo_asset_key')
+        || message.includes('app_logo_mime_type')
+        || message.includes('app_logo_size_bytes')
+        || message.includes('app_logo_filename')
+    )
+}
+
+async function serializeCompanyAppLogo(companyId: string, row: any): Promise<{
+    logo_storage: 'none' | 'r2'
+    logo_asset_key: string | null
+    logo_mime_type: string | null
+    logo_size_bytes: number | null
+    logo_filename: string | null
+    logo_url: string | null
+    logo_max_bytes: number
+}> {
+    const logoStorage = normalizeAppLogoStorage(row?.app_logo_storage)
+    const logoAssetKeyRaw = normalizeAppLogoAssetKey(row?.app_logo_asset_key)
+    const logoMimeType = normalizeAppLogoMimeType(row?.app_logo_mime_type)
+    const logoSizeBytes = normalizeAppLogoSizeBytes(row?.app_logo_size_bytes)
+    const logoFilename = normalizeAppLogoFilename(row?.app_logo_filename)
+    let logoAssetKey = ''
+    if (logoStorage === 'r2' && logoAssetKeyRaw) {
+        try {
+            logoAssetKey = assertCompanyAssetKey(companyId, logoAssetKeyRaw)
+        } catch {
+            logoAssetKey = ''
+        }
+    }
+
+    let logoUrl = ''
+    if (logoAssetKey && isR2Configured()) {
+        try {
+            logoUrl = await createDownloadUrl({
+                companyId,
+                assetKey: logoAssetKey
+            })
+        } catch {
+            logoUrl = ''
+        }
+    }
+
+    return {
+        logo_storage: logoAssetKey ? 'r2' : 'none',
+        logo_asset_key: logoAssetKey || null,
+        logo_mime_type: logoAssetKey ? (logoMimeType || null) : null,
+        logo_size_bytes: logoAssetKey ? logoSizeBytes : null,
+        logo_filename: logoAssetKey ? (logoFilename || null) : null,
+        logo_url: logoUrl || null,
+        logo_max_bytes: getAppLogoMaxBytes()
+    }
 }
 
 export function registerCompanyRoutes(app: Express, ctx: any) {
@@ -184,11 +286,26 @@ app.get('/api/company/ui-controls', requireSupabaseUserMiddleware, async (req: a
         const access = await resolveCompanyAccess(req, res, 'agent')
         if (!access) return
 
-        const { data, error } = await supabase
+        let data: any = null
+        let error: any = null
+
+        const withLogoResponse = await supabase
             .from('company')
-            .select('id, ui_hidden_features')
+            .select('id, ui_hidden_features, app_logo_storage, app_logo_asset_key, app_logo_mime_type, app_logo_size_bytes, app_logo_filename')
             .eq('id', access.companyId)
             .maybeSingle()
+        data = withLogoResponse.data
+        error = withLogoResponse.error
+
+        if (error && isAppLogoFieldsMissingError(error)) {
+            const fallbackResponse = await supabase
+                .from('company')
+                .select('id, ui_hidden_features')
+                .eq('id', access.companyId)
+                .maybeSingle()
+            data = fallbackResponse.data
+            error = fallbackResponse.error
+        }
 
         if (error) {
             if (isUiHiddenFeaturesMissingError(error)) {
@@ -205,11 +322,140 @@ app.get('/api/company/ui-controls', requireSupabaseUserMiddleware, async (req: a
             return res.status(404).json({ success: false, error: 'Company profile not found' })
         }
 
+        const logo = await serializeCompanyAppLogo(access.companyId, data)
         return res.json({
             success: true,
             data: {
                 company_id: data.id || access.companyId,
-                hidden_features: sanitizeUiHiddenFeatures((data as any).ui_hidden_features)
+                hidden_features: sanitizeUiHiddenFeatures((data as any).ui_hidden_features),
+                app_logo_storage: logo.logo_storage,
+                app_logo_asset_key: logo.logo_asset_key,
+                app_logo_mime_type: logo.logo_mime_type,
+                app_logo_size_bytes: logo.logo_size_bytes,
+                app_logo_filename: logo.logo_filename,
+                app_logo_url: logo.logo_url,
+                app_logo_max_bytes: logo.logo_max_bytes
+            }
+        })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error.message })
+    }
+})
+
+app.get('/api/company/app-logo', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    try {
+        const access = await resolveCompanyAccess(req, res, 'agent')
+        if (!access) return
+
+        const { data, error } = await supabase
+            .from('company')
+            .select('id, app_logo_storage, app_logo_asset_key, app_logo_mime_type, app_logo_size_bytes, app_logo_filename')
+            .eq('id', access.companyId)
+            .maybeSingle()
+
+        if (error) {
+            if (isAppLogoFieldsMissingError(error)) {
+                return res.status(503).json({
+                    success: false,
+                    code: 'APP_LOGO_FIELDS_MISSING',
+                    error: APP_LOGO_FIELDS_MISSING_MESSAGE
+                })
+            }
+            return res.status(500).json({ success: false, error: error.message })
+        }
+
+        if (!data) {
+            return res.status(404).json({ success: false, error: 'Company profile not found' })
+        }
+
+        const logo = await serializeCompanyAppLogo(access.companyId, data)
+        return res.json({
+            success: true,
+            data: {
+                company_id: data.id || access.companyId,
+                ...logo
+            }
+        })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error.message })
+    }
+})
+
+app.post('/api/company/app-logo', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    try {
+        const access = await resolveCompanyAccess(req, res, 'admin')
+        if (!access) return
+
+        const clear = req.body?.clear === true || req.body?.remove === true
+        const nextAssetKeyRaw = typeof req.body?.app_logo_asset_key === 'string'
+            ? req.body.app_logo_asset_key
+            : typeof req.body?.logoAssetKey === 'string'
+                ? req.body.logoAssetKey
+                : ''
+        const nextMimeType = normalizeAppLogoMimeType(req.body?.app_logo_mime_type || req.body?.logoMimeType)
+        const nextSizeBytes = normalizeAppLogoSizeBytes(req.body?.app_logo_size_bytes ?? req.body?.logoSizeBytes)
+        const nextFilename = normalizeAppLogoFilename(req.body?.app_logo_filename || req.body?.logoFilename)
+
+        let appLogoStorage: 'none' | 'r2' = 'none'
+        let appLogoAssetKey: string | null = null
+
+        if (!clear) {
+            if (!nextAssetKeyRaw) {
+                return res.status(400).json({ success: false, error: 'app_logo_asset_key is required.' })
+            }
+            try {
+                appLogoAssetKey = assertCompanyAssetKey(access.companyId, nextAssetKeyRaw)
+            } catch (error: any) {
+                return res.status(400).json({ success: false, error: error?.message || 'Invalid app_logo_asset_key.' })
+            }
+            if (nextMimeType && !nextMimeType.startsWith('image/')) {
+                return res.status(400).json({ success: false, error: 'App logo must be an image MIME type.' })
+            }
+            const maxBytes = getAppLogoMaxBytes()
+            if (nextSizeBytes && maxBytes > 0 && nextSizeBytes > maxBytes) {
+                return res.status(413).json({
+                    success: false,
+                    error: `App logo file too large. Max ${maxBytes} bytes.`,
+                    maxBytes
+                })
+            }
+            appLogoStorage = 'r2'
+        }
+
+        const { data, error } = await supabase
+            .from('company')
+            .update({
+                app_logo_storage: appLogoStorage,
+                app_logo_asset_key: appLogoAssetKey,
+                app_logo_mime_type: appLogoAssetKey ? (nextMimeType || null) : null,
+                app_logo_size_bytes: appLogoAssetKey ? nextSizeBytes : null,
+                app_logo_filename: appLogoAssetKey ? (nextFilename || null) : null
+            })
+            .eq('id', access.companyId)
+            .select('id, app_logo_storage, app_logo_asset_key, app_logo_mime_type, app_logo_size_bytes, app_logo_filename')
+            .maybeSingle()
+
+        if (error) {
+            if (isAppLogoFieldsMissingError(error)) {
+                return res.status(503).json({
+                    success: false,
+                    code: 'APP_LOGO_FIELDS_MISSING',
+                    error: APP_LOGO_FIELDS_MISSING_MESSAGE
+                })
+            }
+            return res.status(500).json({ success: false, error: error.message })
+        }
+
+        if (!data) {
+            return res.status(404).json({ success: false, error: 'Company profile not found' })
+        }
+
+        const logo = await serializeCompanyAppLogo(access.companyId, data)
+        return res.json({
+            success: true,
+            data: {
+                company_id: data.id || access.companyId,
+                ...logo
             }
         })
     } catch (error: any) {
@@ -233,7 +479,7 @@ app.post('/api/company/media/upload-url', requireSupabaseUserMiddleware, async (
         const sizeBytes = Number(req.body?.sizeBytes)
 
         if (!purpose) {
-            return res.status(400).json({ success: false, error: 'purpose must be quick_reply or chat_message.' })
+            return res.status(400).json({ success: false, error: 'purpose must be quick_reply, chat_message, or app_logo.' })
         }
         if (!messageType) {
             return res.status(400).json({ success: false, error: 'messageType must be image, video, or document.' })
@@ -248,7 +494,14 @@ app.post('/api/company/media/upload-url', requireSupabaseUserMiddleware, async (
             return res.status(400).json({ success: false, error: 'sizeBytes must be a positive number.' })
         }
 
-        const maxBytes = getMaxUploadBytes(messageType)
+        let maxBytes = getMaxUploadBytes(messageType)
+        if (purpose === 'app_logo') {
+            if (messageType !== 'image') {
+                return res.status(400).json({ success: false, error: 'App logo uploads only support image messageType.' })
+            }
+            const logoMaxBytes = getAppLogoMaxBytes()
+            maxBytes = maxBytes > 0 ? Math.min(maxBytes, logoMaxBytes) : logoMaxBytes
+        }
         if (maxBytes > 0 && sizeBytes > maxBytes) {
             return res.status(413).json({
                 success: false,

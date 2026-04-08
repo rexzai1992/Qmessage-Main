@@ -1,8 +1,9 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Plus, Trash2, Globe, Shield } from 'lucide-react';
 import { getSocketUrl } from './runtimeConfig';
 import { supabase } from './supabase';
+import { uploadFileToCompanyStorage } from './features/media/uploadToCompanyStorage';
 
 const SOCKET_URL = getSocketUrl();
 
@@ -53,12 +54,43 @@ const COMMAND_NAME_MAX_LENGTH = 32;
 const COMMAND_DESCRIPTION_MAX_LENGTH = 256;
 const COMMAND_NAME_REGEX = /^[a-z0-9_-]+$/;
 const EMOJI_REGEX = /\p{Extended_Pictographic}/u;
+const DEFAULT_APP_LOGO_MAX_BYTES = 2 * 1024 * 1024;
 
 const normalizeCommandName = (value: unknown): string =>
     (typeof value === 'string' ? value.trim() : '').replace(/^\/+/, '').toLowerCase();
 
 const normalizeCommandDescription = (value: unknown): string =>
     typeof value === 'string' ? value.trim() : '';
+
+const readTrimmed = (value: unknown): string =>
+    typeof value === 'string' ? value.trim() : '';
+
+const normalizeAppLogoMaxBytes = (value: unknown): number => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return DEFAULT_APP_LOGO_MAX_BYTES;
+    const normalized = Math.max(1, Math.floor(parsed));
+    return normalized;
+};
+
+const normalizeAppLogoSizeBytes = (value: unknown): number | null => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return null;
+    const normalized = Math.max(0, Math.floor(parsed));
+    return normalized || null;
+};
+
+const formatBytes = (value: number): string => {
+    if (!Number.isFinite(value) || value <= 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let amount = value;
+    let unitIndex = 0;
+    while (amount >= 1024 && unitIndex < units.length - 1) {
+        amount /= 1024;
+        unitIndex += 1;
+    }
+    const digits = amount >= 10 || unitIndex === 0 ? 0 : 1;
+    return `${amount.toFixed(digits)} ${units[unitIndex]}`;
+};
 
 const sanitizeCommandInput = (value: unknown): ConversationalCommand[] => {
     if (!Array.isArray(value)) return [];
@@ -122,6 +154,7 @@ type WebhookViewProps = {
     quickRepliesError: string | null;
     onRefreshQuickReplies: () => void;
     onSaveQuickReplies: (items: QuickReply[]) => void;
+    onRefreshUiControls: () => void;
 };
 
 export default function WebhookView({
@@ -133,10 +166,13 @@ export default function WebhookView({
     quickRepliesSaving,
     quickRepliesError,
     onRefreshQuickReplies,
-    onSaveQuickReplies
+    onSaveQuickReplies,
+    onRefreshUiControls
 }: WebhookViewProps) {
     const [webhooks, setWebhooks] = useState<any[]>([]);
     const [webhookError, setWebhookError] = useState<string | null>(null);
+    const [webhookLoading, setWebhookLoading] = useState(true);
+    const [webhooksLoaded, setWebhooksLoaded] = useState(false);
     const [newUrl, setNewUrl] = useState('');
     const [newEvents, setNewEvents] = useState<string[]>(['message_received']);
     const [loading, setLoading] = useState(false);
@@ -149,7 +185,7 @@ export default function WebhookView({
         prompts: [],
         commands: []
     });
-    const [autoLoading, setAutoLoading] = useState(false);
+    const [autoLoading, setAutoLoading] = useState(Boolean(sessionToken));
     const [autoSaving, setAutoSaving] = useState(false);
     const [autoError, setAutoError] = useState<string | null>(null);
     const [reminderConfig, setReminderConfig] = useState<{
@@ -161,21 +197,21 @@ export default function WebhookView({
         minutes: 30,
         text: ''
     });
-    const [reminderLoading, setReminderLoading] = useState(false);
+    const [reminderLoading, setReminderLoading] = useState(Boolean(sessionToken));
     const [reminderSaving, setReminderSaving] = useState(false);
     const [connectedBusinesses, setConnectedBusinesses] = useState<any[]>([]);
     const [connectedPaging, setConnectedPaging] = useState<any | null>(null);
-    const [connectedLoading, setConnectedLoading] = useState(false);
+    const [connectedLoading, setConnectedLoading] = useState(Boolean(isAdmin));
     const [connectedError, setConnectedError] = useState<string | null>(null);
     const [connectedAppId, setConnectedAppId] = useState('');
     const [quickRepliesDraft, setQuickRepliesDraft] = useState<QuickReply[]>([]);
     const [connectLoading, setConnectLoading] = useState(false);
     const [connectError, setConnectError] = useState<string | null>(null);
     const [clientConnections, setClientConnections] = useState<any[]>([]);
-    const [clientLoading, setClientLoading] = useState(false);
+    const [clientLoading, setClientLoading] = useState(Boolean(isAdmin));
     const [clientError, setClientError] = useState<string | null>(null);
     const [teamUsers, setTeamUsers] = useState<TeamUser[]>([]);
-    const [teamLoading, setTeamLoading] = useState(false);
+    const [teamLoading, setTeamLoading] = useState(Boolean(sessionToken));
     const [teamError, setTeamError] = useState<string | null>(null);
     const [teamCurrentRole, setTeamCurrentRole] = useState<TeamRole>('agent');
     const [teamCurrentUserId, setTeamCurrentUserId] = useState<string | null>(null);
@@ -234,6 +270,19 @@ export default function WebhookView({
   "vertical": "OTHER"
 }`);
     const [registrationBusy, setRegistrationBusy] = useState<null | 'request' | 'verify' | 'register' | 'profile'>(null);
+    const appLogoFileInputRef = useRef<HTMLInputElement>(null);
+    const [appLogoLoading, setAppLogoLoading] = useState(Boolean(sessionToken));
+    const [appLogoUploading, setAppLogoUploading] = useState(false);
+    const [appLogoSaving, setAppLogoSaving] = useState(false);
+    const [appLogoError, setAppLogoError] = useState<string | null>(null);
+    const [appLogoNotice, setAppLogoNotice] = useState<string | null>(null);
+    const [appLogoUrl, setAppLogoUrl] = useState('');
+    const [appLogoAssetKey, setAppLogoAssetKey] = useState('');
+    const [appLogoMimeType, setAppLogoMimeType] = useState('');
+    const [appLogoFilename, setAppLogoFilename] = useState('');
+    const [appLogoSizeBytes, setAppLogoSizeBytes] = useState<number | null>(null);
+    const [appLogoMaxBytes, setAppLogoMaxBytes] = useState(DEFAULT_APP_LOGO_MAX_BYTES);
+    const showLegacyAutomationSettings = false;
 
     useEffect(() => {
         if (!profileId) return;
@@ -289,6 +338,171 @@ export default function WebhookView({
     const handleSaveQuickReplies = () => {
         onSaveQuickReplies(quickRepliesDraft);
     };
+
+    const applyAppLogoPayload = (payload: any) => {
+        setAppLogoUrl(readTrimmed(payload?.logo_url));
+        setAppLogoAssetKey(readTrimmed(payload?.logo_asset_key));
+        setAppLogoMimeType(readTrimmed(payload?.logo_mime_type).toLowerCase());
+        setAppLogoFilename(readTrimmed(payload?.logo_filename));
+        setAppLogoSizeBytes(normalizeAppLogoSizeBytes(payload?.logo_size_bytes));
+        setAppLogoMaxBytes(normalizeAppLogoMaxBytes(payload?.logo_max_bytes));
+    };
+
+    const fetchAppLogoSettings = async () => {
+        if (!sessionToken) {
+            setAppLogoUrl('');
+            setAppLogoAssetKey('');
+            setAppLogoMimeType('');
+            setAppLogoFilename('');
+            setAppLogoSizeBytes(null);
+            setAppLogoError(null);
+            setAppLogoNotice(null);
+            setAppLogoMaxBytes(DEFAULT_APP_LOGO_MAX_BYTES);
+            setAppLogoLoading(false);
+            return;
+        }
+
+        setAppLogoLoading(true);
+        setAppLogoError(null);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/company/app-logo`, {
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`
+                }
+            });
+            const text = await res.text();
+            let data: any = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch {
+                data = null;
+            }
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to load app logo settings.');
+            }
+            applyAppLogoPayload(data?.data || {});
+        } catch (error: any) {
+            setAppLogoUrl('');
+            setAppLogoAssetKey('');
+            setAppLogoMimeType('');
+            setAppLogoFilename('');
+            setAppLogoSizeBytes(null);
+            setAppLogoError(error?.message || 'Failed to load app logo settings.');
+        } finally {
+            setAppLogoLoading(false);
+        }
+    };
+
+    const saveAppLogoAsset = async (uploaded: { assetKey: string; mimeType: string; sizeBytes: number; fileName: string }) => {
+        if (!sessionToken) throw new Error('You must be logged in to update app logo.');
+        setAppLogoSaving(true);
+        const res = await fetch(`${SOCKET_URL}/api/company/app-logo`, {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${sessionToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                app_logo_asset_key: uploaded.assetKey,
+                app_logo_mime_type: uploaded.mimeType,
+                app_logo_size_bytes: uploaded.sizeBytes,
+                app_logo_filename: uploaded.fileName
+            })
+        });
+        const text = await res.text();
+        let data: any = null;
+        try {
+            data = text ? JSON.parse(text) : null;
+        } catch {
+            data = null;
+        }
+        if (!res.ok || !data?.success) {
+            throw new Error(data?.error || 'Failed to save app logo.');
+        }
+        applyAppLogoPayload(data?.data || {});
+    };
+
+    const handleUploadAppLogo = async (file: File | null) => {
+        if (!file) return;
+        if (!profileId || !sessionToken) {
+            setAppLogoError('Select an active profile and login before uploading app logo.');
+            return;
+        }
+        if (!file.type || !file.type.toLowerCase().startsWith('image/')) {
+            setAppLogoError('App logo must be an image file.');
+            return;
+        }
+        if (file.size > appLogoMaxBytes) {
+            setAppLogoError(`App logo is too large. Max size is ${formatBytes(appLogoMaxBytes)}.`);
+            return;
+        }
+
+        setAppLogoNotice(null);
+        setAppLogoError(null);
+        setAppLogoUploading(true);
+        try {
+            const uploaded = await uploadFileToCompanyStorage({
+                apiBaseUrl: SOCKET_URL,
+                profileId,
+                sessionToken,
+                purpose: 'app_logo',
+                messageType: 'image',
+                file
+            });
+            await saveAppLogoAsset(uploaded);
+            setAppLogoNotice('App logo updated.');
+            void onRefreshUiControls();
+        } catch (error: any) {
+            setAppLogoError(error?.message || 'Failed to upload app logo.');
+        } finally {
+            setAppLogoUploading(false);
+            setAppLogoSaving(false);
+            if (appLogoFileInputRef.current) {
+                appLogoFileInputRef.current.value = '';
+            }
+        }
+    };
+
+    const handleRemoveAppLogo = async () => {
+        if (!sessionToken) {
+            setAppLogoError('You must be logged in to remove app logo.');
+            return;
+        }
+        setAppLogoNotice(null);
+        setAppLogoError(null);
+        setAppLogoSaving(true);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/company/app-logo`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ clear: true })
+            });
+            const text = await res.text();
+            let data: any = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch {
+                data = null;
+            }
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to remove app logo.');
+            }
+            applyAppLogoPayload(data?.data || {});
+            setAppLogoNotice('App logo removed.');
+            void onRefreshUiControls();
+        } catch (error: any) {
+            setAppLogoError(error?.message || 'Failed to remove app logo.');
+        } finally {
+            setAppLogoSaving(false);
+        }
+    };
+
+    useEffect(() => {
+        fetchAppLogoSettings();
+    }, [sessionToken]);
 
     const handleConnectWhatsapp = async () => {
         if (!sessionToken) {
@@ -626,7 +840,13 @@ export default function WebhookView({
     };
 
     const fetchWebhooks = () => {
-        if (!sessionToken || !profileId) return;
+        if (!sessionToken || !profileId) {
+            setWebhooks([]);
+            setWebhookLoading(false);
+            setWebhooksLoaded(false);
+            return;
+        }
+        setWebhookLoading(true);
         setWebhookError(null);
         fetch(`${SOCKET_URL}/addon/admin/webhooks?profileId=${profileId}`, {
             headers: {
@@ -653,6 +873,10 @@ export default function WebhookView({
             .catch(error => {
                 setWebhooks([]);
                 setWebhookError(error?.message || 'Failed to load webhooks');
+            })
+            .finally(() => {
+                setWebhookLoading(false);
+                setWebhooksLoaded(true);
             });
     };
 
@@ -1274,12 +1498,19 @@ export default function WebhookView({
                     )}
 
                     <div className="space-y-4 mb-8">
-                        {webhooks.length === 0 && (
+                        {(webhookLoading || !webhooksLoaded) && (
+                            <div className="animate-pulse space-y-3">
+                                <div className="h-16 rounded-2xl bg-[#eef2f5]" />
+                                <div className="h-16 rounded-2xl bg-[#eef2f5]" />
+                                <div className="h-16 rounded-2xl bg-[#eef2f5]" />
+                            </div>
+                        )}
+                        {!webhookLoading && webhooksLoaded && webhooks.length === 0 && (
                             <div className="bg-[#f8f9fa] border-2 border-dashed border-[#eceff1] p-10 rounded-2xl text-center">
                                 <p className="text-sm text-[#aebac1] font-bold uppercase tracking-widest italic">No endpoints configured</p>
                             </div>
                         )}
-                        {webhooks.map((hook, i) => (
+                        {!webhookLoading && webhooksLoaded && webhooks.map((hook, i) => (
                             <div key={i} className="bg-[#fcfdfd] p-5 rounded-2xl flex items-start justify-between border border-[#eceff1] group hover:border-[#00a884]/30 transition-all">
                                 <div className="min-w-0 pr-4">
                                     <div className="font-mono text-sm break-all mb-2 text-[#111b21] font-bold leading-relaxed">{hook.url}</div>
@@ -1325,7 +1556,7 @@ export default function WebhookView({
                         </div>
                         <button
                             onClick={handleAddWebhook}
-                            disabled={loading || !newUrl}
+                            disabled={loading || webhookLoading || !newUrl}
                             className="w-full bg-[#00a884] hover:bg-[#008f6f] text-white font-black py-4 rounded-2xl transition-all flex items-center justify-center gap-3 shadow-[0_8px_20px_rgba(0,168,132,0.2)] disabled:opacity-50 active:scale-95"
                         >
                             {loading ? <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" /> : <Plus className="w-5 h-5" />}
@@ -1335,6 +1566,95 @@ export default function WebhookView({
                 </div>
 
                 {/* API Keys Section Removed */}
+
+                <div id="settings-branding" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                    <div className="flex items-center justify-between gap-3 mb-5">
+                        <div>
+                            <h3 className="text-xl text-[#111b21] font-bold">App Logo</h3>
+                            <p className="text-sm text-[#54656f] font-medium mt-1">
+                                Set the logo shown in the dashboard header.
+                            </p>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={fetchAppLogoSettings}
+                            className="text-xs font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-3 py-2 rounded-xl hover:bg-[#00a884]/5 transition-all"
+                            disabled={appLogoLoading || appLogoUploading || appLogoSaving}
+                        >
+                            Refresh
+                        </button>
+                    </div>
+
+                    <div className="bg-[#fcfdfd] border border-[#eceff1] rounded-2xl p-4 mb-4">
+                        <div className="text-[11px] font-bold uppercase tracking-widest text-[#54656f] mb-2">
+                            Preview
+                        </div>
+                        <div className="h-16 rounded-xl border border-[#eceff1] bg-white flex items-center justify-center px-3 overflow-hidden">
+                            {appLogoLoading ? (
+                                <div className="w-28 h-6 rounded bg-[#eef2f5] animate-pulse" />
+                            ) : appLogoUrl ? (
+                                <img
+                                    src={appLogoUrl}
+                                    alt="App logo preview"
+                                    className="h-10 w-auto max-w-full object-contain"
+                                    loading="lazy"
+                                />
+                            ) : (
+                                <span className="text-[10px] font-black uppercase tracking-widest text-[#8696a0]">No Logo</span>
+                            )}
+                        </div>
+                        <p className="text-[11px] text-[#8696a0] mt-3">
+                            Max size: <span className="font-bold text-[#54656f]">{formatBytes(appLogoMaxBytes)}</span>. Supported: image files only.
+                        </p>
+                        {appLogoFilename && (
+                            <p className="text-[11px] text-[#54656f] mt-1 break-all">
+                                File: {appLogoFilename}
+                                {appLogoSizeBytes ? ` (${formatBytes(appLogoSizeBytes)})` : ''}
+                            </p>
+                        )}
+                    </div>
+
+                    <input
+                        ref={appLogoFileInputRef}
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={(event) => {
+                            const file = event.target.files?.[0] || null;
+                            handleUploadAppLogo(file);
+                        }}
+                    />
+
+                    <div className="flex items-center gap-3">
+                        <button
+                            type="button"
+                            onClick={() => appLogoFileInputRef.current?.click()}
+                            disabled={!sessionToken || !profileId || appLogoLoading || appLogoUploading || appLogoSaving}
+                            className="bg-[#00a884] hover:bg-[#008f6f] text-white px-4 py-2.5 rounded-xl font-bold transition-all disabled:opacity-50"
+                        >
+                            {appLogoUploading || appLogoSaving ? 'Uploading…' : 'Upload Logo'}
+                        </button>
+                        <button
+                            type="button"
+                            onClick={handleRemoveAppLogo}
+                            disabled={!sessionToken || !appLogoAssetKey || appLogoUploading || appLogoSaving}
+                            className="border border-[#eceff1] hover:bg-[#f8f9fa] text-[#111b21] px-4 py-2.5 rounded-xl font-bold transition-all disabled:opacity-50"
+                        >
+                            Remove
+                        </button>
+                    </div>
+
+                    {appLogoError && (
+                        <div className="mt-4 bg-rose-50 border border-rose-200 text-rose-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                            {appLogoError}
+                        </div>
+                    )}
+                    {appLogoNotice && (
+                        <div className="mt-4 bg-emerald-50 border border-emerald-200 text-emerald-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                            {appLogoNotice}
+                        </div>
+                    )}
+                </div>
 
                 {/* Conversational Components */}
                 <div id="settings-conversational" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
@@ -1361,6 +1681,7 @@ export default function WebhookView({
                                     type="checkbox"
                                     checked={autoConfig.enable_welcome_message}
                                     onChange={(e) => setAutoConfig(prev => ({ ...prev, enable_welcome_message: e.target.checked }))}
+                                    disabled={autoLoading}
                                     className="w-4 h-4 accent-[#00a884]"
                                 />
                             </div>
@@ -1380,6 +1701,7 @@ export default function WebhookView({
                                             prompts: [...(prev.prompts || []), '']
                                         }))
                                     }}
+                                    disabled={autoLoading}
                                     className="text-[11px] font-bold text-[#00a884] hover:underline disabled:opacity-50 disabled:no-underline"
                                 >
                                     + Add
@@ -1409,7 +1731,7 @@ export default function WebhookView({
                                         </button>
                                     </div>
                                 ))}
-                                {autoConfig.prompts.length === 0 && (
+                                {!autoLoading && autoConfig.prompts.length === 0 && (
                                     <p className="text-[11px] text-[#aebac1]">No ice breakers configured.</p>
                                 )}
                             </div>
@@ -1430,7 +1752,7 @@ export default function WebhookView({
                                             commands: [...(prev.commands || []), { command_name: '', command_description: '' }]
                                         }))
                                     }}
-                                    disabled={(autoConfig.commands || []).length >= COMMAND_MAX_COUNT}
+                                    disabled={autoLoading || (autoConfig.commands || []).length >= COMMAND_MAX_COUNT}
                                     className="text-[11px] font-bold text-[#00a884] hover:underline"
                                 >
                                     + Add
@@ -1490,7 +1812,7 @@ export default function WebhookView({
                                         </button>
                                     </div>
                                 ))}
-                                {autoConfig.commands.length === 0 && (
+                                {!autoLoading && autoConfig.commands.length === 0 && (
                                     <p className="text-[11px] text-[#aebac1]">No commands configured.</p>
                                 )}
                             </div>
@@ -1514,6 +1836,8 @@ export default function WebhookView({
                     </div>
                 </div>
 
+                {showLegacyAutomationSettings && (
+                    <>
                 {/* 24h Window Reminder */}
                 <div id="settings-reminder" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
                     <div className="flex items-center justify-between mb-6">
@@ -1604,7 +1928,12 @@ export default function WebhookView({
                     )}
 
                     <div className="space-y-4">
-                        {quickRepliesDraft.length === 0 ? (
+                        {quickRepliesLoading && quickRepliesDraft.length === 0 ? (
+                            <div className="animate-pulse space-y-3">
+                                <div className="h-24 rounded-2xl bg-[#eef2f5]" />
+                                <div className="h-24 rounded-2xl bg-[#eef2f5]" />
+                            </div>
+                        ) : quickRepliesDraft.length === 0 ? (
                             <div className="bg-[#fcfdfd] border border-dashed border-[#d7dfe2] rounded-2xl p-6 text-sm text-[#8696a0]">
                                 No quick replies yet. Add one below.
                             </div>
@@ -1660,6 +1989,8 @@ export default function WebhookView({
                         </button>
                     </div>
                 </div>
+                    </>
+                )}
 
                 <div id="settings-team-users" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
                     <div className="flex items-center justify-between mb-6">

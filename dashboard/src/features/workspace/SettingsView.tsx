@@ -25,6 +25,7 @@ type SettingsViewProps = {
     quickRepliesError: string | null;
     onRefreshQuickReplies: () => void;
     onSaveQuickReplies: (items: any[]) => void;
+    onRefreshUiControls: () => void;
     WebhookViewComponent: React.ComponentType<any>;
 };
 
@@ -42,6 +43,7 @@ export default function SettingsView({
     quickRepliesError,
     onRefreshQuickReplies,
     onSaveQuickReplies,
+    onRefreshUiControls,
     WebhookViewComponent
 }: SettingsViewProps) {
     return (
@@ -105,6 +107,7 @@ export default function SettingsView({
                             quickRepliesError={quickRepliesError}
                             onRefreshQuickReplies={onRefreshQuickReplies}
                             onSaveQuickReplies={onSaveQuickReplies}
+                            onRefreshUiControls={onRefreshUiControls}
                         />
                     </Suspense>
                 </div>

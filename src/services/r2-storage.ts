@@ -3,7 +3,7 @@ import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 
 export type MediaMessageType = 'image' | 'video' | 'document'
-export type MediaUploadPurpose = 'quick_reply' | 'chat_message'
+export type MediaUploadPurpose = 'quick_reply' | 'chat_message' | 'app_logo'
 
 type R2Config = {
     accountId: string
@@ -113,6 +113,7 @@ export function normalizeUploadPurpose(value: unknown): MediaUploadPurpose | nul
     const normalized = typeof value === 'string' ? value.trim().toLowerCase() : ''
     if (normalized === 'quick_reply') return 'quick_reply'
     if (normalized === 'chat_message') return 'chat_message'
+    if (normalized === 'app_logo') return 'app_logo'
     return null
 }
 

@@ -147,6 +147,13 @@ interface MediaData {
     mimetype: string;
 }
 
+type MediaDownloadStatus = 'requesting' | 'downloading' | 'processing' | 'error';
+
+interface MediaDownloadProgressState {
+    percent: number;
+    status: MediaDownloadStatus;
+}
+
 interface QuickReply {
     id?: string;
     shortcut: string;
@@ -627,6 +634,8 @@ export default function App() {
     const [assigningContactId, setAssigningContactId] = useState<string | null>(null);
     const [humanTakeoverSaving, setHumanTakeoverSaving] = useState(false);
     const [mediaCache, setMediaCache] = useState<Record<string, MediaData>>({});
+    const [mediaDownloadProgress, setMediaDownloadProgress] = useState<Record<string, MediaDownloadProgressState>>({});
+    const [unreadMessagesByChat, setUnreadMessagesByChat] = useState<Record<string, number>>({});
     const [showContactInfo, setShowContactInfo] = useState(false);
     const [showNewChatModal, setShowNewChatModal] = useState(false);
     const [newPhoneNumber, setNewPhoneNumber] = useState('');
@@ -649,6 +658,8 @@ export default function App() {
         'team-inbox' | 'broadcast' | 'chatbots' | 'contacts' | 'ads' | 'automations' | 'more'
     >('team-inbox');
     const [hiddenUiFeatures, setHiddenUiFeatures] = useState<string[]>([]);
+    const [appLogoUrl, setAppLogoUrl] = useState('');
+    const [uiControlsLoading, setUiControlsLoading] = useState(true);
     const [broadcastSection, setBroadcastSection] = useState<
         'template-library' | 'my-templates' | 'broadcast-history' | 'scheduled-broadcasts'
     >('template-library');
@@ -681,9 +692,14 @@ export default function App() {
     const messageInputRef = useRef<HTMLTextAreaElement>(null);
     const composerFileInputRef = useRef<HTMLInputElement>(null);
     const activeProfileIdRef = useRef<string | null>(null);
+    const selectedChatIdRef = useRef<string | null>(null);
     const lastRecoverAtRef = useRef(0);
     const lastInboundRef = useRef<number | null>(null);
     const requestedMediaRef = useRef<Set<string>>(new Set());
+    const seenIncomingMessageKeysRef = useRef<Set<string>>(new Set());
+    const mediaDownloadProgressRef = useRef<Record<string, MediaDownloadProgressState>>({});
+    const mediaProgressTimerRef = useRef<Record<string, number>>({});
+    const mediaProgressTimeoutRef = useRef<Record<string, number>>({});
     const { ref: chatListViewportRef, size: chatListViewport } = useElementSize<HTMLDivElement>();
     const { ref: messageViewportRef, size: messageViewport } = useElementSize<HTMLDivElement>();
     const messageListRef = useListRef(null);
@@ -691,6 +707,10 @@ export default function App() {
         defaultRowHeight: 120,
         key: selectedChatId || 'all'
     });
+
+    useEffect(() => {
+        mediaDownloadProgressRef.current = mediaDownloadProgress;
+    }, [mediaDownloadProgress]);
 
     const settingsNav = [
         {
@@ -704,14 +724,8 @@ export default function App() {
         {
             group: 'Connectivity',
             items: [
-                { id: 'settings-webhooks', label: 'Outgoing Webhooks' }
-            ]
-        },
-        {
-            group: 'Automation',
-            items: [
-                { id: 'settings-reminder', label: '24h Window Reminder' },
-                { id: 'settings-quick-replies', label: 'Quick Replies' }
+                { id: 'settings-webhooks', label: 'Outgoing Webhooks' },
+                { id: 'settings-branding', label: 'App Logo' }
             ]
         },
         {
@@ -1649,8 +1663,11 @@ export default function App() {
     const fetchUiControls = useCallback(async () => {
         if (!session?.access_token) {
             setHiddenUiFeatures([]);
+            setAppLogoUrl('');
+            setUiControlsLoading(false);
             return;
         }
+        setUiControlsLoading(true);
         try {
             const res = await fetch(`${SOCKET_URL}/api/company/ui-controls`, {
                 headers: {
@@ -1668,21 +1685,30 @@ export default function App() {
             if (!res.ok || !data?.success) {
                 if (data?.code === 'UI_CONTROLS_MISSING') {
                     setHiddenUiFeatures([]);
+                    setAppLogoUrl('');
                     return;
                 }
                 throw new Error(data?.error || 'Failed to load UI controls');
             }
 
             setHiddenUiFeatures(normalizeHiddenFeatureList(data?.data?.hidden_features));
+            setAppLogoUrl(typeof data?.data?.app_logo_url === 'string' ? data.data.app_logo_url.trim() : '');
         } catch (error: any) {
             console.warn('Failed to load company UI controls:', error?.message || error);
             setHiddenUiFeatures([]);
+            setAppLogoUrl('');
+        } finally {
+            setUiControlsLoading(false);
         }
     }, [normalizeHiddenFeatureList, session?.access_token]);
 
     useEffect(() => {
         activeProfileIdRef.current = activeProfileId;
     }, [activeProfileId]);
+
+    useEffect(() => {
+        selectedChatIdRef.current = selectedChatId;
+    }, [selectedChatId]);
 
     useEffect(() => {
         try {
@@ -1707,9 +1733,19 @@ export default function App() {
     useEffect(() => {
         if (!session?.access_token) {
             setHiddenUiFeatures([]);
+            setAppLogoUrl('');
+            setUiControlsLoading(false);
             return;
         }
         fetchUiControls();
+    }, [fetchUiControls, session?.access_token]);
+
+    useEffect(() => {
+        if (!session?.access_token) return;
+        const refreshTimer = window.setInterval(() => {
+            fetchUiControls();
+        }, 4 * 60 * 1000);
+        return () => window.clearInterval(refreshTimer);
     }, [fetchUiControls, session?.access_token]);
 
 
@@ -1783,6 +1819,17 @@ export default function App() {
         if (canonical && canonical !== selectedChatId) {
             setSelectedChatId(canonical);
         }
+    }, [selectedChatId]);
+
+    useEffect(() => {
+        const chatKey = canonicalContactJid(selectedChatId || '');
+        if (!chatKey) return;
+        setUnreadMessagesByChat((prev) => {
+            if (!(chatKey in prev)) return prev;
+            const next = { ...prev };
+            delete next[chatKey];
+            return next;
+        });
     }, [selectedChatId]);
 
     useEffect(() => {
@@ -1864,6 +1911,7 @@ export default function App() {
     }, [activeProfileId, workspaceSection]);
 
     useEffect(() => {
+        if (uiControlsLoading) return;
         const activeFeature = UI_FEATURE_KEY_BY_WORKSPACE_SECTION[workspaceSection];
         if (!activeFeature || !isUiFeatureHidden(activeFeature)) return;
 
@@ -1877,24 +1925,28 @@ export default function App() {
         ];
         const firstVisible = candidateSections.find((section) => !isUiFeatureHidden(UI_FEATURE_KEY_BY_WORKSPACE_SECTION[section]));
         setWorkspaceSection(firstVisible || 'ads');
-    }, [isUiFeatureHidden, workspaceSection]);
+    }, [isUiFeatureHidden, workspaceSection, uiControlsLoading]);
 
     useEffect(() => {
+        if (uiControlsLoading) return;
         if (activeView !== 'settings') return;
         if (!isUiFeatureHidden(SETTINGS_UI_FEATURE_KEY)) return;
         setActiveView('dashboard');
-    }, [activeView, isUiFeatureHidden]);
+    }, [activeView, isUiFeatureHidden, uiControlsLoading]);
 
     useEffect(() => {
+        if (uiControlsLoading) return;
         if (!showAnalytics) return;
         if (!isUiFeatureHidden('analytics')) return;
         setShowAnalytics(false);
-    }, [isUiFeatureHidden, showAnalytics]);
+    }, [isUiFeatureHidden, showAnalytics, uiControlsLoading]);
 
 
     const handleSignOut = async () => {
         clearAllDrafts();
         setMessageText('');
+        setUnreadMessagesByChat({});
+        seenIncomingMessageKeysRef.current.clear();
         setHostAuthError(null);
         setShowOnboardingTutorial(false);
         resetOnboardingWizard();
@@ -2094,15 +2146,51 @@ export default function App() {
 
         newSocket.on('messages.upsert', (data) => {
             if (data.profileId === activeProfileIdRef.current) {
-                setAllMessages((prev) => [...data.messages, ...prev]);
+                const incomingMessages = Array.isArray(data?.messages) ? data.messages : [];
+                setAllMessages((prev) => [...incomingMessages, ...prev]);
                 setLoadingChats(false);
+                if (incomingMessages.length === 0) return;
+                const activeChatKey = canonicalContactJid(selectedChatIdRef.current || '');
+                setUnreadMessagesByChat((prev) => {
+                    let next = prev;
+                    let changed = false;
+                    incomingMessages.forEach((msg: any, index: number) => {
+                        if (msg?.key?.fromMe) return;
+                        const jid = canonicalContactJid(msg?.key?.remoteJid || '');
+                        if (!jid) return;
+                        const rawId = typeof msg?.key?.id === 'string' ? msg.key.id.trim() : '';
+                        const ts = Number(msg?.messageTimestamp || 0);
+                        const dedupeKey = `${jid}:${rawId || `ts-${ts}-idx-${index}`}`;
+                        if (seenIncomingMessageKeysRef.current.has(dedupeKey)) return;
+                        seenIncomingMessageKeysRef.current.add(dedupeKey);
+                        if (activeChatKey && jid === activeChatKey) return;
+                        if (!changed) {
+                            next = { ...prev };
+                            changed = true;
+                        }
+                        next[jid] = (next[jid] || 0) + 1;
+                    });
+                    return changed ? next : prev;
+                });
             }
         });
 
         newSocket.on('messages.history', (data) => {
             if (data.profileId === activeProfileIdRef.current) {
-                setAllMessages(data.messages);
+                const historyMessages = Array.isArray(data?.messages) ? data.messages : [];
+                setAllMessages(historyMessages);
                 setLoadingChats(false);
+                const nextSeen = new Set<string>();
+                historyMessages.forEach((msg: any, index: number) => {
+                    if (msg?.key?.fromMe) return;
+                    const jid = canonicalContactJid(msg?.key?.remoteJid || '');
+                    if (!jid) return;
+                    const rawId = typeof msg?.key?.id === 'string' ? msg.key.id.trim() : '';
+                    const ts = Number(msg?.messageTimestamp || 0);
+                    nextSeen.add(`${jid}:${rawId || `ts-${ts}-idx-${index}`}`);
+                });
+                seenIncomingMessageKeysRef.current = nextSeen;
+                setUnreadMessagesByChat({});
             }
         });
 
@@ -2127,10 +2215,26 @@ export default function App() {
             if (data.profileId !== activeProfileIdRef.current) return;
             const targetKey = canonicalContactJid(data.jid);
             setAllMessages(prev => prev.filter(msg => canonicalContactJid(msg.key.remoteJid) !== targetKey));
+            if (!targetKey) return;
+            setUnreadMessagesByChat((prev) => {
+                if (!(targetKey in prev)) return prev;
+                const next = { ...prev };
+                delete next[targetKey];
+                return next;
+            });
         });
 
         newSocket.on('messaging-history.set', (history) => {
             setAllMessages(prev => [...history.messages, ...prev]);
+            const list = Array.isArray(history?.messages) ? history.messages : [];
+            list.forEach((msg: any, index: number) => {
+                if (msg?.key?.fromMe) return;
+                const jid = canonicalContactJid(msg?.key?.remoteJid || '');
+                if (!jid) return;
+                const rawId = typeof msg?.key?.id === 'string' ? msg.key.id.trim() : '';
+                const ts = Number(msg?.messageTimestamp || 0);
+                seenIncomingMessageKeysRef.current.add(`${jid}:${rawId || `ts-${ts}-idx-${index}`}`);
+            });
         });
 
         newSocket.on('contacts.update', (data) => {
@@ -2182,6 +2286,50 @@ export default function App() {
                 ...(messageId ? { [messageId]: { data, mimetype } } : {}),
                 ...(mediaId ? { [mediaId]: { data, mimetype } } : {})
             }));
+            const completionKeys = Array.from(
+                new Set(
+                    [messageId, mediaId].filter((value): value is string => (
+                        typeof value === 'string' && value.trim().length > 0
+                    ))
+                )
+            );
+            if (completionKeys.length === 0) return;
+
+            completionKeys.forEach((key) => {
+                requestedMediaRef.current.delete(key);
+                const progressTimer = mediaProgressTimerRef.current[key];
+                if (typeof progressTimer === 'number') {
+                    window.clearInterval(progressTimer);
+                    delete mediaProgressTimerRef.current[key];
+                }
+                const timeoutTimer = mediaProgressTimeoutRef.current[key];
+                if (typeof timeoutTimer === 'number') {
+                    window.clearTimeout(timeoutTimer);
+                    delete mediaProgressTimeoutRef.current[key];
+                }
+            });
+
+            setMediaDownloadProgress((prev) => {
+                const next = { ...prev };
+                let changed = false;
+                completionKeys.forEach((key) => {
+                    const current = next[key];
+                    if (!current || current.percent !== 100 || current.status !== 'processing') {
+                        next[key] = {
+                            percent: 100,
+                            status: 'processing'
+                        };
+                        changed = true;
+                    }
+                });
+                return changed ? next : prev;
+            });
+
+            completionKeys.forEach((key) => {
+                mediaProgressTimeoutRef.current[key] = window.setTimeout(() => {
+                    removeMediaProgress(key);
+                }, 450);
+            });
         });
 
         newSocket.on('profile.added', (id) => {
@@ -2486,6 +2634,12 @@ export default function App() {
         };
     }, [allMessages, contacts, searchQuery, chatListFilter]);
 
+    const totalUnreadMessages = useMemo(
+        () => Object.values(unreadMessagesByChat).reduce((sum, count) => sum + Math.max(0, Number(count) || 0), 0),
+        [unreadMessagesByChat]
+    );
+    const totalUnreadBadgeCount = Math.max(0, Math.min(999, totalUnreadMessages));
+
     const contactsList = useMemo(() => {
         type ContactRow = {
             id: string;
@@ -2788,6 +2942,162 @@ export default function App() {
         return Math.max(0, viewportHeight - messageContentHeight);
     }, [messageViewport.height, messageContentHeight]);
 
+    const getMessageMediaId = useCallback((message: Message): string | null => {
+        if (!message?.message) return null;
+        const imageMediaId = message.message.imageMessage?.mediaId;
+        const documentMediaId = message.message.documentMessage?.mediaId;
+        const audioMediaId = message.message.audioMessage?.mediaId;
+        const videoMediaId = message.message.videoMessage?.mediaId;
+        return imageMediaId || documentMediaId || audioMediaId || videoMediaId || null;
+    }, []);
+
+    const clearMediaDownloadTimers = useCallback((key: string | null | undefined) => {
+        if (!key) return;
+        const progressTimer = mediaProgressTimerRef.current[key];
+        if (typeof progressTimer === 'number') {
+            window.clearInterval(progressTimer);
+            delete mediaProgressTimerRef.current[key];
+        }
+        const timeoutTimer = mediaProgressTimeoutRef.current[key];
+        if (typeof timeoutTimer === 'number') {
+            window.clearTimeout(timeoutTimer);
+            delete mediaProgressTimeoutRef.current[key];
+        }
+    }, []);
+
+    const removeMediaProgress = useCallback((key: string | null | undefined) => {
+        if (!key) return;
+        clearMediaDownloadTimers(key);
+        setMediaDownloadProgress((prev) => {
+            if (!(key in prev)) return prev;
+            const next = { ...prev };
+            delete next[key];
+            return next;
+        });
+    }, [clearMediaDownloadTimers]);
+
+    const beginMediaDownload = useCallback((message: Message, options?: { force?: boolean }) => {
+        if (!socket || !activeProfileId) return;
+        const mediaId = getMessageMediaId(message);
+        if (!mediaId) return;
+        const messageId = message.key?.id;
+        if (messageId && mediaCache[messageId]) return;
+        if (mediaCache[mediaId]) return;
+        const requestKey = messageId || mediaId;
+        if (!requestKey) return;
+        if (requestedMediaRef.current.has(requestKey)) return;
+
+        const existingProgress = mediaDownloadProgressRef.current[requestKey];
+        if (!options?.force && existingProgress?.status === 'error') return;
+
+        clearMediaDownloadTimers(requestKey);
+        requestedMediaRef.current.add(requestKey);
+        setMediaDownloadProgress((prev) => ({
+            ...prev,
+            [requestKey]: {
+                percent: 8,
+                status: 'requesting'
+            }
+        }));
+
+        const progressTimer = window.setInterval(() => {
+            setMediaDownloadProgress((prev) => {
+                const current = prev[requestKey];
+                if (!current || current.status === 'error') return prev;
+                const increment = current.status === 'requesting' ? 16 : current.percent < 62 ? 9 : 4;
+                const nextPercent = Math.min(92, current.percent + increment);
+                const nextStatus: MediaDownloadStatus = nextPercent >= 72 ? 'processing' : 'downloading';
+                if (nextPercent === current.percent && nextStatus === current.status) return prev;
+                return {
+                    ...prev,
+                    [requestKey]: {
+                        percent: nextPercent,
+                        status: nextStatus
+                    }
+                };
+            });
+        }, 550);
+        mediaProgressTimerRef.current[requestKey] = progressTimer;
+
+        const timeoutTimer = window.setTimeout(() => {
+            clearMediaDownloadTimers(requestKey);
+            requestedMediaRef.current.delete(requestKey);
+            setMediaDownloadProgress((prev) => {
+                const current = prev[requestKey];
+                if (!current) return prev;
+                return {
+                    ...prev,
+                    [requestKey]: {
+                        percent: Math.max(current.percent, 12),
+                        status: 'error'
+                    }
+                };
+            });
+        }, 30000);
+        mediaProgressTimeoutRef.current[requestKey] = timeoutTimer;
+
+        socket.emit('downloadMedia', { profileId: activeProfileId, message });
+    }, [activeProfileId, clearMediaDownloadTimers, getMessageMediaId, mediaCache, socket]);
+
+    const getMediaDownloadProgress = useCallback((message: Message): MediaDownloadProgressState | null => {
+        const requestKey = message.key?.id || getMessageMediaId(message);
+        if (!requestKey) return null;
+        return mediaDownloadProgress[requestKey] || null;
+    }, [getMessageMediaId, mediaDownloadProgress]);
+
+    const renderMediaLoadingPlaceholder = useCallback((message: Message, compact = false) => {
+        const progress = getMediaDownloadProgress(message);
+        if (!progress) {
+            return (
+                <div className={`animate-pulse space-y-2 ${compact ? 'w-32' : 'w-28'}`}>
+                    <div className="h-3 rounded bg-[#e8edf1]" />
+                    <div className="h-3 rounded bg-[#eef2f5]" />
+                </div>
+            );
+        }
+
+        const isError = progress.status === 'error';
+        const percent = Math.max(1, Math.min(100, Math.round(progress.percent)));
+        const statusLabel =
+            progress.status === 'requesting'
+                ? 'Requesting file...'
+                : progress.status === 'downloading'
+                    ? 'Downloading file...'
+                    : progress.status === 'processing'
+                        ? 'Preparing preview...'
+                        : 'Download failed';
+
+        return (
+            <div className={`space-y-2 ${compact ? 'w-44' : 'w-52'}`}>
+                <div className="h-2 rounded-full bg-[#e8edf1] overflow-hidden">
+                    <div
+                        className={`h-full transition-all duration-300 ${isError ? 'bg-rose-400' : 'bg-[#00a884]'}`}
+                        style={{ width: `${isError ? Math.max(percent, 12) : percent}%` }}
+                    />
+                </div>
+                <div className="flex items-center justify-between gap-2">
+                    <span className={`text-[10px] font-semibold ${isError ? 'text-rose-600' : 'text-[#54656f]'}`}>
+                        {statusLabel}
+                    </span>
+                    {isError ? (
+                        <button
+                            type="button"
+                            onClick={(event) => {
+                                event.stopPropagation();
+                                beginMediaDownload(message, { force: true });
+                            }}
+                            className="text-[10px] font-bold text-rose-600 hover:text-rose-700 hover:underline"
+                        >
+                            Retry
+                        </button>
+                    ) : (
+                        <span className="text-[10px] font-semibold text-[#54656f]">{percent}%</span>
+                    )}
+                </div>
+            </div>
+        );
+    }, [beginMediaDownload, getMediaDownloadProgress]);
+
     useEffect(() => {
         if (!selectedChatId) return;
         if (messageRows.length === 0) return;
@@ -2811,10 +3121,22 @@ export default function App() {
     }, [selectedChatId, chatOpenNonce, messageRows.length, messageViewport.height]);
 
     useEffect(() => {
-        if (!socket || !activeProfileId) return;
+        return () => {
+            Object.keys(mediaProgressTimerRef.current).forEach((key) => {
+                window.clearInterval(mediaProgressTimerRef.current[key]);
+            });
+            Object.keys(mediaProgressTimeoutRef.current).forEach((key) => {
+                window.clearTimeout(mediaProgressTimeoutRef.current[key]);
+            });
+            mediaProgressTimerRef.current = {};
+            mediaProgressTimeoutRef.current = {};
+            requestedMediaRef.current.clear();
+        };
+    }, []);
+
+    useEffect(() => {
         if (!selectedChatId) return;
-        currentChatMessages.forEach(msg => {
-            const messageId = msg.key?.id;
+        currentChatMessages.forEach((msg) => {
             const imageMediaId = msg.message?.imageMessage?.mediaId;
             const docMediaId = msg.message?.documentMessage?.mediaId;
             const docName = msg.message?.documentMessage?.fileName || '';
@@ -2824,16 +3146,12 @@ export default function App() {
                 /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(docName)
             );
             const audioMediaId = msg.message?.audioMessage?.mediaId;
-            const mediaId = imageMediaId || (docIsImage ? docMediaId : undefined) || audioMediaId;
+            const videoMediaId = msg.message?.videoMessage?.mediaId;
+            const mediaId = imageMediaId || (docIsImage ? docMediaId : undefined) || audioMediaId || videoMediaId;
             if (!mediaId) return;
-            if (messageId && mediaCache[messageId]) return;
-            if (mediaCache[mediaId]) return;
-            const requestKey = messageId || mediaId;
-            if (requestedMediaRef.current.has(requestKey)) return;
-            requestedMediaRef.current.add(requestKey);
-            socket.emit('downloadMedia', { profileId: activeProfileId, message: msg });
+            beginMediaDownload(msg);
         });
-    }, [socket, activeProfileId, selectedChatId, currentChatMessages, mediaCache]);
+    }, [beginMediaDownload, selectedChatId, currentChatMessages]);
 
     const currentAgentName =
         (session?.user?.user_metadata as any)?.full_name ||
@@ -3682,15 +4000,7 @@ export default function App() {
     };
 
     const handleDownloadMedia = (message: Message) => {
-        const mediaId =
-            message.message?.imageMessage?.mediaId ||
-            message.message?.documentMessage?.mediaId ||
-            message.message?.audioMessage?.mediaId ||
-            message.message?.videoMessage?.mediaId;
-        if (!socket) return;
-        if (message.key.id && mediaCache[message.key.id]) return;
-        if (mediaId && mediaCache[mediaId]) return;
-        socket.emit('downloadMedia', { profileId: activeProfileId, message });
+        beginMediaDownload(message, { force: true });
     };
 
     const handleSendTemplate = () => {
@@ -3808,6 +4118,8 @@ export default function App() {
         setAllMessages([]);
         setContacts({});
         setSelectedChatId(null);
+        setUnreadMessagesByChat({});
+        seenIncomingMessageKeysRef.current.clear();
         setShowTemplateComposer(false);
         setConnectionStatus('connecting'); // Anticipate status update
         setLoadingChats(true);
@@ -3855,6 +4167,15 @@ export default function App() {
 
     const handleOpenChat = useCallback((chatId: string) => {
         setSelectedChatId(chatId);
+        const chatKey = canonicalContactJid(chatId);
+        if (chatKey) {
+            setUnreadMessagesByChat((prev) => {
+                if (!(chatKey in prev)) return prev;
+                const next = { ...prev };
+                delete next[chatKey];
+                return next;
+            });
+        }
         setChatOpenNonce((prev) => prev + 1);
     }, []);
 
@@ -3954,7 +4275,10 @@ export default function App() {
             { id: 'more', label: 'Analytic', icon: BarChart3 }
         ];
 
-    const workspaceTabs = baseWorkspaceTabs.filter((tab) => !isUiFeatureHidden(UI_FEATURE_KEY_BY_WORKSPACE_SECTION[tab.id]));
+    const showUiControlsSkeleton = Boolean(session?.access_token) && uiControlsLoading;
+    const workspaceTabs = showUiControlsSkeleton
+        ? []
+        : baseWorkspaceTabs.filter((tab) => !isUiFeatureHidden(UI_FEATURE_KEY_BY_WORKSPACE_SECTION[tab.id]));
 
     const activeWorkspaceLabel = workspaceTabs.find(tab => tab.id === workspaceSection)?.label || 'Workspace';
     const defaultWorkspaceSection = workspaceTabs[0]?.id || 'team-inbox';
@@ -3997,16 +4321,29 @@ export default function App() {
                 <div className="h-full px-5 flex items-center justify-between gap-4">
                     <div className="flex items-center gap-5 min-w-0 flex-1">
                         <div className="flex items-center gap-2 shrink-0">
-                            <div className="w-9 h-9 rounded-xl bg-[#00a884]/10 border border-[#00a884]/20 text-[#00a884] flex items-center justify-center">
-                                <MessageSquare className="w-5 h-5" />
-                            </div>
-                            <div className="h-8 min-w-[96px] px-3 rounded-lg border border-[#eceff1] bg-[#f8f9fa] flex items-center justify-center">
-                                <span className="text-[10px] font-black uppercase tracking-widest text-[#8696a0]">Logo</span>
+                            <div className="h-8 min-w-[96px] max-w-[170px] px-3 rounded-lg border border-[#eceff1] bg-[#f8f9fa] flex items-center justify-center overflow-hidden">
+                                {appLogoUrl ? (
+                                    <img
+                                        src={appLogoUrl}
+                                        alt="App logo"
+                                        className="h-6 w-auto max-w-[150px] object-contain"
+                                        loading="lazy"
+                                    />
+                                ) : (
+                                    <span className="text-[10px] font-black uppercase tracking-widest text-[#8696a0]">Logo</span>
+                                )}
                             </div>
                         </div>
                         <div className="hidden xl:block w-px h-8 bg-[#eceff1]" />
                         <nav className="flex items-center gap-1 overflow-x-auto whitespace-nowrap custom-scrollbar">
-                            {workspaceTabs.map((tab) => {
+                            {showUiControlsSkeleton ? (
+                                <div className="animate-pulse flex items-center gap-2">
+                                    <div className="h-9 w-28 rounded-xl bg-[#eef2f5]" />
+                                    <div className="h-9 w-24 rounded-xl bg-[#eef2f5]" />
+                                    <div className="h-9 w-24 rounded-xl bg-[#eef2f5]" />
+                                    <div className="h-9 w-24 rounded-xl bg-[#eef2f5]" />
+                                </div>
+                            ) : workspaceTabs.map((tab) => {
                                 const Icon = tab.icon;
                                 const active = tab.id === 'more' ? showAnalytics : workspaceSection === tab.id;
                                 return (
@@ -4033,14 +4370,40 @@ export default function App() {
                             })}
                         </nav>
                     </div>
-                    <div className="hidden md:flex items-center gap-3">
-                        {!isUiFeatureHidden(SETTINGS_UI_FEATURE_KEY) && (
-                            <button
-                                onClick={openSettingsFromMore}
-                                className="w-10 h-10 rounded-full bg-[#f3f4f6] text-[#6b7280] flex items-center justify-center"
-                            >
-                                <User className="w-5 h-5" />
-                            </button>
+                    <div className="flex items-center gap-2">
+                        {showUiControlsSkeleton ? (
+                            <>
+                                <div className="w-10 h-10 rounded-full bg-[#eef2f5] animate-pulse" />
+                                <div className="hidden md:block w-10 h-10 rounded-full bg-[#eef2f5] animate-pulse" />
+                            </>
+                        ) : (
+                            <>
+                                <button
+                                    type="button"
+                                    onClick={() => {
+                                        setActiveView('dashboard');
+                                        setShowAnalytics(false);
+                                        setWorkspaceSection('team-inbox');
+                                    }}
+                                    className="relative w-10 h-10 rounded-full bg-[#f3f4f6] text-[#00a884] flex items-center justify-center hover:bg-[#e8f5f1] transition-all"
+                                    title="Unread messages"
+                                >
+                                    <MessageSquare className="w-5 h-5" />
+                                    {totalUnreadBadgeCount > 0 && (
+                                        <span className="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 px-1 rounded-full bg-[#ef4444] text-white text-[9px] font-black leading-4 text-center border border-white">
+                                            {totalUnreadBadgeCount}
+                                        </span>
+                                    )}
+                                </button>
+                                {!isUiFeatureHidden(SETTINGS_UI_FEATURE_KEY) && (
+                                    <button
+                                        onClick={openSettingsFromMore}
+                                        className="hidden md:flex w-10 h-10 rounded-full bg-[#f3f4f6] text-[#6b7280] items-center justify-center"
+                                    >
+                                        <User className="w-5 h-5" />
+                                    </button>
+                                )}
+                            </>
                         )}
                     </div>
                 </div>
@@ -4051,6 +4414,32 @@ export default function App() {
             <div className="w-[400px] border-r border-[#eceff1] flex flex-col bg-white">
                 <div className="px-3 py-2 border-b border-[#f0f2f5]">
                     <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-1.5">
+                            <button
+                                type="button"
+                                onClick={() => setShowNewChatModal(true)}
+                                className="w-8 h-8 rounded-lg bg-[#00a884]/12 border border-[#00a884]/25 text-[#00a884] flex items-center justify-center hover:bg-[#00a884]/18 transition-all"
+                                title="Start new chat"
+                            >
+                                <MessageSquare className="w-4 h-4" />
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setShowNewChatModal(true)}
+                                className="w-8 h-8 rounded-lg bg-[#2563eb]/12 border border-[#2563eb]/25 text-[#2563eb] flex items-center justify-center hover:bg-[#2563eb]/18 transition-all"
+                                title="Start new chat"
+                            >
+                                <MessageSquare className="w-4 h-4" />
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setShowNewChatModal(true)}
+                                className="w-8 h-8 rounded-lg bg-[#ec4899]/12 border border-[#ec4899]/25 text-[#ec4899] flex items-center justify-center hover:bg-[#ec4899]/18 transition-all"
+                                title="Start new chat"
+                            >
+                                <MessageSquare className="w-4 h-4" />
+                            </button>
+                        </div>
                         <div className="flex-1 bg-[#f0f2f5] rounded-xl flex items-center px-4 py-2 focus-within:bg-white focus-within:ring-1 focus-within:ring-[#00a884]/20 transition-all">
                             <Search className="w-4 h-4 text-[#54656f] mr-4" />
                             <input
@@ -4259,7 +4648,8 @@ export default function App() {
             </div>
 
             {selectedChatId ? (
-                <div className="flex-1 flex flex-col min-h-0 bg-[#f0f2f5] relative overflow-hidden">
+                <div className="flex-1 min-w-0 flex bg-[#f0f2f5] relative overflow-hidden">
+                    <div className="flex-1 min-w-0 flex flex-col min-h-0 relative overflow-hidden">
                     <div className="absolute inset-0 opacity-[0.06] pointer-events-none bg-[url('https://web.whatsapp.com/img/bg-chat-tile-light_6860a4760a595861d83d.png')] bg-repeat" />
 
                     <header className="h-[60px] shrink-0 bg-[#f0f2f5] px-3 flex items-center justify-between z-10 border-l border-[#eceff1]">
@@ -4510,10 +4900,7 @@ export default function App() {
                                                                             />
                                                                         ) : (
                                                                             <div className="p-4 text-center" onClick={() => handleDownloadMedia(msg)}>
-                                                                                <div className="animate-pulse space-y-2 w-28">
-                                                                                    <div className="h-3 rounded bg-[#e8edf1]" />
-                                                                                    <div className="h-3 rounded bg-[#eef2f5]" />
-                                                                                </div>
+                                                                                {renderMediaLoadingPlaceholder(msg)}
                                                                             </div>
                                                                         );
                                                                     })()}
@@ -4556,10 +4943,7 @@ export default function App() {
                                                                                 />
                                                                             ) : (
                                                                                 <div className="p-4 text-center">
-                                                                                    <div className="animate-pulse space-y-2 w-28">
-                                                                                        <div className="h-3 rounded bg-[#e8edf1]" />
-                                                                                        <div className="h-3 rounded bg-[#eef2f5]" />
-                                                                                    </div>
+                                                                                    {renderMediaLoadingPlaceholder(msg)}
                                                                                 </div>
                                                                             )}
                                                                         </div>
@@ -4590,6 +4974,11 @@ export default function App() {
                                                                             <p className="text-[10px] text-[#54656f] font-bold uppercase tracking-tight">
                                                                                 {Math.round((Number(doc.fileLength) || 0) / 1024)} KB • {doc.mimetype?.split('/')[1]?.toUpperCase() || 'FILE'}
                                                                             </p>
+                                                                            {!cacheEntry && !docUrl && (
+                                                                                <div className="mt-2">
+                                                                                    {renderMediaLoadingPlaceholder(msg, true)}
+                                                                                </div>
+                                                                            )}
                                                                         </div>
                                                                     </div>
                                                                 );
@@ -4615,10 +5004,7 @@ export default function App() {
                                                                             />
                                                                         ) : (
                                                                             <div className="p-4 text-center" onClick={() => handleDownloadMedia(msg)}>
-                                                                                <div className="animate-pulse space-y-2 w-28">
-                                                                                    <div className="h-3 rounded bg-[#e8edf1]" />
-                                                                                    <div className="h-3 rounded bg-[#eef2f5]" />
-                                                                                </div>
+                                                                                {renderMediaLoadingPlaceholder(msg)}
                                                                             </div>
                                                                         )}
                                                                     </div>
@@ -4637,9 +5023,8 @@ export default function App() {
                                                                                 src={`data:${cacheEntry.mimetype};base64,${cacheEntry.data}`}
                                                                             />
                                                                         ) : (
-                                                                            <div className="animate-pulse space-y-2">
-                                                                                <div className="h-3 rounded bg-[#e8edf1]" />
-                                                                                <div className="h-3 rounded bg-[#eef2f5]" />
+                                                                            <div className="cursor-pointer" onClick={() => handleDownloadMedia(msg)}>
+                                                                                {renderMediaLoadingPlaceholder(msg, true)}
                                                                             </div>
                                                                         )}
                                                                     </div>
@@ -5060,16 +5445,11 @@ export default function App() {
                         </div>
                     </footer>
 
+                    </div>
+
                     {/* Contact Info Sidebar */}
                     {showContactInfo && (
-                        <div
-                            className="fixed inset-0 z-[180] flex items-center justify-center bg-black/25 backdrop-blur-sm p-4"
-                            onClick={() => setShowContactInfo(false)}
-                        >
-                            <div
-                                className="w-[360px] max-w-[92vw] max-h-[90vh] bg-white border border-[#eceff1] rounded-3xl shadow-[0_18px_60px_rgba(0,0,0,0.18)] flex flex-col overflow-hidden"
-                                onClick={(e) => e.stopPropagation()}
-                            >
+                        <aside className="w-[360px] max-w-[42vw] min-w-[320px] h-full bg-white border-l border-[#eceff1] shadow-[-12px_0_28px_rgba(0,0,0,0.08)] flex flex-col overflow-hidden z-20">
                                 <header className="h-[54px] bg-[#f0f2f5] px-4 flex items-center gap-4 text-[#111b21] border-b border-[#eceff1]">
                                     <X className="w-5 h-5 cursor-pointer hover:text-[#54656f]" onClick={() => setShowContactInfo(false)} />
                                     <h2 className="text-[14px] font-bold">Contact Info</h2>
@@ -5281,8 +5661,7 @@ export default function App() {
                                     </button>
                                 </div>
                             </div>
-                        </div>
-                    </div>
+                        </aside>
                     )}
                 </div>
             ) : (
@@ -5409,6 +5788,7 @@ export default function App() {
                         quickRepliesError={quickRepliesError}
                         onRefreshQuickReplies={fetchQuickReplies}
                         onSaveQuickReplies={saveQuickReplies}
+                        onRefreshUiControls={fetchUiControls}
                         WebhookViewComponent={LazyWebhookView}
                     />
                 )
