@@ -1,6 +1,6 @@
 
 import React, { useEffect, useRef, useState } from 'react';
-import { Plus, Trash2, Globe, Shield } from 'lucide-react';
+import { Plus, Trash2, Globe, Shield, PhoneCall } from 'lucide-react';
 import { getSocketUrl } from './runtimeConfig';
 import { supabase } from './supabase';
 import { uploadFileToCompanyStorage } from './features/media/uploadToCompanyStorage';
@@ -31,6 +31,17 @@ type TeamUser = {
 type ConversationalCommand = {
     command_name: string;
     command_description: string;
+};
+
+type CallStatus = 'ENABLED' | 'DISABLED';
+type CallIconVisibility = 'DEFAULT' | 'DISABLE_ALL';
+type CallbackPermissionStatus = 'ENABLED' | 'DISABLED';
+
+type CallSettingsFormState = {
+    status: CallStatus;
+    callIconVisibility: CallIconVisibility;
+    callbackPermissionStatus: CallbackPermissionStatus;
+    restrictToUserCountries: string;
 };
 
 const TEAM_DEPARTMENT_OPTIONS: Array<{ value: TeamDepartment; label: string }> = [
@@ -155,6 +166,7 @@ type WebhookViewProps = {
     onRefreshQuickReplies: () => void;
     onSaveQuickReplies: (items: QuickReply[]) => void;
     onRefreshUiControls: () => void;
+    showCallSettings?: boolean;
 };
 
 export default function WebhookView({
@@ -167,7 +179,8 @@ export default function WebhookView({
     quickRepliesError,
     onRefreshQuickReplies,
     onSaveQuickReplies,
-    onRefreshUiControls
+    onRefreshUiControls,
+    showCallSettings = true
 }: WebhookViewProps) {
     const [webhooks, setWebhooks] = useState<any[]>([]);
     const [webhookError, setWebhookError] = useState<string | null>(null);
@@ -204,6 +217,19 @@ export default function WebhookView({
     const [connectedLoading, setConnectedLoading] = useState(Boolean(isAdmin));
     const [connectedError, setConnectedError] = useState<string | null>(null);
     const [connectedAppId, setConnectedAppId] = useState('');
+    const [callSettingsLoading, setCallSettingsLoading] = useState(Boolean(sessionToken));
+    const [callSettingsSaving, setCallSettingsSaving] = useState(false);
+    const [callSettingsError, setCallSettingsError] = useState<string | null>(null);
+    const [callSettingsNotice, setCallSettingsNotice] = useState<string | null>(null);
+    const [callSettingsPhoneNumberId, setCallSettingsPhoneNumberId] = useState('');
+    const [includeSipCredentials, setIncludeSipCredentials] = useState(false);
+    const [callSettingsRaw, setCallSettingsRaw] = useState<any | null>(null);
+    const [callSettingsForm, setCallSettingsForm] = useState<CallSettingsFormState>({
+        status: 'DISABLED',
+        callIconVisibility: 'DEFAULT',
+        callbackPermissionStatus: 'DISABLED',
+        restrictToUserCountries: ''
+    });
     const [quickRepliesDraft, setQuickRepliesDraft] = useState<QuickReply[]>([]);
     const [connectLoading, setConnectLoading] = useState(false);
     const [connectError, setConnectError] = useState<string | null>(null);
@@ -296,9 +322,12 @@ export default function WebhookView({
         if (sessionToken) {
             fetchRegistrationConfig();
             fetchTeamUsers();
+            if (showCallSettings) {
+                fetchCallSettings();
+            }
         }
         onRefreshQuickReplies();
-    }, [profileId, onRefreshQuickReplies, isAdmin, sessionToken]);
+    }, [profileId, onRefreshQuickReplies, isAdmin, sessionToken, showCallSettings]);
 
     useEffect(() => {
         if (!sessionToken) return;
@@ -772,6 +801,169 @@ export default function WebhookView({
         }
     };
 
+    const parseCallSettingsError = (data: any, fallback: string): string => {
+        const message = readTrimmed(data?.error) || fallback;
+        const details = Array.isArray(data?.details)
+            ? data.details.map((item: any) => readTrimmed(item)).filter(Boolean)
+            : [];
+        if (!details.length) return message;
+        return `${message} (${details.join(', ')})`;
+    };
+
+    const normalizeCallStatus = (value: unknown): CallStatus => {
+        const normalized = readTrimmed(value).toUpperCase();
+        return normalized === 'ENABLED' ? 'ENABLED' : 'DISABLED';
+    };
+
+    const normalizeCallIconVisibility = (value: unknown): CallIconVisibility => {
+        const normalized = readTrimmed(value).toUpperCase();
+        return normalized === 'DISABLE_ALL' ? 'DISABLE_ALL' : 'DEFAULT';
+    };
+
+    const normalizeCallbackPermissionStatus = (value: unknown): CallbackPermissionStatus => {
+        const normalized = readTrimmed(value).toUpperCase();
+        return normalized === 'ENABLED' ? 'ENABLED' : 'DISABLED';
+    };
+
+    const parseRestrictedCountries = (value: unknown): string[] => {
+        if (!Array.isArray(value)) return [];
+        return value
+            .map((item) => readTrimmed(item).toUpperCase())
+            .filter(Boolean);
+    };
+
+    const applyCallSettingsPayload = (payload: any) => {
+        const data = payload && typeof payload === 'object' ? payload : {};
+        const calling = data?.calling && typeof data.calling === 'object' && !Array.isArray(data.calling)
+            ? data.calling
+            : {};
+        const countries = parseRestrictedCountries(calling?.call_icons?.restrict_to_user_countries);
+
+        setCallSettingsRaw(data);
+        setCallSettingsForm({
+            status: normalizeCallStatus(calling?.status),
+            callIconVisibility: normalizeCallIconVisibility(calling?.call_icon_visibility),
+            callbackPermissionStatus: normalizeCallbackPermissionStatus(calling?.callback_permission_status),
+            restrictToUserCountries: countries.join(', ')
+        });
+    };
+
+    const fetchCallSettings = async () => {
+        if (!sessionToken || !profileId) {
+            setCallSettingsRaw(null);
+            setCallSettingsForm({
+                status: 'DISABLED',
+                callIconVisibility: 'DEFAULT',
+                callbackPermissionStatus: 'DISABLED',
+                restrictToUserCountries: ''
+            });
+            setCallSettingsError(null);
+            setCallSettingsNotice(null);
+            setCallSettingsLoading(false);
+            return;
+        }
+
+        setCallSettingsLoading(true);
+        setCallSettingsError(null);
+        try {
+            const params = new URLSearchParams();
+            params.set('profileId', profileId);
+            if (callSettingsPhoneNumberId.trim()) {
+                params.set('phoneNumberId', callSettingsPhoneNumberId.trim());
+            }
+            if (includeSipCredentials) {
+                params.set('include_sip_credentials', 'true');
+            }
+
+            const res = await fetch(`${SOCKET_URL}/api/waba/call-settings?${params.toString()}`, {
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`
+                }
+            });
+            const text = await res.text();
+            let data: any = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch {
+                data = null;
+            }
+            if (!res.ok || !data?.success) {
+                throw new Error(parseCallSettingsError(data, 'Failed to load call settings.'));
+            }
+
+            applyCallSettingsPayload(data?.data || {});
+        } catch (error: any) {
+            setCallSettingsError(error?.message || 'Failed to load call settings.');
+            setCallSettingsRaw(null);
+        } finally {
+            setCallSettingsLoading(false);
+        }
+    };
+
+    const handleSaveCallSettings = async () => {
+        if (!sessionToken || !profileId) return;
+        setCallSettingsSaving(true);
+        setCallSettingsError(null);
+        setCallSettingsNotice(null);
+        try {
+            const countries = callSettingsForm.restrictToUserCountries
+                .split(/[\n,;\s]+/)
+                .map((item) => readTrimmed(item).toUpperCase())
+                .filter(Boolean);
+            const existingCalling = callSettingsRaw?.calling && typeof callSettingsRaw.calling === 'object' && !Array.isArray(callSettingsRaw.calling)
+                ? callSettingsRaw.calling
+                : {};
+            const existingCallIcons = existingCalling?.call_icons && typeof existingCalling.call_icons === 'object' && !Array.isArray(existingCalling.call_icons)
+                ? existingCalling.call_icons
+                : {};
+
+            const payload = {
+                ...existingCalling,
+                status: callSettingsForm.status,
+                call_icon_visibility: callSettingsForm.callIconVisibility,
+                callback_permission_status: callSettingsForm.callbackPermissionStatus,
+                call_icons: {
+                    ...existingCallIcons,
+                    restrict_to_user_countries: countries
+                }
+            };
+
+            const body: any = {
+                profileId,
+                calling: payload
+            };
+            if (callSettingsPhoneNumberId.trim()) {
+                body.phoneNumberId = callSettingsPhoneNumberId.trim();
+            }
+
+            const res = await fetch(`${SOCKET_URL}/api/waba/call-settings`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(body)
+            });
+            const text = await res.text();
+            let data: any = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch {
+                data = null;
+            }
+            if (!res.ok || !data?.success) {
+                throw new Error(parseCallSettingsError(data, 'Failed to save call settings.'));
+            }
+
+            setCallSettingsNotice('Call settings updated.');
+            await fetchCallSettings();
+        } catch (error: any) {
+            setCallSettingsError(error?.message || 'Failed to save call settings.');
+        } finally {
+            setCallSettingsSaving(false);
+        }
+    };
+
     const fetchClientConnections = () => {
         if (!sessionToken) {
             setClientConnections([]);
@@ -1202,6 +1394,9 @@ export default function WebhookView({
     };
 
     const canManageTeam = teamCurrentRole === 'owner' || teamCurrentRole === 'admin';
+    const callRestrictions = Array.isArray(callSettingsRaw?.calling?.restrictions?.restrictions_list)
+        ? callSettingsRaw.calling.restrictions.restrictions_list
+        : [];
 
     const handleInviteTeamUser = async () => {
         if (!sessionToken) return;
@@ -1565,7 +1760,147 @@ export default function WebhookView({
                     </div>
                 </div>
 
-                {/* API Keys Section Removed */}
+                {showCallSettings && (
+                <div id="settings-calls" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                    <div className="flex items-center justify-between gap-3 mb-5">
+                        <div className="flex items-center gap-3">
+                            <PhoneCall className="w-6 h-6 text-[#00a884]" />
+                            <div>
+                                <h3 className="text-xl text-[#111b21] font-bold">Call Settings</h3>
+                                <p className="text-sm text-[#54656f] font-medium mt-1">
+                                    Configure WhatsApp Calling API behavior for this profile.
+                                </p>
+                            </div>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={fetchCallSettings}
+                            disabled={callSettingsLoading || callSettingsSaving || !sessionToken}
+                            className="text-xs font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-3 py-2 rounded-xl hover:bg-[#00a884]/5 transition-all disabled:opacity-50"
+                        >
+                            Refresh
+                        </button>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                        <div className="lg:col-span-2">
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Phone Number ID (optional)</label>
+                            <input
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20 focus:border-[#00a884] text-[#111b21] font-bold placeholder-[#aebac1]"
+                                placeholder="Leave empty to use phoneNumberId from profile config"
+                                value={callSettingsPhoneNumberId}
+                                onChange={e => setCallSettingsPhoneNumberId(e.target.value)}
+                                disabled={callSettingsSaving}
+                            />
+                        </div>
+
+                        <div>
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Calling Status</label>
+                            <select
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-bold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                value={callSettingsForm.status}
+                                onChange={e => setCallSettingsForm(prev => ({ ...prev, status: (e.target.value as CallStatus) || 'DISABLED' }))}
+                                disabled={callSettingsLoading || callSettingsSaving}
+                            >
+                                <option value="ENABLED">ENABLED</option>
+                                <option value="DISABLED">DISABLED</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Call Icon Visibility</label>
+                            <select
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-bold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                value={callSettingsForm.callIconVisibility}
+                                onChange={e => setCallSettingsForm(prev => ({ ...prev, callIconVisibility: (e.target.value as CallIconVisibility) || 'DEFAULT' }))}
+                                disabled={callSettingsLoading || callSettingsSaving}
+                            >
+                                <option value="DEFAULT">DEFAULT</option>
+                                <option value="DISABLE_ALL">DISABLE_ALL</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Callback Permission</label>
+                            <select
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-bold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                value={callSettingsForm.callbackPermissionStatus}
+                                onChange={e => setCallSettingsForm(prev => ({ ...prev, callbackPermissionStatus: (e.target.value as CallbackPermissionStatus) || 'DISABLED' }))}
+                                disabled={callSettingsLoading || callSettingsSaving}
+                            >
+                                <option value="ENABLED">ENABLED</option>
+                                <option value="DISABLED">DISABLED</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Restrict Call Icons To Countries</label>
+                            <input
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20 focus:border-[#00a884] text-[#111b21] font-bold placeholder-[#aebac1]"
+                                placeholder="US, BR"
+                                value={callSettingsForm.restrictToUserCountries}
+                                onChange={e => setCallSettingsForm(prev => ({ ...prev, restrictToUserCountries: e.target.value }))}
+                                disabled={callSettingsLoading || callSettingsSaving}
+                            />
+                        </div>
+                    </div>
+
+                    <div className="mt-4 flex items-center gap-3">
+                        <label className="inline-flex items-center gap-2 text-xs font-bold text-[#54656f] uppercase tracking-widest cursor-pointer">
+                            <input
+                                type="checkbox"
+                                checked={includeSipCredentials}
+                                onChange={e => setIncludeSipCredentials(e.target.checked)}
+                                disabled={callSettingsLoading || callSettingsSaving}
+                                className="w-4 h-4 accent-[#00a884]"
+                            />
+                            Include SIP Credentials On Refresh
+                        </label>
+                    </div>
+
+                    <p className="mt-3 text-[11px] text-[#8696a0] leading-relaxed">
+                        Save sends the <code className="font-mono">calling</code> object and preserves existing unknown fields from the latest fetch.
+                    </p>
+
+                    {callRestrictions.length > 0 && (
+                        <div className="mt-4 bg-amber-50 border border-amber-200 rounded-2xl p-4">
+                            <p className="text-xs font-bold uppercase tracking-widest text-amber-700 mb-2">Current Restrictions</p>
+                            <div className="space-y-2">
+                                {callRestrictions.map((item: any, index: number) => (
+                                    <div key={`${item?.type || 'restriction'}-${index}`} className="text-xs text-amber-800">
+                                        <span className="font-bold">{readTrimmed(item?.type) || 'Restriction'}:</span> {readTrimmed(item?.reason) || 'No reason provided'}
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+
+                    {callSettingsError && (
+                        <div className="mt-4 bg-rose-50 border border-rose-200 text-rose-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                            {callSettingsError}
+                        </div>
+                    )}
+                    {callSettingsNotice && (
+                        <div className="mt-4 bg-emerald-50 border border-emerald-200 text-emerald-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                            {callSettingsNotice}
+                        </div>
+                    )}
+
+                    <div className="mt-5 flex items-center gap-3">
+                        <button
+                            type="button"
+                            onClick={handleSaveCallSettings}
+                            disabled={!sessionToken || callSettingsLoading || callSettingsSaving}
+                            className="bg-[#111b21] hover:bg-[#202c33] text-white px-5 py-3 rounded-2xl font-bold transition-all disabled:opacity-50"
+                        >
+                            {callSettingsSaving ? 'Saving...' : 'Save Call Settings'}
+                        </button>
+                        {callSettingsLoading && (
+                            <span className="text-xs text-[#8696a0] font-semibold uppercase tracking-widest">Loading current settings...</span>
+                        )}
+                    </div>
+                </div>
+                )}
 
                 <div id="settings-branding" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
                     <div className="flex items-center justify-between gap-3 mb-5">

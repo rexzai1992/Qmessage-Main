@@ -26,6 +26,7 @@ type SettingsViewProps = {
     onRefreshQuickReplies: () => void;
     onSaveQuickReplies: (items: any[]) => void;
     onRefreshUiControls: () => void;
+    showCallSettings?: boolean;
     WebhookViewComponent: React.ComponentType<any>;
 };
 
@@ -44,6 +45,7 @@ export default function SettingsView({
     onRefreshQuickReplies,
     onSaveQuickReplies,
     onRefreshUiControls,
+    showCallSettings,
     WebhookViewComponent
 }: SettingsViewProps) {
     return (
@@ -108,6 +110,7 @@ export default function SettingsView({
                             onRefreshQuickReplies={onRefreshQuickReplies}
                             onSaveQuickReplies={onSaveQuickReplies}
                             onRefreshUiControls={onRefreshUiControls}
+                            showCallSettings={showCallSettings}
                         />
                     </Suspense>
                 </div>

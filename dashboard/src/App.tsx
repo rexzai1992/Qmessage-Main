@@ -633,6 +633,7 @@ export default function App() {
     const [assignMenuContactId, setAssignMenuContactId] = useState<string | null>(null);
     const [assigningContactId, setAssigningContactId] = useState<string | null>(null);
     const [humanTakeoverSaving, setHumanTakeoverSaving] = useState(false);
+    const [callActionLoading, setCallActionLoading] = useState<'voice' | 'video' | null>(null);
     const [mediaCache, setMediaCache] = useState<Record<string, MediaData>>({});
     const [mediaDownloadProgress, setMediaDownloadProgress] = useState<Record<string, MediaDownloadProgressState>>({});
     const [unreadMessagesByChat, setUnreadMessagesByChat] = useState<Record<string, number>>({});
@@ -725,6 +726,11 @@ export default function App() {
             group: 'Connectivity',
             items: [
                 { id: 'settings-webhooks', label: 'Outgoing Webhooks' },
+                ...(
+                    hiddenUiFeatures.some((feature) => String(feature).trim().toLowerCase() === 'calls')
+                        ? []
+                        : [{ id: 'settings-calls', label: 'Call Settings' }]
+                ),
                 { id: 'settings-branding', label: 'App Logo' }
             ]
         },
@@ -1624,6 +1630,7 @@ export default function App() {
             'broadcast',
             'chatbots',
             'contacts',
+            'calls',
             'analytics',
             'settings'
         ]);
@@ -2094,9 +2101,15 @@ export default function App() {
         setProfilesLoaded(false);
         const newSocket = io(SOCKET_URL, {
             auth: { token: session.access_token },
-            transports: ['websocket', 'polling']
+            transports: ['websocket', 'polling'],
+            autoConnect: false
         });
         setSocket(newSocket);
+        const connectTimer = window.setTimeout(() => {
+            if (!newSocket.connected) {
+                newSocket.connect();
+            }
+        }, 0);
 
         newSocket.on('connect', () => {
             if (activeProfileIdRef.current) {
@@ -2209,6 +2222,29 @@ export default function App() {
                         : msg
                 )
             );
+        });
+
+        newSocket.on('calls.update', (data) => {
+            if (data?.profileId !== activeProfileIdRef.current) return;
+            const eventName = typeof data?.event === 'string' ? data.event.trim().toLowerCase() : '';
+            const callId = typeof data?.callId === 'string' ? data.callId.trim() : '';
+            const from = typeof data?.from === 'string' ? data.from.trim() : '';
+            const to = typeof data?.to === 'string' ? data.to.trim() : '';
+
+            if (eventName === 'connect') {
+                pushLog(`[Calls] Incoming call ${callId || '-'} from ${from || 'unknown'} to ${to || '-'}.`, 'info');
+                showToast('Incoming WhatsApp call received.', 'success');
+                return;
+            }
+
+            if (eventName === 'terminate') {
+                pushLog(`[Calls] Call ${callId || '-'} ended.`, 'info');
+                return;
+            }
+
+            if (eventName) {
+                pushLog(`[Calls] ${eventName.toUpperCase()} ${callId || '-'}.`, 'info');
+            }
         });
 
         newSocket.on('messages.cleared', (data) => {
@@ -2382,7 +2418,11 @@ export default function App() {
 
         return () => {
             clearInterval(refreshInterval);
-            newSocket.close();
+            window.clearTimeout(connectTimer);
+            newSocket.removeAllListeners();
+            if (newSocket.connected || newSocket.active) {
+                newSocket.disconnect();
+            }
         };
     }, [session]); // ONLY reconnect if session changes
 
@@ -3718,6 +3758,74 @@ export default function App() {
         }
     }, [activeProfileId, selectedChatId, selectedHumanTakeover, socket]);
 
+    const handleCallAction = useCallback(async (kind: 'voice' | 'video') => {
+        if (!session?.access_token) {
+            showToast('Please login again before checking call permission.', 'error');
+            return;
+        }
+        if (!activeProfileId) {
+            showToast('No active profile selected.', 'error');
+            return;
+        }
+        if (!selectedChatId) return;
+        if (selectedChatId.endsWith('@g.us')) {
+            showToast('Calls are not supported for groups yet.', 'error');
+            return;
+        }
+
+        const userWaId = getCleanId(selectedChatId).replace(/\D/g, '');
+        if (!userWaId) {
+            showToast('This contact has no valid WhatsApp ID for calling.', 'error');
+            return;
+        }
+
+        setCallActionLoading(kind);
+        try {
+            const params = new URLSearchParams({
+                profileId: activeProfileId,
+                user_wa_id: userWaId
+            });
+            const response = await fetch(`${SOCKET_URL}/api/waba/call-permissions?${params.toString()}`, {
+                method: 'GET',
+                headers: {
+                    Authorization: `Bearer ${session.access_token}`
+                }
+            });
+            const payload = await response.json().catch(() => null);
+            if (!response.ok || payload?.success === false) {
+                throw new Error(payload?.error || `Failed with status ${response.status}`);
+            }
+
+            const permissionStatus = String(payload?.data?.permission?.status || '').toLowerCase();
+            const actions = Array.isArray(payload?.data?.actions) ? payload.data.actions : [];
+            const startAction = actions.find((entry: any) => String(entry?.action_name || '').toLowerCase() === 'start_call');
+            const canStartCall = startAction?.can_perform_action === true;
+            const callTypeLabel = kind === 'video' ? 'Video call' : 'Voice call';
+
+            if (permissionStatus === 'granted' && canStartCall) {
+                showToast(`${callTypeLabel} is permitted. Dialer UI not enabled yet.`, 'success');
+                pushLog(`[Calls] ${callTypeLabel} permitted for ${userWaId}.`, 'info');
+            } else if (permissionStatus === 'pending') {
+                showToast('Call permission is pending approval from this user.', 'error');
+            } else if (permissionStatus === 'denied') {
+                showToast('Call permission was denied by this user.', 'error');
+            } else if (permissionStatus === 'expired') {
+                showToast('Call permission has expired. Request permission again.', 'error');
+            } else {
+                showToast('Call permission is not available for this contact.', 'error');
+            }
+        } catch (error: any) {
+            const rawMessage = String(error?.message || '').toLowerCase();
+            if (rawMessage.includes('calling api not enabled') || rawMessage.includes('code=138000')) {
+                showToast('Meta Calling API is not enabled for this phone number yet. Enable WhatsApp Cloud Calling for this number first.', 'error');
+            } else {
+                showToast(error?.message || 'Failed to check call permission.', 'error');
+            }
+        } finally {
+            setCallActionLoading(null);
+        }
+    }, [activeProfileId, selectedChatId, session?.access_token, showToast, pushLog]);
+
     const handleStartWorkflow = () => {
         if (!socket || !selectedChatId || !activeProfileId || !startWorkflowId) return;
         if (selectedChatId.endsWith('@g.us')) {
@@ -4733,8 +4841,28 @@ export default function App() {
                             </div>
                         </div>
                         <div className="flex items-center gap-6 text-[#54656f]">
-                            <Video className="w-5 h-5 cursor-pointer hover:text-[#111b21]" />
-                            <Phone className="w-5 h-5 cursor-pointer hover:text-[#111b21]" />
+                            {!isUiFeatureHidden('calls') && (
+                                <>
+                                    <button
+                                        type="button"
+                                        onClick={() => void handleCallAction('video')}
+                                        disabled={callActionLoading !== null}
+                                        title="Check video call permission"
+                                        className="text-[#54656f] hover:text-[#111b21] transition-colors disabled:opacity-50"
+                                    >
+                                        <Video className="w-5 h-5" />
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => void handleCallAction('voice')}
+                                        disabled={callActionLoading !== null}
+                                        title="Check voice call permission"
+                                        className="text-[#54656f] hover:text-[#111b21] transition-colors disabled:opacity-50"
+                                    >
+                                        <Phone className="w-5 h-5" />
+                                    </button>
+                                </>
+                            )}
                             <div className="w-px h-6 bg-[#eceff1] mx-1" />
                             <Search className="w-5 h-5 cursor-pointer hover:text-[#111b21]" />
                             <User className="w-5 h-5 cursor-pointer hover:text-[#111b21]" onClick={() => setShowContactInfo(true)} />
@@ -5789,6 +5917,7 @@ export default function App() {
                         onRefreshQuickReplies={fetchQuickReplies}
                         onSaveQuickReplies={saveQuickReplies}
                         onRefreshUiControls={fetchUiControls}
+                        showCallSettings={!isUiFeatureHidden('calls')}
                         WebhookViewComponent={LazyWebhookView}
                     />
                 )
