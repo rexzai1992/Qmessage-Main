@@ -264,19 +264,19 @@ export default function BroadcastView({
     };
 
     return (
-        <div className="h-screen pt-[72px] bg-[#f1f3f6] text-[#111b21] font-sans">
-            <div className="h-full flex">
-                <aside className="w-72 bg-white border-r border-[#eceff1] p-5">
-                    <div className="mb-4">
+        <div className="h-screen pt-[64px] lg:pt-[72px] pb-[76px] lg:pb-0 bg-[#f1f3f6] text-[#111b21] font-sans">
+            <div className="h-full flex flex-col lg:flex-row">
+                <aside className="w-full lg:w-72 bg-white border-b lg:border-b-0 lg:border-r border-[#eceff1] p-3 lg:p-5">
+                    <div className="mb-3 lg:mb-4">
                         <h2 className="text-xl font-black text-[#111b21]">Broadcast</h2>
                         <p className="text-xs text-[#6b7280] mt-1">Campaign and template workspace</p>
                     </div>
-                    <div className="space-y-2">
+                    <div className="flex lg:flex-col gap-2 overflow-x-auto pb-1">
                         {broadcastNav.map((item) => (
                             <button
                                 key={item.id}
                                 onClick={() => setBroadcastSection(item.id)}
-                                className={`w-full text-left px-3 py-2.5 rounded-xl text-sm font-bold transition-all ${broadcastSection === item.id
+                                className={`shrink-0 w-auto lg:w-full text-left px-3 py-2.5 rounded-xl text-sm font-bold transition-all ${broadcastSection === item.id
                                     ? 'bg-[#00a884]/10 text-[#00a884]'
                                     : 'text-[#111b21] hover:bg-[#f3f4f6]'
                                     }`}
@@ -287,10 +287,10 @@ export default function BroadcastView({
                     </div>
                 </aside>
 
-                <main className="flex-1 overflow-hidden">
+                <main className="flex-1 min-h-0 overflow-hidden">
                     {broadcastSection === 'template-library' && (
                         <Suspense fallback={
-                            <div className="p-6 md:p-8 animate-pulse space-y-4">
+                            <div className="p-4 md:p-8 animate-pulse space-y-4">
                                 <div className="h-4 w-44 rounded bg-[#e8edf1]" />
                                 <div className="h-28 rounded-2xl bg-white border border-[#eceff1]" />
                                 <div className="h-[380px] rounded-2xl bg-white border border-[#eceff1]" />
@@ -306,7 +306,7 @@ export default function BroadcastView({
                     )}
                     {broadcastSection === 'my-templates' && (
                         <Suspense fallback={
-                            <div className="p-6 md:p-8 animate-pulse space-y-4">
+                            <div className="p-4 md:p-8 animate-pulse space-y-4">
                                 <div className="h-4 w-36 rounded bg-[#e8edf1]" />
                                 <div className="h-12 rounded-xl bg-white border border-[#eceff1]" />
                                 <div className="h-[420px] rounded-2xl bg-white border border-[#eceff1]" />
@@ -320,8 +320,8 @@ export default function BroadcastView({
                         </Suspense>
                     )}
                     {broadcastSection === 'broadcast-history' && (
-                        <div className="h-full p-6 overflow-y-auto custom-scrollbar">
-                            <div className="bg-white rounded-3xl border border-[#eceff1] p-8 shadow-[0_10px_30px_rgba(0,0,0,0.05)]">
+                        <div className="h-full p-3 sm:p-4 lg:p-6 overflow-y-auto custom-scrollbar">
+                            <div className="bg-white rounded-2xl lg:rounded-3xl border border-[#eceff1] p-5 lg:p-8 shadow-[0_10px_30px_rgba(0,0,0,0.05)]">
                                 <h3 className="text-2xl font-black text-[#111b21] mb-2">Broadcast History</h3>
                                 <p className="text-sm text-[#54656f]">
                                     Broadcast send logs will appear here once you start campaigns.
@@ -330,8 +330,8 @@ export default function BroadcastView({
                         </div>
                     )}
                     {broadcastSection === 'scheduled-broadcasts' && (
-                        <div className="h-full p-6 overflow-y-auto custom-scrollbar">
-                            <div className="bg-white rounded-3xl border border-[#eceff1] p-8 shadow-[0_10px_30px_rgba(0,0,0,0.05)]">
+                        <div className="h-full p-3 sm:p-4 lg:p-6 overflow-y-auto custom-scrollbar">
+                            <div className="bg-white rounded-2xl lg:rounded-3xl border border-[#eceff1] p-5 lg:p-8 shadow-[0_10px_30px_rgba(0,0,0,0.05)]">
                                 <div className="flex items-center justify-between gap-3 flex-wrap">
                                     <div>
                                         <h3 className="text-2xl font-black text-[#111b21] mb-1">Scheduled Broadcasts</h3>

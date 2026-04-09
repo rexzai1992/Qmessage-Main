@@ -144,10 +144,10 @@ export default function ChatbotsView({
     }, [apiBaseUrl, apiKeyInput, profileId, sessionToken, settings]);
 
     return (
-        <div className="h-screen pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans">
-            <div className="h-full p-6 overflow-y-auto custom-scrollbar">
+        <div className="h-screen pt-[64px] lg:pt-[72px] pb-[76px] lg:pb-0 bg-[#f8f9fa] text-[#111b21] font-sans">
+            <div className="h-full p-3 sm:p-4 lg:p-6 overflow-y-auto custom-scrollbar">
                 <div className="max-w-[860px] mx-auto">
-                    <section className="bg-white border border-[#eceff1] rounded-3xl shadow-[0_10px_30px_rgba(0,0,0,0.05)] p-5">
+                    <section className="bg-white border border-[#eceff1] rounded-2xl lg:rounded-3xl shadow-[0_10px_30px_rgba(0,0,0,0.05)] p-4 lg:p-5">
                         <div className="flex items-start justify-between gap-3">
                             <div>
                                 <h2 className="text-2xl font-black text-[#111b21] flex items-center gap-2">
@@ -244,7 +244,7 @@ export default function ChatbotsView({
                                 </select>
                             </div>
 
-                            <div className="grid grid-cols-2 gap-3">
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                                 <label className="space-y-1">
                                     <span className="text-[11px] font-black uppercase tracking-widest text-[#54656f]">Temperature</span>
                                     <input

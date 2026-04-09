@@ -64,16 +64,18 @@ export class FlowAssistant {
             }
 
             // Check if flow exists
-            const flow = this.config.flows.find(f => f.id === session.activeFlowId);
+            const activeFlowId = session.activeFlowId;
+            const flow = this.config.flows.find(f => f.id === activeFlowId);
             if (!flow) {
-                console.log(`[FlowAssistant] Flow ${session.activeFlowId} not found. Clearing session.`);
+                console.log(`[FlowAssistant] Flow ${activeFlowId} not found. Clearing session.`);
                 delete this.sessions[jid];
                 session = undefined; // Mark as undefined so we check triggers
             } else {
                 // Check if node exists
-                const currentNode = flow.nodes.find(n => n.id === session.currentNodeId);
+                const currentNodeId = session.currentNodeId;
+                const currentNode = flow.nodes.find(n => n.id === currentNodeId);
                 if (!currentNode) {
-                    console.log(`[FlowAssistant] Node ${session.currentNodeId} not found. Clearing session.`);
+                    console.log(`[FlowAssistant] Node ${currentNodeId} not found. Clearing session.`);
                     delete this.sessions[jid];
                     session = undefined;
                 } else {

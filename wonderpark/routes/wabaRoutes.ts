@@ -113,6 +113,38 @@ function toHttpErrorPayload(error: any, fallback = 'Unexpected error'): {
     }
 }
 
+const SUPER_ADMIN_ROLE_VALUES = new Set(['super_admin', 'superadmin', 'super-admin'])
+
+function isSuperAdminUser(user: any): boolean {
+    const userMeta = user?.user_metadata || {}
+    const appMeta = user?.app_metadata || {}
+    const roleCandidates = [
+        userMeta.role,
+        appMeta.role
+    ]
+    const flagCandidates = [
+        userMeta.super_admin,
+        userMeta.is_super_admin,
+        appMeta.super_admin,
+        appMeta.is_super_admin
+    ]
+
+    const hasRole = roleCandidates.some((value) => {
+        if (typeof value !== 'string') return false
+        return SUPER_ADMIN_ROLE_VALUES.has(value.trim().toLowerCase())
+    })
+    if (hasRole) return true
+
+    return flagCandidates.some((value) => {
+        if (value === true) return true
+        if (typeof value === 'string') {
+            const normalized = value.trim().toLowerCase()
+            return normalized === 'true' || normalized === '1' || normalized === 'yes'
+        }
+        return false
+    })
+}
+
 function isPdfUrl(value: string): boolean {
     return /\.pdf(?:$|[?#])/i.test(value)
 }
@@ -2525,6 +2557,9 @@ app.get('/api/waba/connected-client-businesses', async (req: any, res: any) => {
     try {
         const access = await resolveProfileAccess(req, res)
         if (!access) return
+        if (!isSuperAdminUser(access.user)) {
+            return res.status(403).json({ success: false, error: 'Superadmin access required' })
+        }
 
         const client = await wabaRegistry.getClientByProfile(access.profileId)
         if (!client) {

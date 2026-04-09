@@ -5,6 +5,7 @@ import { io, Socket } from 'socket.io-client';
 import {
     Search,
     MoreVertical,
+    Menu,
     MessageSquare,
     FileText,
     File as FileIcon,
@@ -19,7 +20,6 @@ import {
     BarChart3,
     Filter,
     User,
-    ArrowLeft,
     Settings,
     Phone,
     Video,
@@ -51,6 +51,11 @@ import ContactsView from './features/workspace/ContactsView';
 import ChatbotsView from './features/workspace/ChatbotsView';
 import SettingsView from './features/workspace/SettingsView';
 import ChatflowView from './features/workspace/ChatflowView';
+import BottomNavBar from './features/mobile/BottomNavBar';
+import ChatHeader from './features/mobile/ChatHeader';
+import ContactListItem from './features/mobile/ContactListItem';
+import ChatBubble from './features/mobile/ChatBubble';
+import MessageInputBar from './features/mobile/MessageInputBar';
 import AddProfileModal from './features/workspace/modals/AddProfileModal';
 import EditProfileModal from './features/workspace/modals/EditProfileModal';
 import NewChatModal from './features/workspace/modals/NewChatModal';
@@ -78,6 +83,8 @@ import qmessageLogo from './assets/qmessage-logo.jpg';
 const SOCKET_URL = getSocketUrl();
 const SINGLE_PROFILE_MODE = true;
 const OAUTH_PENDING_COMPANY_KEY = 'pendingOAuthCompanyId';
+const MOBILE_LAYOUT_BREAKPOINT = 1024;
+const MOBILE_BOTTOM_TAB_SECTIONS = ['team-inbox', 'automations', 'contacts', 'more'] as const;
 
 const LazyWebhookView = lazy(() => import('./WebhookView'));
 const LazyBroadcastTemplateBuilder = lazy(() => import('./BroadcastTemplateBuilder'));
@@ -578,6 +585,7 @@ export default function App() {
     const [contacts, setContacts] = useState<Record<string, ContactMeta>>({});
     const [selectedChatId, setSelectedChatId] = useState<string | null>(() => {
         if (typeof window === 'undefined') return null;
+        if (window.innerWidth < MOBILE_LAYOUT_BREAKPOINT) return null;
         try {
             return window.localStorage.getItem('lastChatId');
         } catch {
@@ -597,6 +605,7 @@ export default function App() {
     const [composerDragActive, setComposerDragActive] = useState(false);
     const [composerMediaError, setComposerMediaError] = useState<string | null>(null);
     const [showMediaComposer, setShowMediaComposer] = useState(false);
+    const [showMobileComposerMenu, setShowMobileComposerMenu] = useState(false);
     const [templateName, setTemplateName] = useState('');
     const [templateLanguage, setTemplateLanguage] = useState('en_US');
     const [templateComponents, setTemplateComponents] = useState('');
@@ -641,6 +650,9 @@ export default function App() {
 
     const [searchQuery, setSearchQuery] = useState('');
     const [chatListFilter, setChatListFilter] = useState<'all' | 'tagged' | 'untagged' | 'assigned' | 'unassigned'>('all');
+    const [mobileChatQuickFilter, setMobileChatQuickFilter] = useState<'all' | 'unread'>('all');
+    const [mobileTagFilter, setMobileTagFilter] = useState('');
+    const [showMobileTagFilterMenu, setShowMobileTagFilterMenu] = useState(false);
     const [contactsSearchQuery, setContactsSearchQuery] = useState('');
     const [teamUsers, setTeamUsers] = useState<TeamUserLite[]>([]);
     const [teamUsersLoading, setTeamUsersLoading] = useState(false);
@@ -667,6 +679,10 @@ export default function App() {
     const [isOffline, setIsOffline] = useState(() => {
         if (typeof window === 'undefined') return false;
         return !window.navigator.onLine;
+    });
+    const [isMobile, setIsMobile] = useState(() => {
+        if (typeof window === 'undefined') return false;
+        return window.innerWidth < MOBILE_LAYOUT_BREAKPOINT;
     });
 
     const [activeView, setActiveView] = useState<'dashboard' | 'chatflow' | 'settings' | 'admin'>('dashboard');
@@ -705,10 +721,12 @@ export default function App() {
     const [workflowEditorMode, setWorkflowEditorMode] = useState<'visual' | 'json'>('visual');
     const menuRef = useRef<HTMLDivElement>(null);
     const profileMenuRef = useRef<HTMLDivElement>(null);
+    const mobileTagFilterMenuRef = useRef<HTMLDivElement>(null);
     const messageInputRef = useRef<HTMLTextAreaElement>(null);
     const composerFileInputRef = useRef<HTMLInputElement>(null);
     const activeProfileIdRef = useRef<string | null>(null);
     const selectedChatIdRef = useRef<string | null>(null);
+    const isMobileRef = useRef(false);
     const lastRecoverAtRef = useRef(0);
     const lastInboundRef = useRef<number | null>(null);
     const requestedMediaRef = useRef<Set<string>>(new Set());
@@ -727,6 +745,37 @@ export default function App() {
     useEffect(() => {
         mediaDownloadProgressRef.current = mediaDownloadProgress;
     }, [mediaDownloadProgress]);
+
+    const isSuperAdmin = useMemo(() => {
+        const userMeta: any = (session?.user?.user_metadata as any) || {};
+        const appMeta: any = (session?.user?.app_metadata as any) || {};
+        const roleCandidates = [
+            userMeta.role,
+            appMeta.role
+        ];
+        const flagCandidates = [
+            userMeta.super_admin,
+            userMeta.is_super_admin,
+            appMeta.super_admin,
+            appMeta.is_super_admin
+        ];
+        const hasSuperRole = roleCandidates.some((value) => {
+            if (typeof value === 'string') {
+                const normalized = value.trim().toLowerCase();
+                return normalized === 'super_admin' || normalized === 'superadmin' || normalized === 'super-admin';
+            }
+            return false;
+        });
+        if (hasSuperRole) return true;
+        return flagCandidates.some((value) => {
+            if (value === true) return true;
+            if (typeof value === 'string') {
+                const normalized = value.trim().toLowerCase();
+                return normalized === 'true' || normalized === '1' || normalized === 'yes';
+            }
+            return false;
+        });
+    }, [session?.user?.app_metadata, session?.user?.user_metadata]);
 
     const settingsNav = [
         {
@@ -756,7 +805,7 @@ export default function App() {
                 { id: 'settings-team-users', label: 'Team Users' }
             ]
         },
-        ...(isAdmin ? [{
+        ...(isSuperAdmin ? [{
             group: 'Admin',
             items: [
                 { id: 'settings-connected-clients', label: 'Connected Clients' },
@@ -779,27 +828,6 @@ export default function App() {
         if (!normalized) return false;
         return hiddenUiFeatureSet.has(normalized);
     }, [hiddenUiFeatureSet]);
-
-    const isWabaProviderAdmin = useMemo(() => {
-        const userMeta: any = (session?.user?.user_metadata as any) || {};
-        const appMeta: any = (session?.user?.app_metadata as any) || {};
-        const candidates = [
-            userMeta.waba_admin,
-            userMeta.is_waba_admin,
-            appMeta.waba_admin,
-            appMeta.is_waba_admin,
-            userMeta.role,
-            appMeta.role
-        ];
-        return candidates.some((value) => {
-            if (typeof value === 'boolean') return value;
-            if (typeof value === 'string') {
-                const normalized = value.trim().toLowerCase();
-                return normalized === 'true' || normalized === 'waba_admin' || normalized === 'super_admin';
-            }
-            return false;
-        });
-    }, [session?.user?.app_metadata, session?.user?.user_metadata]);
 
     const onboardingSteps = useMemo<OnboardingStepConfig[]>(() => ([
         {
@@ -1367,7 +1395,7 @@ export default function App() {
     );
 
     const fetchAnalytics = useCallback(() => {
-        if (!activeProfileId) return;
+        if (!activeProfileId || !session?.access_token) return;
         setAnalyticsLoading(true);
         setAnalyticsError(null);
         const params = new URLSearchParams({
@@ -1376,7 +1404,11 @@ export default function App() {
             end: analyticsEnd
         });
         if (analyticsTag.trim()) params.set('tag', analyticsTag.trim());
-        fetch(`${SOCKET_URL}/api/analytics?${params.toString()}`)
+        fetch(`${SOCKET_URL}/api/analytics?${params.toString()}`, {
+            headers: {
+                Authorization: `Bearer ${session.access_token}`
+            }
+        })
             .then(async res => {
                 const text = await res.text();
                 try {
@@ -1397,7 +1429,7 @@ export default function App() {
                 setAnalyticsError(err?.message || 'Failed to load analytics');
             })
             .finally(() => setAnalyticsLoading(false));
-    }, [activeProfileId, analyticsStart, analyticsEnd, analyticsTag]);
+    }, [activeProfileId, analyticsStart, analyticsEnd, analyticsTag, session?.access_token]);
 
     const analyticsRows = useMemo<AnalyticsPerDayRow[]>(() => analyticsData?.per_day || [], [analyticsData]);
     const analyticsStaffRows = useMemo<AnalyticsStaffRow[]>(() => analyticsData?.per_staff || [], [analyticsData]);
@@ -1734,6 +1766,10 @@ export default function App() {
     }, [selectedChatId]);
 
     useEffect(() => {
+        isMobileRef.current = isMobile;
+    }, [isMobile]);
+
+    useEffect(() => {
         try {
             if (activeProfileId) {
                 window.localStorage.setItem('lastActiveProfileId', activeProfileId);
@@ -1773,6 +1809,7 @@ export default function App() {
 
 
     useEffect(() => {
+        if (isMobile) return;
         if (!activeProfileId) return;
         try {
             const stored = window.localStorage.getItem(`lastChatId:${activeProfileId}`);
@@ -1782,7 +1819,13 @@ export default function App() {
         } catch {
             // ignore storage errors
         }
-    }, [activeProfileId, selectedChatId]);
+    }, [activeProfileId, isMobile, selectedChatId]);
+
+    useEffect(() => {
+        if (!isMobile) return;
+        if (!selectedChatId) return;
+        setSelectedChatId(null);
+    }, [isMobile]);
 
     useEffect(() => {
         if (!activeProfileId || !selectedChatId) {
@@ -1864,6 +1907,11 @@ export default function App() {
     }, [selectedChatId, activeProfileId]);
 
     useEffect(() => {
+        setShowMobileComposerMenu(false);
+        setShowMobileTagFilterMenu(false);
+    }, [selectedChatId, workspaceSection, isMobile, showMediaComposer, showTemplateComposer]);
+
+    useEffect(() => {
         if (!selectedChatId) return;
         const contact = pickContactMetaByJid(contacts, selectedChatId);
         setContactDraftName(contact?.name || getCleanId(selectedChatId));
@@ -1888,6 +1936,9 @@ export default function App() {
             if (profileMenuRef.current && !profileMenuRef.current.contains(event.target as Node)) {
                 setShowProfileMenu(false);
             }
+            if (mobileTagFilterMenuRef.current && !mobileTagFilterMenuRef.current.contains(event.target as Node)) {
+                setShowMobileTagFilterMenu(false);
+            }
         };
         document.addEventListener('mousedown', handleClickOutside);
         return () => document.removeEventListener('mousedown', handleClickOutside);
@@ -1908,6 +1959,14 @@ export default function App() {
             window.removeEventListener('online', syncOnlineState);
             window.removeEventListener('offline', syncOnlineState);
         };
+    }, []);
+
+    useEffect(() => {
+        if (typeof window === 'undefined') return;
+        const syncMobileLayout = () => setIsMobile(window.innerWidth < MOBILE_LAYOUT_BREAKPOINT);
+        syncMobileLayout();
+        window.addEventListener('resize', syncMobileLayout);
+        return () => window.removeEventListener('resize', syncMobileLayout);
     }, []);
 
     useEffect(() => {
@@ -1967,6 +2026,19 @@ export default function App() {
         if (!isUiFeatureHidden('analytics')) return;
         setShowAnalytics(false);
     }, [isUiFeatureHidden, showAnalytics, uiControlsLoading]);
+
+    useEffect(() => {
+        if (!isMobile) return;
+        if ((MOBILE_BOTTOM_TAB_SECTIONS as readonly string[]).includes(workspaceSection)) return;
+        setWorkspaceSection('team-inbox');
+        setSelectedChatId(null);
+    }, [isMobile, workspaceSection]);
+
+    useEffect(() => {
+        if (!isMobile) return;
+        if (chatListFilter === 'all') return;
+        setChatListFilter('all');
+    }, [isMobile, chatListFilter]);
 
 
     const handleSignOut = async () => {
@@ -2057,7 +2129,7 @@ export default function App() {
             return;
         }
         if (authChecking || hostAuthError) return;
-        if (!session?.user?.id || !onboardingStorageKey || !isAdmin || isWabaProviderAdmin) {
+        if (!session?.user?.id || !onboardingStorageKey || !isAdmin || isSuperAdmin) {
             setShowOnboardingTutorial(false);
             resetOnboardingWizard();
             return;
@@ -2077,7 +2149,7 @@ export default function App() {
 
         resetOnboardingWizard();
         setShowOnboardingTutorial(true);
-    }, [authChecking, hostAuthError, isAdmin, isWabaProviderAdmin, onboardingStorageKey, resetOnboardingWizard, session?.user?.id]);
+    }, [authChecking, hostAuthError, isAdmin, isSuperAdmin, onboardingStorageKey, resetOnboardingWizard, session?.user?.id]);
 
     useEffect(() => {
         if (!session) {
@@ -2196,7 +2268,7 @@ export default function App() {
                         const dedupeKey = `${jid}:${rawId || `ts-${ts}-idx-${index}`}`;
                         if (seenIncomingMessageKeysRef.current.has(dedupeKey)) return;
                         seenIncomingMessageKeysRef.current.add(dedupeKey);
-                        if (activeChatKey && jid === activeChatKey) return;
+                        if (isMobileRef.current && activeChatKey && jid === activeChatKey) return;
                         if (!changed) {
                             next = { ...prev };
                             changed = true;
@@ -2213,17 +2285,32 @@ export default function App() {
                 const historyMessages = Array.isArray(data?.messages) ? data.messages : [];
                 setAllMessages(historyMessages);
                 setLoadingChats(false);
+                const previousSeen = seenIncomingMessageKeysRef.current;
                 const nextSeen = new Set<string>();
+                const activeChatKey = canonicalContactJid(selectedChatIdRef.current || '');
+                const unreadDeltaByChat: Record<string, number> = {};
                 historyMessages.forEach((msg: any, index: number) => {
                     if (msg?.key?.fromMe) return;
                     const jid = canonicalContactJid(msg?.key?.remoteJid || '');
                     if (!jid) return;
                     const rawId = typeof msg?.key?.id === 'string' ? msg.key.id.trim() : '';
                     const ts = Number(msg?.messageTimestamp || 0);
-                    nextSeen.add(`${jid}:${rawId || `ts-${ts}-idx-${index}`}`);
+                    const dedupeKey = `${jid}:${rawId || `ts-${ts}-idx-${index}`}`;
+                    nextSeen.add(dedupeKey);
+                    if (previousSeen.has(dedupeKey)) return;
+                    if (isMobileRef.current && activeChatKey && jid === activeChatKey) return;
+                    unreadDeltaByChat[jid] = (unreadDeltaByChat[jid] || 0) + 1;
                 });
                 seenIncomingMessageKeysRef.current = nextSeen;
-                setUnreadMessagesByChat({});
+                if (Object.keys(unreadDeltaByChat).length > 0) {
+                    setUnreadMessagesByChat((prev) => {
+                        const next = { ...prev };
+                        Object.entries(unreadDeltaByChat).forEach(([jid, count]) => {
+                            next[jid] = (next[jid] || 0) + count;
+                        });
+                        return next;
+                    });
+                }
             }
         });
 
@@ -2510,9 +2597,13 @@ export default function App() {
     };
 
     useEffect(() => {
-        if (activeView !== 'chatflow' || !activeProfileId) return;
+        if (activeView !== 'chatflow' || !activeProfileId || !session?.access_token) return;
         setWorkflowsLoading(true);
-        fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`)
+        fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`, {
+            headers: {
+                Authorization: `Bearer ${session.access_token}`
+            }
+        })
             .then(res => res.json())
             .then(data => {
                 const list = Array.isArray(data?.workflows) ? data.workflows : [];
@@ -2520,12 +2611,16 @@ export default function App() {
             })
             .catch(err => console.error('Failed to fetch workflows:', err))
             .finally(() => setWorkflowsLoading(false));
-    }, [activeView, activeProfileId]);
+    }, [activeView, activeProfileId, session?.access_token]);
 
     useEffect(() => {
-        if (activeView !== 'dashboard' || !activeProfileId) return;
+        if (activeView !== 'dashboard' || !activeProfileId || !session?.access_token) return;
         setWorkflowsLoading(true);
-        fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`)
+        fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`, {
+            headers: {
+                Authorization: `Bearer ${session.access_token}`
+            }
+        })
             .then(res => res.json())
             .then(data => {
                 const list = Array.isArray(data?.workflows) ? data.workflows : [];
@@ -2533,7 +2628,7 @@ export default function App() {
             })
             .catch(err => console.error('Failed to fetch workflows:', err))
             .finally(() => setWorkflowsLoading(false));
-    }, [activeView, activeProfileId]);
+    }, [activeView, activeProfileId, session?.access_token]);
 
     useEffect(() => {
         if (activeView !== 'chatflow' || workflowEditorMode !== 'visual' || !selectedWorkflowId) return;
@@ -2546,8 +2641,8 @@ export default function App() {
 
     const handleSaveWorkflows = async (updatedWorkflows: any[], draftOverrides?: Record<string, string>) => {
         try {
-            if (!activeProfileId) {
-                alert('No active profile selected.');
+            if (!activeProfileId || !session?.access_token) {
+                alert('Please sign in and select an active profile.');
                 return false;
             }
             // Validate JSON drafts before saving
@@ -2581,7 +2676,10 @@ export default function App() {
 
             const res = await fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${session.access_token}`
+                },
                 body: JSON.stringify({ workflows: normalized })
             });
 
@@ -2590,7 +2688,11 @@ export default function App() {
                 throw new Error(payload?.error || `Failed to save workflows (${res.status})`);
             }
 
-            const refreshed = await fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`);
+            const refreshed = await fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`, {
+                headers: {
+                    Authorization: `Bearer ${session.access_token}`
+                }
+            });
             const refreshedPayload = await refreshed.json().catch(() => ({}));
             const list = Array.isArray(refreshedPayload?.workflows) ? refreshedPayload.workflows : [];
             applyWorkflowsFromServer(list);
@@ -2605,6 +2707,10 @@ export default function App() {
 
     const { chatsMap, chatList, latestChatId } = useMemo(() => {
         const nextMap = new Map<string, Chat>();
+        const getUnreadCount = (jidValue: string) => {
+            const key = canonicalContactJid(jidValue) || jidValue;
+            return Math.max(0, Number(unreadMessagesByChat[key] || 0));
+        };
         allMessages.forEach(msg => {
             const rawJid = msg.key.remoteJid;
             if (!rawJid) return;
@@ -2631,7 +2737,7 @@ export default function App() {
                     name: rawName,
                     lastMessage: content,
                     timestamp: msg.messageTimestamp,
-                    unreadCount: 0,
+                    unreadCount: getUnreadCount(jid),
                 });
             }
         });
@@ -2653,7 +2759,7 @@ export default function App() {
                 name: rawName,
                 lastMessage: '',
                 timestamp,
-                unreadCount: 0
+                unreadCount: getUnreadCount(jid)
             });
         });
 
@@ -2687,18 +2793,54 @@ export default function App() {
             return true;
         });
 
+        const nextListWithUnread = nextList.map((chat) => ({
+            ...chat,
+            unreadCount: getUnreadCount(chat.id)
+        }));
+
         return {
             chatsMap: nextMap,
-            chatList: nextList,
-            latestChatId: nextList[0]?.id || null
+            chatList: nextListWithUnread,
+            latestChatId: nextListWithUnread[0]?.id || null
         };
-    }, [allMessages, contacts, searchQuery, chatListFilter]);
+    }, [allMessages, contacts, searchQuery, chatListFilter, unreadMessagesByChat]);
 
     const totalUnreadMessages = useMemo(
-        () => Object.values(unreadMessagesByChat).reduce((sum, count) => sum + Math.max(0, Number(count) || 0), 0),
-        [unreadMessagesByChat]
+        () => chatList.reduce((sum, chat) => sum + Math.max(0, Number(chat.unreadCount) || 0), 0),
+        [chatList]
     );
     const totalUnreadBadgeCount = Math.max(0, Math.min(999, totalUnreadMessages));
+    const mobileUnreadChatCount = useMemo(
+        () => chatList.reduce((sum, chat) => sum + (chat.unreadCount > 0 ? 1 : 0), 0),
+        [chatList]
+    );
+    const mobileChatFilterTags = useMemo(() => {
+        const next = new Set<string>();
+        Object.values(contacts).forEach((meta) => {
+            splitContactTags(meta?.tags).labelTags.forEach((tag) => {
+                const normalized = tag.trim();
+                if (normalized) next.add(normalized);
+            });
+        });
+        return Array.from(next).sort((a, b) => a.localeCompare(b));
+    }, [contacts]);
+    const mobileTagFilterKey = mobileTagFilter.trim().toLowerCase();
+    const chatListForView = useMemo(() => {
+        if (!isMobile) return chatList;
+        let next = chatList;
+        if (mobileChatQuickFilter === 'unread') {
+            next = next.filter((chat) => chat.unreadCount > 0);
+        }
+        if (mobileTagFilterKey) {
+            next = next.filter((chat) => {
+                const meta: ContactMeta = pickContactMetaByJid(contacts, chat.id) || {};
+                return splitContactTags(meta.tags).labelTags.some(
+                    (tag) => tag.trim().toLowerCase() === mobileTagFilterKey
+                );
+            });
+        }
+        return next;
+    }, [chatList, contacts, isMobile, mobileChatQuickFilter, mobileTagFilterKey]);
 
     const contactsList = useMemo(() => {
         type ContactRow = {
@@ -2779,11 +2921,13 @@ export default function App() {
     }, [contacts, allMessages, contactsSearchQuery]);
 
     useEffect(() => {
+        if (isMobile) return;
         if (activeView !== 'dashboard') return;
+        if (workspaceSection !== 'team-inbox') return;
         if (!selectedChatId && latestChatId) {
             setSelectedChatId(latestChatId);
         }
-    }, [activeView, selectedChatId, latestChatId]);
+    }, [activeView, isMobile, latestChatId, selectedChatId, workspaceSection]);
 
     const tagAnalytics = useMemo(() => {
         const tagCounts = new Map<string, number>();
@@ -3233,6 +3377,7 @@ export default function App() {
             unreadCount: 0
         })
         : null;
+    const isMobileChatOpen = isMobile && Boolean(selectedChatId);
     const selectedContact = selectedChatId ? pickContactMetaByJid(contacts, selectedChatId) : null;
     const selectedContactTemplateAttributes = useMemo(() => {
         const list = Array.isArray(selectedContact?.templateAttributes)
@@ -3263,6 +3408,14 @@ export default function App() {
     const windowExpiresMs = lastInboundMs ? lastInboundMs + 24 * 60 * 60 * 1000 : null;
     const windowRemainingMs = windowExpiresMs ? windowExpiresMs - now : null;
     const windowOpen = windowRemainingMs !== null && windowRemainingMs > 0;
+    const showMobileWindowClosedBanner = Boolean(
+        isMobile
+        && selectedChatId
+        && selectedChat
+        && !selectedChat.id.endsWith('@g.us')
+        && lastInboundMs
+        && !windowOpen
+    );
     const ctaFreeWindowExpiresMs = selectedContact?.ctaFreeWindowExpiresAt
         ? new Date(selectedContact.ctaFreeWindowExpiresAt || '').getTime()
         : null;
@@ -4462,7 +4615,7 @@ export default function App() {
             { id: 'broadcast', label: 'Broadcast', icon: Send },
             { id: 'chatbots', label: 'Chatbot', icon: Bot },
             { id: 'contacts', label: 'Contacts', icon: Users },
-            { id: 'more', label: 'Analytic', icon: BarChart3 }
+            { id: 'more', label: 'Analytics', icon: BarChart3 }
         ];
 
     const showUiControlsSkeleton = Boolean(session?.access_token) && uiControlsLoading;
@@ -4472,6 +4625,14 @@ export default function App() {
 
     const activeWorkspaceLabel = workspaceTabs.find(tab => tab.id === workspaceSection)?.label || 'Workspace';
     const defaultWorkspaceSection = workspaceTabs[0]?.id || 'team-inbox';
+    const hideGlobalHeaderOnMobileInbox = isMobile && workspaceSection === 'team-inbox';
+    const shouldShowMobileBottomNav = isMobile
+        && activeView === 'dashboard'
+        && (showAnalytics || !(workspaceSection === 'team-inbox' && Boolean(selectedChatId)))
+        && !showContactInfo;
+    const mobileWorkspaceTabs = workspaceTabs.filter((tab) =>
+        (MOBILE_BOTTOM_TAB_SECTIONS as readonly string[]).includes(tab.id)
+    );
     const broadcastNav: Array<{ id: 'template-library' | 'my-templates' | 'broadcast-history' | 'scheduled-broadcasts'; label: string }> = [
         { id: 'template-library', label: 'Create Template' },
         { id: 'my-templates', label: 'My Templates' },
@@ -4507,8 +4668,9 @@ export default function App() {
                     </div>
                 </>
             )}
-            <header className="fixed top-0 inset-x-0 z-[120] h-[72px] bg-white border-b border-[#eceff1]">
-                <div className="h-full px-5 flex items-center justify-between gap-4">
+            {!hideGlobalHeaderOnMobileInbox && (
+            <header className="fixed top-0 inset-x-0 z-[120] h-[64px] lg:h-[72px] bg-white border-b border-[#eceff1]">
+                <div className="h-full px-3 sm:px-4 lg:px-5 flex items-center justify-between gap-3 lg:gap-4">
                     <div className="flex items-center gap-5 min-w-0 flex-1">
                         <div className="flex items-center gap-2 shrink-0">
                             <div className="h-8 min-w-[96px] max-w-[170px] px-3 rounded-lg border border-[#eceff1] bg-[#f8f9fa] flex items-center justify-center overflow-hidden">
@@ -4521,7 +4683,10 @@ export default function App() {
                             </div>
                         </div>
                         <div className="hidden xl:block w-px h-8 bg-[#eceff1]" />
-                        <nav className="flex items-center gap-1 overflow-x-auto whitespace-nowrap custom-scrollbar">
+                        <div className="lg:hidden min-w-0">
+                            <div className="text-[14px] font-bold text-[#111b21] truncate">{activeWorkspaceLabel}</div>
+                        </div>
+                        <nav className="hidden lg:flex items-center gap-1 overflow-x-auto whitespace-nowrap custom-scrollbar">
                             {showUiControlsSkeleton ? (
                                 <div className="animate-pulse flex items-center gap-2">
                                     <div className="h-9 w-28 rounded-xl bg-[#eef2f5]" />
@@ -4570,6 +4735,7 @@ export default function App() {
                                         setActiveView('dashboard');
                                         setShowAnalytics(false);
                                         setWorkspaceSection('team-inbox');
+                                        if (isMobile) setSelectedChatId(null);
                                     }}
                                     className="relative w-10 h-10 rounded-full bg-[#f3f4f6] text-[#00a884] flex items-center justify-center hover:bg-[#e8f5f1] transition-all"
                                     title="Unread messages"
@@ -4584,7 +4750,7 @@ export default function App() {
                                 {!isUiFeatureHidden(SETTINGS_UI_FEATURE_KEY) && (
                                     <button
                                         onClick={openSettingsFromMore}
-                                        className="hidden md:flex w-10 h-10 rounded-full bg-[#f3f4f6] text-[#6b7280] items-center justify-center"
+                                        className="hidden sm:flex w-10 h-10 rounded-full bg-[#f3f4f6] text-[#6b7280] items-center justify-center"
                                     >
                                         <User className="w-5 h-5" />
                                     </button>
@@ -4594,11 +4760,12 @@ export default function App() {
                     </div>
                 </div>
             </header>
+            )}
 
             {workspaceSection === 'team-inbox' ? (
-                <div className="flex h-screen pt-[72px] bg-[#f8f9fa] overflow-hidden text-[#111b21] font-sans">
-            <div className="w-[400px] border-r border-[#eceff1] flex flex-col bg-white">
-                <div className="px-3 py-2 border-b border-[#f0f2f5]">
+                <div className={`flex h-screen ${hideGlobalHeaderOnMobileInbox ? 'pt-0' : 'pt-[64px] lg:pt-[72px]'} bg-[#f8f9fa] overflow-hidden text-[#111b21] font-sans ${shouldShowMobileBottomNav ? 'pb-[76px]' : ''}`}>
+            <div className={`${isMobileChatOpen ? 'hidden' : 'flex'} w-full lg:w-[400px] border-r border-[#eceff1] flex-col bg-white`}>
+                <div className={`px-3 py-2 border-b border-[#f0f2f5] ${hideGlobalHeaderOnMobileInbox ? 'pt-[max(env(safe-area-inset-top),0.35rem)]' : ''}`}>
                     <div className="flex items-center gap-2">
                         <div className="flex items-center gap-1.5">
                             <button
@@ -4636,21 +4803,94 @@ export default function App() {
                                 className="bg-transparent border-none text-[15px] w-full focus:outline-none placeholder:text-[#54656f]"
                             />
                         </div>
-                        <div className="w-[132px] bg-[#f0f2f5] rounded-xl flex items-center px-2.5 py-2 border border-transparent focus-within:border-[#00a884]/30 transition-all">
-                            <Filter className="w-3.5 h-3.5 text-[#54656f] mr-2" />
-                            <select
-                                value={chatListFilter}
-                                onChange={(e) => setChatListFilter(e.target.value as typeof chatListFilter)}
-                                className="bg-transparent text-[11px] font-bold text-[#334155] w-full focus:outline-none"
-                            >
-                                <option value="all">All</option>
-                                <option value="tagged">Tagged</option>
-                                <option value="untagged">Untagged</option>
-                                <option value="assigned">Assigned</option>
-                                <option value="unassigned">Unassigned</option>
-                            </select>
-                        </div>
+                        {!isMobile && (
+                            <div className="flex w-[108px] sm:w-[132px] bg-[#f0f2f5] rounded-xl items-center px-2.5 py-2 border border-transparent focus-within:border-[#00a884]/30 transition-all">
+                                <Filter className="w-3.5 h-3.5 text-[#54656f] mr-2" />
+                                <select
+                                    value={chatListFilter}
+                                    onChange={(e) => setChatListFilter(e.target.value as typeof chatListFilter)}
+                                    className="bg-transparent text-[11px] font-bold text-[#334155] w-full focus:outline-none"
+                                >
+                                    <option value="all">All</option>
+                                    <option value="tagged">Tagged</option>
+                                    <option value="untagged">Untagged</option>
+                                    <option value="assigned">Assigned</option>
+                                    <option value="unassigned">Unassigned</option>
+                                </select>
+                            </div>
+                        )}
                     </div>
+                    {isMobile && (
+                        <div className="mt-2 flex items-center gap-2 overflow-x-auto pr-1">
+                            <button
+                                type="button"
+                                onClick={() => setMobileChatQuickFilter('all')}
+                                className={`h-8 px-3 rounded-full text-[11px] font-bold border whitespace-nowrap transition-all ${mobileChatQuickFilter === 'all'
+                                        ? 'bg-[#e9f7f4] border-[#b9eadd] text-[#008f6f]'
+                                        : 'bg-[#f7f9fa] border-[#e2e8ee] text-[#54656f]'
+                                    }`}
+                            >
+                                All
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setMobileChatQuickFilter('unread')}
+                                className={`h-8 px-3 rounded-full text-[11px] font-bold border whitespace-nowrap transition-all ${mobileChatQuickFilter === 'unread'
+                                        ? 'bg-[#e9f7f4] border-[#b9eadd] text-[#008f6f]'
+                                        : 'bg-[#f7f9fa] border-[#e2e8ee] text-[#54656f]'
+                                    }`}
+                            >
+                                Unread {mobileUnreadChatCount > 0 ? `(${mobileUnreadChatCount})` : ''}
+                            </button>
+                            <div className="relative" ref={mobileTagFilterMenuRef}>
+                                <button
+                                    type="button"
+                                    onClick={() => setShowMobileTagFilterMenu((prev) => !prev)}
+                                    className={`h-8 px-3 rounded-full text-[11px] font-bold border whitespace-nowrap transition-all flex items-center gap-1.5 ${mobileTagFilter
+                                            ? 'bg-[#ecfdf3] border-[#bbf7d0] text-[#166534]'
+                                            : 'bg-[#f7f9fa] border-[#e2e8ee] text-[#54656f]'
+                                        }`}
+                                >
+                                    <Plus className="w-3.5 h-3.5" />
+                                    {mobileTagFilter ? `Tag: ${mobileTagFilter}` : '+ Tag'}
+                                </button>
+                                {showMobileTagFilterMenu && (
+                                    <div className="absolute left-0 top-full mt-2 min-w-[190px] max-h-56 overflow-y-auto rounded-2xl border border-[#e5ebf0] bg-white shadow-[0_12px_28px_rgba(0,0,0,0.14)] p-1.5 z-30">
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                setMobileTagFilter('');
+                                                setShowMobileTagFilterMenu(false);
+                                            }}
+                                            className={`w-full text-left rounded-xl px-2.5 py-2 text-[11px] font-semibold transition-all ${mobileTagFilter ? 'text-[#0f172a] hover:bg-[#f1f5f9]' : 'text-[#00a884] bg-[#e9f7f4]'}`}
+                                        >
+                                            All tags
+                                        </button>
+                                        {mobileChatFilterTags.length === 0 ? (
+                                            <div className="px-2.5 py-2 text-[11px] text-[#94a3b8]">No tags yet</div>
+                                        ) : (
+                                            mobileChatFilterTags.map((tag) => (
+                                                <button
+                                                    type="button"
+                                                    key={`mobile-filter-tag-${tag}`}
+                                                    onClick={() => {
+                                                        setMobileTagFilter(tag);
+                                                        setShowMobileTagFilterMenu(false);
+                                                    }}
+                                                    className={`w-full text-left rounded-xl px-2.5 py-2 text-[11px] font-semibold transition-all ${mobileTagFilter.trim().toLowerCase() === tag.toLowerCase()
+                                                            ? 'bg-[#e9f7f4] text-[#008f6f]'
+                                                            : 'text-[#334155] hover:bg-[#f8fafc]'
+                                                        }`}
+                                                >
+                                                    {tag}
+                                                </button>
+                                            ))
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    )}
                 </div>
 
                 <div className="flex-1 overflow-y-auto custom-scrollbar">
@@ -4718,7 +4958,7 @@ export default function App() {
                                         </div>
                                     ))}
                                 </div>
-                            ) : chatList.length === 0 ? (
+                            ) : chatListForView.length === 0 ? (
                                 <div className="h-full flex items-center justify-center text-sm text-[#8696a0]">
                                     No chats found.
                                 </div>
@@ -4728,101 +4968,72 @@ export default function App() {
                                         height: chatListViewport.height,
                                         width: chatListViewport.width || '100%'
                                     }}
-                                    rowCount={chatList.length}
+                                    rowCount={chatListForView.length}
                                     rowHeight={CHAT_ROW_HEIGHT}
                                     rowProps={{}}
                                     overscanCount={8}
                                     rowComponent={(props: any) => {
                                         const { index, style } = props as { index: number; style: React.CSSProperties };
-                                        const chat = chatList[index];
+                                        const chat = chatListForView[index];
                                         const contactMeta = pickContactMetaByJid(contacts, chat.id) || {};
                                         const assigneeName = contactMeta.assigneeName || null;
                                         const assigneeColor = contactMeta.assigneeColor || '#6b7280';
                                         const contactTags = splitContactTags(contactMeta.tags).labelTags;
                                         const primaryTag = contactTags[0] || null;
                                         const extraTagCount = Math.max(0, contactTags.length - (primaryTag ? 1 : 0));
+                                        const assigneeNode = assigneeName ? (
+                                            <button
+                                                type="button"
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    if (!teamUsers.length && !teamUsersLoading) fetchTeamUsers();
+                                                    setAssignMenuContactId(prev => (prev === chat.id ? null : chat.id));
+                                                }}
+                                                className="px-1.5 py-0.5 text-[9px] rounded uppercase font-bold border tracking-tight hover:opacity-85 transition-all"
+                                                style={{
+                                                    backgroundColor: withHexAlpha(assigneeColor, '20', '#f3f4f6'),
+                                                    borderColor: withHexAlpha(assigneeColor, '66', '#d1d5db'),
+                                                    color: textColor(assigneeColor, '#374151')
+                                                }}
+                                            >
+                                                {assigneeName}
+                                            </button>
+                                        ) : chat.id.endsWith('@g.us') ? (
+                                            <span className="px-1.5 py-0.5 bg-[#f0f2f5] text-[#54656f] text-[9px] rounded uppercase font-bold border border-[#eceff1] tracking-tight">Group</span>
+                                        ) : (
+                                            <button
+                                                type="button"
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    if (!teamUsers.length && !teamUsersLoading) fetchTeamUsers();
+                                                    setAssignMenuContactId(prev => (prev === chat.id ? null : chat.id));
+                                                }}
+                                                className="px-1.5 py-0.5 bg-[#f8f9fa] text-[#9ca3af] text-[9px] rounded uppercase font-bold border border-[#eceff1] tracking-tight hover:bg-[#f0f2f5] transition-all"
+                                            >
+                                                Unassigned
+                                            </button>
+                                        );
                                         return (
                                             <div style={style}>
-                                                <div
+                                                <ContactListItem
+                                                    id={chat.id}
+                                                    name={chat.name}
+                                                    preview={chat.lastMessage || ''}
+                                                    timestampLabel={chat.timestamp ? new Date(chat.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
+                                                    isSelected={selectedChatId === chat.id}
+                                                    isGroup={chat.id.endsWith('@g.us')}
+                                                    phoneLabel={
+                                                        (chat.id.endsWith('@s.whatsapp.net') || chat.id.endsWith('@lid'))
+                                                            && getCleanId(chat.name) !== getCleanId(chat.id)
+                                                            ? formatPhoneNumber(getCleanId(chat.id))
+                                                            : undefined
+                                                    }
+                                                    badgeCount={chat.unreadCount}
+                                                    primaryTag={primaryTag}
+                                                    extraTagCount={extraTagCount}
+                                                    assignee={assigneeNode}
                                                     onClick={() => handleOpenChat(chat.id)}
-                                                    className={`flex items-center px-3 py-2 cursor-pointer hover:bg-[#f5f6f6] transition-colors border-b border-[#fcfdfd] ${selectedChatId === chat.id ? 'bg-[#f0f2f5]' : ''}`}
-                                                >
-                                                    <div className="w-12 h-12 rounded-full bg-[#f0f2f5] mr-3 flex-shrink-0 flex items-center justify-center border border-[#eceff1]">
-                                                        {chat.id.endsWith('@g.us') ? (
-                                                            <Users className="text-[#54656f] w-5 h-5" />
-                                                        ) : (
-                                                            <User className="text-[#54656f] w-5 h-5" />
-                                                        )}
-                                                    </div>
-                                                    <div className="flex-1 min-w-0 border-b border-[#f5f6f6] pb-3 pt-1">
-                                                        <div className="flex justify-between items-baseline mb-0.5">
-                                                            <h3 className="font-bold text-[16px] truncate pr-2 text-[#111b21]">
-                                                                {chat.name}
-                                                            </h3>
-                                                            <span className="text-[11px] font-medium text-[#54656f]">
-                                                                {chat.timestamp ? new Date(chat.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
-                                                            </span>
-                                                        </div>
-                                                        {(chat.id.endsWith('@s.whatsapp.net') || chat.id.endsWith('@lid')) &&
-                                                            getCleanId(chat.name) !== getCleanId(chat.id) && (
-                                                                <div className="text-[11px] text-[#00a884] font-bold leading-none mb-1">
-                                                                    {formatPhoneNumber(getCleanId(chat.id))}
-                                                                </div>
-                                                            )}
-                                                        <div className="flex items-center justify-between mt-0.5 gap-2">
-                                                            <div className="flex-1 min-w-0 flex items-center gap-1.5">
-                                                                <p className="truncate text-[13px] text-[#54656f] font-medium leading-tight flex-1 min-w-0">
-                                                                    {chat.lastMessage}
-                                                                </p>
-                                                                {primaryTag && (
-                                                                    <span
-                                                                        className="max-w-[84px] truncate px-1.5 py-0.5 rounded-full bg-[#e8f5f1] border border-[#d1eee6] text-[9px] font-bold text-[#0f766e] uppercase tracking-wide"
-                                                                        title={primaryTag}
-                                                                    >
-                                                                        {primaryTag}
-                                                                    </span>
-                                                                )}
-                                                                {extraTagCount > 0 && (
-                                                                    <span className="text-[9px] font-bold text-[#6b7280]">+{extraTagCount}</span>
-                                                                )}
-                                                            </div>
-                                                            <div className="ml-2 flex items-center gap-1.5 shrink-0">
-                                                                {assigneeName ? (
-                                                                    <button
-                                                                        type="button"
-                                                                        onClick={(e) => {
-                                                                            e.stopPropagation();
-                                                                            if (!teamUsers.length && !teamUsersLoading) fetchTeamUsers();
-                                                                            setAssignMenuContactId(prev => (prev === chat.id ? null : chat.id));
-                                                                        }}
-                                                                        className="px-1.5 py-0.5 text-[9px] rounded uppercase font-bold border tracking-tight hover:opacity-85 transition-all"
-                                                                        style={{
-                                                                            backgroundColor: withHexAlpha(assigneeColor, '20', '#f3f4f6'),
-                                                                            borderColor: withHexAlpha(assigneeColor, '66', '#d1d5db'),
-                                                                            color: textColor(assigneeColor, '#374151')
-                                                                        }}
-                                                                    >
-                                                                        {assigneeName}
-                                                                    </button>
-                                                                ) : chat.id.endsWith('@g.us') ? (
-                                                                    <span className="px-1.5 py-0.5 bg-[#f0f2f5] text-[#54656f] text-[9px] rounded uppercase font-bold border border-[#eceff1] tracking-tight">Group</span>
-                                                                ) : (
-                                                                    <button
-                                                                        type="button"
-                                                                        onClick={(e) => {
-                                                                            e.stopPropagation();
-                                                                            if (!teamUsers.length && !teamUsersLoading) fetchTeamUsers();
-                                                                            setAssignMenuContactId(prev => (prev === chat.id ? null : chat.id));
-                                                                        }}
-                                                                        className="px-1.5 py-0.5 bg-[#f8f9fa] text-[#9ca3af] text-[9px] rounded uppercase font-bold border border-[#eceff1] tracking-tight hover:bg-[#f0f2f5] transition-all"
-                                                                    >
-                                                                        Unassigned
-                                                                    </button>
-                                                                )}
-                                                            </div>
-                                                        </div>
-                                                    </div>
-                                                </div>
+                                                />
                                             </div>
                                         );
                                     }}
@@ -4838,6 +5049,44 @@ export default function App() {
                     <div className="flex-1 min-w-0 flex flex-col min-h-0 relative overflow-hidden">
                     <div className="absolute inset-0 opacity-[0.06] pointer-events-none bg-[url('https://web.whatsapp.com/img/bg-chat-tile-light_6860a4760a595861d83d.png')] bg-repeat" />
 
+                    {isMobile ? (
+                        <ChatHeader
+                            title={selectedChat?.name || 'Chat'}
+                            subtitle={selectedChat?.id.endsWith('@g.us')
+                                ? 'Group chat'
+                                : (
+                                    <>
+                                        <span className="text-[#00a884] font-bold">{formatPhoneNumber(getCleanId(selectedChat?.id))}</span>
+                                        {lastInboundMs ? (
+                                            windowOpen ? (
+                                                <span className="ml-1.5 font-semibold text-[#00a884]">
+                                                    {`${formatRemaining(windowRemainingMs || 0)} left`}
+                                                </span>
+                                            ) : null
+                                        ) : (
+                                            <span className="ml-1.5 text-[#8a9aa1]">24h: no inbound</span>
+                                        )}
+                                    </>
+                                )}
+                            isGroup={selectedChat?.id.endsWith('@g.us')}
+                            showBack
+                            onBack={() => {
+                                setSelectedChatId(null);
+                                setShowContactInfo(false);
+                            }}
+                            onOpenInfo={() => setShowContactInfo(true)}
+                            rightSlot={(
+                                <button
+                                    type="button"
+                                    onClick={handleClearChat}
+                                    className="p-2 rounded-lg hover:bg-white/90 text-[#54656f] hover:text-rose-600 transition-all"
+                                    title="Clear chat"
+                                >
+                                    <Trash2 className="w-4 h-4" />
+                                </button>
+                            )}
+                        />
+                    ) : (
                     <header className="h-[60px] shrink-0 bg-[#f0f2f5] px-3 flex items-center justify-between z-10 border-l border-[#eceff1]">
                         <div className="flex items-center gap-3 cursor-pointer" onClick={() => setShowContactInfo(true)}>
                             <div className="w-10 h-10 rounded-full bg-white flex items-center justify-center overflow-hidden border border-[#eceff1] shadow-sm">
@@ -4948,8 +5197,17 @@ export default function App() {
                             <MoreVertical className="w-5 h-5 cursor-pointer hover:text-[#111b21]" />
                         </div>
                     </header>
+                    )}
 
-                    <div className="flex-1 min-h-0 px-16 py-6 z-10 flex flex-col">
+                    {showMobileWindowClosedBanner && (
+                        <div className="absolute top-[66px] left-1/2 -translate-x-1/2 z-20 pointer-events-none">
+                            <div className="px-3 py-1.5 rounded-full bg-[#fff3e0]/95 text-[#a16207] text-[11px] font-bold border border-[#fde68a] shadow-[0_8px_24px_rgba(0,0,0,0.12)] backdrop-blur-[2px] whitespace-nowrap">
+                                24h window closed. Use template message to reply.
+                            </div>
+                        </div>
+                    )}
+
+                    <div className={`flex-1 min-h-0 z-10 flex flex-col ${isMobile ? (showMobileWindowClosedBanner ? 'px-2 pt-11 pb-3' : 'px-2 py-3') : 'px-16 py-6'}`}>
                         {lastProfileError && (
                             <div className="self-center sticky top-2 z-20 mb-2 flex items-center gap-3 bg-[#fff4e5] border border-[#ffd9b3] text-[#7a4b00] px-3 py-2 rounded-xl text-[11px] font-bold shadow-sm">
                                 <span className="flex-1">{lastProfileError}</span>
@@ -5005,21 +5263,37 @@ export default function App() {
                                         const buttons = Array.isArray(buttonsMessage?.buttons) ? buttonsMessage?.buttons : [];
                                         const listSections = Array.isArray(listMessage?.sections) ? listMessage?.sections : [];
                                         const isFailedOutgoing = msg.key.fromMe && msg.status === 'failed';
+                                        const messageTimestampLabel = msg.messageTimestamp
+                                            ? new Date(msg.messageTimestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })
+                                            : '';
 
                                         return (
                                             <div style={style} className="w-full px-1">
-                                                <div className={`w-full flex ${msg.key.fromMe ? 'justify-end' : 'justify-start'}`}>
-                                                    <div className="max-w-[85%] flex flex-col">
-                                                        <div className={`
-                                                            px-3 py-1.5 rounded-xl text-[14px] shadow-[0_1px_0.5px_rgba(0,0,0,0.1)] relative mb-1 tracking-tight
-                                                            ${msg.key.fromMe
-                                                            ? (isFailedOutgoing
-                                                                ? 'bg-[#fee2e2] border border-[#fecaca] text-[#7f1d1d] rounded-tr-none'
-                                                                : 'bg-[#d9fdd3] text-[#111b21] rounded-tr-none')
-                                                            : 'bg-white text-[#111b21] rounded-tl-none'}
-                                                        `}>
+                                                <ChatBubble
+                                                    fromMe={Boolean(msg.key.fromMe)}
+                                                    failed={isFailedOutgoing}
+                                                    senderName={messageSenderName}
+                                                    senderColor={textColor(messageSenderColor, '#6b7280')}
+                                                    timestampLabel={messageTimestampLabel}
+                                                    statusIcon={renderMessageStatus(msg)}
+                                                    footerSlot={isFailedOutgoing ? (
+                                                        <div className="mt-1 text-right">
+                                                            <button
+                                                                type="button"
+                                                                onClick={(event) => {
+                                                                    event.stopPropagation();
+                                                                    if (!msg.key?.id) return;
+                                                                    handleResendMessage(msg.key.id);
+                                                                }}
+                                                                className="text-[10px] font-bold text-[#d93025] hover:underline"
+                                                            >
+                                                                Resend
+                                                            </button>
+                                                        </div>
+                                                    ) : undefined}
+                                                >
                                                             {messageText && (
-                                                                <p className={`leading-relaxed whitespace-pre-wrap break-words ${isFailedOutgoing ? 'pr-28' : 'pr-14'}`}>
+                                                                <p className="leading-relaxed whitespace-pre-wrap break-words">
                                                                     {messageText}
                                                                 </p>
                                                             )}
@@ -5194,24 +5468,31 @@ export default function App() {
                                                                 const mediaId = msg.message?.videoMessage?.mediaId;
                                                                 const directUrl = msg.message?.videoMessage?.url;
                                                                 const cacheEntry = mediaCache[msg.key.id!] || (mediaId ? mediaCache[mediaId] : undefined);
+                                                                const videoSrc = cacheEntry
+                                                                    ? `data:${cacheEntry.mimetype};base64,${cacheEntry.data}`
+                                                                    : (directUrl || '');
                                                                 return (
-                                                                    <div className="mt-1 mb-1 max-w-sm rounded-lg overflow-hidden bg-[#fcfdfd] min-h-[100px] flex items-center justify-center relative border border-[#eceff1]">
-                                                                        {cacheEntry ? (
-                                                                            <video
-                                                                                controls
-                                                                                className="max-w-full h-auto block"
-                                                                                src={`data:${cacheEntry.mimetype};base64,${cacheEntry.data}`}
-                                                                            />
-                                                                        ) : directUrl ? (
-                                                                            <video
-                                                                                controls
-                                                                                className="max-w-full h-auto block"
-                                                                                src={directUrl}
-                                                                            />
-                                                                        ) : (
-                                                                            <div className="p-4 text-center" onClick={() => handleDownloadMedia(msg)}>
-                                                                                {renderMediaLoadingPlaceholder(msg)}
+                                                                    <div className="mt-1 mb-1 w-[280px] max-w-[78vw] rounded-xl overflow-hidden bg-[#0b141a] border border-[#eceff1]">
+                                                                        {videoSrc ? (
+                                                                            <div className="w-full aspect-[16/10] bg-black">
+                                                                                <video
+                                                                                    controls
+                                                                                    preload="metadata"
+                                                                                    playsInline
+                                                                                    className="w-full h-full object-cover block"
+                                                                                    src={videoSrc}
+                                                                                />
                                                                             </div>
+                                                                        ) : (
+                                                                            <button
+                                                                                type="button"
+                                                                                onClick={() => handleDownloadMedia(msg)}
+                                                                                className="w-full aspect-[16/10] bg-[#f8f9fa] text-[#54656f] flex flex-col items-center justify-center gap-2 px-3"
+                                                                            >
+                                                                                <Video className="w-6 h-6 text-[#00a884]" />
+                                                                                <span className="text-[11px] font-bold uppercase tracking-widest text-[#54656f]">Video Preview</span>
+                                                                                {renderMediaLoadingPlaceholder(msg, true)}
+                                                                            </button>
                                                                         )}
                                                                     </div>
                                                                 );
@@ -5237,36 +5518,7 @@ export default function App() {
                                                                 );
                                                             })()}
 
-                                                            <div className="absolute bottom-1 right-2 flex items-center gap-1">
-                                                                <span className="text-[10px] text-[#54656f]/70 font-bold">
-                                                                    {msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }) : ''}
-                                                                </span>
-                                                                {renderMessageStatus(msg)}
-                                                                {isFailedOutgoing && (
-                                                                    <button
-                                                                        type="button"
-                                                                        onClick={(event) => {
-                                                                            event.stopPropagation();
-                                                                            if (!msg.key?.id) return;
-                                                                            handleResendMessage(msg.key.id);
-                                                                        }}
-                                                                        className="text-[10px] font-bold text-[#d93025] hover:underline"
-                                                                    >
-                                                                        Resend
-                                                                    </button>
-                                                                )}
-                                                            </div>
-                                                        </div>
-                                                        {messageSenderName && (
-                                                            <div
-                                                                className="mt-0.5 px-1 text-[10px] font-medium text-right"
-                                                                style={{ color: textColor(messageSenderColor, '#6b7280') }}
-                                                            >
-                                                                {messageSenderName}
-                                                            </div>
-                                                        )}
-                                                    </div>
-                                                </div>
+                                                </ChatBubble>
                                             </div>
                                         );
                                     }}
@@ -5275,37 +5527,52 @@ export default function App() {
                         </div>
                     </div>
 
-                    <footer className="shrink-0 bg-[#f0f2f5] px-3 py-2 flex items-center gap-1.5 z-10 min-h-[54px]">
-                        <div className="flex items-center text-[#54656f]">
+                    <MessageInputBar>
+                        <div className="flex items-center gap-1.5 z-10 min-h-[54px]">
+                        <div className="relative flex items-center text-[#54656f]">
+                            {isMobile && (
+                                <button
+                                    type="button"
+                                    onClick={() => setShowMobileComposerMenu((prev) => !prev)}
+                                    className={`p-1.5 rounded-lg transition-all cursor-pointer ${showMobileComposerMenu ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
+                                    title="More actions"
+                                >
+                                    <Menu className="w-5 h-5" />
+                                </button>
+                            )}
                             <button type="button" className="p-1.5 hover:bg-white rounded-lg transition-all cursor-pointer">
                                 <Smile className="w-6 h-6" />
                             </button>
-                            <button
-                                type="button"
-                                onClick={() => openComposerMediaPicker('image')}
-                                className={`p-1.5 rounded-lg transition-all cursor-pointer ${composerMediaType === 'image' && showMediaComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
-                                title="Attach image"
-                            >
-                                <ImageIcon className="w-5 h-5" />
-                            </button>
-                            <button
-                                type="button"
-                                onClick={() => openComposerMediaPicker('document')}
-                                className={`p-1.5 rounded-lg transition-all cursor-pointer ${composerMediaType === 'document' && showMediaComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
-                                title="Attach document"
-                            >
-                                <FileIcon className="w-5 h-5" />
-                            </button>
-                            <button
-                                type="button"
-                                onClick={() => openComposerMediaPicker('video')}
-                                className={`p-1.5 rounded-lg transition-all cursor-pointer ${composerMediaType === 'video' && showMediaComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
-                                title="Attach video"
-                            >
-                                <Paperclip className="w-6 h-6 -rotate-45" />
-                            </button>
+                            {!isMobile && (
+                                <>
+                                    <button
+                                        type="button"
+                                        onClick={() => openComposerMediaPicker('image')}
+                                        className={`p-1.5 rounded-lg transition-all cursor-pointer ${composerMediaType === 'image' && showMediaComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
+                                        title="Attach image"
+                                    >
+                                        <ImageIcon className="w-5 h-5" />
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => openComposerMediaPicker('document')}
+                                        className={`p-1.5 rounded-lg transition-all cursor-pointer ${composerMediaType === 'document' && showMediaComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
+                                        title="Attach document"
+                                    >
+                                        <FileIcon className="w-5 h-5" />
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => openComposerMediaPicker('video')}
+                                        className={`p-1.5 rounded-lg transition-all cursor-pointer ${composerMediaType === 'video' && showMediaComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
+                                        title="Attach video"
+                                    >
+                                        <Paperclip className="w-6 h-6 -rotate-45" />
+                                    </button>
+                                </>
+                            )}
                         </div>
-                        {workflowStarter}
+                        {!isMobile && workflowStarter}
                         <div
                             className="flex-1 mx-1 relative"
                             onDragOver={handleComposerDragOver}
@@ -5319,9 +5586,9 @@ export default function App() {
                                     </span>
                                 </div>
                             )}
-                            {!canSendText && (
-                                <div className="absolute -top-8 left-0 px-3 py-1.5 rounded-lg bg-[#fff3e0] text-[#a16207] text-[11px] font-bold border border-[#fde68a]">
-                                    24h window closed for free text. Template message can still be sent anytime.
+                            {!canSendText && !isMobile && (
+                                <div className="absolute -top-8 left-0 px-3 py-1.5 rounded-lg text-[11px] bg-[#fff3e0] text-[#a16207] font-bold border border-[#fde68a]">
+                                    24h window closed. Use template message to reply.
                                 </div>
                             )}
                             {canSendText && quickReplyQuery !== null && (
@@ -5427,33 +5694,43 @@ export default function App() {
                                     </p>
                                 </div>
                             )}
-                                <textarea
-                                    ref={messageInputRef}
-                                    placeholder={canSendText ? 'Type a message (Enter = newline, Ctrl/Cmd+Enter = send)' : 'Type a message (24h closed - use template)'}
-                                    value={messageText}
-                                    disabled={!canSendText}
-                                    onChange={(e) => setMessageTextWithDraft(e.target.value)}
-                                    onKeyDown={(e) => {
-                                        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-                                            e.preventDefault();
-                                            if (!canSendText) {
-                                                setShowTemplateComposer(true);
-                                                return;
+                                {isMobile && !canSendText ? (
+                                    <button
+                                        type="button"
+                                        onClick={() => setShowTemplateComposer(true)}
+                                        className="w-full border border-[#f7dca2] bg-[#fff8e7] text-[#9a6700] rounded-xl px-3 py-2.5 text-[13px] font-bold text-left hover:bg-[#fff3d6] transition-all"
+                                    >
+                                        Tap here to send a template message
+                                    </button>
+                                ) : (
+                                    <textarea
+                                        ref={messageInputRef}
+                                        placeholder={canSendText ? 'Type a message (Enter = newline, Ctrl/Cmd+Enter = send)' : 'Type a message (24h closed - use template)'}
+                                        value={messageText}
+                                        disabled={!canSendText}
+                                        onChange={(e) => setMessageTextWithDraft(e.target.value)}
+                                        onKeyDown={(e) => {
+                                            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                                                e.preventDefault();
+                                                if (!canSendText) {
+                                                    setShowTemplateComposer(true);
+                                                    return;
+                                                }
+                                                if (quickReplyQuery !== null && quickReplySuggestions.length > 0) {
+                                                    handleQuickReplyPick(quickReplySuggestions[0]);
+                                                    return;
+                                                }
+                                                handleSendMessage();
                                             }
-                                            if (quickReplyQuery !== null && quickReplySuggestions.length > 0) {
+                                            if (canSendText && e.key === 'Tab' && quickReplyQuery !== null && quickReplySuggestions.length > 0) {
+                                                e.preventDefault();
                                                 handleQuickReplyPick(quickReplySuggestions[0]);
-                                                return;
                                             }
-                                            handleSendMessage();
-                                        }
-                                        if (canSendText && e.key === 'Tab' && quickReplyQuery !== null && quickReplySuggestions.length > 0) {
-                                            e.preventDefault();
-                                            handleQuickReplyPick(quickReplySuggestions[0]);
-                                        }
-                                    }}
-                                    rows={1}
-                                    className={`w-full border border-[#eceff1] rounded-lg px-3 py-2.5 text-[14px] leading-5 resize-y min-h-[44px] max-h-[132px] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20 placeholder:text-[#54656f]/50 ${canSendText ? 'bg-white text-[#111b21]' : 'bg-[#f8f9fa] text-[#9ca3af] cursor-not-allowed'}`}
-                                />
+                                        }}
+                                        rows={1}
+                                        className={`w-full border border-[#eceff1] rounded-lg px-3 py-2.5 text-[14px] leading-5 resize-y min-h-[44px] max-h-[132px] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20 placeholder:text-[#54656f]/50 ${canSendText ? 'bg-white text-[#111b21]' : 'bg-[#f8f9fa] text-[#9ca3af] cursor-not-allowed'}`}
+                                    />
+                                )}
                             {composerMediaUploading ? (
                                 <div className="mt-1 text-[11px] font-bold text-[#54656f]">
                                     Uploading attachment…
@@ -5466,15 +5743,17 @@ export default function App() {
                         </div>
                         <div className="text-[#54656f] flex items-center gap-1.5">
                             <div className="relative">
-                                <button
-                                    type="button"
-                                    onClick={() => setShowTemplateComposer(prev => !prev)}
-                                    className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-bold transition-all ${showTemplateComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'bg-white border border-[#eceff1] text-[#334155] hover:bg-[#f8fafc]'}`}
-                                    title="Send template message"
-                                >
-                                    <FileText className="w-4 h-4" />
-                                    <span>Template</span>
-                                </button>
+                                {!isMobile && (
+                                    <button
+                                        type="button"
+                                        onClick={() => setShowTemplateComposer(prev => !prev)}
+                                        className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-bold transition-all ${showTemplateComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'bg-white border border-[#eceff1] text-[#334155] hover:bg-[#f8fafc]'}`}
+                                        title="Send template message"
+                                    >
+                                        <FileText className="w-4 h-4" />
+                                        <span>Template</span>
+                                    </button>
+                                )}
                                 {showTemplateComposer && (
                                     <div className="absolute bottom-[52px] right-0 w-[460px] max-w-[90vw] bg-white border border-[#eceff1] rounded-2xl shadow-xl z-30 p-3 space-y-2">
                                         <div className="text-[11px] font-bold uppercase tracking-widest text-[#54656f]">Send Template Message</div>
@@ -5653,22 +5932,111 @@ export default function App() {
                                     </div>
                                 )}
                             </div>
-                            {canSendText ? (
-                                (messageText.trim() || hasComposerMedia) ? (
-                                    <div onClick={handleSendMessage} className="p-2.5 bg-[#00a884] shadow-sm rounded-lg cursor-pointer text-white transition-transform active:scale-95"><Send className="w-5 h-5" /></div>
-                                ) : (
-                                    <div className="p-1.5 hover:bg-white rounded-lg transition-all cursor-pointer"><Mic className="w-6 h-6" /></div>
-                                )
-                            ) : null}
+                            {canSendText && (messageText.trim() || hasComposerMedia) ? (
+                                <button
+                                    type="button"
+                                    onClick={handleSendMessage}
+                                    className="w-11 h-11 rounded-full bg-[#00a884] shadow-sm cursor-pointer text-white transition-all hover:bg-[#008f6f] active:scale-95 flex items-center justify-center"
+                                    title="Send message"
+                                >
+                                    <Send className="w-5 h-5" />
+                                </button>
+                            ) : (
+                                <button
+                                    type="button"
+                                    onClick={() => {
+                                        if (!canSendText) {
+                                            setShowTemplateComposer(true);
+                                            return;
+                                        }
+                                        // Voice recording trigger placeholder (matches existing behavior).
+                                    }}
+                                    className={`w-11 h-11 rounded-full transition-all cursor-pointer flex items-center justify-center ${canSendText ? 'bg-[#00a884] text-white hover:bg-[#008f6f]' : 'bg-[#e6ebef] text-[#7d8b95]'}`}
+                                    title={canSendText ? 'Voice record' : 'Voice message unavailable, use template'}
+                                >
+                                    <Mic className="w-5 h-5" />
+                                </button>
+                            )}
                         </div>
-                    </footer>
+                        {isMobile && (
+                            <>
+                                <div
+                                    className={`fixed inset-0 z-[205] bg-[#111b21]/45 backdrop-blur-[1px] transition-opacity duration-300 ${showMobileComposerMenu ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}
+                                    onClick={() => setShowMobileComposerMenu(false)}
+                                />
+                                <div
+                                    className={`fixed inset-0 z-[210] flex items-end transition-opacity duration-200 ${showMobileComposerMenu ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}
+                                    style={{ paddingBottom: 'max(env(safe-area-inset-bottom), 0.5rem)' }}
+                                >
+                                    <div className={`mx-2 rounded-t-[28px] rounded-b-2xl border border-[#eceff1] bg-white shadow-[0_-16px_40px_rgba(0,0,0,0.22)] transition-transform duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${showMobileComposerMenu ? 'translate-y-0' : 'translate-y-full'}`}>
+                                        <div className="pt-2 pb-1.5 flex justify-center">
+                                            <div className="h-1.5 w-12 rounded-full bg-[#d2dbe1]" />
+                                        </div>
+                                        <div className="px-4 pb-2 text-[11px] font-bold uppercase tracking-widest text-[#667781]">
+                                            Attach
+                                        </div>
+                                        <div className="px-3 pb-3 grid grid-cols-2 gap-2">
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    setShowMobileComposerMenu(false);
+                                                    openComposerMediaPicker('image');
+                                                }}
+                                                className="h-[52px] rounded-2xl border border-[#e7edf2] bg-[#f8fafb] text-[12px] font-semibold text-[#334155] hover:bg-[#eef4f6] flex items-center justify-center gap-2"
+                                            >
+                                                <ImageIcon className="w-4 h-4 text-[#54656f]" />
+                                                Image
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    setShowMobileComposerMenu(false);
+                                                    openComposerMediaPicker('document');
+                                                }}
+                                                className="h-[52px] rounded-2xl border border-[#e7edf2] bg-[#f8fafb] text-[12px] font-semibold text-[#334155] hover:bg-[#eef4f6] flex items-center justify-center gap-2"
+                                            >
+                                                <FileIcon className="w-4 h-4 text-[#54656f]" />
+                                                Document
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    setShowMobileComposerMenu(false);
+                                                    openComposerMediaPicker('video');
+                                                }}
+                                                className="h-[52px] rounded-2xl border border-[#e7edf2] bg-[#f8fafb] text-[12px] font-semibold text-[#334155] hover:bg-[#eef4f6] flex items-center justify-center gap-2"
+                                            >
+                                                <Paperclip className="w-4 h-4 -rotate-45 text-[#54656f]" />
+                                                Video
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    setShowMobileComposerMenu(false);
+                                                    setShowTemplateComposer(true);
+                                                }}
+                                                className="h-[52px] rounded-2xl border border-[#e7edf2] bg-[#f8fafb] text-[12px] font-semibold text-[#334155] hover:bg-[#eef4f6] flex items-center justify-center gap-2"
+                                            >
+                                                <FileText className="w-4 h-4 text-[#54656f]" />
+                                                Template
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </>
+                        )}
+                        </div>
+                    </MessageInputBar>
 
                     </div>
 
                     {/* Contact Info Sidebar */}
                     {showContactInfo && (
-                        <aside className="w-[360px] max-w-[42vw] min-w-[320px] h-full bg-white border-l border-[#eceff1] shadow-[-12px_0_28px_rgba(0,0,0,0.08)] flex flex-col overflow-hidden z-20">
-                                <header className="h-[54px] bg-[#f0f2f5] px-4 flex items-center gap-4 text-[#111b21] border-b border-[#eceff1]">
+                        <aside className={isMobile
+                            ? "fixed inset-0 z-[220] bg-white flex flex-col overflow-hidden"
+                            : "w-[360px] max-w-[42vw] min-w-[320px] h-full bg-white border-l border-[#eceff1] shadow-[-12px_0_28px_rgba(0,0,0,0.08)] flex flex-col overflow-hidden z-20"}
+                        >
+                                <header className="h-[54px] bg-[#f0f2f5] px-3 sm:px-4 flex items-center gap-4 text-[#111b21] border-b border-[#eceff1]">
                                     <X className="w-5 h-5 cursor-pointer hover:text-[#54656f]" onClick={() => setShowContactInfo(false)} />
                                     <h2 className="text-[14px] font-bold">Contact Info</h2>
                                 </header>
@@ -5882,7 +6250,7 @@ export default function App() {
                         </aside>
                     )}
                 </div>
-            ) : (
+            ) : isMobile ? null : (
                 <div className="flex-1 flex flex-col items-center justify-center bg-[#fcfdfd] relative">
                     <div className="absolute inset-x-0 bottom-0 h-1.5 bg-[#00a884] z-20" />
                     <div className="text-center relative z-10 px-6">
@@ -6000,6 +6368,7 @@ export default function App() {
                         profileId={activeProfileId || ''}
                         sessionToken={session?.access_token || null}
                         isAdmin={isAdmin}
+                        isSuperAdmin={isSuperAdmin}
                         quickReplies={quickReplies}
                         quickRepliesLoading={quickRepliesLoading}
                         quickRepliesSaving={quickRepliesSaving}
@@ -6024,7 +6393,7 @@ export default function App() {
                             <X className="w-6 h-6 text-[#54656f]" />
                         </button>
                     </header>
-                    <div className="flex-1 overflow-y-auto p-8 custom-scrollbar">
+                    <div className={`flex-1 overflow-y-auto custom-scrollbar ${isMobile ? 'p-4 pb-[92px]' : 'p-8'}`}>
                         <div className="bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] mb-8">
                             <div className="flex flex-col lg:flex-row lg:items-end gap-4">
                                 <div>
@@ -6307,6 +6676,7 @@ export default function App() {
 
             {/* Admin View is handled above - deleting redundant block if any */}
 
+            {!isMobile && (
             <div className="fixed bottom-6 right-6 z-[200] flex flex-col items-end gap-3">
                 {import.meta.env.DEV && (
                     <DebugButton
@@ -6436,6 +6806,7 @@ export default function App() {
                     )}
                 </button>
             </div>
+            )}
 
             <style dangerouslySetInnerHTML={{
                 __html: `
@@ -6466,6 +6837,7 @@ export default function App() {
                 <AutomationsView
                     workflows={automationWorkflows}
                     workflowsLoading={workflowsLoading}
+                    isMobileView={isMobile}
                     profileId={activeProfileId}
                     sessionToken={session?.access_token || null}
                     apiBaseUrl={SOCKET_URL}
@@ -6483,7 +6855,7 @@ export default function App() {
                     apiBaseUrl={SOCKET_URL}
                 />
             ) : workspaceSection === 'more' ? (
-                <div className="h-screen pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans">
+                <div className={`h-screen pt-[64px] lg:pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans ${shouldShowMobileBottomNav ? 'pb-[76px]' : ''}`}>
                     <div className="h-full p-6 overflow-y-auto custom-scrollbar">
                         <div className="max-w-3xl mx-auto space-y-4">
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -6529,6 +6901,7 @@ export default function App() {
             ) : workspaceSection === 'contacts' ? (
                 <ContactsView
                     contactsList={contactsList}
+                    isMobileView={isMobile}
                     teamUsersLoading={teamUsersLoading}
                     teamUsers={teamUsers}
                     contactsSearchQuery={contactsSearchQuery}
@@ -6544,7 +6917,7 @@ export default function App() {
                     }}
                 />
             ) : (
-                <div className="h-screen pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans">
+                <div className={`h-screen pt-[64px] lg:pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans ${shouldShowMobileBottomNav ? 'pb-[76px]' : ''}`}>
                     <div className="h-full flex items-center justify-center p-6">
                         <div className="w-full max-w-xl bg-white border border-[#eceff1] rounded-3xl p-8 shadow-[0_12px_40px_rgba(0,0,0,0.06)]">
                             <h2 className="text-2xl font-black text-[#111b21] mb-3">{activeWorkspaceLabel}</h2>
@@ -6560,6 +6933,30 @@ export default function App() {
                         </div>
                     </div>
                 </div>
+            )}
+
+            {shouldShowMobileBottomNav && mobileWorkspaceTabs.length > 0 && (
+                <BottomNavBar
+                    items={mobileWorkspaceTabs.map((tab) => ({
+                        id: tab.id,
+                        label: tab.label,
+                        icon: tab.icon,
+                        badgeCount: tab.id === 'team-inbox' ? totalUnreadBadgeCount : undefined
+                    }))}
+                    activeId={showAnalytics ? 'more' : workspaceSection}
+                    onSelect={(id) => {
+                        if (id === 'more') {
+                            openAnalyticsFromMore();
+                            return;
+                        }
+                        setShowAnalytics(false);
+                        setShowContactInfo(false);
+                        if (id === 'team-inbox') {
+                            setSelectedChatId(null);
+                        }
+                        setWorkspaceSection(id as typeof workspaceSection);
+                    }}
+                />
             )}
 
             {assignMenuContactId && !assignMenuContactId.endsWith('@g.us') && (

@@ -164,18 +164,22 @@ function humanizeVariableLabel(key: string): string {
 
 function sanitizeAwaitingConfirmation(raw: any): AwaitingConfirmationState | undefined {
     if (!raw || typeof raw !== 'object') return undefined
-    const fieldsRaw = Array.isArray(raw.fields) ? raw.fields : []
+    const fieldsRaw: unknown[] = Array.isArray(raw.fields) ? raw.fields : []
     const fields = fieldsRaw
-        .map((entry: any) => {
-            const key = normalizeVariableKey(entry?.key ?? entry)
+        .map((entry: unknown): { key: string; label: string } | null => {
+            const entryObj =
+                entry && typeof entry === 'object'
+                    ? (entry as { key?: unknown; label?: unknown })
+                    : null
+            const key = normalizeVariableKey(entryObj?.key ?? entry)
             if (!key) return null
-            const labelRaw = typeof entry?.label === 'string' ? entry.label.trim() : ''
+            const labelRaw = typeof entryObj?.label === 'string' ? entryObj.label.trim() : ''
             return {
                 key,
                 label: labelRaw || humanizeVariableLabel(key) || key
             }
         })
-        .filter((entry): entry is { key: string; label: string } => Boolean(entry))
+        .filter((entry): entry is { key: string; label: string } => entry !== null)
     if (fields.length === 0) return undefined
     return {
         fields,
@@ -187,12 +191,13 @@ function sanitizeAwaitingConfirmation(raw: any): AwaitingConfirmationState | und
 }
 
 function resolveConfirmationFields(action: any, state: WorkflowState): Array<{ key: string; label: string }> {
-    const actionFields = Array.isArray(action?.fields) ? action.fields : []
+    const actionFields: unknown[] = Array.isArray(action?.fields) ? action.fields : []
     const normalizedActionFields = actionFields
-        .map((value: any) => normalizeVariableKey(value))
-        .filter((value): value is string => Boolean(value))
+        .map((value: unknown): string => normalizeVariableKey(value))
+        .filter((value): boolean => Boolean(value))
     if (normalizedActionFields.length > 0) {
-        return Array.from(new Set(normalizedActionFields)).map((key) => ({
+        const uniqueActionFields = Array.from(new Set<string>(normalizedActionFields))
+        return uniqueActionFields.map((key) => ({
             key,
             label: humanizeVariableLabel(key) || key
         }))

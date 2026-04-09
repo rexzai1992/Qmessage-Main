@@ -169,6 +169,7 @@ type WebhookViewProps = {
     profileId: string;
     sessionToken?: string | null;
     isAdmin?: boolean;
+    isSuperAdmin?: boolean;
     quickReplies: QuickReply[];
     quickRepliesLoading: boolean;
     quickRepliesSaving: boolean;
@@ -183,6 +184,7 @@ export default function WebhookView({
     profileId,
     sessionToken,
     isAdmin,
+    isSuperAdmin = false,
     quickReplies,
     quickRepliesLoading,
     quickRepliesSaving,
@@ -224,7 +226,7 @@ export default function WebhookView({
     const [reminderSaving, setReminderSaving] = useState(false);
     const [connectedBusinesses, setConnectedBusinesses] = useState<any[]>([]);
     const [connectedPaging, setConnectedPaging] = useState<any | null>(null);
-    const [connectedLoading, setConnectedLoading] = useState(Boolean(isAdmin));
+    const [connectedLoading, setConnectedLoading] = useState(Boolean(isSuperAdmin));
     const [connectedError, setConnectedError] = useState<string | null>(null);
     const [connectedAppId, setConnectedAppId] = useState('');
     const [callSettingsLoading, setCallSettingsLoading] = useState(Boolean(sessionToken));
@@ -259,7 +261,7 @@ export default function WebhookView({
     const [connectLoading, setConnectLoading] = useState(false);
     const [connectError, setConnectError] = useState<string | null>(null);
     const [clientConnections, setClientConnections] = useState<any[]>([]);
-    const [clientLoading, setClientLoading] = useState(Boolean(isAdmin));
+    const [clientLoading, setClientLoading] = useState(Boolean(isSuperAdmin));
     const [clientError, setClientError] = useState<string | null>(null);
     const [teamUsers, setTeamUsers] = useState<TeamUser[]>([]);
     const [teamLoading, setTeamLoading] = useState(Boolean(sessionToken));
@@ -341,7 +343,7 @@ export default function WebhookView({
         fetchWebhooks();
         fetchAutomation();
         fetchWindowReminder();
-        if (isAdmin) {
+        if (isSuperAdmin) {
             fetchConnectedBusinesses();
             fetchClientConnections();
         }
@@ -354,7 +356,7 @@ export default function WebhookView({
             fetchBusinessProfile();
         }
         onRefreshQuickReplies();
-    }, [profileId, onRefreshQuickReplies, isAdmin, sessionToken, showCallSettings]);
+    }, [profileId, onRefreshQuickReplies, isSuperAdmin, sessionToken, showCallSettings]);
 
     useEffect(() => {
         if (!sessionToken) return;
@@ -2976,7 +2978,7 @@ export default function WebhookView({
                     </div>
                 </div>
 
-                {isAdmin && (
+                {isSuperAdmin && (
                     <div id="settings-connected-clients" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
                         <div className="flex items-center justify-between mb-6">
                             <div>
@@ -3083,7 +3085,7 @@ export default function WebhookView({
                     </div>
                 )}
 
-                {isAdmin && (
+                {isSuperAdmin && (
                     <div id="settings-connected-businesses" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
                     <div className="flex items-center justify-between mb-6">
                         <div>

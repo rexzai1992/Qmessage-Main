@@ -19,6 +19,7 @@ type SettingsViewProps = {
     profileId: string;
     sessionToken: string | null;
     isAdmin: boolean;
+    isSuperAdmin?: boolean;
     quickReplies: any[];
     quickRepliesLoading: boolean;
     quickRepliesSaving: boolean;
@@ -38,6 +39,7 @@ export default function SettingsView({
     profileId,
     sessionToken,
     isAdmin,
+    isSuperAdmin = false,
     quickReplies,
     quickRepliesLoading,
     quickRepliesSaving,
@@ -50,37 +52,37 @@ export default function SettingsView({
 }: SettingsViewProps) {
     return (
         <div className="fixed inset-0 bg-[#f8f9fa] z-[150] flex flex-col">
-            <header className="h-[70px] bg-[#f0f2f5] px-6 flex items-center justify-between border-b border-[#eceff1]">
+            <header className="h-[64px] lg:h-[70px] bg-[#f0f2f5] px-3 sm:px-4 lg:px-6 flex items-center justify-between border-b border-[#eceff1]">
                 <div className="flex items-center gap-4">
-                    <Settings className="text-[#00a884] w-8 h-8" />
-                    <h1 className="text-xl font-bold text-[#111b21]">Settings</h1>
+                    <Settings className="text-[#00a884] w-6 h-6 lg:w-8 lg:h-8" />
+                    <h1 className="text-lg lg:text-xl font-bold text-[#111b21]">Settings</h1>
                 </div>
                 <div className="flex items-center gap-3">
                     <button
                         onClick={onSignOut}
-                        className="px-4 py-2 rounded-xl bg-white text-rose-500 font-bold border border-[#eceff1] hover:bg-rose-50 transition-all flex items-center gap-2"
+                        className="px-3 lg:px-4 py-2 rounded-xl bg-white text-rose-500 font-bold border border-[#eceff1] hover:bg-rose-50 transition-all flex items-center gap-2"
                     >
                         <LogOut className="w-4 h-4" />
-                        Log Out
+                        <span className="hidden sm:inline">Log Out</span>
                     </button>
                     <button onClick={onClose} className="p-2 hover:bg-white rounded-xl transition-all">
                         <X className="w-6 h-6 text-[#54656f]" />
                     </button>
                 </div>
             </header>
-            <div className="flex-1 flex overflow-hidden">
-                <aside className="w-64 bg-white border-r border-[#eceff1] px-5 py-6 overflow-y-auto">
+            <div className="flex-1 flex flex-col lg:flex-row overflow-hidden">
+                <aside className="w-full lg:w-64 bg-white border-b lg:border-b-0 lg:border-r border-[#eceff1] px-3 lg:px-5 py-3 lg:py-6 overflow-x-auto lg:overflow-y-auto">
                     <p className="text-[10px] font-black uppercase tracking-widest text-[#54656f] mb-4">Settings</p>
-                    <div className="space-y-6">
+                    <div className="space-y-4 lg:space-y-6">
                         {settingsNav.map((section) => (
                             <div key={section.group}>
                                 <p className="text-[10px] font-black uppercase tracking-widest text-[#8696a0] mb-2">{section.group}</p>
-                                <div className="flex flex-col gap-2">
+                                <div className="flex lg:flex-col gap-2 overflow-x-auto lg:overflow-visible pb-1 lg:pb-0">
                                     {section.items.map((item) => (
                                         <button
                                             key={item.id}
                                             onClick={() => onScrollToSettingsSection(item.id)}
-                                            className="text-left px-3 py-2 rounded-xl text-sm font-bold text-[#111b21] hover:bg-[#f0f2f5] transition-all"
+                                            className="text-left whitespace-nowrap px-3 py-2 rounded-xl text-sm font-bold text-[#111b21] hover:bg-[#f0f2f5] transition-all"
                                         >
                                             {item.label}
                                         </button>
@@ -103,6 +105,7 @@ export default function SettingsView({
                             profileId={profileId}
                             sessionToken={sessionToken}
                             isAdmin={isAdmin}
+                            isSuperAdmin={isSuperAdmin}
                             quickReplies={quickReplies}
                             quickRepliesLoading={quickRepliesLoading}
                             quickRepliesSaving={quickRepliesSaving}

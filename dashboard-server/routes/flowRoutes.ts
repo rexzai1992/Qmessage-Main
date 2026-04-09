@@ -1,7 +1,15 @@
 import type { Express } from 'express'
 
 export function registerFlowRoutes(app: Express, ctx: any) {
-    const { supabase, getCompanyIdForProfile, parseDateInput, toDayKey, lowerBound, WINDOW_MS } = ctx
+    const {
+        supabase,
+        parseDateInput,
+        toDayKey,
+        lowerBound,
+        WINDOW_MS,
+        resolveProfileAccess,
+        requireSupabaseUserMiddleware
+    } = ctx
 
     const isMissingColumnInSchemaCache = (error: any, column: string): boolean => {
         const raw = `${error?.message || ''} ${error?.details || ''} ${error?.hint || ''}`.toLowerCase()
@@ -12,16 +20,15 @@ export function registerFlowRoutes(app: Express, ctx: any) {
         res.send('Dashboard Server Running')
     })
 
-    app.get('/api/flows', async (req: any, res: any) => {
+    app.get('/api/flows', requireSupabaseUserMiddleware, async (req: any, res: any) => {
         try {
-            const profileId = req.query.profileId || 'default'
-            const companyId = await getCompanyIdForProfile(profileId)
-            if (!companyId) return res.json({ workflows: [] })
+            const access = await resolveProfileAccess(req, res)
+            if (!access) return
 
             const { data, error } = await supabase
                 .from('workflows')
                 .select('*')
-                .eq('company_id', companyId)
+                .eq('company_id', access.companyId)
 
             if (error) {
                 return res.status(500).json({ success: false, error: error.message })
@@ -50,11 +57,10 @@ export function registerFlowRoutes(app: Express, ctx: any) {
         }
     })
 
-    app.post('/api/flows', async (req: any, res: any) => {
+    app.post('/api/flows', requireSupabaseUserMiddleware, async (req: any, res: any) => {
         try {
-            const profileId = req.query.profileId || 'default'
-            const companyId = await getCompanyIdForProfile(profileId)
-            if (!companyId) return res.status(400).json({ success: false, error: 'Company not found' })
+            const access = await resolveProfileAccess(req, res)
+            if (!access) return
 
             const payload = req.body?.workflows || req.body
             if (!Array.isArray(payload)) {
@@ -79,7 +85,7 @@ export function registerFlowRoutes(app: Express, ctx: any) {
 
                 return {
                     id: wf.id,
-                    company_id: companyId,
+                    company_id: access.companyId,
                     name: workflowName,
                     trigger_keyword: wf.trigger_keyword || wf.triggerKeyword || '',
                     run_on_new_chat: runOnNewChat,
@@ -116,13 +122,11 @@ export function registerFlowRoutes(app: Express, ctx: any) {
         }
     })
 
-    app.get('/api/analytics', async (req: any, res: any) => {
+    app.get('/api/analytics', requireSupabaseUserMiddleware, async (req: any, res: any) => {
         try {
-            const profileId = req.query.profileId || 'default'
-            const companyId = await getCompanyIdForProfile(profileId)
-            if (!companyId) {
-                return res.status(400).json({ success: false, error: 'Company not found' })
-            }
+            const access = await resolveProfileAccess(req, res)
+            if (!access) return
+            const companyId = access.companyId
 
             const now = new Date()
             const startDate = parseDateInput(req.query.start) || new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000)

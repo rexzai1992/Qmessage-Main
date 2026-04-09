@@ -173,7 +173,7 @@ export default function Login({
     const activeMessage = msg || forcedMessage || ''
 
     return (
-        <div className="min-h-screen bg-[#fcfdfd] text-[#111b21] flex items-center justify-center overflow-hidden font-sans px-6 relative">
+        <div className="min-h-screen bg-[#fcfdfd] text-[#111b21] flex items-center justify-center overflow-hidden font-sans px-4 sm:px-6 relative">
             <div className="w-full max-w-md flex flex-col items-center">
                 {/* Decorative background elements - lighter flow */}
                 <div className="absolute top-1/4 left-1/4 w-64 h-64 bg-[#00a884] rounded-full filter blur-[120px] opacity-5 animate-pulse"></div>
@@ -191,8 +191,8 @@ export default function Login({
                         <h1 className="text-2xl font-bold tracking-tight">QMessage <span className="text-[#00a884]">SaaS</span></h1>
                     </div>
 
-                    <div className="bg-white p-10 rounded-3xl border border-[#eceff1] shadow-[0_20px_50px_rgba(0,0,0,0.04)] relative">
-                        <div className="mb-10 text-center lg:text-left">
+                    <div className="bg-white p-5 sm:p-8 lg:p-10 rounded-2xl sm:rounded-3xl border border-[#eceff1] shadow-[0_20px_50px_rgba(0,0,0,0.04)] relative">
+                        <div className="mb-8 sm:mb-10 text-center lg:text-left">
                             <h2 className="text-2xl font-bold mb-2 text-[#111b21]">
                                 {mode === 'login' ? 'Welcome Back' : 'Create Company Account'}
                             </h2>
@@ -201,7 +201,7 @@ export default function Login({
                             </p>
                         </div>
 
-                        <div className="flex bg-[#f0f2f5] p-1 rounded-2xl mb-8 border border-[#eceff1]">
+                        <div className="flex bg-[#f0f2f5] p-1 rounded-2xl mb-6 sm:mb-8 border border-[#eceff1]">
                             <button
                                 onClick={() => setMode('login')}
                                 className={`flex-1 py-3 rounded-xl text-sm font-bold transition-all duration-300 ${mode === 'login' ? 'bg-white text-[#00a884] shadow-sm' : 'text-[#54656f] hover:text-[#111b21]'}`}
@@ -216,7 +216,7 @@ export default function Login({
                             </button>
                         </div>
 
-                        <form onSubmit={handleAuth} className="space-y-6">
+                        <form onSubmit={handleAuth} className="space-y-5 sm:space-y-6">
                             <div className="space-y-2">
                                 <label className="text-xs font-bold text-[#54656f] uppercase tracking-wider ml-1">Company ID</label>
                                 <input

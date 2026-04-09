@@ -5,6 +5,7 @@ import { uploadFileToCompanyStorage } from '../media/uploadToCompanyStorage';
 type AutomationsViewProps = {
     workflows: any[];
     workflowsLoading: boolean;
+    isMobileView?: boolean;
     profileId: string | null;
     sessionToken: string | null;
     apiBaseUrl: string;
@@ -133,6 +134,7 @@ const validateCommandsForSave = (commands: ConversationalCommand[]): { commands:
 export default function AutomationsView({
     workflows,
     workflowsLoading,
+    isMobileView = false,
     profileId,
     sessionToken,
     apiBaseUrl,
@@ -827,9 +829,9 @@ export default function AutomationsView({
     };
 
     return (
-        <div className="h-screen pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans">
-            <div className="h-full max-w-6xl mx-auto flex flex-col p-4 md:p-6 gap-3 overflow-hidden">
-                <div className="bg-white border border-[#e6ebef] rounded-2xl p-4 md:p-5">
+        <div className="h-screen pt-[64px] lg:pt-[72px] pb-[76px] lg:pb-0 bg-[#f8f9fa] text-[#111b21] font-sans">
+            <div className={`h-full max-w-6xl mx-auto flex flex-col p-3 sm:p-4 md:p-6 gap-3 ${isMobileView ? 'overflow-y-auto custom-scrollbar' : 'overflow-hidden'}`}>
+                <div className={isMobileView ? 'px-1 py-1' : 'bg-white border border-[#e6ebef] rounded-2xl p-4 md:p-5'}>
                     <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
                         <div>
                             <h2 className="text-lg md:text-xl font-semibold text-[#111b21] tracking-tight">Automations</h2>
@@ -837,28 +839,30 @@ export default function AutomationsView({
                                 Your saved workflows for this company profile.
                             </p>
                         </div>
-                        <div className="flex items-center gap-1.5">
-                            <button
-                                type="button"
-                                {...bindOpenHandlers(onCreateWorkflow)}
-                                className="h-8 px-3 rounded-lg bg-[#00a884] text-white text-[10px] font-semibold uppercase tracking-wide hover:bg-[#008f6f] transition-all inline-flex items-center gap-1 cursor-pointer"
-                            >
-                                <Plus className="w-3 h-3" />
-                                New Automation
-                            </button>
-                            <button
-                                type="button"
-                                {...bindOpenHandlers(handleOpenWorkflowBuilder)}
-                                className="h-8 px-3 rounded-lg border border-[#d8dee4] bg-white text-[#1f2a33] text-[10px] font-semibold uppercase tracking-wide hover:bg-[#f7f9fb] transition-all inline-flex items-center gap-1 cursor-pointer pointer-events-auto"
-                            >
-                                <Workflow className="w-3 h-3" />
-                                Open Workflow Builder
-                            </button>
-                        </div>
+                        {!isMobileView && (
+                            <div className="flex items-center gap-1.5">
+                                <button
+                                    type="button"
+                                    {...bindOpenHandlers(onCreateWorkflow)}
+                                    className="h-8 px-3 rounded-lg bg-[#00a884] text-white text-[10px] font-semibold uppercase tracking-wide hover:bg-[#008f6f] transition-all inline-flex items-center gap-1 cursor-pointer"
+                                >
+                                    <Plus className="w-3 h-3" />
+                                    New Automation
+                                </button>
+                                <button
+                                    type="button"
+                                    {...bindOpenHandlers(handleOpenWorkflowBuilder)}
+                                    className="h-8 px-3 rounded-lg border border-[#d8dee4] bg-white text-[#1f2a33] text-[10px] font-semibold uppercase tracking-wide hover:bg-[#f7f9fb] transition-all inline-flex items-center gap-1 cursor-pointer pointer-events-auto"
+                                >
+                                    <Workflow className="w-3 h-3" />
+                                    Open Workflow Builder
+                                </button>
+                            </div>
+                        )}
                     </div>
                 </div>
 
-                <div className="bg-white border border-[#e6ebef] rounded-2xl p-4 md:p-5">
+                <div className={isMobileView ? 'px-1 py-1' : 'bg-white border border-[#e6ebef] rounded-2xl p-4 md:p-5'}>
                     <div className="flex items-center justify-between gap-3">
                         <div>
                             <h3 className="text-base md:text-lg font-semibold text-[#111b21] tracking-tight">Automation Tools</h3>
@@ -915,9 +919,9 @@ export default function AutomationsView({
                     </div>
                 </div>
 
-                <div className="flex-1 min-h-0 bg-white border border-[#e6ebef] rounded-2xl overflow-hidden">
+                <div className={isMobileView ? 'pb-3' : 'flex-1 min-h-0 bg-white border border-[#e6ebef] rounded-2xl overflow-hidden'}>
                     {workflowsLoading ? (
-                        <div className="h-full overflow-y-auto custom-scrollbar p-4 md:p-5">
+                        <div className={isMobileView ? 'p-2' : 'h-full overflow-y-auto custom-scrollbar p-4 md:p-5'}>
                             <div className="animate-pulse space-y-3">
                                 {workflowSkeletonRows.map((row) => (
                                     <div
@@ -951,18 +955,22 @@ export default function AutomationsView({
                             <Workflow className="w-12 h-12 text-[#aebac1] mb-3" />
                             <p className="text-[#111b21] font-bold">No workflows yet</p>
                             <p className="text-xs text-[#8696a0] mt-1 mb-4">
-                                Create your first automation workflow in Chatflow builder.
+                                {isMobileView
+                                    ? 'No automations configured yet.'
+                                    : 'Create your first automation workflow in Chatflow builder.'}
                             </p>
-                            <button
-                                type="button"
-                                {...bindOpenHandlers(onCreateWorkflow)}
-                                className="h-8 px-3 rounded-lg bg-[#00a884] text-white text-[10px] font-semibold uppercase tracking-wide hover:bg-[#008f6f] transition-all inline-flex items-center gap-1 cursor-pointer"
-                            >
-                                Create Workflow
-                            </button>
+                            {!isMobileView && (
+                                <button
+                                    type="button"
+                                    {...bindOpenHandlers(onCreateWorkflow)}
+                                    className="h-8 px-3 rounded-lg bg-[#00a884] text-white text-[10px] font-semibold uppercase tracking-wide hover:bg-[#008f6f] transition-all inline-flex items-center gap-1 cursor-pointer"
+                                >
+                                    Create Workflow
+                                </button>
+                            )}
                         </div>
                     ) : (
-                        <div className="h-full overflow-y-auto custom-scrollbar">
+                        <div className={isMobileView ? '' : 'h-full overflow-y-auto custom-scrollbar'}>
                             <div className="hidden md:grid grid-cols-12 gap-2 px-4 py-2 border-b border-[#eef2f5] bg-[#fcfdfe]">
                                 <span className="col-span-3 text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">Workflow</span>
                                 <span className="col-span-3 text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">Trigger</span>
@@ -983,15 +991,16 @@ export default function AutomationsView({
                                         if (workflowId) onOpenBuilder(workflowId);
                                         else handleOpenWorkflowBuilder();
                                     };
+                                    const rowHandlers = isMobileView ? {} : bindOpenHandlers(openRowBuilder);
                                     return (
                                         <div
                                             key={`automation-workflow-${workflowLabel}-${idx}`}
-                                            {...bindOpenHandlers(openRowBuilder)}
-                                            className="grid grid-cols-12 gap-2 px-4 py-3 hover:bg-[#fafcfd] transition-colors cursor-pointer"
+                                            {...rowHandlers}
+                                            className={`grid grid-cols-12 gap-2 px-4 py-3 transition-colors ${isMobileView ? '' : 'hover:bg-[#fafcfd] cursor-pointer'}`}
                                         >
                                             <div className="col-span-12 md:col-span-3 min-w-0">
                                                 <p className="text-[12px] font-semibold text-[#111b21] truncate">{workflowLabel}</p>
-                                                {!workflowName && (
+                                                {!workflowName && !isMobileView && (
                                                     <p className="text-[10px] text-[#8c9aa4] mt-0.5">Set name in workflow builder</p>
                                                 )}
                                             </div>
@@ -1015,52 +1024,56 @@ export default function AutomationsView({
                                                 </span>
                                             </div>
 
-                                            <div className="col-span-6 md:col-span-4 flex items-center justify-end gap-1.5">
-                                                <button
-                                                    type="button"
-                                                    disabled={!workflowId}
-                                                    onClick={(event) => {
-                                                        event.stopPropagation();
-                                                        if (!workflowId) return;
-                                                        runOncePerTap(() => onOpenBuilder(workflowId));
-                                                    }}
-                                                    onMouseDown={(event) => {
-                                                        event.stopPropagation();
-                                                        if (!workflowId) return;
-                                                        runOncePerTap(() => onOpenBuilder(workflowId));
-                                                    }}
-                                                    onTouchStart={(event) => {
-                                                        event.stopPropagation();
-                                                        if (!workflowId) return;
-                                                        runOncePerTap(() => onOpenBuilder(workflowId));
-                                                    }}
-                                                    className="h-7 px-2.5 rounded-md bg-[#00a884] text-white text-[9px] font-semibold uppercase tracking-wide hover:bg-[#008f6f] transition-all cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
-                                                >
-                                                    Builder
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    disabled={!workflowId}
-                                                    onClick={(event) => {
-                                                        event.stopPropagation();
-                                                        if (!workflowId) return;
-                                                        runOncePerTap(() => onCopyWorkflow(workflowId));
-                                                    }}
-                                                    onMouseDown={(event) => {
-                                                        event.stopPropagation();
-                                                        if (!workflowId) return;
-                                                        runOncePerTap(() => onCopyWorkflow(workflowId));
-                                                    }}
-                                                    onTouchStart={(event) => {
-                                                        event.stopPropagation();
-                                                        if (!workflowId) return;
-                                                        runOncePerTap(() => onCopyWorkflow(workflowId));
-                                                    }}
-                                                    className="h-7 px-2.5 rounded-md border border-[#dbe2e8] bg-white text-[#334155] text-[9px] font-semibold uppercase tracking-wide transition-all inline-flex items-center justify-center gap-1 hover:bg-[#f8fafc] disabled:opacity-60 disabled:cursor-not-allowed"
-                                                >
-                                                    <Copy className="w-3 h-3" />
-                                                    Copy
-                                                </button>
+                                            <div className="col-span-6 md:col-span-4 flex items-center justify-start md:justify-end gap-1.5">
+                                                {!isMobileView && (
+                                                    <>
+                                                        <button
+                                                            type="button"
+                                                            disabled={!workflowId}
+                                                            onClick={(event) => {
+                                                                event.stopPropagation();
+                                                                if (!workflowId) return;
+                                                                runOncePerTap(() => onOpenBuilder(workflowId));
+                                                            }}
+                                                            onMouseDown={(event) => {
+                                                                event.stopPropagation();
+                                                                if (!workflowId) return;
+                                                                runOncePerTap(() => onOpenBuilder(workflowId));
+                                                            }}
+                                                            onTouchStart={(event) => {
+                                                                event.stopPropagation();
+                                                                if (!workflowId) return;
+                                                                runOncePerTap(() => onOpenBuilder(workflowId));
+                                                            }}
+                                                            className="h-7 px-2.5 rounded-md bg-[#00a884] text-white text-[9px] font-semibold uppercase tracking-wide hover:bg-[#008f6f] transition-all cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+                                                        >
+                                                            Builder
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            disabled={!workflowId}
+                                                            onClick={(event) => {
+                                                                event.stopPropagation();
+                                                                if (!workflowId) return;
+                                                                runOncePerTap(() => onCopyWorkflow(workflowId));
+                                                            }}
+                                                            onMouseDown={(event) => {
+                                                                event.stopPropagation();
+                                                                if (!workflowId) return;
+                                                                runOncePerTap(() => onCopyWorkflow(workflowId));
+                                                            }}
+                                                            onTouchStart={(event) => {
+                                                                event.stopPropagation();
+                                                                if (!workflowId) return;
+                                                                runOncePerTap(() => onCopyWorkflow(workflowId));
+                                                            }}
+                                                            className="h-7 px-2.5 rounded-md border border-[#dbe2e8] bg-white text-[#334155] text-[9px] font-semibold uppercase tracking-wide transition-all inline-flex items-center justify-center gap-1 hover:bg-[#f8fafc] disabled:opacity-60 disabled:cursor-not-allowed"
+                                                        >
+                                                            <Copy className="w-3 h-3" />
+                                                            Copy
+                                                        </button>
+                                                    </>
+                                                )}
                                                 <button
                                                     type="button"
                                                     disabled={!workflowId}
