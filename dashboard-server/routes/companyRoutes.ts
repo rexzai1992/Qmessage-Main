@@ -786,6 +786,24 @@ app.post('/api/company/quick-replies', requireSupabaseUserMiddleware, async (req
     }
 })
 
+app.get('/api/company/me', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    try {
+        const access = await resolveCompanyAccess(req, res, 'agent')
+        if (!access) return
+
+        return res.json({
+            success: true,
+            data: {
+                id: access.user.id,
+                role: access.role,
+                companyId: access.companyId
+            }
+        })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error.message })
+    }
+})
+
 // Team user management (company-level)
 app.get('/api/company/team-users', requireSupabaseUserMiddleware, async (req: any, res: any) => {
     try {

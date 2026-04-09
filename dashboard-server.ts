@@ -660,31 +660,62 @@ async function ensureUserRoleMembership(user: any, companyId: string): Promise<T
     const userId = typeof user?.id === 'string' ? user.id : ''
     if (!userId || !companyId) return 'agent'
 
-    const { data: existing, error: existingError } = await supabase
+    const { data: companyMembership, error: companyMembershipError } = await supabase
         .from('user_roles')
         .select('user_id, role, company_id')
         .eq('user_id', userId)
+        .eq('company_id', companyId)
         .maybeSingle()
 
-    if (existingError) {
-        console.warn(`[${userId}] Failed to load user role:`, existingError.message)
+    if (companyMembershipError) {
+        console.warn(`[${userId}] Failed to load company role:`, companyMembershipError.message)
     }
 
-    if (existing?.user_id) {
-        const role = normalizeTeamRole(existing.role)
-        const updates: any = {}
-        if (existing.company_id !== companyId) updates.company_id = companyId
-        if (existing.role !== role) updates.role = role
-        if (Object.keys(updates).length > 0) {
+    if (companyMembership?.user_id) {
+        const role = normalizeTeamRole(companyMembership.role)
+        if (companyMembership.role !== role) {
             const { error: updateError } = await supabase
                 .from('user_roles')
-                .update(updates)
+                .update({ role })
                 .eq('user_id', userId)
+                .eq('company_id', companyId)
             if (updateError) {
-                console.warn(`[${userId}] Failed to normalize user role:`, updateError.message)
+                console.warn(`[${userId}] Failed to normalize company role:`, updateError.message)
             }
         }
         return role
+    }
+
+    // Legacy fallback: upgrade old rows where company_id was null into the scoped company row.
+    const { data: legacyMembership, error: legacyMembershipError } = await supabase
+        .from('user_roles')
+        .select('user_id, role')
+        .eq('user_id', userId)
+        .is('company_id', null)
+        .maybeSingle()
+
+    if (legacyMembershipError) {
+        console.warn(`[${userId}] Failed to load legacy role:`, legacyMembershipError.message)
+    }
+
+    if (legacyMembership?.user_id) {
+        const role = normalizeTeamRole(legacyMembership.role)
+        const { error: updateError } = await supabase
+            .from('user_roles')
+            .update({
+                company_id: companyId,
+                role
+            })
+            .eq('user_id', userId)
+            .is('company_id', null)
+
+        if (updateError) {
+            const fallbackRole = await getUserRoleInCompany(userId, companyId)
+            if (fallbackRole) return fallbackRole
+            console.warn(`[${userId}] Failed to migrate legacy role:`, updateError.message)
+        } else {
+            return role
+        }
     }
 
     const { count: companyRoleCount, error: countError } = await supabase

@@ -13,6 +13,8 @@ const isChunkLoadError = (value: unknown): boolean => {
         || text.includes('importing a module script failed')
         || text.includes('loading chunk')
         || text.includes('chunkloaderror')
+        || text.includes('node cannot be found in the current page')
+        || text.includes('node cannot be found')
     );
 };
 

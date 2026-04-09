@@ -99,6 +99,11 @@ const OAUTH_PENDING_COMPANY_KEY = 'pendingOAuthCompanyId';
 const MOBILE_LAYOUT_BREAKPOINT = 1024;
 const MOBILE_BOTTOM_TAB_SECTIONS = ['team-inbox', 'automations', 'contacts', 'more'] as const;
 const PWA_UPDATE_AVAILABLE_EVENT = 'qmessage:pwa-update-available';
+const API_REQUEST_TIMEOUT_MS = 40_000;
+const AUTH_CHECK_TIMEOUT_MS = 8_000;
+const PROFILE_SYNC_TIMEOUT_MS = 12_000;
+const CHAT_SYNC_TIMEOUT_MS = 12_000;
+const SOCKET_STALE_REFRESH_INTERVAL_MS = 20_000;
 
 const LazyWebhookView = lazy(() => import('./WebhookView'));
 const LazyBroadcastTemplateBuilder = lazy(() => import('./BroadcastTemplateBuilder'));
@@ -2309,15 +2314,104 @@ export default function App() {
         [persistDraft, selectedChatId]
     );
 
+    const fetchWithSessionAuth = useCallback(
+        async (
+            input: RequestInfo | URL,
+            init: RequestInit = {},
+            retryOnUnauthorized = true,
+            requestTimeoutMs = API_REQUEST_TIMEOUT_MS
+        ) => {
+            const method = typeof init.method === 'string' ? init.method.trim().toUpperCase() : 'GET';
+            const isRetryableTimeoutMethod = method === 'GET' || method === 'HEAD';
+            const buildHeaders = (token: string) => {
+                const headers = new Headers(init.headers || undefined);
+                headers.set('Authorization', `Bearer ${token}`);
+                return headers;
+            };
+
+            const runWithToken = async (token: string) => {
+                const timeoutController = new AbortController();
+                const externalSignal = init.signal;
+                const onExternalAbort = () => timeoutController.abort();
+                if (externalSignal) {
+                    if (externalSignal.aborted) {
+                        timeoutController.abort();
+                    } else {
+                        externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+                    }
+                }
+
+                const shouldTimeout = Number.isFinite(requestTimeoutMs) && requestTimeoutMs > 0;
+                const timeoutId = shouldTimeout
+                    ? window.setTimeout(() => {
+                        timeoutController.abort();
+                    }, requestTimeoutMs)
+                    : null;
+
+                try {
+                    return await fetch(input, {
+                        ...init,
+                        headers: buildHeaders(token),
+                        signal: timeoutController.signal
+                    });
+                } catch (error: any) {
+                    if (timeoutController.signal.aborted && !externalSignal?.aborted) {
+                        throw new Error('Request timed out. Please retry.');
+                    }
+                    throw error;
+                } finally {
+                    if (typeof timeoutId === 'number') {
+                        window.clearTimeout(timeoutId);
+                    }
+                    if (externalSignal) {
+                        externalSignal.removeEventListener('abort', onExternalAbort);
+                    }
+                }
+            };
+
+            const runWithTimeoutRetry = async (token: string) => {
+                try {
+                    return await runWithToken(token);
+                } catch (error: any) {
+                    const message = typeof error?.message === 'string' ? error.message : '';
+                    if (!isRetryableTimeoutMethod || !message.includes('Request timed out')) {
+                        throw error;
+                    }
+                    await new Promise<void>((resolve) => {
+                        window.setTimeout(() => resolve(), 350);
+                    });
+                    return runWithToken(token);
+                }
+            };
+
+            const currentToken = session?.access_token?.trim();
+            if (!currentToken) {
+                throw new Error('Invalid or expired session');
+            }
+
+            let response = await runWithTimeoutRetry(currentToken);
+            if (response.status !== 401 || !retryOnUnauthorized) {
+                return response;
+            }
+
+            const { data, error } = await supabase.auth.refreshSession();
+            const refreshedToken = data?.session?.access_token?.trim();
+            if (error || !refreshedToken) {
+                return response;
+            }
+
+            setSession(data.session);
+            response = await runWithTimeoutRetry(refreshedToken);
+            return response;
+        },
+        [session?.access_token]
+    );
+
     const fetchTeamUsers = useCallback(async () => {
         if (!session?.access_token) return;
         setTeamUsersLoading(true);
         try {
-            const res = await fetch(`${SOCKET_URL}/api/company/team-users`, {
-                headers: {
-                    Authorization: `Bearer ${session.access_token}`
-                }
-            });
+            const res = await fetchWithSessionAuth(`${SOCKET_URL}/api/company/team-users`);
             const data = await res.json().catch(() => null);
             if (!res.ok || !data?.success) {
                 throw new Error(data?.error || 'Failed to load team users');
@@ -2337,7 +2431,7 @@ export default function App() {
         } finally {
             setTeamUsersLoading(false);
         }
-    }, [session?.access_token]);
+    }, [fetchWithSessionAuth, session?.access_token]);
 
     const fetchWorkflowTemplateOptions = useCallback(async () => {
         if (!activeProfileId || !session?.access_token) {
@@ -2629,17 +2723,17 @@ export default function App() {
     ]);
 
     const fetchQuickReplies = useCallback(() => {
-        if (!activeProfileId || !session?.access_token) {
+        if (!profilesLoaded) {
+            return;
+        }
+        const profileExists = profiles.some((profile: any) => profile?.id === activeProfileId);
+        if (!activeProfileId || !session?.access_token || !profileExists) {
             setQuickReplies([]);
             return;
         }
         setQuickRepliesLoading(true);
         setQuickRepliesError(null);
-        fetch(`${SOCKET_URL}/api/company/quick-replies?profileId=${encodeURIComponent(activeProfileId)}`, {
-            headers: {
-                Authorization: `Bearer ${session.access_token}`
-            }
-        })
+        fetchWithSessionAuth(`${SOCKET_URL}/api/company/quick-replies?profileId=${encodeURIComponent(activeProfileId)}`)
             .then(async res => {
                 const text = await res.text();
                 try {
@@ -2660,7 +2754,7 @@ export default function App() {
                 setQuickRepliesError(err?.message || 'Failed to load quick replies');
             })
             .finally(() => setQuickRepliesLoading(false));
-    }, [activeProfileId, normalizeQuickReplyRecord, session?.access_token]);
+    }, [activeProfileId, fetchWithSessionAuth, normalizeQuickReplyRecord, profiles, profilesLoaded, session?.access_token]);
 
     const saveQuickReplies = useCallback(async (items: QuickReply[]) => {
         if (!activeProfileId || !session?.access_token) return;
@@ -2811,11 +2905,7 @@ export default function App() {
         }
         setUiControlsLoading(true);
         try {
-            const res = await fetch(`${SOCKET_URL}/api/company/ui-controls`, {
-                headers: {
-                    Authorization: `Bearer ${session.access_token}`
-                }
-            });
+            const res = await fetchWithSessionAuth(`${SOCKET_URL}/api/company/ui-controls`, {}, true, 45_000);
             const text = await res.text();
             let data: any = null;
             try {
@@ -2842,7 +2932,7 @@ export default function App() {
         } finally {
             setUiControlsLoading(false);
         }
-    }, [normalizeHiddenFeatureList, session?.access_token]);
+    }, [fetchWithSessionAuth, normalizeHiddenFeatureList, session?.access_token]);
 
     const markChatAsRead = useCallback((chatId: string | null | undefined) => {
         const chatKey = canonicalContactJid(chatId || '');
@@ -3313,17 +3403,34 @@ export default function App() {
 
     // Check Auth
     useEffect(() => {
-        supabase.auth.getSession().then(({ data: { session } }) => {
-            setSession(session);
+        let cancelled = false;
+        const authTimeout = window.setTimeout(() => {
+            if (cancelled) return;
             setAuthChecking(false);
-        });
+        }, AUTH_CHECK_TIMEOUT_MS);
+
+        supabase.auth.getSession()
+            .then(({ data: { session } }) => {
+                if (cancelled) return;
+                setSession(session);
+                setAuthChecking(false);
+            })
+            .catch(() => {
+                if (cancelled) return;
+                setAuthChecking(false);
+            });
 
         const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+            if (cancelled) return;
             setSession(session);
             setAuthChecking(false);
         });
 
-        return () => subscription.unsubscribe();
+        return () => {
+            cancelled = true;
+            window.clearTimeout(authTimeout);
+            subscription.unsubscribe();
+        };
     }, []);
 
     useEffect(() => {
@@ -3410,21 +3517,33 @@ export default function App() {
             return;
         }
 
-        supabase
-            .from('user_roles')
-            .select('role')
-            .eq('user_id', session.user.id)
-            .maybeSingle()
-            .then(({ data, error }) => {
-                if (error) {
-                    console.warn('user_roles lookup failed', error);
-                    setIsAdmin(false);
-                    return;
+        let cancelled = false;
+        const resolveRole = async () => {
+            try {
+                const res = await fetchWithSessionAuth(`${SOCKET_URL}/api/company/me`);
+                const data = await res.json().catch(() => null);
+                if (!res.ok || !data?.success) {
+                    throw new Error(data?.error || 'Failed to resolve current user role');
                 }
-                const role = typeof data?.role === 'string' ? data.role.toLowerCase() : '';
-                setIsAdmin(role === 'admin' || role === 'owner');
-            });
-    }, [session]);
+                const role = typeof data?.data?.role === 'string'
+                    ? data.data.role.toLowerCase()
+                    : '';
+                if (!cancelled) {
+                    setIsAdmin(role === 'admin' || role === 'owner');
+                }
+            } catch (error) {
+                console.warn('company role lookup failed', error);
+                if (!cancelled) {
+                    setIsAdmin(false);
+                }
+            }
+        };
+
+        void resolveRole();
+        return () => {
+            cancelled = true;
+        };
+    }, [fetchWithSessionAuth, session]);
 
     useEffect(() => {
         const statusEmoji = connectionStatus === 'open' ? '🟢' : connectionStatus === 'connecting' ? '🟡' : '🔴';
@@ -3949,10 +4068,10 @@ export default function App() {
                 return;
             }
             const staleForMs = Date.now() - lastRealtimeEventAtRef.current;
-            if (staleForMs < 12_000) return;
+            if (staleForMs < SOCKET_STALE_REFRESH_INTERVAL_MS) return;
             newSocket.emit('refreshMessages', profileId);
             lastRealtimeEventAtRef.current = Date.now();
-        }, 12_000);
+        }, SOCKET_STALE_REFRESH_INTERVAL_MS);
 
         document.addEventListener('visibilitychange', handleVisibilityChange);
         window.addEventListener('focus', handleWindowFocus);
@@ -3993,7 +4112,8 @@ export default function App() {
         if (!session || profilesLoaded) return;
         const timer = window.setTimeout(() => {
             recoverSocketConnection('Profiles load timed out. Restarting socket connection...');
-        }, 15_000);
+            setProfilesLoaded(true);
+        }, PROFILE_SYNC_TIMEOUT_MS);
         return () => window.clearTimeout(timer);
     }, [session, profilesLoaded, recoverSocketConnection]);
 
@@ -4001,7 +4121,8 @@ export default function App() {
         if (!session || !activeProfileId || !loadingChats) return;
         const timer = window.setTimeout(() => {
             recoverSocketConnection('Chat sync timed out. Restarting socket connection...');
-        }, 15_000);
+            setLoadingChats(false);
+        }, CHAT_SYNC_TIMEOUT_MS);
         return () => window.clearTimeout(timer);
     }, [session, activeProfileId, loadingChats, recoverSocketConnection]);
 
