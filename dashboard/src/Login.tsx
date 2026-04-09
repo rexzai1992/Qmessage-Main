@@ -13,6 +13,21 @@ import {
 const OAUTH_PENDING_COMPANY_KEY = 'pendingOAuthCompanyId'
 const COMPANY_ID_REGEX = /^[a-z0-9-]{3,63}$/
 const RESERVED_COMPANY_IDS = new Set(['www', 'admin', 'myadmin'])
+const AUTH_REQUEST_TIMEOUT_MS = 12_000
+
+const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> => {
+    let timeoutId: number | null = null
+    const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutId = window.setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs)
+    })
+    try {
+        return await Promise.race([promise, timeoutPromise])
+    } finally {
+        if (typeof timeoutId === 'number') {
+            window.clearTimeout(timeoutId)
+        }
+    }
+}
 
 function GoogleLogo() {
     return (
@@ -70,10 +85,15 @@ export default function Login({
     }
 
     const signInAndValidate = async (trimmedEmail: string, rawPassword: string, expectedCompanyId: string) => {
-        const { data, error } = await supabase.auth.signInWithPassword({
+        const signInPromise = supabase.auth.signInWithPassword({
             email: trimmedEmail,
             password: rawPassword
         })
+        const { data, error } = await withTimeout(
+            signInPromise,
+            AUTH_REQUEST_TIMEOUT_MS,
+            'Authentication request timed out. Please retry in a few seconds.'
+        )
         if (error) throw error
         if (!data?.session || !data?.user) {
             throw new Error('Login succeeded but no session was created. Please confirm your email or disable email confirmations in Supabase Auth settings.')
@@ -135,7 +155,16 @@ export default function Login({
             const session = await signInAndValidate(trimmedEmail, password, trimmedCompany)
             onLogin(session)
         } catch (error: any) {
-            setMsg(error.message)
+            const rawMessage = typeof error?.message === 'string' ? error.message : 'Unable to sign in right now. Please retry.'
+            const networkLikeError =
+                rawMessage.toLowerCase().includes('failed to fetch')
+                || rawMessage.toLowerCase().includes('timed out')
+                || rawMessage.toLowerCase().includes('gateway timeout')
+                || rawMessage.toLowerCase().includes('service unavailable')
+            setMsg(networkLikeError
+                ? 'Auth server is busy or unreachable right now. Please retry in a few seconds.'
+                : rawMessage
+            )
         } finally {
             setLoading(false)
         }

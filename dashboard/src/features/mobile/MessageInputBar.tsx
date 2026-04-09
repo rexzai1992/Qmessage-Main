@@ -11,7 +11,7 @@ export default function MessageInputBar({ children }: MessageInputBarProps) {
             style={{
                 paddingLeft: 'max(env(safe-area-inset-left), 0.625rem)',
                 paddingRight: 'max(env(safe-area-inset-right), 0.625rem)',
-                paddingBottom: 'max(env(safe-area-inset-bottom), 0.5rem)'
+                paddingBottom: 'calc(max(env(safe-area-inset-bottom), 0px) + 0.5rem)'
             }}
             role="region"
             aria-label="Message composer"

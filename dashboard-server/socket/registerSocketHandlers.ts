@@ -1,4 +1,4 @@
-import type { Server } from 'socket.io'
+import type { Server, Socket } from 'socket.io'
 import { createDownloadUrl } from '../../src/services/r2-storage'
 
 export function registerSocketHandlers(io: Server, ctx: any) {
@@ -18,6 +18,7 @@ export function registerSocketHandlers(io: Server, ctx: any) {
         getUsersForCompany,
         buildContactPayload,
         getMessagesForUsers,
+        getMessagesForUsersSince,
         normalizePhoneNumber,
         recordToSyntheticMessage,
         findOrCreateUser,
@@ -61,6 +62,176 @@ export function registerSocketHandlers(io: Server, ctx: any) {
         const normalized = normalizePhoneNumber(raw)
         if (!normalized) return ''
         return isLikelyGroupTarget(raw) ? `${normalized}@g.us` : `${normalized}@s.whatsapp.net`
+    }
+
+    const parseBoundedLimit = (value: unknown, fallback: number, min: number, max: number): number => {
+        const parsed = Number(value)
+        if (!Number.isFinite(parsed)) return fallback
+        return Math.max(min, Math.min(max, Math.floor(parsed)))
+    }
+
+    const FULL_HISTORY_LIMIT = parseBoundedLimit(process.env.SOCKET_FULL_HISTORY_LIMIT, 60, 20, 500)
+    const DELTA_HISTORY_LIMIT = parseBoundedLimit(process.env.SOCKET_DELTA_HISTORY_LIMIT, 40, 10, 500)
+    const CONTACT_CACHE_TTL_MS = 15_000
+    const companySyncCache = new Map<string, {
+        loadedAt: number
+        userIds: string[]
+        contacts: any[]
+        userMap: Map<string, { phone: string; name: string | null }>
+    }>()
+
+    const invalidateCompanySyncCache = (companyId: string | null | undefined) => {
+        if (!companyId) return
+        companySyncCache.delete(companyId)
+    }
+
+    const normalizeRefreshRequest = (value: any): {
+        profileId: string
+        sinceTimestamp: number
+        includeContacts: boolean
+        forceFullHistory: boolean
+    } => {
+        if (typeof value === 'string') {
+            return {
+                profileId: value,
+                sinceTimestamp: 0,
+                includeContacts: true,
+                forceFullHistory: true
+            }
+        }
+
+        const profileId = typeof value?.profileId === 'string' ? value.profileId : ''
+        const parsedSince = Number(value?.sinceTimestamp || 0)
+        return {
+            profileId,
+            sinceTimestamp: Number.isFinite(parsedSince) ? Math.max(0, Math.floor(parsedSince)) : 0,
+            includeContacts: value?.includeContacts === true,
+            forceFullHistory: value?.forceFullHistory === true
+        }
+    }
+
+    const getCompanySyncContext = async (
+        companyId: string,
+        force = false
+    ): Promise<{
+        userIds: string[]
+        contacts: any[]
+        userMap: Map<string, { phone: string; name: string | null }>
+    }> => {
+        const cached = companySyncCache.get(companyId)
+        if (!force && cached && (Date.now() - cached.loadedAt) < CONTACT_CACHE_TTL_MS) {
+            return {
+                userIds: cached.userIds,
+                contacts: cached.contacts,
+                userMap: cached.userMap
+            }
+        }
+
+        const users = await getUsersForCompany(companyId)
+        const contacts = users.map((u: any) => buildContactPayload(u))
+        const userIds = users.map((u: any) => u.id).filter(Boolean)
+        const userMap = new Map(
+            users.map((u: any) => [
+                u.id,
+                {
+                    phone: normalizePhoneNumber(u.phone_number),
+                    name: u.name || null
+                }
+            ])
+        )
+
+        companySyncCache.set(companyId, {
+            loadedAt: Date.now(),
+            userIds,
+            contacts,
+            userMap
+        })
+
+        return { userIds, contacts, userMap }
+    }
+
+    const toLatestMessageTimestamp = (messages: any[]): number => {
+        let latest = 0
+        for (const msg of messages) {
+            const ts = Number(msg?.messageTimestamp || 0)
+            if (Number.isFinite(ts) && ts > latest) latest = ts
+        }
+        return latest
+    }
+
+    const emitProfileMessagesSnapshot = async (
+        socket: Socket,
+        profileId: string,
+        companyId: string,
+        options: { includeContacts?: boolean; forceContactsReload?: boolean; historyLimit?: number } = {}
+    ) => {
+        const includeContacts = options.includeContacts !== false
+        const forceContactsReload = options.forceContactsReload === true
+        const historyLimit = Number.isFinite(options.historyLimit)
+            ? Math.max(1, Math.min(500, Math.floor(options.historyLimit || FULL_HISTORY_LIMIT)))
+            : FULL_HISTORY_LIMIT
+
+        const { userIds, contacts, userMap } = await getCompanySyncContext(companyId, forceContactsReload)
+
+        if (includeContacts) {
+            socket.emit('contacts.update', { profileId, contacts })
+        }
+
+        if (userIds.length === 0) {
+            socket.emit('messages.history', { profileId, messages: [], latestTimestamp: 0 })
+            return
+        }
+
+        const messages = await getMessagesForUsers(userIds, historyLimit)
+        const syntheticMessages = (await Promise.all(
+            messages.map((msg: any) => recordToSyntheticMessage(msg, userMap, companyId))
+        ))
+            .filter(Boolean)
+            .reverse()
+
+        socket.emit('messages.history', {
+            profileId,
+            messages: syntheticMessages,
+            latestTimestamp: toLatestMessageTimestamp(syntheticMessages as any[])
+        })
+    }
+
+    const emitProfileMessagesDelta = async (
+        socket: Socket,
+        profileId: string,
+        companyId: string,
+        sinceTimestamp: number,
+        options: { includeContacts?: boolean; forceContactsReload?: boolean; limit?: number } = {}
+    ) => {
+        const includeContacts = options.includeContacts === true
+        const forceContactsReload = options.forceContactsReload === true
+        const limit = Number.isFinite(options.limit)
+            ? Math.max(1, Math.min(500, Math.floor(options.limit || DELTA_HISTORY_LIMIT)))
+            : DELTA_HISTORY_LIMIT
+
+        const { userIds, contacts, userMap } = await getCompanySyncContext(companyId, forceContactsReload)
+
+        if (includeContacts) {
+            socket.emit('contacts.update', { profileId, contacts })
+        }
+
+        if (userIds.length === 0) {
+            socket.emit('messages.delta', { profileId, messages: [], latestTimestamp: sinceTimestamp })
+            return
+        }
+
+        const messages = await getMessagesForUsersSince(userIds, sinceTimestamp, limit)
+        const syntheticMessages = (await Promise.all(
+            messages.map((msg: any) => recordToSyntheticMessage(msg, userMap, companyId))
+        ))
+            .filter(Boolean)
+            .reverse()
+
+        socket.emit('messages.delta', {
+            profileId,
+            messages: syntheticMessages,
+            latestTimestamp: toLatestMessageTimestamp(syntheticMessages as any[])
+        })
     }
 
 // Auth Middleware for Socket.io
@@ -192,6 +363,14 @@ io.on('connection', async (socket) => {
 
     socket.emit('profiles.update', await enrichProfilesWithConnectionStatus(userProfiles || []))
 
+    let refreshInFlight = false
+    let lastRefreshRequest = {
+        at: 0,
+        profileId: '',
+        sinceTimestamp: 0,
+        forceFullHistory: false
+    }
+
     const resolveConfiguredProfileForCompany = async (requestedProfileId: unknown): Promise<{
         profileId: string
         companyId: string
@@ -269,69 +448,107 @@ io.on('connection', async (socket) => {
             socket.emit('contacts.update', { profileId, contacts: [] })
             socket.emit('messages.history', { profileId, messages: [] })
         } else {
-            const users = await getUsersForCompany(profileCompanyId)
-            const contacts = users.map(u => buildContactPayload(u))
-            socket.emit('contacts.update', { profileId, contacts })
-
-            const messages = await getMessagesForUsers(users.map(u => u.id), 500)
-            const userMap = new Map(
-                users.map(u => [
-                    u.id,
-                    {
-                        phone: normalizePhoneNumber(u.phone_number),
-                        name: u.name || null
-                    }
-                ])
-            )
-            const syntheticMessages = (await Promise.all(
-                messages.map((msg) => recordToSyntheticMessage(msg, userMap, profileCompanyId))
-            ))
-                .filter(Boolean)
-                .reverse()
-
-            socket.emit('messages.history', { profileId, messages: syntheticMessages })
+            await emitProfileMessagesSnapshot(socket, profileId, profileCompanyId, {
+                includeContacts: true,
+                forceContactsReload: true,
+                historyLimit: FULL_HISTORY_LIMIT
+            })
         }
 
         // Reset unread for this profile when switched to
         await supabase.from('profiles').update({ unreadCount: 0 }).eq('id', profileId).eq('company_id', currentCompanyId)
-        const { data: refreshed } = await supabase.from('profiles').select('*').eq('company_id', currentCompanyId).order('created_at', { ascending: true })
-        io.to(getCompanyRoom(currentCompanyId)).emit('profiles.update', await enrichProfilesWithConnectionStatus(refreshed || []))
+        io.to(getCompanyRoom(currentCompanyId)).emit('profile.unread', { profileId, unreadCount: 0 })
     })
 
     // Lightweight refresh without resetting unread counts
-    socket.on('refreshMessages', async (profileId) => {
+    socket.on('refreshMessages', async (rawRequest) => {
+        const request = normalizeRefreshRequest(rawRequest)
+        const profileId = request.profileId
         if (!profileId) return
-        const client = await wabaRegistry.getClientByProfile(profileId)
-        socket.emit('connection.update', { profileId, connection: client ? 'open' : 'close' })
 
-        const companyId = await getCompanyIdForProfile(profileId)
-        if (!companyId) {
-            socket.emit('contacts.update', { profileId, contacts: [] })
-            socket.emit('messages.history', { profileId, messages: [] })
+        const now = Date.now()
+        const refreshThrottleMs = request.forceFullHistory ? 0 : 1200
+        const isNearDuplicateRequest =
+            !request.forceFullHistory
+            && !lastRefreshRequest.forceFullHistory
+            && lastRefreshRequest.profileId === profileId
+            && Math.abs(lastRefreshRequest.sinceTimestamp - request.sinceTimestamp) <= 2
+            && (now - lastRefreshRequest.at) < refreshThrottleMs
+
+        if (refreshInFlight || isNearDuplicateRequest) {
             return
         }
 
-        const users = await getUsersForCompany(companyId)
-        const contacts = users.map(u => buildContactPayload(u))
-        socket.emit('contacts.update', { profileId, contacts })
+        refreshInFlight = true
+        lastRefreshRequest = {
+            at: now,
+            profileId,
+            sinceTimestamp: request.sinceTimestamp,
+            forceFullHistory: request.forceFullHistory
+        }
 
-        const messages = await getMessagesForUsers(users.map(u => u.id), 500)
-        const userMap = new Map(
-            users.map(u => [
-                u.id,
-                {
-                    phone: normalizePhoneNumber(u.phone_number),
-                    name: u.name || null
+        try {
+            const client = await wabaRegistry.getClientByProfile(profileId)
+            socket.emit('connection.update', { profileId, connection: client ? 'open' : 'close' })
+
+            const companyId = await getCompanyIdForProfile(profileId)
+            if (!companyId) {
+                if (request.includeContacts) {
+                    socket.emit('contacts.update', { profileId, contacts: [] })
                 }
-            ])
-        )
-        const syntheticMessages = (await Promise.all(
-            messages.map((msg) => recordToSyntheticMessage(msg, userMap, companyId))
-        ))
-            .filter(Boolean)
-            .reverse()
+                if (request.forceFullHistory || request.sinceTimestamp <= 0) {
+                    socket.emit('messages.history', { profileId, messages: [], latestTimestamp: 0 })
+                } else {
+                    socket.emit('messages.delta', { profileId, messages: [], latestTimestamp: request.sinceTimestamp })
+                }
+                return
+            }
 
-        socket.emit('messages.history', { profileId, messages: syntheticMessages })
+            if (request.forceFullHistory || request.sinceTimestamp <= 0) {
+                await emitProfileMessagesSnapshot(socket, profileId, companyId, {
+                    includeContacts: request.includeContacts,
+                    forceContactsReload: request.includeContacts,
+                    historyLimit: FULL_HISTORY_LIMIT
+                })
+                return
+            }
+
+            await emitProfileMessagesDelta(socket, profileId, companyId, request.sinceTimestamp, {
+                includeContacts: request.includeContacts,
+                forceContactsReload: request.includeContacts,
+                limit: DELTA_HISTORY_LIMIT
+            })
+        } finally {
+            refreshInFlight = false
+        }
+    })
+
+    socket.on('notification.test', async (payload, ack) => {
+        try {
+            const rawTitle = typeof payload?.title === 'string' ? payload.title.trim() : ''
+            const rawBody = typeof payload?.body === 'string' ? payload.body.trim() : ''
+            const title = rawTitle || 'QMessage Test Notification'
+            const body = rawBody || `Test sent by ${deriveAgentName(socket.data.user)}`
+            const eventPayload = {
+                id: `test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                title: title.slice(0, 80),
+                body: body.slice(0, 220),
+                fromUserId: userId,
+                fromName: deriveAgentName(socket.data.user),
+                createdAt: new Date().toISOString()
+            }
+
+            // Broadcast only to the same signed-in user on other devices (B/C),
+            // not to every teammate in the company room.
+            socket.to(userId).emit('notification.test', eventPayload)
+            if (typeof ack === 'function') {
+                ack({ success: true, data: eventPayload })
+            }
+        } catch (error: any) {
+            if (typeof ack === 'function') {
+                ack({ success: false, error: error?.message || 'Failed to send notification test.' })
+            }
+        }
     })
 
     socket.on('contact.update', async ({ profileId, jid, name, tags }) => {
@@ -361,6 +578,7 @@ io.on('connection', async (socket) => {
             if (Array.isArray(tags)) {
                 await setUserTags(user.id, tags)
             }
+            invalidateCompanySyncCache(companyId)
 
             const updated = await getUserByPhone(companyId, phoneNumber)
             if (updated) {
@@ -420,6 +638,7 @@ io.on('connection', async (socket) => {
             }
 
             const contactPayload = { ...buildContactPayload(updated), id: `${phoneNumber}@s.whatsapp.net` }
+            invalidateCompanySyncCache(companyId)
             io.to(getCompanyRoom(companyId)).emit('contacts.update', {
                 profileId,
                 contacts: [contactPayload]
@@ -535,6 +754,7 @@ io.on('connection', async (socket) => {
             }
 
             const contactPayload = { ...buildContactPayload(updated), id: `${phoneNumber}@s.whatsapp.net` }
+            invalidateCompanySyncCache(companyId)
             io.to(getCompanyRoom(companyId)).emit('contacts.update', {
                 profileId,
                 contacts: [contactPayload]
@@ -750,6 +970,7 @@ io.on('connection', async (socket) => {
                 color: actor.color
             })
             if (assigned) {
+                invalidateCompanySyncCache(resolvedCompanyId)
                 io.to(getCompanyRoom(resolvedCompanyId)).emit('contacts.update', {
                     profileId,
                     contacts: [{ ...buildContactPayload(assigned), id: isGroup ? `${recipientId}@g.us` : `${recipientId}@s.whatsapp.net` }]
@@ -854,6 +1075,7 @@ io.on('connection', async (socket) => {
                 color: actor.color
             })
             if (assigned) {
+                invalidateCompanySyncCache(resolvedCompanyId)
                 io.to(getCompanyRoom(resolvedCompanyId)).emit('contacts.update', {
                     profileId,
                     contacts: [{ ...buildContactPayload(assigned), id: isGroup ? `${recipientId}@g.us` : `${recipientId}@s.whatsapp.net` }]

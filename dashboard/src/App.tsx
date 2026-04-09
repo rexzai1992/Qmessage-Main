@@ -36,7 +36,8 @@ import {
     Workflow,
     ShieldCheck,
     Bug,
-    Bot
+    Bot,
+    Bell
 } from 'lucide-react';
 import Login from './Login';
 import DebugButton from './DebugButton';
@@ -99,11 +100,12 @@ const OAUTH_PENDING_COMPANY_KEY = 'pendingOAuthCompanyId';
 const MOBILE_LAYOUT_BREAKPOINT = 1024;
 const MOBILE_BOTTOM_TAB_SECTIONS = ['team-inbox', 'automations', 'contacts', 'more'] as const;
 const PWA_UPDATE_AVAILABLE_EVENT = 'qmessage:pwa-update-available';
-const API_REQUEST_TIMEOUT_MS = 40_000;
-const AUTH_CHECK_TIMEOUT_MS = 8_000;
-const PROFILE_SYNC_TIMEOUT_MS = 12_000;
-const CHAT_SYNC_TIMEOUT_MS = 12_000;
-const SOCKET_STALE_REFRESH_INTERVAL_MS = 20_000;
+const API_REQUEST_TIMEOUT_MS = 18_000;
+const AUTH_CHECK_TIMEOUT_MS = 4_000;
+const PROFILE_SYNC_TIMEOUT_MS = 20_000;
+const CHAT_SYNC_TIMEOUT_MS = 24_000;
+const SOCKET_STALE_REFRESH_INTERVAL_MS = 90_000;
+const QUICK_REPLIES_PREFETCH_DELAY_MS = 220;
 
 const LazyWebhookView = lazy(() => import('./WebhookView'));
 const LazyBroadcastTemplateBuilder = lazy(() => import('./BroadcastTemplateBuilder'));
@@ -115,6 +117,17 @@ declare global {
         __resetInstallOnboardingPrompt?: () => void;
     }
 }
+
+const isSameSessionIdentity = (left: Session | null, right: Session | null): boolean => {
+    if (!left && !right) return true;
+    if (!left || !right) return false;
+    return (
+        left.access_token === right.access_token
+        && left.refresh_token === right.refresh_token
+        && left.expires_at === right.expires_at
+        && left.user?.id === right.user?.id
+    );
+};
 
 interface Message {
     key: {
@@ -975,6 +988,44 @@ const collectUnreadDeltaFromHistory = (
     return { nextSeen, unreadDeltaByChat };
 };
 
+const buildMessageIdentityKey = (msg: Message, index = 0): string => {
+    const jid = canonicalContactJid(msg?.key?.remoteJid || '') || msg?.key?.remoteJid || '';
+    const id = typeof msg?.key?.id === 'string' ? msg.key.id.trim() : '';
+    const ts = Number(msg?.messageTimestamp || 0);
+    return `${jid}:${id || `ts-${ts}-i-${index}`}`;
+};
+
+const mergeMessagesByIdentity = (current: Message[], incoming: Message[]): Message[] => {
+    if (!Array.isArray(incoming) || incoming.length === 0) return current;
+    const seen = new Set<string>();
+    const merged: Message[] = [];
+
+    incoming.forEach((msg, index) => {
+        const key = buildMessageIdentityKey(msg, index);
+        if (seen.has(key)) return;
+        seen.add(key);
+        merged.push(msg);
+    });
+
+    current.forEach((msg, index) => {
+        const key = buildMessageIdentityKey(msg, index + incoming.length);
+        if (seen.has(key)) return;
+        seen.add(key);
+        merged.push(msg);
+    });
+
+    return merged;
+};
+
+const getLatestTimestampFromMessages = (messages: Message[]): number => {
+    let latest = 0;
+    messages.forEach((msg) => {
+        const ts = Number(msg?.messageTimestamp || 0);
+        if (Number.isFinite(ts) && ts > latest) latest = ts;
+    });
+    return latest;
+};
+
 const trimString = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
 
 const createClientTempMessageId = (): string => `tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -1597,6 +1648,7 @@ export default function App() {
     const [notificationPermissionState, setNotificationPermissionState] = useState<NotificationPermission | 'unsupported'>(
         () => getNotificationPermissionState()
     );
+    const [sendingTestNotification, setSendingTestNotification] = useState(false);
     const [pwaUpdateRegistration, setPwaUpdateRegistration] = useState<ServiceWorkerRegistration | null>(null);
     const [showPwaUpdateBanner, setShowPwaUpdateBanner] = useState(false);
 
@@ -1651,6 +1703,8 @@ export default function App() {
     const lastRecoverAtRef = useRef(0);
     const lastInboundRef = useRef<number | null>(null);
     const lastRealtimeEventAtRef = useRef(Date.now());
+    const lastRefreshRequestEmitAtRef = useRef(0);
+    const latestMessageTimestampRef = useRef(0);
     const requestedMediaRef = useRef<Set<string>>(new Set());
     const seenIncomingMessageKeysRef = useRef<Set<string>>(new Set());
     const notifiedIncomingMessageKeysRef = useRef<Set<string>>(new Set());
@@ -1659,6 +1713,9 @@ export default function App() {
     const mediaProgressTimeoutRef = useRef<Record<string, number>>({});
     const socketInstanceRef = useRef<Socket | null>(null);
     const socketAccessTokenRef = useRef('');
+    const refreshSessionPromiseRef = useRef<Promise<string | null> | null>(null);
+    const refreshAccessTokenRef = useRef<(() => Promise<string | null>) | null>(null);
+    const lastTestNotificationTriggerAtRef = useRef(0);
     const hiddenSocketDisconnectTimerRef = useRef<number | null>(null);
     const pwaUpdateReloadTimerRef = useRef<number | null>(null);
     const pwaUpdateReloadingRef = useRef(false);
@@ -2131,6 +2188,56 @@ export default function App() {
         }
     }, [showToast]);
 
+    const handleSendTestNotification = useCallback(async () => {
+        if (!socket) {
+            showToast('Realtime connection is not ready yet. Please try again.', 'error');
+            return;
+        }
+
+        const nowMs = Date.now();
+        if (nowMs - lastTestNotificationTriggerAtRef.current < 1500) {
+            return;
+        }
+        lastTestNotificationTriggerAtRef.current = nowMs;
+
+        if (notificationPermissionState === 'default') {
+            await handleRequestNotificationPermission();
+        }
+
+        setSendingTestNotification(true);
+        try {
+            const deviceLabel = (() => {
+                const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+                if (/iphone/i.test(ua)) return 'iPhone';
+                if (/ipad/i.test(ua)) return 'iPad';
+                if (/android/i.test(ua)) return 'Android';
+                return 'Device';
+            })();
+
+            const ack = await emitSocketWithTimeout(
+                socket,
+                'notification.test',
+                {
+                    profileId: activeProfileIdRef.current || activeProfileId || '',
+                    title: 'QMessage Test Notification',
+                    body: `Test sent from ${deviceLabel}.`,
+                    source: 'mobile-fab'
+                },
+                5000,
+                'Notification test timed out.'
+            );
+
+            if (!ack?.success) {
+                throw new Error(ack?.error || 'Failed to send test notification.');
+            }
+
+            showToast('Test sent. Check your other logged-in devices.', 'success');
+        } catch (error: any) {
+            showToast(error?.message || 'Failed to send test notification.', 'error');
+        } finally {
+            setSendingTestNotification(false);
+        }
+    }, [activeProfileId, handleRequestNotificationPermission, notificationPermissionState, showToast, socket]);
     const handleInstallApp = useCallback(async () => {
         if (!deferredInstallPrompt) {
             if (installPlatform === 'android') {
@@ -2314,6 +2421,41 @@ export default function App() {
         [persistDraft, selectedChatId]
     );
 
+    const updateSessionState = useCallback((nextSession: Session | null) => {
+        setSession((previousSession) => {
+            if (isSameSessionIdentity(previousSession, nextSession)) {
+                return previousSession;
+            }
+            return nextSession;
+        });
+    }, []);
+
+    const refreshAccessToken = useCallback(async (): Promise<string | null> => {
+        if (refreshSessionPromiseRef.current) {
+            return refreshSessionPromiseRef.current;
+        }
+
+        const pendingRefresh = supabase.auth
+            .refreshSession()
+            .then(({ data, error }) => {
+                const refreshedToken = data?.session?.access_token?.trim() || '';
+                if (error || !refreshedToken) return null;
+                updateSessionState(data.session);
+                return refreshedToken;
+            })
+            .catch(() => null)
+            .finally(() => {
+                refreshSessionPromiseRef.current = null;
+            });
+
+        refreshSessionPromiseRef.current = pendingRefresh;
+        return pendingRefresh;
+    }, [updateSessionState]);
+
+
+    useEffect(() => {
+        refreshAccessTokenRef.current = refreshAccessToken;
+    }, [refreshAccessToken]);
     const fetchWithSessionAuth = useCallback(
         async (
             input: RequestInfo | URL,
@@ -2394,17 +2536,14 @@ export default function App() {
                 return response;
             }
 
-            const { data, error } = await supabase.auth.refreshSession();
-            const refreshedToken = data?.session?.access_token?.trim();
-            if (error || !refreshedToken) {
+            const refreshedToken = await refreshAccessToken();
+            if (!refreshedToken) {
                 return response;
             }
-
-            setSession(data.session);
             response = await runWithTimeoutRetry(refreshedToken);
             return response;
         },
-        [session?.access_token]
+        [refreshAccessToken, session?.access_token]
     );
 
     const fetchTeamUsers = useCallback(async () => {
@@ -2905,7 +3044,7 @@ export default function App() {
         }
         setUiControlsLoading(true);
         try {
-            const res = await fetchWithSessionAuth(`${SOCKET_URL}/api/company/ui-controls`, {}, true, 45_000);
+            const res = await fetchWithSessionAuth(`${SOCKET_URL}/api/company/ui-controls`, {}, true, 18_000);
             const text = await res.text();
             let data: any = null;
             try {
@@ -3051,8 +3190,16 @@ export default function App() {
             setQuickReplies([]);
             return;
         }
-        fetchQuickReplies();
-    }, [activeProfileId, fetchQuickReplies]);
+        if (workspaceSection !== 'team-inbox' || !selectedChatId) {
+            return;
+        }
+        const timer = window.setTimeout(() => {
+            fetchQuickReplies();
+        }, QUICK_REPLIES_PREFETCH_DELAY_MS);
+        return () => {
+            window.clearTimeout(timer);
+        };
+    }, [activeProfileId, fetchQuickReplies, selectedChatId, workspaceSection]);
 
     useEffect(() => {
         if (!session?.access_token) {
@@ -3061,7 +3208,12 @@ export default function App() {
             setUiControlsLoading(false);
             return;
         }
-        fetchUiControls();
+        const timer = window.setTimeout(() => {
+            fetchUiControls();
+        }, 180);
+        return () => {
+            window.clearTimeout(timer);
+        };
     }, [fetchUiControls, session?.access_token]);
 
     useEffect(() => {
@@ -3398,7 +3550,7 @@ export default function App() {
             // ignore
         }
         await supabase.auth.signOut();
-        setSession(null);
+        updateSessionState(null);
     };
 
     // Check Auth
@@ -3412,7 +3564,7 @@ export default function App() {
         supabase.auth.getSession()
             .then(({ data: { session } }) => {
                 if (cancelled) return;
-                setSession(session);
+                updateSessionState(session);
                 setAuthChecking(false);
             })
             .catch(() => {
@@ -3422,7 +3574,7 @@ export default function App() {
 
         const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
             if (cancelled) return;
-            setSession(session);
+            updateSessionState(session);
             setAuthChecking(false);
         });
 
@@ -3431,7 +3583,7 @@ export default function App() {
             window.clearTimeout(authTimeout);
             subscription.unsubscribe();
         };
-    }, []);
+    }, [updateSessionState]);
 
     useEffect(() => {
         if (!session) {
@@ -3478,9 +3630,9 @@ export default function App() {
             // ignore
         }
         supabase.auth.signOut().finally(() => {
-            setSession(null);
+            updateSessionState(null);
         });
-    }, [session]);
+    }, [session, updateSessionState]);
 
     useEffect(() => {
         if (!ENABLE_FIRST_TIME_SETUP) {
@@ -3512,7 +3664,23 @@ export default function App() {
     }, [authChecking, hostAuthError, isAdmin, isSuperAdmin, onboardingStorageKey, resetOnboardingWizard, session?.user?.id]);
 
     useEffect(() => {
-        if (!session) {
+        if (!session?.access_token) {
+            setIsAdmin(false);
+            return;
+        }
+
+        const metadataRoleCandidates = [
+            (session.user.user_metadata as any)?.role,
+            (session.user.app_metadata as any)?.role
+        ]
+            .map((value) => (typeof value === 'string' ? value.trim().toLowerCase() : ''))
+            .filter(Boolean);
+        const metadataRole = metadataRoleCandidates[0] || '';
+        if (metadataRole === 'admin' || metadataRole === 'owner') {
+            setIsAdmin(true);
+            return;
+        }
+        if (metadataRole === 'agent') {
             setIsAdmin(false);
             return;
         }
@@ -3543,7 +3711,7 @@ export default function App() {
         return () => {
             cancelled = true;
         };
-    }, [fetchWithSessionAuth, session]);
+    }, [fetchWithSessionAuth, session?.access_token]);
 
     useEffect(() => {
         const statusEmoji = connectionStatus === 'open' ? '🟢' : connectionStatus === 'connecting' ? '🟡' : '🔴';
@@ -3554,6 +3722,7 @@ export default function App() {
 
     useEffect(() => {
         if (!socketAccessToken) {
+            refreshSessionPromiseRef.current = null;
             const existingSocket = socketInstanceRef.current;
             if (existingSocket) {
                 existingSocket.removeAllListeners();
@@ -3568,6 +3737,7 @@ export default function App() {
             setProfilesLoaded(false);
             setActiveProfileId(null);
             setAllMessages([]);
+            latestMessageTimestampRef.current = 0;
             setContacts({});
             return;
         }
@@ -3592,7 +3762,12 @@ export default function App() {
         const newSocket = io(SOCKET_URL, {
             auth: { token: socketAccessToken },
             transports: ['websocket', 'polling'],
-            autoConnect: false
+            autoConnect: false,
+            reconnection: true,
+            reconnectionAttempts: Infinity,
+            reconnectionDelay: 750,
+            reconnectionDelayMax: 4000,
+            timeout: 12000
         });
         socketInstanceRef.current = newSocket;
         socketAccessTokenRef.current = socketAccessToken;
@@ -3604,11 +3779,35 @@ export default function App() {
             }
         }, 50);
 
+        const emitRefreshMessages = (options: { forceFullHistory?: boolean; includeContacts?: boolean } = {}) => {
+            const profileId = activeProfileIdRef.current;
+            if (!profileId || !newSocket.connected) return;
+
+            const nowMs = Date.now();
+            const latestTs = Math.max(0, Math.floor(latestMessageTimestampRef.current || 0));
+            const forceFullHistory = options.forceFullHistory === true || latestTs <= 0;
+            const minGapMs = forceFullHistory ? 0 : 1200;
+            if (nowMs - lastRefreshRequestEmitAtRef.current < minGapMs) return;
+
+            const sinceTimestamp = forceFullHistory ? 0 : Math.max(0, latestTs - 2);
+            newSocket.emit('refreshMessages', {
+                profileId,
+                sinceTimestamp,
+                includeContacts: options.includeContacts === true,
+                forceFullHistory
+            });
+            lastRefreshRequestEmitAtRef.current = nowMs;
+            lastRealtimeEventAtRef.current = nowMs;
+        };
+
         newSocket.on('connect', () => {
             const profileId = activeProfileIdRef.current;
             if (profileId) {
-                newSocket.emit('switchProfile', profileId);
-                newSocket.emit('refreshMessages', profileId);
+                const shouldRequestContacts = latestMessageTimestampRef.current <= 0;
+                emitRefreshMessages({
+                    forceFullHistory: shouldRequestContacts,
+                    includeContacts: shouldRequestContacts
+                });
             }
             lastRealtimeEventAtRef.current = Date.now();
         });
@@ -3646,15 +3845,21 @@ export default function App() {
             if (next?.id) setActiveProfileId(next.id);
         });
 
+        newSocket.on('profile.unread', (data) => {
+            const profileId = typeof data?.profileId === 'string' ? data.profileId : '';
+            const unreadCount = Math.max(0, Number(data?.unreadCount || 0));
+            if (!profileId) return;
+            setProfiles((prev) => prev.map((item: any) => {
+                if (item?.id !== profileId) return item;
+                return {
+                    ...item,
+                    unreadCount
+                };
+            }));
+        });
+
         newSocket.on('connection.update', (update) => {
             if (update.profileId === activeProfileIdRef.current) setConnectionStatus(update.connection);
-            if (update.connection === 'open' && update.profileId === activeProfileIdRef.current) {
-                const profileId = activeProfileIdRef.current;
-                if (profileId && newSocket.connected) {
-                    newSocket.emit('refreshMessages', profileId);
-                    lastRealtimeEventAtRef.current = Date.now();
-                }
-            }
             if (update.connection === 'close') {
                 pushLog('WABA connection closed.', 'info');
             }
@@ -3744,7 +3949,11 @@ export default function App() {
             if (data.profileId === activeProfileIdRef.current) {
                 lastRealtimeEventAtRef.current = Date.now();
                 const incomingMessages = Array.isArray(data?.messages) ? data.messages : [];
-                setAllMessages((prev) => [...incomingMessages, ...prev]);
+                const latestIncomingTs = getLatestTimestampFromMessages(incomingMessages);
+                if (latestIncomingTs > latestMessageTimestampRef.current) {
+                    latestMessageTimestampRef.current = latestIncomingTs;
+                }
+                setAllMessages((prev) => mergeMessagesByIdentity(prev, incomingMessages));
                 setLoadingChats(false);
                 if (incomingMessages.length === 0) return;
                 void notifyIncomingMessages(incomingMessages);
@@ -3779,6 +3988,8 @@ export default function App() {
                 lastRealtimeEventAtRef.current = Date.now();
                 const historyMessages = Array.isArray(data?.messages) ? data.messages : [];
                 setAllMessages(historyMessages);
+                const latestHistoryTs = Number(data?.latestTimestamp || 0) || getLatestTimestampFromMessages(historyMessages);
+                latestMessageTimestampRef.current = Math.max(latestMessageTimestampRef.current, latestHistoryTs);
                 setLoadingChats(false);
                 const previousSeen = seenIncomingMessageKeysRef.current;
                 const activeChatKey = canonicalContactJid(selectedChatIdRef.current || '');
@@ -3808,6 +4019,78 @@ export default function App() {
             }
         });
 
+        newSocket.on('messages.delta', (data) => {
+            if (data.profileId !== activeProfileIdRef.current) return;
+            lastRealtimeEventAtRef.current = Date.now();
+            const deltaMessages = Array.isArray(data?.messages) ? data.messages : [];
+            const latestDeltaTs = Number(data?.latestTimestamp || 0) || getLatestTimestampFromMessages(deltaMessages);
+            if (latestDeltaTs > latestMessageTimestampRef.current) {
+                latestMessageTimestampRef.current = latestDeltaTs;
+            }
+            if (deltaMessages.length === 0) return;
+
+            setAllMessages((prev) => mergeMessagesByIdentity(prev, deltaMessages));
+            void notifyIncomingMessages(deltaMessages);
+            const activeChatKey = canonicalContactJid(selectedChatIdRef.current || '');
+            const effectiveReadCursor = resolveRealtimeReadCursor(
+                activeProfileIdRef.current,
+                chatReadCursorByChatRef.current
+            );
+            setUnreadMessagesByChat((prev) => {
+                const unreadDeltaByChat = collectUnreadDeltaFromIncomingUpsert(
+                    deltaMessages,
+                    activeChatKey,
+                    seenIncomingMessageKeysRef.current,
+                    effectiveReadCursor
+                );
+                return mergeUnreadDelta(prev, unreadDeltaByChat);
+            });
+        });
+
+        newSocket.on('notification.test', (payload) => {
+            const title = typeof payload?.title === 'string' && payload.title.trim()
+                ? payload.title.trim()
+                : 'QMessage Test Notification';
+            const body = typeof payload?.body === 'string' && payload.body.trim()
+                ? payload.body.trim()
+                : 'Cross-device notification test';
+
+            showToast(`[Test] ${body}`, 'success');
+
+            const canShowSystemNotification = 'Notification' in window && Notification.permission === 'granted';
+            if (!canShowSystemNotification) return;
+
+            const options: NotificationOptions = {
+                body,
+                icon: '/icons/icon-192.png',
+                badge: '/icons/icon-192.png',
+                tag: `test-notification:${payload?.id || Date.now()}`,
+                data: {
+                    url: '/'
+                }
+            };
+
+            void (async () => {
+                try {
+                    const registration = await navigator.serviceWorker?.getRegistration?.();
+                    if (registration) {
+                        await registration.showNotification(title, options);
+                        return;
+                    }
+                } catch {
+                    // fallback below
+                }
+
+                try {
+                    const notification = new Notification(title, options);
+                    notification.onclick = () => {
+                        window.focus();
+                    };
+                } catch {
+                    // ignore unsupported Notification constructor environments
+                }
+            })();
+        });
         newSocket.on('server.stats', (stats) => {
             lastRealtimeEventAtRef.current = Date.now();
             setServerStats(stats);
@@ -3916,7 +4199,6 @@ export default function App() {
                     });
                     return next;
                 });
-                scheduleActiveProfileRefresh(180);
             }
         });
 
@@ -3996,29 +4278,61 @@ export default function App() {
 
         newSocket.on('workflow.started', (data) => {
             setStartingWorkflow(false);
-            const profileId = activeProfileIdRef.current;
-            if (profileId) {
-                newSocket.emit('refreshMessages', profileId);
-            }
+            emitRefreshMessages();
             if (data?.workflowId) {
                 pushLog(`Workflow started: ${data.workflowId}`, 'info');
             }
         });
 
-        newSocket.on('connect_error', (err: any) => {
+        let socketAuthRetryInFlight = false;
+
+        newSocket.on('connect_error', async (err: any) => {
             setProfilesLoaded(true);
-            pushLog(`Socket connect error: ${err?.message || err}`, 'error');
+            setLoadingChats(false);
+
+            const errorMessage = typeof err?.message === 'string' ? err.message : String(err || '');
+            const normalizedErrorMessage = errorMessage.toLowerCase();
+            const shouldTryTokenRefresh =
+                normalizedErrorMessage.includes('invalid session')
+                || normalizedErrorMessage.includes('authentication error')
+                || normalizedErrorMessage.includes('jwt')
+                || normalizedErrorMessage.includes('token');
+
+            if (shouldTryTokenRefresh && !socketAuthRetryInFlight) {
+                socketAuthRetryInFlight = true;
+                try {
+                    const refreshedToken = await refreshAccessTokenRef.current?.();
+                    if (refreshedToken) {
+                        socketAccessTokenRef.current = refreshedToken;
+                        newSocket.auth = { token: refreshedToken };
+                        if (!newSocket.connected) {
+                            newSocket.connect();
+                        }
+                        pushLog('Socket session refreshed. Reconnecting...', 'info');
+                        return;
+                    }
+                } finally {
+                    socketAuthRetryInFlight = false;
+                }
+            }
+
+            pushLog(`Socket connect error: ${errorMessage || err}`, 'error');
         });
 
         newSocket.on('disconnect', (reason: any) => {
             pushLog(`Socket disconnected: ${reason}`, 'info');
+            if (document.visibilityState !== 'visible') return;
+            window.setTimeout(() => {
+                if (!newSocket.connected) {
+                    newSocket.connect();
+                }
+            }, 350);
         });
 
         const requestActiveProfileRefresh = () => {
             if (document.visibilityState !== 'visible') return;
             if (!newSocket.connected || !activeProfileIdRef.current) return;
-            newSocket.emit('refreshMessages', activeProfileIdRef.current);
-            lastRealtimeEventAtRef.current = Date.now();
+            emitRefreshMessages();
         };
         let refreshDebounceTimer: number | null = null;
 
@@ -4046,11 +4360,6 @@ export default function App() {
                 return;
             }
             clearHiddenDisconnectTimer();
-            hiddenSocketDisconnectTimerRef.current = window.setTimeout(() => {
-                if (document.visibilityState !== 'visible' || !isMobileDevice()) return;
-                if (newSocket.connected) newSocket.disconnect();
-                hiddenSocketDisconnectTimerRef.current = null;
-            }, 45_000);
         };
 
         const handleWindowFocus = () => requestActiveProfileRefresh();
@@ -4069,8 +4378,7 @@ export default function App() {
             }
             const staleForMs = Date.now() - lastRealtimeEventAtRef.current;
             if (staleForMs < SOCKET_STALE_REFRESH_INTERVAL_MS) return;
-            newSocket.emit('refreshMessages', profileId);
-            lastRealtimeEventAtRef.current = Date.now();
+            emitRefreshMessages();
         }, SOCKET_STALE_REFRESH_INTERVAL_MS);
 
         document.addEventListener('visibilitychange', handleVisibilityChange);
@@ -4102,8 +4410,8 @@ export default function App() {
     // Handle switching profile separately
     useEffect(() => {
         if (socket && activeProfileId) {
-            console.log('Switching to profile:', activeProfileId);
             setLoadingChats(true);
+            latestMessageTimestampRef.current = 0;
             socket.emit('switchProfile', activeProfileId);
         }
     }, [socket, activeProfileId]);
@@ -4165,24 +4473,10 @@ export default function App() {
     };
 
     useEffect(() => {
-        if (activeView !== 'chatflow' || !activeProfileId || !session?.access_token) return;
-        setWorkflowsLoading(true);
-        fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`, {
-            headers: {
-                Authorization: `Bearer ${session.access_token}`
-            }
-        })
-            .then(res => res.json())
-            .then(data => {
-                const list = Array.isArray(data?.workflows) ? data.workflows : [];
-                applyWorkflowsFromServer(list);
-            })
-            .catch(err => console.error('Failed to fetch workflows:', err))
-            .finally(() => setWorkflowsLoading(false));
-    }, [activeView, activeProfileId, session?.access_token]);
+        const shouldLoadWorkflows = activeView === 'chatflow'
+            || (activeView === 'dashboard' && workspaceSection === 'automations');
+        if (!shouldLoadWorkflows || !activeProfileId || !session?.access_token) return;
 
-    useEffect(() => {
-        if (activeView !== 'dashboard' || !activeProfileId || !session?.access_token) return;
         setWorkflowsLoading(true);
         fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`, {
             headers: {
@@ -4196,7 +4490,7 @@ export default function App() {
             })
             .catch(err => console.error('Failed to fetch workflows:', err))
             .finally(() => setWorkflowsLoading(false));
-    }, [activeView, activeProfileId, session?.access_token]);
+    }, [activeView, activeProfileId, session?.access_token, workspaceSection]);
 
     useEffect(() => {
         if (activeView !== 'chatflow' || workflowEditorMode !== 'visual' || !selectedWorkflowId) return;
@@ -5609,7 +5903,6 @@ export default function App() {
     const submitAddProfile = () => {
         if (newProfileName.trim() && !isCreatingProfile) {
             setIsCreatingProfile(true);
-            console.log('Submitting new profile:', newProfileName.trim());
             socket?.emit('addProfile', newProfileName.trim());
         }
     };
@@ -5753,7 +6046,7 @@ export default function App() {
                 forcedMessage={hostAuthError}
                 onLogin={(nextSession) => {
                     setHostAuthError(null);
-                    setSession(nextSession);
+                    updateSessionState(nextSession);
                     setAuthChecking(false);
                 }}
             />
@@ -5789,6 +6082,15 @@ export default function App() {
     const mobileWorkspaceTabs = workspaceTabs.filter((tab) =>
         (MOBILE_BOTTOM_TAB_SECTIONS as readonly string[]).includes(tab.id)
     );
+    const showMobileNotificationTestFab = isMobile
+        && Boolean(session?.access_token)
+        && activeView === 'dashboard'
+        && !showContactInfo
+        && !showTemplateComposer
+        && !showMediaComposer;
+    const mobileNotificationFabBottom = shouldShowMobileBottomNav
+        ? 'calc(88px + env(safe-area-inset-bottom))'
+        : 'calc(16px + env(safe-area-inset-bottom))';
     const broadcastNav: Array<{ id: 'template-library' | 'my-templates' | 'broadcast-history' | 'scheduled-broadcasts'; label: string }> = [
         { id: 'template-library', label: 'Create Template' },
         { id: 'my-templates', label: 'My Templates' },
@@ -5806,6 +6108,16 @@ export default function App() {
             paddingLeft: 'max(env(safe-area-inset-left), 0px)',
             paddingRight: 'max(env(safe-area-inset-right), 0px)',
             paddingTop: 'calc(64px + env(safe-area-inset-top))'
+        }
+        : undefined;
+    const mobileBottomNavPaddingStyle: React.CSSProperties | undefined = isMobile && shouldShowMobileBottomNav
+        ? {
+            paddingBottom: 'calc(76px + env(safe-area-inset-bottom))'
+        }
+        : undefined;
+    const mobileBottomNavContentPaddingStyle: React.CSSProperties | undefined = isMobile && shouldShowMobileBottomNav
+        ? {
+            paddingBottom: 'calc(92px + env(safe-area-inset-bottom))'
         }
         : undefined;
 
@@ -5948,8 +6260,11 @@ export default function App() {
 
             {workspaceSection === 'team-inbox' ? (
                 <div
-                    className={`flex h-screen ${hideGlobalHeaderOnMobileInbox ? 'pt-0' : 'pt-[64px] lg:pt-[72px]'} bg-[#f8f9fa] overflow-hidden text-[#111b21] font-sans ${shouldShowMobileBottomNav ? 'pb-[76px]' : ''}`}
-                    style={hideGlobalHeaderOnMobileInbox ? mobileSafeInsetsStyle : mobileHeaderOffsetStyle}
+                    className={`flex ${isMobile ? 'h-[100dvh]' : 'h-screen'} ${hideGlobalHeaderOnMobileInbox ? 'pt-0' : 'pt-[64px] lg:pt-[72px]'} bg-[#f8f9fa] overflow-hidden text-[#111b21] font-sans`}
+                    style={{
+                        ...(hideGlobalHeaderOnMobileInbox ? mobileSafeInsetsStyle : mobileHeaderOffsetStyle),
+                        ...(mobileBottomNavPaddingStyle || {})
+                    }}
                     onTouchStart={handleMobileWorkspaceTouchStart}
                     onTouchEnd={handleMobileWorkspaceTouchEnd}
                 >
@@ -7532,69 +7847,77 @@ export default function App() {
             }
 
             {showAnalytics && (
-                <div className="fixed inset-0 bg-[#f8f9fa] z-[160] flex flex-col" style={mobileSafeInsetsStyle}>
-                    <header
-                        className="h-[70px] bg-[#f0f2f5] px-6 flex items-center justify-between border-b border-[#eceff1]"
-                        style={isMobile ? {
-                            minHeight: 'calc(70px + env(safe-area-inset-top))',
-                            paddingTop: 'max(env(safe-area-inset-top), 0px)'
-                        } : undefined}
+                <div
+                    className="fixed inset-0 z-[160] bg-[#f8f9fa] text-[#111b21] font-sans pt-[64px] lg:pt-[72px]"
+                    style={{
+                        ...(mobileHeaderOffsetStyle || {}),
+                        ...(mobileBottomNavPaddingStyle || {})
+                    }}
+                    onTouchStart={handleMobileWorkspaceTouchStart}
+                    onTouchEnd={handleMobileWorkspaceTouchEnd}
+                >
+                    <div
+                        className={`h-full overflow-y-auto custom-scrollbar ${isMobile ? 'p-4' : 'p-6'}`}
+                        style={mobileBottomNavContentPaddingStyle}
                     >
-                        <div className="flex items-center gap-4">
-                            <BarChart3 className="text-[#00a884] w-7 h-7" />
-                            <h1 className="text-xl font-bold text-[#111b21]">Analytics</h1>
-                        </div>
-                        <button onClick={() => setShowAnalytics(false)} className="p-2 hover:bg-white rounded-xl transition-all">
-                            <X className="w-6 h-6 text-[#54656f]" />
-                        </button>
-                    </header>
-                    <div className={`flex-1 overflow-y-auto custom-scrollbar ${isMobile ? 'p-4 pb-[92px]' : 'p-8'}`}>
-                        <div className="bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] mb-8">
-                            <div className="flex flex-col lg:flex-row lg:items-end gap-4">
+                        <div className="mx-auto w-full max-w-[1280px] space-y-6">
+                        <div className={`${isMobile ? 'px-1 py-1' : 'bg-white border border-[#e6ebef] rounded-2xl p-4 md:p-5'}`}>
+                            <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4">
                                 <div>
-                                    <label className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">Start Date</label>
-                                    <input
-                                        type="date"
-                                        value={analyticsStart}
-                                        onChange={(e) => setAnalyticsStart(e.target.value)}
-                                        className="mt-2 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-4 py-2 text-sm font-bold text-[#111b21]"
-                                    />
+                                    <h2 className="text-lg md:text-xl font-semibold text-[#111b21] tracking-tight">Analytics</h2>
+                                    <p className="text-[11px] text-[#54656f] mt-1">
+                                        Message volume, response rates, and team performance.
+                                    </p>
                                 </div>
-                                <div>
-                                    <label className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">End Date</label>
-                                    <input
-                                        type="date"
-                                        value={analyticsEnd}
-                                        onChange={(e) => setAnalyticsEnd(e.target.value)}
-                                        className="mt-2 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-4 py-2 text-sm font-bold text-[#111b21]"
-                                    />
+                                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-[160px_160px_minmax(180px,1fr)_auto] gap-2">
+                                    <div>
+                                        <label className="text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">Start Date</label>
+                                        <input
+                                            type="date"
+                                            value={analyticsStart}
+                                            onChange={(e) => setAnalyticsStart(e.target.value)}
+                                            className="mt-1.5 w-full bg-[#f8f9fa] border border-[#dfe6eb] rounded-xl px-3 py-2 text-sm font-semibold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">End Date</label>
+                                        <input
+                                            type="date"
+                                            value={analyticsEnd}
+                                            onChange={(e) => setAnalyticsEnd(e.target.value)}
+                                            className="mt-1.5 w-full bg-[#f8f9fa] border border-[#dfe6eb] rounded-xl px-3 py-2 text-sm font-semibold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">Tag</label>
+                                        <select
+                                            value={analyticsTag}
+                                            onChange={(e) => setAnalyticsTag(e.target.value)}
+                                            className="mt-1.5 w-full bg-[#f8f9fa] border border-[#dfe6eb] rounded-xl px-3 py-2 text-sm font-semibold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                        >
+                                            <option value="">All tags</option>
+                                            {(analyticsData?.tags || []).map((tag: string) => (
+                                                <option key={tag} value={tag}>{tag}</option>
+                                            ))}
+                                        </select>
+                                    </div>
+                                    <div className="sm:col-span-2 lg:col-span-1 flex items-end">
+                                        <button
+                                            onClick={fetchAnalytics}
+                                            disabled={analyticsLoading}
+                                            className="h-10 px-4 rounded-lg bg-[#00a884] text-white text-[11px] font-semibold uppercase tracking-wide hover:bg-[#008f6f] transition-all disabled:opacity-60"
+                                        >
+                                            {analyticsLoading ? 'Loading�' : 'Apply'}
+                                        </button>
+                                    </div>
                                 </div>
-                                <div className="flex-1">
-                                    <label className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">Tag</label>
-                                    <select
-                                        value={analyticsTag}
-                                        onChange={(e) => setAnalyticsTag(e.target.value)}
-                                        className="mt-2 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-4 py-2 text-sm font-bold text-[#111b21]"
-                                    >
-                                        <option value="">All tags</option>
-                                        {(analyticsData?.tags || []).map((tag: string) => (
-                                            <option key={tag} value={tag}>{tag}</option>
-                                        ))}
-                                    </select>
-                                </div>
-                                <button
-                                    onClick={fetchAnalytics}
-                                    disabled={analyticsLoading}
-                                    className="h-[42px] px-5 rounded-xl bg-[#111b21] text-white text-xs font-bold uppercase tracking-widest hover:bg-[#202c33] transition-all disabled:opacity-50"
-                                >
-                                    {analyticsLoading ? 'Loading…' : 'Apply'}
-                                </button>
                             </div>
                             {analyticsError && (
-                                <div className="mt-4 text-sm text-rose-600 font-medium">{analyticsError}</div>
+                                <div className="mt-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-[11px] text-rose-700">
+                                    {analyticsError}
+                                </div>
                             )}
                         </div>
-
                         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-6 gap-6 mb-8">
                             <div className="bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
                                 <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-2">Total Messages</div>
@@ -7825,6 +8148,7 @@ export default function App() {
                                 </table>
                             </div>
                         </div>
+                        </div>
                     </div>
                 </div>
             )}
@@ -8017,8 +8341,11 @@ export default function App() {
                 </div>
             ) : workspaceSection === 'more' ? (
                 <div
-                    className={`h-screen pt-[64px] lg:pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans ${shouldShowMobileBottomNav ? 'pb-[76px]' : ''}`}
-                    style={mobileHeaderOffsetStyle}
+                    className={`${isMobile ? 'h-[100dvh]' : 'h-screen'} pt-[64px] lg:pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans`}
+                    style={{
+                        ...(mobileHeaderOffsetStyle || {}),
+                        ...(mobileBottomNavPaddingStyle || {})
+                    }}
                     onTouchStart={handleMobileWorkspaceTouchStart}
                     onTouchEnd={handleMobileWorkspaceTouchEnd}
                 >
@@ -8086,8 +8413,11 @@ export default function App() {
                 </div>
             ) : (
                 <div
-                    className={`h-screen pt-[64px] lg:pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans ${shouldShowMobileBottomNav ? 'pb-[76px]' : ''}`}
-                    style={mobileHeaderOffsetStyle}
+                    className={`${isMobile ? 'h-[100dvh]' : 'h-screen'} pt-[64px] lg:pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans`}
+                    style={{
+                        ...(mobileHeaderOffsetStyle || {}),
+                        ...(mobileBottomNavPaddingStyle || {})
+                    }}
                     onTouchStart={handleMobileWorkspaceTouchStart}
                     onTouchEnd={handleMobileWorkspaceTouchEnd}
                 >
@@ -8132,6 +8462,25 @@ export default function App() {
                 />
             )}
 
+            {showMobileNotificationTestFab && (
+                <button
+                    type="button"
+                    onClick={() => {
+                        void handleSendTestNotification();
+                    }}
+                    disabled={sendingTestNotification}
+                    className="fixed right-3 z-[220] h-11 min-w-[44px] px-3 rounded-full bg-[#00a884] text-white shadow-[0_12px_28px_rgba(0,168,132,0.36)] border border-[#ffffffaa] flex items-center justify-center gap-1.5 active:scale-95 disabled:opacity-65 disabled:cursor-not-allowed lg:hidden"
+                    style={{
+                        bottom: mobileNotificationFabBottom,
+                        right: 'max(0.75rem, calc(env(safe-area-inset-right) + 0.5rem))'
+                    }}
+                    title="Test notification on other devices"
+                    aria-label="Test notification on other devices"
+                >
+                    <Bell className="w-4 h-4" />
+                    <span className="text-[11px] font-bold tracking-wide">Test</span>
+                </button>
+            )}
             {showPwaUpdateBanner && (
                 <div className="fixed left-0 right-0 top-0 z-[320] pointer-events-none px-3 pt-[calc(env(safe-area-inset-top,0px)+12px)]">
                     <div className="mx-auto max-w-md pointer-events-auto rounded-2xl border border-white/15 bg-[#111b21] px-4 py-3 text-white shadow-[0_12px_34px_rgba(0,0,0,0.34)]">
@@ -8273,3 +8622,4 @@ export default function App() {
         </>
     );
 }
+

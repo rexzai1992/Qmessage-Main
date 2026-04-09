@@ -76,6 +76,7 @@ function resolveRoute(
 }
 
 const MAX_BUTTONS = 3
+const STORE_INBOUND_RAW_PAYLOAD = process.env.STORE_INBOUND_RAW_PAYLOAD === 'true'
 const DEFAULT_FALLBACK_TEXT = process.env.WORKFLOW_FALLBACK_TEXT || 'automation not in setting'
 const DEFAULT_FALLBACK_LIMIT = (() => {
     const raw = process.env.WORKFLOW_FALLBACK_LIMIT
@@ -519,7 +520,7 @@ export class WorkflowEngine {
                 filename: ctx.media?.filename,
                 file_size: ctx.media?.file_size,
                 referral: referral || null,
-                raw: ctx.raw
+                ...(STORE_INBOUND_RAW_PAYLOAD ? { raw: ctx.raw } : {})
             },
             workflowState: currentState
         })

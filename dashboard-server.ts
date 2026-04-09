@@ -14,7 +14,7 @@ import { supabase, supabaseAuth } from './src/supabase'
 import { WabaRegistry } from './src/waba/registry'
 import { parseWabaWebhook, verifyWabaSignature } from './src/waba/webhook'
 import type { WabaInboundMessage, WabaStatus, WabaConfig, WabaCallUpdate } from './src/waba/types'
-import { resolveCompanyId, findOrCreateUser, getMessagesForUsers, getUsersForCompany, insertMessage, getUserByPhone, deleteMessagesForUser, normalizePhoneNumber, isGroupIdentifier, updateMessageStatusByMessageId, updateUserName, setUserTags, getUsersWithExpiringWindow, updateUserWindowReminder, activateUserCtaFreeWindow, getUserById, assignUserToAgentIfUnassigned, setUserAssignee, hasHumanTakeover, setUserHumanTakeover, setUserTemplateAttributes } from './src/services/wa-store'
+import { resolveCompanyId, findOrCreateUser, getMessagesForUsers, getMessagesForUsersSince, getUsersForCompany, insertMessage, getUserByPhone, deleteMessagesForUser, normalizePhoneNumber, isGroupIdentifier, updateMessageStatusByMessageId, updateUserName, setUserTags, getUsersWithExpiringWindow, updateUserWindowReminder, activateUserCtaFreeWindow, getUserById, assignUserToAgentIfUnassigned, setUserAssignee, hasHumanTakeover, setUserHumanTakeover, setUserTemplateAttributes } from './src/services/wa-store'
 import type { MessageRecord, User as WaStoreUser } from './src/services/wa-store'
 import { sendWhatsAppMessage } from './src/services/whatsapp'
 import { createDownloadUrl, isR2Configured } from './src/services/r2-storage'
@@ -2722,6 +2722,95 @@ const apiKeyStore = createApiKeyStore(resolvePath('api_keys.json'))
 const verifyApiKey = apiKeyStore.middleware
 
 const webhookStore = createWebhookStore(resolvePath('webhooks.json'))
+const INCLUDE_RAW_WEBHOOK_EVENT_PAYLOAD = process.env.WABA_INCLUDE_RAW_WEBHOOK_PAYLOAD === 'true'
+const WEBHOOK_QUEUE_MAX_SIZE = 3000
+const WEBHOOK_PROCESS_CONCURRENCY = Math.max(
+    1,
+    Math.min(16, Number.parseInt(process.env.WABA_WEBHOOK_CONCURRENCY || '4', 10) || 4)
+)
+type QueuedWebhookEvent =
+    | { kind: 'message'; event: WabaInboundMessage }
+    | { kind: 'status'; event: WabaStatus }
+    | { kind: 'call'; event: WabaCallUpdate }
+
+const queuedWebhookEvents: QueuedWebhookEvent[] = []
+let webhookProcessorActive = false
+
+function enqueueWebhookEvents(events: QueuedWebhookEvent[]) {
+    if (!Array.isArray(events) || events.length === 0) return
+    events.forEach((event) => {
+        if (queuedWebhookEvents.length >= WEBHOOK_QUEUE_MAX_SIZE) {
+            queuedWebhookEvents.shift()
+        }
+        queuedWebhookEvents.push(event)
+    })
+    if (!webhookProcessorActive) {
+        webhookProcessorActive = true
+        queueMicrotask(() => {
+            void processWebhookQueue()
+        })
+    }
+}
+
+function toMinimalInboundRaw(inbound: WabaInboundMessage): any | null {
+    if (INCLUDE_RAW_WEBHOOK_EVENT_PAYLOAD) return inbound.raw
+    return {
+        timestamp: inbound.timestamp,
+        referral: inbound.referral || null
+    }
+}
+
+function toMinimalStatusRaw(status: WabaStatus): any | null {
+    if (INCLUDE_RAW_WEBHOOK_EVENT_PAYLOAD) return status.raw
+    return {
+        status: status.status,
+        timestamp: status.timestamp
+    }
+}
+
+function toMinimalCallRaw(call: WabaCallUpdate): any | null {
+    if (INCLUDE_RAW_WEBHOOK_EVENT_PAYLOAD) return call.raw
+    return {
+        event: call.event,
+        timestamp: call.timestamp
+    }
+}
+
+async function processWebhookQueue() {
+    try {
+        while (queuedWebhookEvents.length > 0) {
+            const batch = queuedWebhookEvents.splice(0, WEBHOOK_PROCESS_CONCURRENCY)
+            await Promise.allSettled(batch.map(async (item) => {
+                const config = await wabaRegistry.getConfigByPhoneNumberId(item.event.phoneNumberId)
+                if (!config) {
+                    if (item.kind === 'message') {
+                        console.warn('[WABA] No config for phone_number_id:', item.event.phoneNumberId)
+                    }
+                    return
+                }
+                if (item.kind === 'message') {
+                    await handleInboundMessage(config, item.event)
+                    return
+                }
+                if (item.kind === 'status') {
+                    await handleStatusUpdate(config, item.event)
+                    return
+                }
+                await handleCallUpdate(config, item.event)
+            }))
+        }
+    } catch (error) {
+        console.error('WABA webhook queue error:', error)
+    } finally {
+        webhookProcessorActive = false
+        if (queuedWebhookEvents.length > 0) {
+            webhookProcessorActive = true
+            queueMicrotask(() => {
+                void processWebhookQueue()
+            })
+        }
+    }
+}
 
 // ============================================
 // PUBLIC API ENDPOINTS
@@ -3034,28 +3123,39 @@ app.post('/webhook', async (req: any, res: any) => {
         }
 
         const { messages, statuses, calls } = parseWabaWebhook(req.body || {})
+        const queueItems: QueuedWebhookEvent[] = []
 
-        for (const msg of messages) {
-            const config = await wabaRegistry.getConfigByPhoneNumberId(msg.phoneNumberId)
-            if (!config) {
-                console.warn('[WABA] No config for phone_number_id:', msg.phoneNumberId)
-                continue
-            }
-            await handleInboundMessage(config, msg)
-        }
+        messages.forEach((msg) => {
+            queueItems.push({
+                kind: 'message',
+                event: {
+                    ...msg,
+                    raw: toMinimalInboundRaw(msg)
+                }
+            })
+        })
 
-        for (const status of statuses) {
-            const config = await wabaRegistry.getConfigByPhoneNumberId(status.phoneNumberId)
-            if (!config) continue
-            await handleStatusUpdate(config, status)
-        }
+        statuses.forEach((status) => {
+            queueItems.push({
+                kind: 'status',
+                event: {
+                    ...status,
+                    raw: toMinimalStatusRaw(status)
+                }
+            })
+        })
 
-        for (const call of calls) {
-            const config = await wabaRegistry.getConfigByPhoneNumberId(call.phoneNumberId)
-            if (!config) continue
-            await handleCallUpdate(config, call)
-        }
+        calls.forEach((call) => {
+            queueItems.push({
+                kind: 'call',
+                event: {
+                    ...call,
+                    raw: toMinimalCallRaw(call)
+                }
+            })
+        })
 
+        enqueueWebhookEvents(queueItems)
         return res.sendStatus(200)
     } catch (error) {
         console.error('WABA webhook error:', error)
@@ -4658,7 +4758,7 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
         buttonId: inbound.buttonReplyId,
         buttonTitle: inbound.buttonReplyTitle,
         media: inbound.image || inbound.document || inbound.audio || inbound.video,
-        raw: inbound.raw
+        raw: toMinimalInboundRaw(inbound)
     })
 
     const user = (await getUserByPhone(companyId, phoneNumber)) || baseUser
@@ -4672,21 +4772,36 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
         }
     }
 
-    const { data: profile } = await supabase.from('profiles').select('*').eq('id', profileId).single()
-
-    if (profile) {
-        const newCount = (profile.unreadCount || 0) + 1
-        await supabase.from('profiles').update({ unreadCount: newCount }).eq('id', profileId)
-        const room = getCompanyRoom(companyId)
-        const { data: companyProfiles } = await supabase
+    let profileUnreadCount: number | null = null
+    try {
+        const { data: profile } = await supabase
             .from('profiles')
-            .select('*')
-            .eq('company_id', companyId)
-            .order('created_at', { ascending: true })
-        io.to(room).emit('profiles.update', companyProfiles || [])
+            .select('id, unreadCount')
+            .eq('id', profileId)
+            .maybeSingle()
+
+        if (profile) {
+            const newCount = (profile.unreadCount || 0) + 1
+            const { error: updateUnreadError } = await supabase
+                .from('profiles')
+                .update({ unreadCount: newCount })
+                .eq('id', profileId)
+
+            if (updateUnreadError) {
+                console.warn(`[${profileId}] Failed to update profile unread count:`, updateUnreadError.message)
+            } else {
+                profileUnreadCount = newCount
+            }
+        }
+    } catch (error: any) {
+        console.warn(`[${profileId}] Profile unread update skipped:`, error?.message || error)
     }
 
-    if (profile && workflowResult?.error) {
+    if (typeof profileUnreadCount === 'number') {
+        io.to(getCompanyRoom(companyId)).emit('profile.unread', { profileId, unreadCount: profileUnreadCount })
+    }
+
+    if (workflowResult?.error) {
         io.to(getCompanyRoom(companyId)).emit('profile.error', { message: `Workflow error: ${workflowResult.error}` })
     }
 
@@ -4712,31 +4827,29 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
         }
     }
 
-    if (profile) {
-        const inboundAt = inbound.timestamp ? new Date(Number(inbound.timestamp) * 1000).toISOString() : null
-        const contact = user
-            ? {
-                ...buildContactPayload(user),
-                id: remoteJid,
-                lastInboundAt: inboundAt
-            }
-            : {
-                id: remoteJid,
-                name: isGroupMessage ? `Group ${phoneNumber}` : (inbound.contactName || phoneNumber),
-                lastInboundAt: inboundAt,
-                tags: [],
-                assigneeUserId: null,
-                assigneeName: null,
-                assigneeColor: null,
-                ctaReferralAt: null,
-                ctaFreeWindowStartedAt: null,
-                ctaFreeWindowExpiresAt: null
-            }
-        io.to(getCompanyRoom(companyId)).emit('contacts.update', {
-            profileId,
-            contacts: [contact]
-        })
-    }
+    const inboundAt = inbound.timestamp ? new Date(Number(inbound.timestamp) * 1000).toISOString() : null
+    const contact = user
+        ? {
+            ...buildContactPayload(user),
+            id: remoteJid,
+            lastInboundAt: inboundAt
+        }
+        : {
+            id: remoteJid,
+            name: isGroupMessage ? `Group ${phoneNumber}` : (inbound.contactName || phoneNumber),
+            lastInboundAt: inboundAt,
+            tags: [],
+            assigneeUserId: null,
+            assigneeName: null,
+            assigneeColor: null,
+            ctaReferralAt: null,
+            ctaFreeWindowStartedAt: null,
+            ctaFreeWindowExpiresAt: null
+        }
+    io.to(getCompanyRoom(companyId)).emit('contacts.update', {
+        profileId,
+        contacts: [contact]
+    })
 
     const buttonReply = inbound.buttonReplyId
         ? {
@@ -4757,7 +4870,7 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
         referral: inbound.referral || null,
         button_reply: buttonReply,
         interactive: inbound.interactive || null,
-        raw: inbound.raw
+        raw: INCLUDE_RAW_WEBHOOK_EVENT_PAYLOAD ? inbound.raw : null
     })
 
     addon.webhookService.trigger(profileId, 'message_received', {
@@ -4772,12 +4885,10 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
         referral: inbound.referral || null,
         button_reply: buttonReply,
         interactive: inbound.interactive || null,
-        raw: inbound.raw
+        raw: INCLUDE_RAW_WEBHOOK_EVENT_PAYLOAD ? inbound.raw : null
     })
 
-    if (profile) {
-        io.to(getCompanyRoom(companyId)).emit('messages.upsert', { profileId, messages: [syntheticMsg], type: 'notify' })
-    }
+    io.to(getCompanyRoom(companyId)).emit('messages.upsert', { profileId, messages: [syntheticMsg], type: 'notify' })
 }
 
 async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
@@ -4878,7 +4989,7 @@ async function handleCallUpdate(config: WabaConfig, call: WabaCallUpdate) {
         session: call.session || null,
         contactName: call.contactName || null,
         errors: Array.isArray(call.errors) ? call.errors : [],
-        raw: call.raw
+        raw: INCLUDE_RAW_WEBHOOK_EVENT_PAYLOAD ? call.raw : null
     }
 
     io.to(room).emit('calls.update', payload)
@@ -4909,6 +5020,7 @@ registerSocketHandlers(io, {
     getUsersForCompany,
     buildContactPayload,
     getMessagesForUsers,
+    getMessagesForUsersSince,
     normalizePhoneNumber,
     recordToSyntheticMessage,
     findOrCreateUser,

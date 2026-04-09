@@ -8,6 +8,18 @@ const CONFIG_FILE = resolvePath('addon_webhooks.json')
 const QUEUE_FILE = resolvePath('addon_webhook_queue.json')
 const LEGACY_CONFIG_FILE = resolvePath('webhooks.json')
 
+const WEBHOOK_QUEUE_PROCESS_INTERVAL_MS = (() => {
+    const parsed = Number.parseInt(process.env.ADDON_WEBHOOK_QUEUE_PROCESS_INTERVAL_MS || '1000', 10)
+    if (!Number.isFinite(parsed)) return 1000
+    return Math.max(250, parsed)
+})()
+
+const WEBHOOK_QUEUE_PERSIST_INTERVAL_MS = (() => {
+    const parsed = Number.parseInt(process.env.ADDON_WEBHOOK_QUEUE_PERSIST_INTERVAL_MS || '15000', 10)
+    if (!Number.isFinite(parsed)) return 15000
+    return Math.max(3000, parsed)
+})()
+
 export class WebhookService {
     private configs: Record<string, WebhookConfig[]> = {}
     private queue: WebhookEvent[] = []
@@ -19,10 +31,10 @@ export class WebhookService {
         this.loadQueue()
 
         // Process queue frequently
-        setInterval(() => this.processQueue(), 1000)
+        setInterval(() => this.processQueue(), WEBHOOK_QUEUE_PROCESS_INTERVAL_MS)
 
         // Persist queue periodically (Debounced I/O)
-        setInterval(() => this.persistQueue(), 3000)
+        setInterval(() => this.persistQueue(), WEBHOOK_QUEUE_PERSIST_INTERVAL_MS)
     }
 
     private loadConfig() {
@@ -113,7 +125,7 @@ export class WebhookService {
 
         try {
             // Async write to strictly avoid blocking event loop
-            await fs.promises.writeFile(QUEUE_FILE, JSON.stringify(this.queue, null, 2))
+            await fs.promises.writeFile(QUEUE_FILE, JSON.stringify(this.queue))
         } catch (e) {
             console.error('Failed to persist webhook queue', e)
             // If save failed, mark dirty again to retry next cycle

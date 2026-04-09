@@ -1070,10 +1070,35 @@ export async function getWorkflowById(workflowId: string): Promise<any | null> {
 }
 
 export async function getUsersForCompany(companyId: string): Promise<User[]> {
+    const primarySelect = 'id, company_id, phone_number, name, tags, last_inbound_at, last_window_reminder_at, assigned_to_user_id, assigned_to_name, assigned_to_color, assigned_at, cta_referral_at, cta_referral_source, cta_free_window_started_at, cta_free_window_expires_at, template_attributes'
+    const fallbackSelect = 'id, company_id, phone_number, name, tags, last_inbound_at, last_window_reminder_at, assigned_to_user_id, assigned_to_name, assigned_to_color, assigned_at'
+
     const { data, error } = await supabase
         .from('users')
-        .select('*')
+        .select(primarySelect)
         .eq('company_id', companyId)
+
+    if (error && (error.code === '42703' || String(error.message || '').toLowerCase().includes('does not exist'))) {
+        console.warn('[DB] users schema is missing newer columns, using fallback user projection.')
+        const { data: fallbackData, error: fallbackError } = await supabase
+            .from('users')
+            .select(fallbackSelect)
+            .eq('company_id', companyId)
+
+        if (fallbackError) {
+            console.warn('[DB] Failed to load users (fallback):', fallbackError.message)
+            return []
+        }
+
+        return (fallbackData || []).map((row: any) => ({
+            ...row,
+            cta_referral_at: null,
+            cta_referral_source: null,
+            cta_free_window_started_at: null,
+            cta_free_window_expires_at: null,
+            template_attributes: []
+        })) as User[]
+    }
 
     if (error) {
         console.warn('[DB] Failed to load users:', error.message)
@@ -1095,6 +1120,37 @@ export async function getMessagesForUsers(userIds: string[], limit = 500): Promi
 
     if (error) {
         console.warn('[DB] Failed to load messages:', error.message)
+        return []
+    }
+
+    return (data || []) as MessageRecord[]
+}
+
+export async function getMessagesForUsersSince(
+    userIds: string[],
+    sinceTimestamp: number,
+    limit = 200
+): Promise<MessageRecord[]> {
+    if (userIds.length === 0) return []
+
+    const parsedSince = Number(sinceTimestamp)
+    if (!Number.isFinite(parsedSince) || parsedSince <= 0) {
+        return getMessagesForUsers(userIds, limit)
+    }
+
+    const sinceIso = new Date(Math.floor(parsedSince) * 1000).toISOString()
+    const boundedLimit = Math.max(1, Math.min(500, Math.floor(limit)))
+
+    const { data, error } = await supabase
+        .from('messages')
+        .select('*')
+        .in('user_id', userIds)
+        .gt('created_at', sinceIso)
+        .order('created_at', { ascending: false })
+        .limit(boundedLimit)
+
+    if (error) {
+        console.warn('[DB] Failed to load incremental messages:', error.message)
         return []
     }
 
