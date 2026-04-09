@@ -661,6 +661,16 @@ const getChatListPreviewText = (msg: Message): string => (
     || (msg.message?.buttonsMessage ? 'Buttons' : msg.message?.listMessage ? 'List' : 'Media message')
 );
 
+const getIncomingNotificationPreview = (msg: Message): string => {
+    const preview = getMessagePreviewText(msg).trim();
+    if (preview) return preview;
+    if (msg.message?.imageMessage) return 'Photo';
+    if (msg.message?.videoMessage) return 'Video';
+    if (msg.message?.documentMessage) return 'Document';
+    if (msg.message?.audioMessage) return 'Voice message';
+    return 'New message';
+};
+
 const normalizeChatDisplayName = (rawName: string, jid: string): string => {
     const cleanId = getCleanId(jid);
     const normalized = rawName.trim() || cleanId;
@@ -1596,10 +1606,12 @@ export default function App() {
     const activeProfileIdRef = useRef<string | null>(null);
     const selectedChatIdRef = useRef<string | null>(null);
     const chatReadCursorByChatRef = useRef<Record<string, number>>({});
+    const contactsRef = useRef<Record<string, ContactMeta>>({});
     const lastRecoverAtRef = useRef(0);
     const lastInboundRef = useRef<number | null>(null);
     const requestedMediaRef = useRef<Set<string>>(new Set());
     const seenIncomingMessageKeysRef = useRef<Set<string>>(new Set());
+    const notifiedIncomingMessageKeysRef = useRef<Set<string>>(new Set());
     const mediaDownloadProgressRef = useRef<Record<string, MediaDownloadProgressState>>({});
     const mediaProgressTimerRef = useRef<Record<string, number>>({});
     const mediaProgressTimeoutRef = useRef<Record<string, number>>({});
@@ -2764,6 +2776,10 @@ export default function App() {
     }, [chatReadCursorByChat]);
 
     useEffect(() => {
+        contactsRef.current = contacts;
+    }, [contacts]);
+
+    useEffect(() => {
         if (!activeProfileId) {
             setChatReadCursorByChat({});
             return;
@@ -3329,12 +3345,86 @@ export default function App() {
             }
         });
 
+        const notifyIncomingMessages = async (incomingMessages: Message[]) => {
+            if (!Array.isArray(incomingMessages) || incomingMessages.length === 0) return;
+            if (!('Notification' in window) || Notification.permission !== 'granted') return;
+
+            const visibleChatKey = canonicalContactJid(selectedChatIdRef.current || '');
+            const notificationCandidates: Message[] = [];
+
+            incomingMessages.forEach((msg, index) => {
+                if (msg?.key?.fromMe) return;
+                const jid = canonicalContactJid(msg?.key?.remoteJid || '');
+                if (!jid) return;
+                if (document.visibilityState === 'visible' && jid === visibleChatKey) return;
+
+                const rawId = typeof msg?.key?.id === 'string' ? msg.key.id.trim() : '';
+                const ts = Number(msg?.messageTimestamp || 0);
+                const dedupeKey = `${jid}:${rawId || `ts-${ts}-idx-${index}`}`;
+                if (notifiedIncomingMessageKeysRef.current.has(dedupeKey)) return;
+                notifiedIncomingMessageKeysRef.current.add(dedupeKey);
+                notificationCandidates.push(msg);
+            });
+
+            if (notificationCandidates.length === 0) return;
+
+            if (notifiedIncomingMessageKeysRef.current.size > 5000) {
+                const recentKeys = Array.from(notifiedIncomingMessageKeysRef.current).slice(-2500);
+                notifiedIncomingMessageKeysRef.current = new Set(recentKeys);
+            }
+
+            const latest = notificationCandidates[notificationCandidates.length - 1];
+            const jid = canonicalContactJid(latest?.key?.remoteJid || '');
+            if (!jid) return;
+
+            const contactMeta = pickContactMetaByJid(contactsRef.current, jid) || {};
+            const fallbackName = formatPhoneNumber(getCleanId(jid));
+            const senderName =
+                (typeof contactMeta.name === 'string' && contactMeta.name.trim())
+                || (typeof latest?.pushName === 'string' && latest.pushName.trim())
+                || fallbackName
+                || 'New message';
+            const baseBody = getIncomingNotificationPreview(latest);
+            const body = notificationCandidates.length > 1
+                ? `${baseBody} (+${notificationCandidates.length - 1} more)`
+                : baseBody;
+            const options: NotificationOptions = {
+                body,
+                icon: '/icons/icon-192.png',
+                badge: '/icons/icon-192.png',
+                tag: `chat:${jid}`,
+                data: {
+                    url: `/?chat=${encodeURIComponent(jid)}`
+                }
+            };
+
+            try {
+                const registration = await navigator.serviceWorker?.getRegistration?.();
+                if (registration) {
+                    await registration.showNotification(senderName, options);
+                    return;
+                }
+            } catch {
+                // fallback to Notification constructor below
+            }
+
+            try {
+                const notification = new Notification(senderName, options);
+                notification.onclick = () => {
+                    window.focus();
+                };
+            } catch {
+                // ignore unsupported Notification constructor environments
+            }
+        };
+
         newSocket.on('messages.upsert', (data) => {
             if (data.profileId === activeProfileIdRef.current) {
                 const incomingMessages = Array.isArray(data?.messages) ? data.messages : [];
                 setAllMessages((prev) => [...incomingMessages, ...prev]);
                 setLoadingChats(false);
                 if (incomingMessages.length === 0) return;
+                void notifyIncomingMessages(incomingMessages);
                 const activeChatKey = canonicalContactJid(selectedChatIdRef.current || '');
                 setUnreadMessagesByChat((prev) => {
                     const unreadDeltaByChat = collectUnreadDeltaFromIncomingUpsert(
@@ -5171,6 +5261,38 @@ export default function App() {
         setChatOpenNonce((prev) => prev + 1);
     }, [markChatAsRead]);
 
+    useEffect(() => {
+        const consumeNotificationChatParam = (rawUrl: string | null | undefined) => {
+            if (!rawUrl) return;
+            let nextChatId = '';
+            try {
+                const parsed = new URL(rawUrl, window.location.origin);
+                nextChatId = parsed.searchParams.get('chat') || '';
+                if (!nextChatId) return;
+                parsed.searchParams.delete('chat');
+                window.history.replaceState({}, '', parsed.pathname + parsed.search + parsed.hash);
+            } catch {
+                return;
+            }
+
+            setShowAnalytics(false);
+            setWorkspaceSection('team-inbox');
+            handleOpenChat(nextChatId);
+        };
+
+        consumeNotificationChatParam(window.location.href);
+
+        if (!('serviceWorker' in navigator)) return;
+        const handleServiceWorkerMessage = (event: MessageEvent<any>) => {
+            if (event?.data?.type !== 'notification-click') return;
+            consumeNotificationChatParam(event.data?.url);
+        };
+        navigator.serviceWorker.addEventListener('message', handleServiceWorkerMessage);
+        return () => {
+            navigator.serviceWorker.removeEventListener('message', handleServiceWorkerMessage);
+        };
+    }, [handleOpenChat]);
+
     const handleNewChat = () => {
         if (!newPhoneNumber.trim()) return;
         let cleanNumber = newPhoneNumber.replace(/\D/g, '');
@@ -5464,11 +5586,11 @@ export default function App() {
                         )}
                     </div>
                     {isMobile && (
-                        <div className="mt-2 flex items-center gap-2 overflow-x-auto pr-1">
+                        <div className="mobile-horizontal-scroll mt-2 flex items-center gap-2 pr-1">
                             <button
                                 type="button"
                                 onClick={() => setMobileChatQuickFilter('all')}
-                                className={`h-8 px-3 rounded-full text-[11px] font-bold border whitespace-nowrap transition-all ${mobileChatQuickFilter === 'all'
+                                className={`snap-start h-8 px-3 rounded-full text-[11px] font-bold border whitespace-nowrap transition-all ${mobileChatQuickFilter === 'all'
                                         ? 'bg-[#e9f7f4] border-[#b9eadd] text-[#008f6f]'
                                         : 'bg-[#f7f9fa] border-[#e2e8ee] text-[#54656f]'
                                     }`}
@@ -5478,14 +5600,14 @@ export default function App() {
                             <button
                                 type="button"
                                 onClick={() => setMobileChatQuickFilter('unread')}
-                                className={`h-8 px-3 rounded-full text-[11px] font-bold border whitespace-nowrap transition-all ${mobileChatQuickFilter === 'unread'
+                                className={`snap-start h-8 px-3 rounded-full text-[11px] font-bold border whitespace-nowrap transition-all ${mobileChatQuickFilter === 'unread'
                                         ? 'bg-[#e9f7f4] border-[#b9eadd] text-[#008f6f]'
                                         : 'bg-[#f7f9fa] border-[#e2e8ee] text-[#54656f]'
                                     }`}
                             >
                                 Unread {mobileUnreadChatCount > 0 ? `(${mobileUnreadChatCount})` : ''}
                             </button>
-                            <div className={`h-8 rounded-full border whitespace-nowrap transition-all flex items-center gap-1.5 pl-2 pr-2 ${mobileTagFilter ? 'bg-[#ecfdf3] border-[#bbf7d0] text-[#166534]' : 'bg-[#f7f9fa] border-[#e2e8ee] text-[#54656f]'}`}>
+                            <div className={`snap-start h-8 rounded-full border whitespace-nowrap transition-all flex items-center gap-1.5 pl-2 pr-2 ${mobileTagFilter ? 'bg-[#ecfdf3] border-[#bbf7d0] text-[#166534]' : 'bg-[#f7f9fa] border-[#e2e8ee] text-[#54656f]'}`}>
                                 <Plus className="w-3.5 h-3.5 shrink-0" />
                                 <select
                                     value={mobileTagFilter}

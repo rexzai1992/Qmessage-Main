@@ -19,6 +19,8 @@ export default function BottomNavBar({ items, activeId, onSelect }: BottomNavBar
         0,
         items.findIndex((item) => item.id === activeId)
     );
+    const indicatorWidth = `calc((100% - 0.5rem) / ${totalItems})`;
+    const indicatorTransform = `translate3d(${activeIndex * 100}%, 0, 0)`;
 
     return (
         <nav
@@ -31,10 +33,10 @@ export default function BottomNavBar({ items, activeId, onSelect }: BottomNavBar
                 style={{ gridTemplateColumns: `repeat(${totalItems}, minmax(0, 1fr))` }}
             >
                 <div
-                    className="pointer-events-none absolute left-1 top-1 bottom-1 rounded-xl bg-[#e9f7f4] shadow-[0_4px_16px_rgba(0,168,132,0.18)] transition-transform duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] will-change-transform"
+                    className="pointer-events-none absolute left-1 top-1 bottom-1 rounded-xl bg-[#e9f7f4] shadow-[0_4px_16px_rgba(0,168,132,0.18)] transition-transform duration-500 ease-[cubic-bezier(0.22,1,0.36,1)] will-change-transform"
                     style={{
-                        width: `calc((100% - 0.5rem) / ${totalItems})`,
-                        transform: `translateX(${activeIndex * 100}%)`
+                        width: indicatorWidth,
+                        transform: indicatorTransform
                     }}
                 />
                 {items.map((item) => {

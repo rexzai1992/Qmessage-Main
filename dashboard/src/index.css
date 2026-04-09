@@ -42,6 +42,19 @@ body {
   background: #aebac1;
 }
 
+.mobile-horizontal-scroll {
+  overflow-x: auto;
+  scroll-behavior: smooth;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+  scroll-snap-type: x proximity;
+}
+
+.mobile-horizontal-scroll::-webkit-scrollbar {
+  display: none;
+}
+
 .offline-dino-card {
   min-width: 280px;
   max-width: 90vw;
