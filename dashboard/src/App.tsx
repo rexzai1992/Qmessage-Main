@@ -56,6 +56,7 @@ import ChatHeader from './features/mobile/ChatHeader';
 import ContactListItem from './features/mobile/ContactListItem';
 import ChatBubble from './features/mobile/ChatBubble';
 import MessageInputBar from './features/mobile/MessageInputBar';
+import MobileInstallOnboarding from './features/mobile/MobileInstallOnboarding';
 import AddProfileModal from './features/workspace/modals/AddProfileModal';
 import EditProfileModal from './features/workspace/modals/EditProfileModal';
 import NewChatModal from './features/workspace/modals/NewChatModal';
@@ -78,6 +79,18 @@ import {
 } from './features/chat/utils';
 import { uploadFileToWabaMedia } from './features/media/uploadToWabaMedia';
 import qmessageLogo from './assets/qmessage-logo.jpg';
+import {
+    clearInstallOnboardingDecision,
+    detectInstallPlatform,
+    getNotificationPermissionState,
+    isMobileDevice,
+    isStandaloneMode,
+    isIosSafari,
+    persistInstallOnboardingDecision,
+    readInstallOnboardingDecision,
+    type BeforeInstallPromptEvent,
+    type InstallOnboardingDecision
+} from './features/pwa/installUtils';
 
 
 const SOCKET_URL = getSocketUrl();
@@ -90,6 +103,12 @@ const LazyWebhookView = lazy(() => import('./WebhookView'));
 const LazyBroadcastTemplateBuilder = lazy(() => import('./BroadcastTemplateBuilder'));
 const LazyBroadcastTemplatesList = lazy(() => import('./BroadcastTemplatesList'));
 const LazyFlowCanvas = lazy(() => import('./FlowCanvas'));
+
+declare global {
+    interface Window {
+        __resetInstallOnboardingPrompt?: () => void;
+    }
+}
 
 interface Message {
     key: {
@@ -149,6 +168,62 @@ interface Chat {
     timestamp?: number;
     unreadCount: number;
 }
+
+type ChatListFilterOption = 'all' | 'tagged' | 'untagged' | 'assigned' | 'unassigned';
+
+type ChatListComputationResult = {
+    chatsMap: Map<string, Chat>;
+    chatList: Chat[];
+    latestChatId: string | null;
+};
+
+type ContactListRow = {
+    id: string;
+    name: string;
+    phone: string;
+    tags: string[];
+    assigneeUserId: string | null;
+    assigneeName: string | null;
+    assigneeColor: string | null;
+    lastInboundAt: string | null;
+    lastActivityTs: number;
+    totalMessages: number;
+};
+
+type UnreadDeltaByChat = Record<string, number>;
+
+type UnreadCandidate = {
+    jid: string;
+    dedupeKey: string;
+};
+
+type SendMediaKind = 'image' | 'video' | 'document';
+
+type SendMediaPayload = {
+    type: SendMediaKind;
+    id?: string;
+    url?: string;
+    assetKey?: string;
+    filename?: string;
+};
+
+type OutgoingMessagePayload = {
+    text: string;
+    media?: SendMediaPayload;
+};
+
+type TemplateBodyAttributePayload = {
+    scope: 'body';
+    index: number;
+    key: string;
+    value: string;
+};
+
+type TemplateBuildResult = {
+    components?: any[];
+    bodyAttributes: TemplateBodyAttributePayload[];
+    error: string | null;
+};
 
 interface MediaData {
     data: string;
@@ -573,6 +648,786 @@ const formatAnalyticsDateShort = (value: string): string => {
     return parsed.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 };
 
+const getUnreadCountForChat = (unreadMessagesByChat: Record<string, number>, jidValue: string): number => {
+    const key = canonicalContactJid(jidValue) || jidValue;
+    return Math.max(0, Number(unreadMessagesByChat[key] || 0));
+};
+
+const getChatListPreviewText = (msg: Message): string => (
+    msg.message?.conversation
+    || msg.message?.extendedTextMessage?.text
+    || msg.message?.buttonsMessage?.contentText
+    || msg.message?.listMessage?.description
+    || (msg.message?.buttonsMessage ? 'Buttons' : msg.message?.listMessage ? 'List' : 'Media message')
+);
+
+const normalizeChatDisplayName = (rawName: string, jid: string): string => {
+    const cleanId = getCleanId(jid);
+    const normalized = rawName.trim() || cleanId;
+    if (normalized.includes('@')) return getCleanId(normalized);
+    return normalized;
+};
+
+const doesChatMatchQueryAndFilter = (
+    chat: Chat,
+    contacts: Record<string, ContactMeta>,
+    query: string,
+    filter: ChatListFilterOption
+): boolean => {
+    const meta: ContactMeta = pickContactMetaByJid(contacts, chat.id) || {};
+    const tags = splitContactTags(meta.tags).labelTags;
+    const hasTags = tags.length > 0;
+    const hasAssignee = Boolean((meta.assigneeUserId || '').trim() || (meta.assigneeName || '').trim());
+    const cleanId = getCleanId(chat.id).toLowerCase();
+    const matchesQuery =
+        !query
+        || chat.name.toLowerCase().includes(query)
+        || cleanId.includes(query)
+        || tags.some((tag) => tag.toLowerCase().includes(query));
+    if (!matchesQuery) return false;
+    if (filter === 'tagged') return hasTags;
+    if (filter === 'untagged') return !hasTags;
+    if (filter === 'assigned') return hasAssignee;
+    if (filter === 'unassigned') return !hasAssignee;
+    return true;
+};
+
+const dedupeChatsByCanonicalJid = (list: Chat[]): Chat[] => {
+    const seenCustomers = new Set<string>();
+    return list.filter((chat) => {
+        const key = canonicalContactJid(chat.id) || chat.id;
+        if (seenCustomers.has(key)) return false;
+        seenCustomers.add(key);
+        return true;
+    });
+};
+
+const applyUnreadCountsToChats = (
+    list: Chat[],
+    unreadMessagesByChat: Record<string, number>
+): Chat[] => list.map((chat) => ({
+    ...chat,
+    unreadCount: getUnreadCountForChat(unreadMessagesByChat, chat.id)
+}));
+
+const buildChatListComputation = (
+    allMessages: Message[],
+    contacts: Record<string, ContactMeta>,
+    searchQuery: string,
+    chatListFilter: ChatListFilterOption,
+    unreadMessagesByChat: Record<string, number>
+): ChatListComputationResult => {
+    const nextMap = new Map<string, Chat>();
+
+    allMessages.forEach((msg) => {
+        const rawJid = msg.key.remoteJid;
+        if (!rawJid) return;
+        const jid = canonicalContactJid(rawJid);
+        if (!jid) return;
+
+        const existing = nextMap.get(jid);
+        if (!existing || (msg.messageTimestamp && msg.messageTimestamp > (existing.timestamp || 0))) {
+            const cleanId = getCleanId(jid);
+            const rawName = pickContactMetaByJid(contacts, rawJid)?.name || msg.pushName || cleanId;
+            nextMap.set(jid, {
+                id: jid,
+                name: normalizeChatDisplayName(rawName, jid),
+                lastMessage: getChatListPreviewText(msg),
+                timestamp: msg.messageTimestamp,
+                unreadCount: getUnreadCountForChat(unreadMessagesByChat, jid)
+            });
+        }
+    });
+
+    Object.entries(contacts).forEach(([rawJid, contact]) => {
+        const jid = canonicalContactJid(rawJid);
+        if (!jid || nextMap.has(jid)) return;
+        const mergedContact = pickContactMetaByJid(contacts, jid) || contact;
+        const cleanId = getCleanId(jid);
+        const lastInboundMs = mergedContact?.lastInboundAt ? new Date(mergedContact.lastInboundAt).getTime() : 0;
+        const timestamp = Number.isFinite(lastInboundMs) && lastInboundMs > 0
+            ? Math.floor(lastInboundMs / 1000)
+            : 0;
+        nextMap.set(jid, {
+            id: jid,
+            name: normalizeChatDisplayName(mergedContact?.name || cleanId, jid),
+            lastMessage: '',
+            timestamp,
+            unreadCount: getUnreadCountForChat(unreadMessagesByChat, jid)
+        });
+    });
+
+    const query = searchQuery.trim().toLowerCase();
+    const filteredAndSorted = Array.from(nextMap.values())
+        .filter((chat) => doesChatMatchQueryAndFilter(chat, contacts, query, chatListFilter))
+        .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    const dedupedList = dedupeChatsByCanonicalJid(filteredAndSorted);
+    const nextListWithUnread = applyUnreadCountsToChats(dedupedList, unreadMessagesByChat);
+
+    return {
+        chatsMap: nextMap,
+        chatList: nextListWithUnread,
+        latestChatId: nextListWithUnread[0]?.id || null
+    };
+};
+
+const ensureContactRow = (
+    rows: Map<string, ContactListRow>,
+    contacts: Record<string, ContactMeta>,
+    jid: string
+): ContactListRow | null => {
+    const key = canonicalContactJid(jid);
+    if (!key || key.endsWith('@g.us')) return null;
+    const existing = rows.get(key);
+    if (existing) return existing;
+
+    const meta = pickContactMetaByJid(contacts, key) || {};
+    const phone = formatPhoneNumber(getCleanId(key));
+    const fallbackName = phone;
+    const row: ContactListRow = {
+        id: key,
+        name: meta.name || fallbackName,
+        phone,
+        tags: splitContactTags(meta.tags).labelTags,
+        assigneeUserId: meta.assigneeUserId || null,
+        assigneeName: meta.assigneeName || null,
+        assigneeColor: meta.assigneeColor || null,
+        lastInboundAt: meta.lastInboundAt || null,
+        lastActivityTs: meta.lastInboundAt ? new Date(meta.lastInboundAt).getTime() || 0 : 0,
+        totalMessages: 0
+    };
+    rows.set(key, row);
+    return row;
+};
+
+const applyMessageToContactRow = (row: ContactListRow, msg: Message): void => {
+    row.totalMessages += 1;
+    const timestampMs = (msg.messageTimestamp || 0) * 1000;
+    if (timestampMs > row.lastActivityTs) row.lastActivityTs = timestampMs;
+    if (!msg.key.fromMe && timestampMs > 0) {
+        const inboundIso = new Date(timestampMs).toISOString();
+        if (!row.lastInboundAt || timestampMs > new Date(row.lastInboundAt).getTime()) {
+            row.lastInboundAt = inboundIso;
+        }
+    }
+    if (!row.name) {
+        row.name = msg.pushName || row.phone;
+    }
+};
+
+const doesContactMatchQuery = (row: ContactListRow, query: string): boolean => {
+    if (!query) return true;
+    if (row.name.toLowerCase().includes(query)) return true;
+    if (row.phone.toLowerCase().includes(query)) return true;
+    if (row.tags.some((tag) => tag.toLowerCase().includes(query))) return true;
+    return false;
+};
+
+const getContactSortTimestamp = (row: ContactListRow): number => (
+    row.lastActivityTs || (row.lastInboundAt ? new Date(row.lastInboundAt).getTime() : 0)
+);
+
+const buildContactsListComputation = (
+    contacts: Record<string, ContactMeta>,
+    allMessages: Message[],
+    contactsSearchQuery: string
+): ContactListRow[] => {
+    const rows = new Map<string, ContactListRow>();
+    Object.keys(contacts).forEach((jid) => {
+        ensureContactRow(rows, contacts, jid);
+    });
+
+    allMessages.forEach((msg) => {
+        const row = ensureContactRow(rows, contacts, msg.key?.remoteJid || '');
+        if (!row) return;
+        applyMessageToContactRow(row, msg);
+    });
+
+    const query = contactsSearchQuery.trim().toLowerCase();
+    const filtered = Array.from(rows.values()).filter((row) => doesContactMatchQuery(row, query));
+    filtered.sort((a, b) => getContactSortTimestamp(b) - getContactSortTimestamp(a));
+    return filtered;
+};
+
+const buildUnreadDedupeKey = (
+    jid: string,
+    rawMessageId: string,
+    timestamp: number,
+    index: number
+): string => `${jid}:${rawMessageId || `ts-${timestamp}-idx-${index}`}`;
+
+const toUnreadCandidate = (
+    message: any,
+    index: number,
+    chatReadCursorByChat: Record<string, number>
+): UnreadCandidate | null => {
+    if (message?.key?.fromMe) return null;
+    const jid = canonicalContactJid(message?.key?.remoteJid || '');
+    if (!jid) return null;
+    const rawMessageId = typeof message?.key?.id === 'string' ? message.key.id.trim() : '';
+    const timestamp = Number(message?.messageTimestamp || 0);
+    const readCursor = Number(chatReadCursorByChat[jid] || 0);
+    if (readCursor > 0 && (!timestamp || timestamp <= readCursor)) return null;
+    return {
+        jid,
+        dedupeKey: buildUnreadDedupeKey(jid, rawMessageId, timestamp, index)
+    };
+};
+
+const incrementUnreadDelta = (target: UnreadDeltaByChat, jid: string): void => {
+    target[jid] = (target[jid] || 0) + 1;
+};
+
+const mergeUnreadDelta = (
+    currentUnreadByChat: Record<string, number>,
+    unreadDeltaByChat: UnreadDeltaByChat
+): Record<string, number> => {
+    if (Object.keys(unreadDeltaByChat).length === 0) return currentUnreadByChat;
+    const next = { ...currentUnreadByChat };
+    Object.entries(unreadDeltaByChat).forEach(([jid, count]) => {
+        next[jid] = (next[jid] || 0) + count;
+    });
+    return next;
+};
+
+const collectUnreadDeltaFromIncomingUpsert = (
+    incomingMessages: any[],
+    activeChatKey: string,
+    seenIncomingMessageKeys: Set<string>,
+    chatReadCursorByChat: Record<string, number>
+): UnreadDeltaByChat => {
+    const unreadDeltaByChat: UnreadDeltaByChat = {};
+    incomingMessages.forEach((msg, index) => {
+        const candidate = toUnreadCandidate(msg, index, chatReadCursorByChat);
+        if (!candidate) return;
+        if (seenIncomingMessageKeys.has(candidate.dedupeKey)) return;
+        seenIncomingMessageKeys.add(candidate.dedupeKey);
+        if (activeChatKey && candidate.jid === activeChatKey) return;
+        incrementUnreadDelta(unreadDeltaByChat, candidate.jid);
+    });
+    return unreadDeltaByChat;
+};
+
+const collectUnreadDeltaFromHistory = (
+    historyMessages: any[],
+    activeChatKey: string,
+    previousSeen: Set<string>,
+    chatReadCursorByChat: Record<string, number>
+): { nextSeen: Set<string>; unreadDeltaByChat: UnreadDeltaByChat } => {
+    const nextSeen = new Set<string>();
+    const unreadDeltaByChat: UnreadDeltaByChat = {};
+    historyMessages.forEach((msg, index) => {
+        const candidate = toUnreadCandidate(msg, index, chatReadCursorByChat);
+        if (!candidate) return;
+        nextSeen.add(candidate.dedupeKey);
+        if (previousSeen.has(candidate.dedupeKey)) return;
+        if (activeChatKey && candidate.jid === activeChatKey) return;
+        incrementUnreadDelta(unreadDeltaByChat, candidate.jid);
+    });
+    return { nextSeen, unreadDeltaByChat };
+};
+
+const trimString = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
+
+const createClientTempMessageId = (): string => `tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+const createSendMediaPayload = (
+    type: SendMediaKind,
+    mediaId: string,
+    mediaUrl: string,
+    mediaAssetKey: string,
+    mediaFilename = ''
+): SendMediaPayload | null => {
+    if (!mediaId && !mediaUrl && !mediaAssetKey) return null;
+    return {
+        type,
+        ...(mediaId ? { id: mediaId } : {}),
+        ...(mediaUrl ? { url: mediaUrl } : {}),
+        ...(mediaAssetKey ? { assetKey: mediaAssetKey } : {}),
+        ...(type === 'document' && mediaFilename ? { filename: mediaFilename } : {})
+    };
+};
+
+const buildSendMediaFromComposerState = (
+    mediaType: 'none' | 'image' | 'video' | 'document',
+    mediaId: string,
+    mediaUrl: string,
+    mediaAssetKey: string,
+    mediaFilename: string
+): SendMediaPayload | null => {
+    if (mediaType !== 'image' && mediaType !== 'video' && mediaType !== 'document') return null;
+    return createSendMediaPayload(mediaType, mediaId, mediaUrl, mediaAssetKey, mediaFilename);
+};
+
+const extractMessageMediaFields = (mediaMessage: any): { mediaId: string; mediaUrl: string; mediaAssetKey: string } => ({
+    mediaId: trimString(mediaMessage?.mediaId),
+    mediaUrl: trimString(mediaMessage?.url),
+    mediaAssetKey: trimString(mediaMessage?.assetKey)
+});
+
+const buildOutgoingMediaFromMessage = (msg: Message): SendMediaPayload | null => {
+    const imageFields = extractMessageMediaFields(msg?.message?.imageMessage);
+    const imagePayload = createSendMediaPayload('image', imageFields.mediaId, imageFields.mediaUrl, imageFields.mediaAssetKey);
+    if (imagePayload) return imagePayload;
+
+    const videoFields = extractMessageMediaFields(msg?.message?.videoMessage);
+    const videoPayload = createSendMediaPayload('video', videoFields.mediaId, videoFields.mediaUrl, videoFields.mediaAssetKey);
+    if (videoPayload) return videoPayload;
+
+    const documentFields = extractMessageMediaFields(msg?.message?.documentMessage);
+    const documentPayload = createSendMediaPayload(
+        'document',
+        documentFields.mediaId,
+        documentFields.mediaUrl,
+        documentFields.mediaAssetKey,
+        trimString(msg?.message?.documentMessage?.fileName)
+    );
+    if (documentPayload) return documentPayload;
+
+    return null;
+};
+
+const buildOptimisticMessageContent = (
+    outgoingText: string,
+    sendMedia: SendMediaPayload | null
+): NonNullable<Message['message']> => {
+    if (!sendMedia) return { conversation: outgoingText };
+    if (sendMedia.type === 'image') {
+        return {
+            ...(outgoingText ? { conversation: outgoingText } : {}),
+            imageMessage: {
+                mediaId: sendMedia.id,
+                caption: outgoingText,
+                assetKey: sendMedia.assetKey,
+                url: sendMedia.url
+            }
+        };
+    }
+    if (sendMedia.type === 'video') {
+        return {
+            ...(outgoingText ? { conversation: outgoingText } : {}),
+            videoMessage: {
+                mediaId: sendMedia.id,
+                caption: outgoingText,
+                assetKey: sendMedia.assetKey,
+                url: sendMedia.url
+            }
+        };
+    }
+    return {
+        ...(outgoingText ? { conversation: outgoingText } : {}),
+        documentMessage: {
+            mediaId: sendMedia.id,
+            caption: outgoingText,
+            assetKey: sendMedia.assetKey,
+            fileName: sendMedia.filename || 'document',
+            url: sendMedia.url
+        }
+    };
+};
+
+const buildOptimisticPendingMessage = (args: {
+    tempMessageId: string;
+    remoteJid: string;
+    outgoingText: string;
+    sendMedia: SendMediaPayload | null;
+    agentUserId?: string;
+    agentName: string;
+}): Message => ({
+    key: { id: args.tempMessageId, remoteJid: args.remoteJid, fromMe: true },
+    message: buildOptimisticMessageContent(args.outgoingText, args.sendMedia),
+    messageTimestamp: Math.floor(Date.now() / 1000),
+    status: 'pending',
+    agent: {
+        user_id: args.agentUserId,
+        name: args.agentName,
+        color: '#6b7280'
+    }
+});
+
+const markMessageStatusById = (
+    messages: Message[],
+    messageId: string,
+    status: NonNullable<Message['status']>
+): Message[] => messages.map((msg) => (
+    msg.key?.id === messageId
+        ? { ...msg, status }
+        : msg
+));
+
+const replaceTempMessageIdAndStatus = (
+    messages: Message[],
+    tempMessageId: string,
+    realMessageId: string,
+    status: NonNullable<Message['status']>
+): Message[] => messages.map((msg) => (
+    msg.key?.id === tempMessageId
+        ? { ...msg, key: { ...msg.key, id: realMessageId }, status }
+        : msg
+));
+
+const buildWorkflowBuilderWithNameMeta = (workflow: any, workflowName: string): any => {
+    const builderMeta =
+        workflow?.builder && typeof workflow.builder === 'object' && !Array.isArray(workflow.builder)
+            ? (workflow.builder as any)
+            : null;
+    if (!builderMeta) return workflow?.builder || null;
+    return {
+        ...builderMeta,
+        meta: {
+            ...(builderMeta.meta && typeof builderMeta.meta === 'object' ? builderMeta.meta : {}),
+            name: workflowName,
+            enabled: workflow?.enabled !== false
+        }
+    };
+};
+
+const normalizeWorkflowForSave = (workflow: any, drafts: Record<string, string>): any => {
+    const workflowName = trimString(workflow?.name);
+    const builder = buildWorkflowBuilderWithNameMeta(workflow, workflowName);
+    const draft = drafts[workflow.id];
+    if (typeof draft !== 'string') {
+        return { ...workflow, name: workflowName, builder };
+    }
+    try {
+        return { ...workflow, name: workflowName, builder, actions: JSON.parse(draft) };
+    } catch {
+        throw new Error(`Invalid JSON in actions for workflow: ${workflow.id}`);
+    }
+};
+
+const normalizeWorkflowsForSave = (workflows: any[], drafts: Record<string, string>): any[] => (
+    workflows.map((workflow) => normalizeWorkflowForSave(workflow, drafts))
+);
+
+const ensureWorkflowDraftEntries = (
+    workflows: any[],
+    existingDrafts: Record<string, string>
+): Record<string, string> => {
+    const nextDrafts = { ...existingDrafts };
+    workflows.forEach((workflow) => {
+        if (typeof nextDrafts[workflow.id] === 'string') return;
+        nextDrafts[workflow.id] = JSON.stringify(Array.isArray(workflow.actions) ? workflow.actions : [], null, 2);
+    });
+    return nextDrafts;
+};
+
+const createUniqueWorkflowId = (existingIds: Set<string>): string => {
+    let nextId = `wf-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    while (existingIds.has(nextId)) {
+        nextId = `wf-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    }
+    return nextId;
+};
+
+const createCopiedWorkflowName = (existingNames: Set<string>, sourceName: string): string => {
+    let copiedName = sourceName ? `${sourceName}-copy` : 'workflow-copy';
+    let copyNameIndex = 2;
+    while (existingNames.has(copiedName.toLowerCase())) {
+        copiedName = sourceName ? `${sourceName}-copy-${copyNameIndex}` : `workflow-copy-${copyNameIndex}`;
+        copyNameIndex += 1;
+    }
+    return copiedName;
+};
+
+const deepCloneJsonValue = <T,>(value: T): T => JSON.parse(JSON.stringify(value));
+
+const buildCopiedWorkflowRecord = (
+    sourceWorkflow: any,
+    copiedId: string,
+    copiedName: string,
+    buildBuilderFromActionsFn: typeof buildBuilderFromActions
+): { copiedWorkflow: any; copiedActions: any[] } => {
+    const sourceActions = Array.isArray(sourceWorkflow.actions) ? sourceWorkflow.actions : [];
+    const copiedActions = deepCloneJsonValue(sourceActions);
+    const copiedBuilder = sourceWorkflow?.builder && Array.isArray(sourceWorkflow.builder.nodes)
+        ? deepCloneJsonValue(sourceWorkflow.builder)
+        : buildBuilderFromActionsFn(copiedActions, copiedId);
+    if (copiedBuilder && typeof copiedBuilder === 'object') {
+        copiedBuilder.id = copiedId;
+    }
+    const sourceTrigger = trimString(sourceWorkflow?.trigger_keyword);
+    return {
+        copiedWorkflow: {
+            ...sourceWorkflow,
+            id: copiedId,
+            name: copiedName,
+            trigger_keyword: sourceTrigger,
+            run_on_new_chat: false,
+            enabled: false,
+            actions: copiedActions,
+            builder: copiedBuilder
+        },
+        copiedActions
+    };
+};
+
+const extractCallPermissionSummary = (payload: any): { permissionStatus: string; canStartCall: boolean } => {
+    const permissionStatus = String(payload?.data?.permission?.status || '').toLowerCase();
+    const actions = Array.isArray(payload?.data?.actions) ? payload.data.actions : [];
+    const startAction = actions.find((entry: any) => String(entry?.action_name || '').toLowerCase() === 'start_call');
+    const canStartCall = startAction?.can_perform_action === true;
+    return { permissionStatus, canStartCall };
+};
+
+const getCallPermissionFeedback = (
+    kind: 'voice' | 'video',
+    permissionStatus: string,
+    canStartCall: boolean,
+    userWaId: string
+): { message: string; tone: 'success' | 'error'; logMessage?: string } => {
+    const callTypeLabel = kind === 'video' ? 'Video call' : 'Voice call';
+    if (permissionStatus === 'granted' && canStartCall) {
+        return {
+            message: `${callTypeLabel} is permitted. Dialer UI not enabled yet.`,
+            tone: 'success',
+            logMessage: `[Calls] ${callTypeLabel} permitted for ${userWaId}.`
+        };
+    }
+    if (permissionStatus === 'pending') {
+        return { message: 'Call permission is pending approval from this user.', tone: 'error' };
+    }
+    if (permissionStatus === 'denied') {
+        return { message: 'Call permission was denied by this user.', tone: 'error' };
+    }
+    if (permissionStatus === 'expired') {
+        return { message: 'Call permission has expired. Request permission again.', tone: 'error' };
+    }
+    return { message: 'Call permission is not available for this contact.', tone: 'error' };
+};
+
+const isCallingApiNotEnabledError = (errorMessage: string): boolean => (
+    errorMessage.includes('calling api not enabled') || errorMessage.includes('code=138000')
+);
+
+const emitSocketWithTimeout = async (
+    socket: Socket,
+    eventName: string,
+    payload: Record<string, unknown>,
+    timeoutMs: number,
+    timeoutError: string
+): Promise<any> => new Promise((resolve) => {
+    const timeout = window.setTimeout(() => {
+        resolve({ success: false, error: timeoutError });
+    }, timeoutMs);
+    socket.emit(eventName, payload, (ack: any) => {
+        window.clearTimeout(timeout);
+        resolve(ack);
+    });
+});
+
+const applyAssignedContactUpdate = (
+    previousContacts: Record<string, ContactMeta>,
+    targetJid: string,
+    contact: any
+): Record<string, ContactMeta> => {
+    const next = { ...previousContacts };
+    const aliasKeys = Array.from(new Set([
+        ...buildContactJidVariants(targetJid),
+        ...buildContactJidVariants(contact?.id)
+    ]));
+    const canonicalKey = canonicalContactJid(contact?.id || targetJid) || contact?.id || targetJid;
+    const prevMeta = pickContactMetaByJid(next, canonicalKey) || {};
+    aliasKeys.forEach((key) => {
+        if (key !== canonicalKey) delete next[key];
+    });
+    next[canonicalKey] = {
+        ...prevMeta,
+        name: contact?.name || prevMeta.name || getCleanId(canonicalKey),
+        lastInboundAt: contact?.lastInboundAt ?? prevMeta.lastInboundAt ?? null,
+        tags: Array.isArray(contact?.tags) ? contact.tags : (prevMeta.tags || []),
+        assigneeUserId: contact?.assigneeUserId ?? null,
+        assigneeName: contact?.assigneeName ?? null,
+        assigneeColor: contact?.assigneeColor ?? null,
+        ctaReferralAt: contact?.ctaReferralAt ?? prevMeta.ctaReferralAt ?? null,
+        ctaFreeWindowStartedAt: contact?.ctaFreeWindowStartedAt ?? prevMeta.ctaFreeWindowStartedAt ?? null,
+        ctaFreeWindowExpiresAt: contact?.ctaFreeWindowExpiresAt ?? prevMeta.ctaFreeWindowExpiresAt ?? null
+    };
+    return next;
+};
+
+const parseTemplateComponentsInput = (templateComponents: string): { components?: any[]; error: string | null } => {
+    const raw = templateComponents.trim();
+    if (!raw) return { components: undefined, error: null };
+    try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) {
+            return { components: undefined, error: 'Template components must be a JSON array.' };
+        }
+        return { components: parsed, error: null };
+    } catch {
+        return { components: undefined, error: 'Invalid JSON in template components.' };
+    }
+};
+
+const buildTemplateHeaderComponent = (args: {
+    selectedTemplateHeaderFormat: string;
+    requiredTemplateHeaderAttributeCount: number;
+    templateHeaderAttributes: string[];
+    templateHeaderMediaUrl: string;
+    templateHeaderDocumentFilename: string;
+}): { component?: any; error: string | null } => {
+    const {
+        selectedTemplateHeaderFormat,
+        requiredTemplateHeaderAttributeCount,
+        templateHeaderAttributes,
+        templateHeaderMediaUrl,
+        templateHeaderDocumentFilename
+    } = args;
+    const headerType = selectedTemplateHeaderFormat;
+    const mediaLink = templateHeaderMediaUrl.trim();
+    if (requiredTemplateHeaderAttributeCount > 0) {
+        const missingHeaderParamIndex = templateHeaderAttributes.findIndex((value) => !value.trim());
+        if (missingHeaderParamIndex >= 0) {
+            return { error: `Header attribute {{${missingHeaderParamIndex + 1}}} is required.` };
+        }
+        return {
+            component: {
+                type: 'header',
+                parameters: templateHeaderAttributes.map((value) => ({
+                    type: 'text',
+                    text: value.trim()
+                }))
+            },
+            error: null
+        };
+    }
+    if (headerType !== 'IMAGE' && headerType !== 'VIDEO' && headerType !== 'DOCUMENT') {
+        return { component: undefined, error: null };
+    }
+    if (!mediaLink) {
+        return { error: `Template header requires ${headerType.toLowerCase()} link.` };
+    }
+    if (headerType === 'DOCUMENT') {
+        return {
+            component: {
+                type: 'header',
+                parameters: [
+                    {
+                        type: 'document',
+                        document: {
+                            link: mediaLink,
+                            ...(templateHeaderDocumentFilename.trim()
+                                ? { filename: templateHeaderDocumentFilename.trim() }
+                                : {})
+                        }
+                    }
+                ]
+            },
+            error: null
+        };
+    }
+    if (headerType === 'IMAGE') {
+        return {
+            component: {
+                type: 'header',
+                parameters: [{ type: 'image', image: { link: mediaLink } }]
+            },
+            error: null
+        };
+    }
+    return {
+        component: {
+            type: 'header',
+            parameters: [{ type: 'video', video: { link: mediaLink } }]
+        },
+        error: null
+    };
+};
+
+const buildTemplateBodyComponent = (args: {
+    requiredTemplateBodyAttributeCount: number;
+    templateBodyAttributes: string[];
+    templateBodyAttributeNames: string[];
+    selectedTemplateBodyText: unknown;
+}): { component?: any; bodyAttributes: TemplateBodyAttributePayload[]; error: string | null } => {
+    const {
+        requiredTemplateBodyAttributeCount,
+        templateBodyAttributes,
+        templateBodyAttributeNames,
+        selectedTemplateBodyText
+    } = args;
+    if (requiredTemplateBodyAttributeCount <= 0) {
+        return { component: undefined, bodyAttributes: [], error: null };
+    }
+    const missingBodyParamIndex = templateBodyAttributes.findIndex((value) => !value.trim());
+    if (missingBodyParamIndex >= 0) {
+        return { component: undefined, bodyAttributes: [], error: `Body attribute {{${missingBodyParamIndex + 1}}} is required.` };
+    }
+    const missingBodyAttributeNameIndex = templateBodyAttributeNames.findIndex((value) => !value.trim());
+    if (missingBodyAttributeNameIndex >= 0) {
+        return {
+            component: undefined,
+            bodyAttributes: [],
+            error: `Body attribute label for {{${missingBodyAttributeNameIndex + 1}}} is required.`
+        };
+    }
+    return {
+        component: {
+            type: 'body',
+            parameters: templateBodyAttributes.map((value) => ({
+                type: 'text',
+                text: value.trim()
+            }))
+        },
+        bodyAttributes: templateBodyAttributes.map((value, index) => ({
+            scope: 'body' as const,
+            index: index + 1,
+            key: (
+                templateBodyAttributeNames[index]
+                || inferTemplateVariableLabel(selectedTemplateBodyText, index + 1, 'body')
+            ).trim(),
+            value: value.trim()
+        })),
+        error: null
+    };
+};
+
+const buildTemplateFromSelection = (args: {
+    selectedTemplateHeaderFormat: string;
+    requiredTemplateHeaderAttributeCount: number;
+    templateHeaderAttributes: string[];
+    templateHeaderMediaUrl: string;
+    templateHeaderDocumentFilename: string;
+    requiredTemplateBodyAttributeCount: number;
+    templateBodyAttributes: string[];
+    templateBodyAttributeNames: string[];
+    selectedTemplateBodyText: unknown;
+}): TemplateBuildResult => {
+    const built: any[] = [];
+    const headerResult = buildTemplateHeaderComponent({
+        selectedTemplateHeaderFormat: args.selectedTemplateHeaderFormat,
+        requiredTemplateHeaderAttributeCount: args.requiredTemplateHeaderAttributeCount,
+        templateHeaderAttributes: args.templateHeaderAttributes,
+        templateHeaderMediaUrl: args.templateHeaderMediaUrl,
+        templateHeaderDocumentFilename: args.templateHeaderDocumentFilename
+    });
+    if (headerResult.error) {
+        return { components: undefined, bodyAttributes: [], error: headerResult.error };
+    }
+    if (headerResult.component) {
+        built.push(headerResult.component);
+    }
+
+    const bodyResult = buildTemplateBodyComponent({
+        requiredTemplateBodyAttributeCount: args.requiredTemplateBodyAttributeCount,
+        templateBodyAttributes: args.templateBodyAttributes,
+        templateBodyAttributeNames: args.templateBodyAttributeNames,
+        selectedTemplateBodyText: args.selectedTemplateBodyText
+    });
+    if (bodyResult.error) {
+        return { components: undefined, bodyAttributes: [], error: bodyResult.error };
+    }
+    if (bodyResult.component) {
+        built.push(bodyResult.component);
+    }
+    return {
+        components: built.length > 0 ? built : undefined,
+        bodyAttributes: bodyResult.bodyAttributes,
+        error: null
+    };
+};
+
 
 export default function App() {
     // Auth State
@@ -685,6 +1540,15 @@ export default function App() {
         if (typeof window === 'undefined') return false;
         return window.innerWidth < MOBILE_LAYOUT_BREAKPOINT;
     });
+    const [isStandaloneInstalled, setIsStandaloneInstalled] = useState(() => isStandaloneMode());
+    const [installOnboardingDecision, setInstallOnboardingDecision] = useState<InstallOnboardingDecision | null>(
+        () => readInstallOnboardingDecision()
+    );
+    const [installOnboardingOpen, setInstallOnboardingOpen] = useState(false);
+    const [deferredInstallPrompt, setDeferredInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
+    const [notificationPermissionState, setNotificationPermissionState] = useState<NotificationPermission | 'unsupported'>(
+        () => getNotificationPermissionState()
+    );
 
     const [activeView, setActiveView] = useState<'dashboard' | 'chatflow' | 'settings' | 'admin'>('dashboard');
     const [workspaceSection, setWorkspaceSection] = useState<
@@ -720,6 +1584,11 @@ export default function App() {
     const [selectedWorkflowId, setSelectedWorkflowId] = useState<string | null>(null);
     const [workflowDrafts, setWorkflowDrafts] = useState<Record<string, string>>({});
     const [workflowEditorMode, setWorkflowEditorMode] = useState<'visual' | 'json'>('visual');
+    const installPlatform = useMemo(() => detectInstallPlatform(), []);
+    const installPlatformForPrompt = useMemo(
+        () => (installPlatform === 'ios' && !isIosSafari() ? 'other' : installPlatform),
+        [installPlatform]
+    );
     const menuRef = useRef<HTMLDivElement>(null);
     const profileMenuRef = useRef<HTMLDivElement>(null);
     const messageInputRef = useRef<HTMLTextAreaElement>(null);
@@ -734,6 +1603,10 @@ export default function App() {
     const mediaDownloadProgressRef = useRef<Record<string, MediaDownloadProgressState>>({});
     const mediaProgressTimerRef = useRef<Record<string, number>>({});
     const mediaProgressTimeoutRef = useRef<Record<string, number>>({});
+    const socketInstanceRef = useRef<Socket | null>(null);
+    const socketAccessTokenRef = useRef('');
+    const hiddenSocketDisconnectTimerRef = useRef<number | null>(null);
+    const lastUiControlsRefreshAtRef = useRef(0);
     const { ref: chatListViewportRef, size: chatListViewport } = useElementSize<HTMLDivElement>();
     const { ref: messageViewportRef, size: messageViewport } = useElementSize<HTMLDivElement>();
     const messageListRef = useListRef(null);
@@ -1147,6 +2020,132 @@ export default function App() {
         return () => window.clearTimeout(timer);
     }, [appToast]);
 
+    const handleInstallOnboardingDecision = useCallback((decision: InstallOnboardingDecision) => {
+        persistInstallOnboardingDecision(decision);
+        setInstallOnboardingDecision(decision);
+        setInstallOnboardingOpen(false);
+    }, []);
+
+    const handleRequestNotificationPermission = useCallback(async () => {
+        if (!('Notification' in window)) {
+            setNotificationPermissionState('unsupported');
+            showToast('This device does not support browser notifications.', 'error');
+            return;
+        }
+        try {
+            const permission = await Notification.requestPermission();
+            setNotificationPermissionState(permission);
+            if (permission === 'granted') {
+                showToast('Notifications enabled for incoming chat alerts.', 'success');
+                return;
+            }
+            if (permission === 'denied') {
+                showToast('Notifications blocked. You can enable them in browser settings.', 'error');
+            }
+        } catch (error: any) {
+            showToast(error?.message || 'Failed to request notification permission.', 'error');
+        }
+    }, [showToast]);
+
+    const handleInstallApp = useCallback(async () => {
+        if (!deferredInstallPrompt) {
+            if (installPlatform === 'android') {
+                showToast('Open browser menu and tap Add to Home screen.', 'success');
+            }
+            return;
+        }
+        const promptEvent = deferredInstallPrompt;
+        setDeferredInstallPrompt(null);
+        try {
+            await promptEvent.prompt();
+            const choice = await promptEvent.userChoice;
+            if (choice?.outcome === 'accepted') {
+                handleInstallOnboardingDecision('done');
+                showToast('App installation started.', 'success');
+                return;
+            }
+            handleInstallOnboardingDecision('dismissed');
+        } catch {
+            handleInstallOnboardingDecision('dismissed');
+        }
+    }, [deferredInstallPrompt, handleInstallOnboardingDecision, installPlatform, showToast]);
+
+    useEffect(() => {
+        const syncStandaloneState = () => {
+            setIsStandaloneInstalled(isStandaloneMode());
+        };
+        syncStandaloneState();
+
+        const onBeforeInstallPrompt = (event: Event) => {
+            const installEvent = event as BeforeInstallPromptEvent;
+            installEvent.preventDefault();
+            setDeferredInstallPrompt(installEvent);
+        };
+        const onAppInstalled = () => {
+            syncStandaloneState();
+            setDeferredInstallPrompt(null);
+            handleInstallOnboardingDecision('done');
+        };
+
+        window.addEventListener('beforeinstallprompt', onBeforeInstallPrompt as EventListener);
+        window.addEventListener('appinstalled', onAppInstalled);
+        const displayModeMedia = window.matchMedia('(display-mode: standalone)');
+        const onDisplayModeChange = () => syncStandaloneState();
+        if (typeof displayModeMedia.addEventListener === 'function') {
+            displayModeMedia.addEventListener('change', onDisplayModeChange);
+        } else if (typeof displayModeMedia.addListener === 'function') {
+            displayModeMedia.addListener(onDisplayModeChange);
+        }
+
+        return () => {
+            window.removeEventListener('beforeinstallprompt', onBeforeInstallPrompt as EventListener);
+            window.removeEventListener('appinstalled', onAppInstalled);
+            if (typeof displayModeMedia.removeEventListener === 'function') {
+                displayModeMedia.removeEventListener('change', onDisplayModeChange);
+            } else if (typeof displayModeMedia.removeListener === 'function') {
+                displayModeMedia.removeListener(onDisplayModeChange);
+            }
+        };
+    }, [handleInstallOnboardingDecision]);
+
+    useEffect(() => {
+        const syncPermission = () => setNotificationPermissionState(getNotificationPermissionState());
+        syncPermission();
+        document.addEventListener('visibilitychange', syncPermission);
+        return () => {
+            document.removeEventListener('visibilitychange', syncPermission);
+        };
+    }, []);
+
+    useEffect(() => {
+        const canShow =
+            Boolean(session?.user?.id)
+            && isMobile
+            && isMobileDevice()
+            && !isStandaloneInstalled
+            && !installOnboardingDecision;
+        if (!canShow) {
+            setInstallOnboardingOpen(false);
+            return;
+        }
+        const timer = window.setTimeout(() => {
+            setInstallOnboardingOpen(true);
+        }, 900);
+        return () => window.clearTimeout(timer);
+    }, [installOnboardingDecision, isMobile, isStandaloneInstalled, session?.user?.id]);
+
+    useEffect(() => {
+        window.__resetInstallOnboardingPrompt = () => {
+            clearInstallOnboardingDecision();
+            setInstallOnboardingDecision(null);
+            setInstallOnboardingOpen(false);
+            setDeferredInstallPrompt(null);
+        };
+        return () => {
+            delete window.__resetInstallOnboardingPrompt;
+        };
+    }, []);
+
     const getDraftStorageKey = useCallback((profileId?: string | null, chatId?: string | null) => {
         if (!profileId || !chatId) return null;
         return `${MESSAGE_DRAFT_STORAGE_PREFIX}${profileId}:${chatId}`;
@@ -1316,23 +2315,17 @@ export default function App() {
             if (!socket || !activeProfileId || !jid || jid.endsWith('@g.us')) return;
             setAssigningContactId(jid);
             try {
-                const response: any = await new Promise((resolve) => {
-                    const timeout = window.setTimeout(() => {
-                        resolve({ success: false, error: 'Assignment timed out. Please try again.' });
-                    }, 8000);
-                    socket.emit(
-                        'contact.assign',
-                        {
-                            profileId: activeProfileId,
-                            jid,
-                            assigneeUserId
-                        },
-                        (ack: any) => {
-                            window.clearTimeout(timeout);
-                            resolve(ack);
-                        }
-                    );
-                });
+                const response: any = await emitSocketWithTimeout(
+                    socket,
+                    'contact.assign',
+                    {
+                        profileId: activeProfileId,
+                        jid,
+                        assigneeUserId
+                    },
+                    8000,
+                    'Assignment timed out. Please try again.'
+                );
 
                 if (!response?.success) {
                     throw new Error(response?.error || 'Failed to assign contact');
@@ -1340,31 +2333,7 @@ export default function App() {
 
                 const contact = response?.data?.contact;
                 if (contact?.id) {
-                    setContacts((prev) => {
-                        const next = { ...prev };
-                        const aliasKeys = Array.from(new Set([
-                            ...buildContactJidVariants(jid),
-                            ...buildContactJidVariants(contact.id)
-                        ]));
-                        const canonicalKey = canonicalContactJid(contact.id || jid) || contact.id || jid;
-                        const prevMeta = pickContactMetaByJid(next, canonicalKey) || {};
-                        aliasKeys.forEach((key) => {
-                            if (key !== canonicalKey) delete next[key];
-                        });
-                        next[canonicalKey] = {
-                            ...prevMeta,
-                            name: contact.name || prevMeta.name || getCleanId(canonicalKey),
-                            lastInboundAt: contact.lastInboundAt ?? prevMeta.lastInboundAt ?? null,
-                            tags: Array.isArray(contact.tags) ? contact.tags : (prevMeta.tags || []),
-                            assigneeUserId: contact.assigneeUserId ?? null,
-                            assigneeName: contact.assigneeName ?? null,
-                            assigneeColor: contact.assigneeColor ?? null,
-                            ctaReferralAt: contact.ctaReferralAt ?? prevMeta.ctaReferralAt ?? null,
-                            ctaFreeWindowStartedAt: contact.ctaFreeWindowStartedAt ?? prevMeta.ctaFreeWindowStartedAt ?? null,
-                            ctaFreeWindowExpiresAt: contact.ctaFreeWindowExpiresAt ?? prevMeta.ctaFreeWindowExpiresAt ?? null
-                        };
-                        return next;
-                    });
+                    setContacts((prev) => applyAssignedContactUpdate(prev, jid, contact));
                 }
             } catch (err: any) {
                 alert(err?.message || 'Failed to assign contact');
@@ -1378,6 +2347,7 @@ export default function App() {
 
     const recoverSocketConnection = useCallback(
         (reason: string) => {
+            if (document.visibilityState !== 'visible') return;
             const nowMs = Date.now();
             if (nowMs - lastRecoverAtRef.current < 30_000) return;
             lastRecoverAtRef.current = nowMs;
@@ -1868,10 +2838,27 @@ export default function App() {
 
     useEffect(() => {
         if (!session?.access_token) return;
-        const refreshTimer = window.setInterval(() => {
+        const refreshUiControlsIfNeeded = (force = false) => {
+            const nowMs = Date.now();
+            if (!force && nowMs - lastUiControlsRefreshAtRef.current < 5 * 60 * 1000) {
+                return;
+            }
+            lastUiControlsRefreshAtRef.current = nowMs;
             fetchUiControls();
-        }, 4 * 60 * 1000);
-        return () => window.clearInterval(refreshTimer);
+        };
+
+        const onVisibilityChange = () => {
+            if (document.visibilityState !== 'visible') return;
+            refreshUiControlsIfNeeded();
+        };
+        const onOnline = () => refreshUiControlsIfNeeded(true);
+
+        document.addEventListener('visibilitychange', onVisibilityChange);
+        window.addEventListener('online', onOnline);
+        return () => {
+            document.removeEventListener('visibilitychange', onVisibilityChange);
+            window.removeEventListener('online', onOnline);
+        };
     }, [fetchUiControls, session?.access_token]);
 
 
@@ -2242,8 +3229,19 @@ export default function App() {
         document.title = `${statusEmoji} WhatsApp Business API`;
     }, [connectionStatus]);
 
+    const socketAccessToken = session?.access_token || '';
+
     useEffect(() => {
-        if (!session) {
+        if (!socketAccessToken) {
+            const existingSocket = socketInstanceRef.current;
+            if (existingSocket) {
+                existingSocket.removeAllListeners();
+                if (existingSocket.connected) {
+                    existingSocket.disconnect();
+                }
+            }
+            socketInstanceRef.current = null;
+            socketAccessTokenRef.current = '';
             setSocket(null);
             setProfiles([]);
             setProfilesLoaded(false);
@@ -2253,19 +3251,37 @@ export default function App() {
             return;
         }
 
-        console.log('Connecting socket with token', session.access_token.substring(0, 10));
+        if (
+            socketInstanceRef.current
+            && socketAccessTokenRef.current === socketAccessToken
+        ) {
+            setSocket(socketInstanceRef.current);
+            return;
+        }
+
+        const previousSocket = socketInstanceRef.current;
+        if (previousSocket) {
+            previousSocket.removeAllListeners();
+            if (previousSocket.connected) {
+                previousSocket.disconnect();
+            }
+        }
+
         setProfilesLoaded(false);
         const newSocket = io(SOCKET_URL, {
-            auth: { token: session.access_token },
+            auth: { token: socketAccessToken },
             transports: ['websocket', 'polling'],
             autoConnect: false
         });
+        socketInstanceRef.current = newSocket;
+        socketAccessTokenRef.current = socketAccessToken;
         setSocket(newSocket);
+        let disposed = false;
         const connectTimer = window.setTimeout(() => {
-            if (!newSocket.connected) {
+            if (!disposed && !newSocket.connected) {
                 newSocket.connect();
             }
-        }, 0);
+        }, 50);
 
         newSocket.on('connect', () => {
             if (activeProfileIdRef.current) {
@@ -2321,27 +3337,13 @@ export default function App() {
                 if (incomingMessages.length === 0) return;
                 const activeChatKey = canonicalContactJid(selectedChatIdRef.current || '');
                 setUnreadMessagesByChat((prev) => {
-                    let next = prev;
-                    let changed = false;
-                    incomingMessages.forEach((msg: any, index: number) => {
-                        if (msg?.key?.fromMe) return;
-                        const jid = canonicalContactJid(msg?.key?.remoteJid || '');
-                        if (!jid) return;
-                        const rawId = typeof msg?.key?.id === 'string' ? msg.key.id.trim() : '';
-                        const ts = Number(msg?.messageTimestamp || 0);
-                        const readCursor = Number(chatReadCursorByChatRef.current[jid] || 0);
-                        if (readCursor > 0 && (!ts || ts <= readCursor)) return;
-                        const dedupeKey = `${jid}:${rawId || `ts-${ts}-idx-${index}`}`;
-                        if (seenIncomingMessageKeysRef.current.has(dedupeKey)) return;
-                        seenIncomingMessageKeysRef.current.add(dedupeKey);
-                        if (activeChatKey && jid === activeChatKey) return;
-                        if (!changed) {
-                            next = { ...prev };
-                            changed = true;
-                        }
-                        next[jid] = (next[jid] || 0) + 1;
-                    });
-                    return changed ? next : prev;
+                    const unreadDeltaByChat = collectUnreadDeltaFromIncomingUpsert(
+                        incomingMessages,
+                        activeChatKey,
+                        seenIncomingMessageKeysRef.current,
+                        chatReadCursorByChatRef.current
+                    );
+                    return mergeUnreadDelta(prev, unreadDeltaByChat);
                 });
             }
         });
@@ -2352,32 +3354,16 @@ export default function App() {
                 setAllMessages(historyMessages);
                 setLoadingChats(false);
                 const previousSeen = seenIncomingMessageKeysRef.current;
-                const nextSeen = new Set<string>();
                 const activeChatKey = canonicalContactJid(selectedChatIdRef.current || '');
-                const unreadDeltaByChat: Record<string, number> = {};
-                historyMessages.forEach((msg: any, index: number) => {
-                    if (msg?.key?.fromMe) return;
-                    const jid = canonicalContactJid(msg?.key?.remoteJid || '');
-                    if (!jid) return;
-                    const rawId = typeof msg?.key?.id === 'string' ? msg.key.id.trim() : '';
-                    const ts = Number(msg?.messageTimestamp || 0);
-                    const readCursor = Number(chatReadCursorByChatRef.current[jid] || 0);
-                    if (readCursor > 0 && (!ts || ts <= readCursor)) return;
-                    const dedupeKey = `${jid}:${rawId || `ts-${ts}-idx-${index}`}`;
-                    nextSeen.add(dedupeKey);
-                    if (previousSeen.has(dedupeKey)) return;
-                    if (activeChatKey && jid === activeChatKey) return;
-                    unreadDeltaByChat[jid] = (unreadDeltaByChat[jid] || 0) + 1;
-                });
+                const { nextSeen, unreadDeltaByChat } = collectUnreadDeltaFromHistory(
+                    historyMessages,
+                    activeChatKey,
+                    previousSeen,
+                    chatReadCursorByChatRef.current
+                );
                 seenIncomingMessageKeysRef.current = nextSeen;
                 if (Object.keys(unreadDeltaByChat).length > 0) {
-                    setUnreadMessagesByChat((prev) => {
-                        const next = { ...prev };
-                        Object.entries(unreadDeltaByChat).forEach(([jid, count]) => {
-                            next[jid] = (next[jid] || 0) + count;
-                        });
-                        return next;
-                    });
+                    setUnreadMessagesByChat((prev) => mergeUnreadDelta(prev, unreadDeltaByChat));
                 }
             }
         });
@@ -2585,21 +3571,60 @@ export default function App() {
             pushLog(`Socket disconnected: ${reason}`, 'info');
         });
 
-        const refreshInterval = setInterval(() => {
-            if (newSocket.connected && activeProfileIdRef.current) {
-                newSocket.emit('refreshMessages', activeProfileIdRef.current);
+        const requestActiveProfileRefresh = () => {
+            if (document.visibilityState !== 'visible') return;
+            if (!newSocket.connected || !activeProfileIdRef.current) return;
+            newSocket.emit('refreshMessages', activeProfileIdRef.current);
+        };
+
+        const clearHiddenDisconnectTimer = () => {
+            if (typeof hiddenSocketDisconnectTimerRef.current !== 'number') return;
+            window.clearTimeout(hiddenSocketDisconnectTimerRef.current);
+            hiddenSocketDisconnectTimerRef.current = null;
+        };
+
+        const handleVisibilityChange = () => {
+            if (document.visibilityState === 'visible') {
+                clearHiddenDisconnectTimer();
+                if (!newSocket.connected) newSocket.connect();
+                requestActiveProfileRefresh();
+                return;
             }
-        }, 10000);
+            clearHiddenDisconnectTimer();
+            hiddenSocketDisconnectTimerRef.current = window.setTimeout(() => {
+                if (document.visibilityState !== 'visible' || !isMobileDevice()) return;
+                if (newSocket.connected) newSocket.disconnect();
+                hiddenSocketDisconnectTimerRef.current = null;
+            }, 45_000);
+        };
+
+        const handleWindowFocus = () => requestActiveProfileRefresh();
+        const handleOnline = () => {
+            if (!newSocket.connected) newSocket.connect();
+            requestActiveProfileRefresh();
+        };
+
+        document.addEventListener('visibilitychange', handleVisibilityChange);
+        window.addEventListener('focus', handleWindowFocus);
+        window.addEventListener('online', handleOnline);
 
         return () => {
-            clearInterval(refreshInterval);
+            disposed = true;
+            document.removeEventListener('visibilitychange', handleVisibilityChange);
+            window.removeEventListener('focus', handleWindowFocus);
+            window.removeEventListener('online', handleOnline);
+            clearHiddenDisconnectTimer();
             window.clearTimeout(connectTimer);
             newSocket.removeAllListeners();
-            if (newSocket.connected || newSocket.active) {
+            if (newSocket.connected) {
                 newSocket.disconnect();
             }
+            if (socketInstanceRef.current === newSocket) {
+                socketInstanceRef.current = null;
+                socketAccessTokenRef.current = '';
+            }
         };
-    }, [session]); // ONLY reconnect if session changes
+    }, [socketAccessToken]);
 
     // Handle switching profile separately
     useEffect(() => {
@@ -2713,34 +3738,8 @@ export default function App() {
                 alert('Please sign in and select an active profile.');
                 return false;
             }
-            // Validate JSON drafts before saving
             const drafts = draftOverrides || workflowDrafts;
-            const normalized = updatedWorkflows.map(wf => {
-                const workflowName = typeof wf?.name === 'string' ? wf.name.trim() : '';
-                const builderMeta =
-                    wf?.builder && typeof wf.builder === 'object' && !Array.isArray(wf.builder)
-                        ? (wf.builder as any)
-                        : null;
-                const builderWithName = builderMeta
-                    ? {
-                        ...builderMeta,
-                        meta: {
-                            ...(builderMeta.meta && typeof builderMeta.meta === 'object' ? builderMeta.meta : {}),
-                            name: workflowName,
-                            enabled: wf?.enabled !== false
-                        }
-                    }
-                    : wf?.builder || null;
-                const draft = drafts[wf.id];
-                if (typeof draft === 'string') {
-                    try {
-                        return { ...wf, name: workflowName, builder: builderWithName, actions: JSON.parse(draft) };
-                    } catch {
-                        throw new Error(`Invalid JSON in actions for workflow: ${wf.id}`);
-                    }
-                }
-                return { ...wf, name: workflowName, builder: builderWithName };
-            });
+            const normalized = normalizeWorkflowsForSave(updatedWorkflows, drafts);
 
             const res = await fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`, {
                 method: 'POST',
@@ -2773,105 +3772,10 @@ export default function App() {
         }
     };
 
-    const { chatsMap, chatList, latestChatId } = useMemo(() => {
-        const nextMap = new Map<string, Chat>();
-        const getUnreadCount = (jidValue: string) => {
-            const key = canonicalContactJid(jidValue) || jidValue;
-            return Math.max(0, Number(unreadMessagesByChat[key] || 0));
-        };
-        allMessages.forEach(msg => {
-            const rawJid = msg.key.remoteJid;
-            if (!rawJid) return;
-            const jid = canonicalContactJid(rawJid);
-            if (!jid) return;
-
-            const existing = nextMap.get(jid);
-            const content =
-                msg.message?.conversation ||
-                msg.message?.extendedTextMessage?.text ||
-                msg.message?.buttonsMessage?.contentText ||
-                msg.message?.listMessage?.description ||
-                (msg.message?.buttonsMessage ? 'Buttons' : msg.message?.listMessage ? 'List' : 'Media message');
-
-            if (!existing || (msg.messageTimestamp && msg.messageTimestamp > (existing.timestamp || 0))) {
-                const cleanId = getCleanId(jid);
-                let rawName = pickContactMetaByJid(contacts, rawJid)?.name || msg.pushName || cleanId;
-                if (rawName.includes('@')) {
-                    rawName = getCleanId(rawName);
-                }
-
-                nextMap.set(jid, {
-                    id: jid,
-                    name: rawName,
-                    lastMessage: content,
-                    timestamp: msg.messageTimestamp,
-                    unreadCount: getUnreadCount(jid),
-                });
-            }
-        });
-
-        // Ensure contacts with no messages still appear in chat list.
-        Object.entries(contacts).forEach(([rawJid, contact]) => {
-            const jid = canonicalContactJid(rawJid);
-            if (!jid || nextMap.has(jid)) return;
-            const mergedContact = pickContactMetaByJid(contacts, jid) || contact;
-            const cleanId = getCleanId(jid);
-            let rawName = mergedContact?.name || cleanId;
-            if (rawName.includes('@')) rawName = getCleanId(rawName);
-            const lastInboundMs = mergedContact?.lastInboundAt ? new Date(mergedContact.lastInboundAt).getTime() : 0;
-            const timestamp = Number.isFinite(lastInboundMs) && lastInboundMs > 0
-                ? Math.floor(lastInboundMs / 1000)
-                : 0;
-            nextMap.set(jid, {
-                id: jid,
-                name: rawName,
-                lastMessage: '',
-                timestamp,
-                unreadCount: getUnreadCount(jid)
-            });
-        });
-
-        const query = searchQuery.trim().toLowerCase();
-        const dedupedList = Array.from(nextMap.values())
-            .filter((chat) => {
-                const meta: ContactMeta = pickContactMetaByJid(contacts, chat.id) || {};
-                const tags = splitContactTags(meta.tags).labelTags;
-                const hasTags = tags.length > 0;
-                const hasAssignee = Boolean((meta.assigneeUserId || '').trim() || (meta.assigneeName || '').trim());
-                const cleanId = getCleanId(chat.id).toLowerCase();
-                const matchesQuery =
-                    !query
-                    || chat.name.toLowerCase().includes(query)
-                    || cleanId.includes(query)
-                    || tags.some((tag) => tag.toLowerCase().includes(query));
-                if (!matchesQuery) return false;
-                if (chatListFilter === 'tagged') return hasTags;
-                if (chatListFilter === 'untagged') return !hasTags;
-                if (chatListFilter === 'assigned') return hasAssignee;
-                if (chatListFilter === 'unassigned') return !hasAssignee;
-                return true;
-            })
-            .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-
-        const seenCustomers = new Set<string>();
-        const nextList = dedupedList.filter((chat) => {
-            const key = canonicalContactJid(chat.id) || chat.id;
-            if (seenCustomers.has(key)) return false;
-            seenCustomers.add(key);
-            return true;
-        });
-
-        const nextListWithUnread = nextList.map((chat) => ({
-            ...chat,
-            unreadCount: getUnreadCount(chat.id)
-        }));
-
-        return {
-            chatsMap: nextMap,
-            chatList: nextListWithUnread,
-            latestChatId: nextListWithUnread[0]?.id || null
-        };
-    }, [allMessages, contacts, searchQuery, chatListFilter, unreadMessagesByChat]);
+    const { chatsMap, chatList, latestChatId } = useMemo(
+        () => buildChatListComputation(allMessages, contacts, searchQuery, chatListFilter, unreadMessagesByChat),
+        [allMessages, contacts, searchQuery, chatListFilter, unreadMessagesByChat]
+    );
 
     const totalUnreadMessages = useMemo(
         () => chatList.reduce((sum, chat) => sum + Math.max(0, Number(chat.unreadCount) || 0), 0),
@@ -2910,83 +3814,10 @@ export default function App() {
         return next;
     }, [chatList, contacts, isMobile, mobileChatQuickFilter, mobileTagFilterKey]);
 
-    const contactsList = useMemo(() => {
-        type ContactRow = {
-            id: string;
-            name: string;
-            phone: string;
-            tags: string[];
-            assigneeUserId: string | null;
-            assigneeName: string | null;
-            assigneeColor: string | null;
-            lastInboundAt: string | null;
-            lastActivityTs: number;
-            totalMessages: number;
-        };
-
-        const rows = new Map<string, ContactRow>();
-        const ensure = (jid: string): ContactRow | null => {
-            const key = canonicalContactJid(jid);
-            if (!key || key.endsWith('@g.us')) return null;
-            const existing = rows.get(key);
-            if (existing) return existing;
-            const meta = pickContactMetaByJid(contacts, key) || {};
-            const fallbackName = formatPhoneNumber(getCleanId(key));
-            const row: ContactRow = {
-                id: key,
-                name: meta.name || fallbackName,
-                phone: formatPhoneNumber(getCleanId(key)),
-                tags: splitContactTags(meta.tags).labelTags,
-                assigneeUserId: meta.assigneeUserId || null,
-                assigneeName: meta.assigneeName || null,
-                assigneeColor: meta.assigneeColor || null,
-                lastInboundAt: meta.lastInboundAt || null,
-                lastActivityTs: meta.lastInboundAt ? new Date(meta.lastInboundAt).getTime() || 0 : 0,
-                totalMessages: 0
-            };
-            rows.set(key, row);
-            return row;
-        };
-
-        Object.keys(contacts).forEach((jid) => {
-            ensure(jid);
-        });
-
-        allMessages.forEach((msg) => {
-            const jid = msg.key?.remoteJid || '';
-            const row = ensure(jid);
-            if (!row) return;
-            row.totalMessages += 1;
-            const ts = (msg.messageTimestamp || 0) * 1000;
-            if (ts > row.lastActivityTs) row.lastActivityTs = ts;
-            if (!msg.key.fromMe && ts > 0) {
-                const inboundIso = new Date(ts).toISOString();
-                if (!row.lastInboundAt || ts > new Date(row.lastInboundAt).getTime()) {
-                    row.lastInboundAt = inboundIso;
-                }
-            }
-            if (!row.name) {
-                row.name = msg.pushName || row.phone;
-            }
-        });
-
-        const query = contactsSearchQuery.trim().toLowerCase();
-        const filtered = Array.from(rows.values()).filter((row) => {
-            if (!query) return true;
-            if (row.name.toLowerCase().includes(query)) return true;
-            if (row.phone.toLowerCase().includes(query)) return true;
-            if (row.tags.some((tag) => tag.toLowerCase().includes(query))) return true;
-            return false;
-        });
-
-        filtered.sort((a, b) => {
-            const aTs = a.lastActivityTs || (a.lastInboundAt ? new Date(a.lastInboundAt).getTime() : 0);
-            const bTs = b.lastActivityTs || (b.lastInboundAt ? new Date(b.lastInboundAt).getTime() : 0);
-            return bTs - aTs;
-        });
-
-        return filtered;
-    }, [contacts, allMessages, contactsSearchQuery]);
+    const contactsList = useMemo(
+        () => buildContactsListComputation(contacts, allMessages, contactsSearchQuery),
+        [contacts, allMessages, contactsSearchQuery]
+    );
 
     useEffect(() => {
         if (isMobile) return;
@@ -3778,76 +4609,11 @@ export default function App() {
         }
     }, [lastInboundMs]);
 
-    const buildOutgoingPayloadFromMessage = useCallback((msg: Message): {
-        text: string;
-        media?: { type: 'image' | 'video' | 'document'; id?: string; url?: string; assetKey?: string; filename?: string };
-    } | null => {
+    const buildOutgoingPayloadFromMessage = useCallback((msg: Message): OutgoingMessagePayload | null => {
         if (!msg?.key?.fromMe) return null;
-        const text =
-            typeof msg?.message?.conversation === 'string'
-                ? msg.message.conversation.trim()
-                : typeof msg?.message?.extendedTextMessage?.text === 'string'
-                    ? msg.message.extendedTextMessage.text.trim()
-                    : '';
-        const imageMediaId =
-            typeof msg?.message?.imageMessage?.mediaId === 'string'
-                ? msg.message.imageMessage.mediaId.trim()
-                : '';
-        const imageUrl = typeof msg?.message?.imageMessage?.url === 'string' ? msg.message.imageMessage.url.trim() : '';
-        const imageAssetKey = typeof msg?.message?.imageMessage?.assetKey === 'string' ? msg.message.imageMessage.assetKey.trim() : '';
-        if (imageMediaId || imageUrl || imageAssetKey) {
-            return {
-                text,
-                media: {
-                    type: 'image',
-                    ...(imageMediaId ? { id: imageMediaId } : {}),
-                    ...(imageUrl ? { url: imageUrl } : {}),
-                    ...(imageAssetKey ? { assetKey: imageAssetKey } : {})
-                }
-            };
-        }
-        const videoMediaId =
-            typeof msg?.message?.videoMessage?.mediaId === 'string'
-                ? msg.message.videoMessage.mediaId.trim()
-                : '';
-        const videoUrl = typeof msg?.message?.videoMessage?.url === 'string' ? msg.message.videoMessage.url.trim() : '';
-        const videoAssetKey = typeof msg?.message?.videoMessage?.assetKey === 'string' ? msg.message.videoMessage.assetKey.trim() : '';
-        if (videoMediaId || videoUrl || videoAssetKey) {
-            return {
-                text,
-                media: {
-                    type: 'video',
-                    ...(videoMediaId ? { id: videoMediaId } : {}),
-                    ...(videoUrl ? { url: videoUrl } : {}),
-                    ...(videoAssetKey ? { assetKey: videoAssetKey } : {})
-                }
-            };
-        }
-        const documentMediaId =
-            typeof msg?.message?.documentMessage?.mediaId === 'string'
-                ? msg.message.documentMessage.mediaId.trim()
-                : '';
-        const documentUrl = typeof msg?.message?.documentMessage?.url === 'string' ? msg.message.documentMessage.url.trim() : '';
-        const documentAssetKey =
-            typeof msg?.message?.documentMessage?.assetKey === 'string'
-                ? msg.message.documentMessage.assetKey.trim()
-                : '';
-        if (documentMediaId || documentUrl || documentAssetKey) {
-            const filename =
-                typeof msg?.message?.documentMessage?.fileName === 'string'
-                    ? msg.message.documentMessage.fileName.trim()
-                    : '';
-            return {
-                text,
-                media: {
-                    type: 'document',
-                    ...(documentMediaId ? { id: documentMediaId } : {}),
-                    ...(documentUrl ? { url: documentUrl } : {}),
-                    ...(documentAssetKey ? { assetKey: documentAssetKey } : {}),
-                    ...(filename ? { filename } : {})
-                }
-            };
-        }
+        const text = trimString(msg?.message?.conversation) || trimString(msg?.message?.extendedTextMessage?.text);
+        const media = buildOutgoingMediaFromMessage(msg);
+        if (media) return { text, media };
         if (!text) return null;
         return { text };
     }, []);
@@ -3863,7 +4629,7 @@ export default function App() {
             : (selectedChatId || '');
         if (!jid) return;
 
-        const resendTempId = `tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const resendTempId = createClientTempMessageId();
         setAllMessages((prev) =>
             prev.map((msg) =>
                 msg.key?.id === messageId
@@ -3888,24 +4654,12 @@ export default function App() {
             },
             (ack: any) => {
                 if (!ack?.success) {
-                    setAllMessages((prev) =>
-                        prev.map((msg) =>
-                            msg.key?.id === resendTempId
-                                ? { ...msg, status: 'failed' }
-                                : msg
-                        )
-                    );
+                    setAllMessages((prev) => markMessageStatusById(prev, resendTempId, 'failed'));
                     return;
                 }
-                const realMessageId = typeof ack?.data?.messageId === 'string' ? ack.data.messageId : '';
+                const realMessageId = trimString(ack?.data?.messageId);
                 if (!realMessageId) return;
-                setAllMessages((prev) =>
-                    prev.map((msg) =>
-                        msg.key?.id === resendTempId
-                            ? { ...msg, key: { ...msg.key, id: realMessageId }, status: 'sent' }
-                            : msg
-                    )
-                );
+                setAllMessages((prev) => replaceTempMessageIdAndStatus(prev, resendTempId, realMessageId, 'sent'));
             }
         );
     }, [activeProfileId, allMessages, buildOutgoingPayloadFromMessage, selectedChatId, socket]);
@@ -3914,24 +4668,16 @@ export default function App() {
         if (!socket || !activeProfileId || !selectedChatId) return;
         if (composerMediaUploading) return;
         const outgoingText = messageText.trim();
-        const mediaId = composerMediaId.trim();
-        const mediaUrl = composerMediaUrl.trim();
-        const mediaAssetKey = composerMediaAssetKey.trim();
-        const mediaType = composerMediaType;
-        const mediaFilename = composerMediaFilename.trim();
-        const tempMessageId = `tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        const sendMedia =
-            (mediaType === 'image' || mediaType === 'video' || mediaType === 'document') && (mediaId || mediaUrl || mediaAssetKey)
-                ? {
-                    type: mediaType,
-                    ...(mediaId ? { id: mediaId } : {}),
-                    ...(mediaUrl ? { url: mediaUrl } : {}),
-                    ...(mediaAssetKey ? { assetKey: mediaAssetKey } : {}),
-                    ...(mediaType === 'document' && mediaFilename ? { filename: mediaFilename } : {})
-                }
-                : null;
+        const sendMedia = buildSendMediaFromComposerState(
+            composerMediaType,
+            composerMediaId.trim(),
+            composerMediaUrl.trim(),
+            composerMediaAssetKey.trim(),
+            composerMediaFilename.trim()
+        );
 
         if (!outgoingText && !sendMedia) return;
+        const tempMessageId = createClientTempMessageId();
 
         socket.emit(
             'sendMessage',
@@ -3944,71 +4690,22 @@ export default function App() {
             },
             (ack: any) => {
                 if (!ack?.success) {
-                    setAllMessages((prev) =>
-                        prev.map((msg) =>
-                            msg.key?.id === tempMessageId
-                                ? { ...msg, status: 'failed' }
-                                : msg
-                        )
-                    );
+                    setAllMessages((prev) => markMessageStatusById(prev, tempMessageId, 'failed'));
                     return;
                 }
-                const realMessageId = typeof ack?.data?.messageId === 'string' ? ack.data.messageId : '';
+                const realMessageId = trimString(ack?.data?.messageId);
                 if (!realMessageId) return;
-                setAllMessages((prev) =>
-                    prev.map((msg) =>
-                        msg.key?.id === tempMessageId
-                            ? { ...msg, key: { ...msg.key, id: realMessageId }, status: 'sent' }
-                            : msg
-                    )
-                );
+                setAllMessages((prev) => replaceTempMessageIdAndStatus(prev, tempMessageId, realMessageId, 'sent'));
             }
         );
-        const tempMsg: Message = {
-            key: { id: tempMessageId, remoteJid: selectedChatId, fromMe: true },
-            message: (() => {
-                if (!sendMedia) return { conversation: outgoingText };
-                if (sendMedia.type === 'image') {
-                    return {
-                        ...(outgoingText ? { conversation: outgoingText } : {}),
-                        imageMessage: {
-                            mediaId: sendMedia.id,
-                            caption: outgoingText,
-                            assetKey: sendMedia.assetKey,
-                            url: sendMedia.url
-                        }
-                    };
-                }
-                if (sendMedia.type === 'video') {
-                    return {
-                        ...(outgoingText ? { conversation: outgoingText } : {}),
-                        videoMessage: {
-                            mediaId: sendMedia.id,
-                            caption: outgoingText,
-                            assetKey: sendMedia.assetKey,
-                            url: sendMedia.url
-                        }
-                    };
-                }
-                return {
-                    ...(outgoingText ? { conversation: outgoingText } : {}),
-                    documentMessage: {
-                        mediaId: sendMedia.id,
-                        caption: outgoingText,
-                        assetKey: sendMedia.assetKey,
-                        fileName: sendMedia.filename || 'document',
-                        url: sendMedia.url
-                    }
-                };
-            })(),
-            messageTimestamp: Math.floor(Date.now() / 1000),
-            status: 'pending',
-            agent: {
-                user_id: session?.user?.id,
-                name: currentAgentName,
-                color: '#6b7280'
-            }
-        };
+        const tempMsg: Message = buildOptimisticPendingMessage({
+            tempMessageId,
+            remoteJid: selectedChatId,
+            outgoingText,
+            sendMedia,
+            agentUserId: session?.user?.id,
+            agentName: currentAgentName
+        });
         setAllMessages(prev => [tempMsg, ...prev]);
         persistDraft('', activeProfileId, selectedChatId);
         setMessageText('');
@@ -4099,27 +4796,15 @@ export default function App() {
                 throw new Error(payload?.error || `Failed with status ${response.status}`);
             }
 
-            const permissionStatus = String(payload?.data?.permission?.status || '').toLowerCase();
-            const actions = Array.isArray(payload?.data?.actions) ? payload.data.actions : [];
-            const startAction = actions.find((entry: any) => String(entry?.action_name || '').toLowerCase() === 'start_call');
-            const canStartCall = startAction?.can_perform_action === true;
-            const callTypeLabel = kind === 'video' ? 'Video call' : 'Voice call';
-
-            if (permissionStatus === 'granted' && canStartCall) {
-                showToast(`${callTypeLabel} is permitted. Dialer UI not enabled yet.`, 'success');
-                pushLog(`[Calls] ${callTypeLabel} permitted for ${userWaId}.`, 'info');
-            } else if (permissionStatus === 'pending') {
-                showToast('Call permission is pending approval from this user.', 'error');
-            } else if (permissionStatus === 'denied') {
-                showToast('Call permission was denied by this user.', 'error');
-            } else if (permissionStatus === 'expired') {
-                showToast('Call permission has expired. Request permission again.', 'error');
-            } else {
-                showToast('Call permission is not available for this contact.', 'error');
+            const { permissionStatus, canStartCall } = extractCallPermissionSummary(payload);
+            const feedback = getCallPermissionFeedback(kind, permissionStatus, canStartCall, userWaId);
+            showToast(feedback.message, feedback.tone);
+            if (feedback.logMessage) {
+                pushLog(feedback.logMessage, 'info');
             }
         } catch (error: any) {
             const rawMessage = String(error?.message || '').toLowerCase();
-            if (rawMessage.includes('calling api not enabled') || rawMessage.includes('code=138000')) {
+            if (isCallingApiNotEnabledError(rawMessage)) {
                 showToast('Meta Calling API is not enabled for this phone number yet. Enable WhatsApp Cloud Calling for this number first.', 'error');
             } else {
                 showToast(error?.message || 'Failed to check call permission.', 'error');
@@ -4222,11 +4907,7 @@ export default function App() {
                     ? { ...workflow, run_on_new_chat: false }
                 : workflow
         );
-        const nextDrafts = { ...workflowDrafts };
-        nextWorkflows.forEach((workflow: any) => {
-            if (typeof nextDrafts[workflow.id] === 'string') return;
-            nextDrafts[workflow.id] = JSON.stringify(Array.isArray(workflow.actions) ? workflow.actions : [], null, 2);
-        });
+        const nextDrafts = ensureWorkflowDraftEntries(nextWorkflows, workflowDrafts);
 
         setWorkflows(nextWorkflows);
         setWorkflowDrafts(nextDrafts);
@@ -4246,11 +4927,7 @@ export default function App() {
                 ? { ...workflow, enabled: nextEnabled }
                 : workflow
         );
-        const nextDrafts = { ...workflowDrafts };
-        nextWorkflows.forEach((workflow: any) => {
-            if (typeof nextDrafts[workflow.id] === 'string') return;
-            nextDrafts[workflow.id] = JSON.stringify(Array.isArray(workflow.actions) ? workflow.actions : [], null, 2);
-        });
+        const nextDrafts = ensureWorkflowDraftEntries(nextWorkflows, workflowDrafts);
 
         setWorkflows(nextWorkflows);
         setWorkflowDrafts(nextDrafts);
@@ -4280,10 +4957,7 @@ export default function App() {
         const existingIds = new Set(
             automationWorkflows.map((workflow: any) => String(workflow?.id ?? '').trim()).filter(Boolean)
         );
-        let copiedId = `wf-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-        while (existingIds.has(copiedId)) {
-            copiedId = `wf-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-        }
+        const copiedId = createUniqueWorkflowId(existingIds);
 
         const existingNames = new Set(
             automationWorkflows
@@ -4291,37 +4965,14 @@ export default function App() {
                 .filter(Boolean)
                 .map((name: string) => name.toLowerCase())
         );
-        const sourceName = typeof sourceWorkflow?.name === 'string' ? sourceWorkflow.name.trim() : '';
-        let copiedName = sourceName ? `${sourceName}-copy` : 'workflow-copy';
-        let copyNameIndex = 2;
-        while (existingNames.has(copiedName.toLowerCase())) {
-            copiedName = sourceName ? `${sourceName}-copy-${copyNameIndex}` : `workflow-copy-${copyNameIndex}`;
-            copyNameIndex += 1;
-        }
-
-        const sourceActions = Array.isArray(sourceWorkflow.actions) ? sourceWorkflow.actions : [];
-        const copiedActions = JSON.parse(JSON.stringify(sourceActions));
-        const copiedBuilder = sourceWorkflow?.builder && Array.isArray(sourceWorkflow.builder.nodes)
-            ? JSON.parse(JSON.stringify(sourceWorkflow.builder))
-            : buildBuilderFromActions(copiedActions, copiedId);
-        if (copiedBuilder && typeof copiedBuilder === 'object') {
-            copiedBuilder.id = copiedId;
-        }
-
-        const sourceTrigger = typeof sourceWorkflow?.trigger_keyword === 'string'
-            ? sourceWorkflow.trigger_keyword.trim()
-            : '';
-
-        const copiedWorkflow = {
-            ...sourceWorkflow,
-            id: copiedId,
-            name: copiedName,
-            trigger_keyword: sourceTrigger,
-            run_on_new_chat: false,
-            enabled: false,
-            actions: copiedActions,
-            builder: copiedBuilder
-        };
+        const sourceName = trimString(sourceWorkflow?.name);
+        const copiedName = createCopiedWorkflowName(existingNames, sourceName);
+        const { copiedWorkflow, copiedActions } = buildCopiedWorkflowRecord(
+            sourceWorkflow,
+            copiedId,
+            copiedName,
+            buildBuilderFromActions
+        );
 
         const nextWorkflows = [...automationWorkflows, copiedWorkflow];
         const nextDrafts = {
@@ -4422,95 +5073,32 @@ export default function App() {
         }
 
         let components: any[] | undefined;
-        let namedBodyAttributes: Array<{ scope: 'body'; index: number; key: string; value: string }> = [];
-        if (templateComponents.trim()) {
-            try {
-                const parsed = JSON.parse(templateComponents);
-                if (!Array.isArray(parsed)) {
-                    alert('Template components must be a JSON array.');
-                    return;
-                }
-                components = parsed;
-            } catch {
-                alert('Invalid JSON in template components.');
+        let namedBodyAttributes: TemplateBodyAttributePayload[] = [];
+        const parsedTemplateInput = parseTemplateComponentsInput(templateComponents);
+        if (parsedTemplateInput.error) {
+            alert(parsedTemplateInput.error);
+            return;
+        }
+        if (parsedTemplateInput.components) {
+            components = parsedTemplateInput.components;
+        } else if (selectedTemplateOption) {
+            const templateBuildResult = buildTemplateFromSelection({
+                selectedTemplateHeaderFormat,
+                requiredTemplateHeaderAttributeCount,
+                templateHeaderAttributes,
+                templateHeaderMediaUrl,
+                templateHeaderDocumentFilename,
+                requiredTemplateBodyAttributeCount,
+                templateBodyAttributes,
+                templateBodyAttributeNames,
+                selectedTemplateBodyText: selectedTemplateBody?.text
+            });
+            if (templateBuildResult.error) {
+                alert(templateBuildResult.error);
                 return;
             }
-        } else if (selectedTemplateOption) {
-            const built: any[] = [];
-            const headerType = selectedTemplateHeaderFormat;
-            const mediaLink = templateHeaderMediaUrl.trim();
-            if (requiredTemplateHeaderAttributeCount > 0) {
-                const missingHeaderParamIndex = templateHeaderAttributes.findIndex((value) => !value.trim());
-                if (missingHeaderParamIndex >= 0) {
-                    alert(`Header attribute {{${missingHeaderParamIndex + 1}}} is required.`);
-                    return;
-                }
-                built.push({
-                    type: 'header',
-                    parameters: templateHeaderAttributes.map((value) => ({
-                        type: 'text',
-                        text: value.trim()
-                    }))
-                });
-            } else if (headerType === 'IMAGE' || headerType === 'VIDEO' || headerType === 'DOCUMENT') {
-                if (!mediaLink) {
-                    alert(`Template header requires ${headerType.toLowerCase()} link.`);
-                    return;
-                }
-                if (headerType === 'DOCUMENT') {
-                    built.push({
-                        type: 'header',
-                        parameters: [
-                            {
-                                type: 'document',
-                                document: {
-                                    link: mediaLink,
-                                    ...(templateHeaderDocumentFilename.trim()
-                                        ? { filename: templateHeaderDocumentFilename.trim() }
-                                        : {})
-                                }
-                            }
-                        ]
-                    });
-                } else if (headerType === 'IMAGE') {
-                    built.push({
-                        type: 'header',
-                        parameters: [{ type: 'image', image: { link: mediaLink } }]
-                    });
-                } else if (headerType === 'VIDEO') {
-                    built.push({
-                        type: 'header',
-                        parameters: [{ type: 'video', video: { link: mediaLink } }]
-                    });
-                }
-            }
-
-            if (requiredTemplateBodyAttributeCount > 0) {
-                const missingBodyParamIndex = templateBodyAttributes.findIndex((value) => !value.trim());
-                if (missingBodyParamIndex >= 0) {
-                    alert(`Body attribute {{${missingBodyParamIndex + 1}}} is required.`);
-                    return;
-                }
-                const missingBodyAttributeNameIndex = templateBodyAttributeNames.findIndex((value) => !value.trim());
-                if (missingBodyAttributeNameIndex >= 0) {
-                    alert(`Body attribute label for {{${missingBodyAttributeNameIndex + 1}}} is required.`);
-                    return;
-                }
-                built.push({
-                    type: 'body',
-                    parameters: templateBodyAttributes.map((value) => ({
-                        type: 'text',
-                        text: value.trim()
-                    }))
-                });
-                namedBodyAttributes = templateBodyAttributes.map((value, index) => ({
-                    scope: 'body' as const,
-                    index: index + 1,
-                    key: (templateBodyAttributeNames[index] || inferTemplateVariableLabel(selectedTemplateBody?.text, index + 1, 'body')).trim(),
-                    value: value.trim()
-                }));
-            }
-            components = built.length > 0 ? built : undefined;
+            components = templateBuildResult.components;
+            namedBodyAttributes = templateBuildResult.bodyAttributes;
         }
 
         socket.emit('sendTemplate', {
@@ -6981,6 +7569,22 @@ export default function App() {
                     }}
                 />
             )}
+
+            <MobileInstallOnboarding
+                open={installOnboardingOpen}
+                platform={installPlatformForPrompt}
+                canTriggerNativeInstall={installPlatform === 'android' && Boolean(deferredInstallPrompt)}
+                notificationPermission={notificationPermissionState}
+                onInstall={() => {
+                    void handleInstallApp();
+                }}
+                onDone={() => handleInstallOnboardingDecision('done')}
+                onNotNow={() => handleInstallOnboardingDecision('not_now')}
+                onDismiss={() => handleInstallOnboardingDecision('dismissed')}
+                onRequestNotifications={() => {
+                    void handleRequestNotificationPermission();
+                }}
+            />
 
             {assignMenuContactId && !assignMenuContactId.endsWith('@g.us') && (
                 <div
