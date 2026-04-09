@@ -1,11 +1,9 @@
-const CACHE_VERSION = 'qmessage-pwa-v1';
+const CACHE_VERSION = 'qmessage-pwa-v2';
 const SHELL_CACHE = `${CACHE_VERSION}-shell`;
 const RUNTIME_CACHE = `${CACHE_VERSION}-runtime`;
 const OFFLINE_URL = '/offline.html';
 
 const SHELL_ASSETS = [
-    '/',
-    '/index.html',
     '/manifest.webmanifest',
     '/qmessage-logo.jpg',
     '/icons/icon-192.png',
@@ -16,7 +14,7 @@ const SHELL_ASSETS = [
 
 self.addEventListener('install', (event) => {
     event.waitUntil(
-        caches.open(SHELL_CACHE).then((cache) => cache.addAll(SHELL_ASSETS)).then(() => self.skipWaiting())
+        caches.open(SHELL_CACHE).then((cache) => cache.addAll(SHELL_ASSETS))
     );
 });
 
@@ -35,12 +33,12 @@ self.addEventListener('activate', (event) => {
 const networkFirstForNavigation = async (request) => {
     try {
         const networkResponse = await fetch(request);
-        const cache = await caches.open(RUNTIME_CACHE);
-        cache.put(request, networkResponse.clone());
+        if (networkResponse && networkResponse.ok) {
+            const cache = await caches.open(RUNTIME_CACHE);
+            cache.put(request, networkResponse.clone());
+        }
         return networkResponse;
     } catch {
-        const cached = await caches.match(request);
-        if (cached) return cached;
         return caches.match(OFFLINE_URL);
     }
 };
@@ -116,4 +114,10 @@ self.addEventListener('notificationclick', (event) => {
         }
         self.clients.openWindow(urlToOpen);
     })());
+});
+
+self.addEventListener('message', (event) => {
+    if (event?.data?.type === 'SKIP_WAITING') {
+        self.skipWaiting();
+    }
 });

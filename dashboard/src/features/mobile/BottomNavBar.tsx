@@ -25,7 +25,11 @@ export default function BottomNavBar({ items, activeId, onSelect }: BottomNavBar
     return (
         <nav
             className="fixed bottom-0 inset-x-0 z-[180] border-t border-[#dfe5ea] bg-white/95 backdrop-blur supports-[backdrop-filter]:bg-white/90 lg:hidden"
-            style={{ paddingBottom: 'max(env(safe-area-inset-bottom), 0.4rem)' }}
+            style={{
+                paddingBottom: 'max(env(safe-area-inset-bottom), 0.4rem)',
+                paddingLeft: 'max(env(safe-area-inset-left), 0.35rem)',
+                paddingRight: 'max(env(safe-area-inset-right), 0.35rem)'
+            }}
             aria-label="Primary"
         >
             <div

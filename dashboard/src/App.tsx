@@ -98,6 +98,7 @@ const SINGLE_PROFILE_MODE = true;
 const OAUTH_PENDING_COMPANY_KEY = 'pendingOAuthCompanyId';
 const MOBILE_LAYOUT_BREAKPOINT = 1024;
 const MOBILE_BOTTOM_TAB_SECTIONS = ['team-inbox', 'automations', 'contacts', 'more'] as const;
+const PWA_UPDATE_AVAILABLE_EVENT = 'qmessage:pwa-update-available';
 
 const LazyWebhookView = lazy(() => import('./WebhookView'));
 const LazyBroadcastTemplateBuilder = lazy(() => import('./BroadcastTemplateBuilder'));
@@ -478,6 +479,38 @@ const canonicalContactJid = (jid: string | null | undefined): string => {
     if (digits.length >= 6) return `${digits}@s.whatsapp.net`;
     const normalized = clean.toLowerCase().trim();
     return normalized ? `${normalized}@s.whatsapp.net` : value.toLowerCase();
+};
+
+const normalizeChatReadCursorMap = (value: unknown): Record<string, number> => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    const next: Record<string, number> = {};
+    Object.entries(value as Record<string, unknown>).forEach(([jid, ts]) => {
+        const canonical = canonicalContactJid(jid);
+        const numericTs = Number(ts);
+        if (!canonical || !Number.isFinite(numericTs) || numericTs <= 0) return;
+        next[canonical] = Math.floor(numericTs);
+    });
+    return next;
+};
+
+const readChatReadCursorFromStorage = (profileId: string | null | undefined): Record<string, number> => {
+    if (typeof window === 'undefined' || !profileId) return {};
+    try {
+        const raw = window.localStorage.getItem(`${CHAT_READ_CURSOR_STORAGE_PREFIX}${profileId}`);
+        if (!raw) return {};
+        const parsed = JSON.parse(raw);
+        return normalizeChatReadCursorMap(parsed);
+    } catch {
+        return {};
+    }
+};
+
+const resolveRealtimeReadCursor = (
+    profileId: string | null | undefined,
+    inMemoryCursor: Record<string, number>
+): Record<string, number> => {
+    if (Object.keys(inMemoryCursor).length > 0) return inMemoryCursor;
+    return readChatReadCursorFromStorage(profileId);
 };
 
 const pickContactMetaByJid = (
@@ -1559,6 +1592,8 @@ export default function App() {
     const [notificationPermissionState, setNotificationPermissionState] = useState<NotificationPermission | 'unsupported'>(
         () => getNotificationPermissionState()
     );
+    const [pwaUpdateRegistration, setPwaUpdateRegistration] = useState<ServiceWorkerRegistration | null>(null);
+    const [showPwaUpdateBanner, setShowPwaUpdateBanner] = useState(false);
 
     const [activeView, setActiveView] = useState<'dashboard' | 'chatflow' | 'settings' | 'admin'>('dashboard');
     const [workspaceSection, setWorkspaceSection] = useState<
@@ -1606,9 +1641,11 @@ export default function App() {
     const activeProfileIdRef = useRef<string | null>(null);
     const selectedChatIdRef = useRef<string | null>(null);
     const chatReadCursorByChatRef = useRef<Record<string, number>>({});
+    const mobileSwipeStartRef = useRef<{ x: number; y: number; at: number } | null>(null);
     const contactsRef = useRef<Record<string, ContactMeta>>({});
     const lastRecoverAtRef = useRef(0);
     const lastInboundRef = useRef<number | null>(null);
+    const lastRealtimeEventAtRef = useRef(Date.now());
     const requestedMediaRef = useRef<Set<string>>(new Set());
     const seenIncomingMessageKeysRef = useRef<Set<string>>(new Set());
     const notifiedIncomingMessageKeysRef = useRef<Set<string>>(new Set());
@@ -1618,6 +1655,8 @@ export default function App() {
     const socketInstanceRef = useRef<Socket | null>(null);
     const socketAccessTokenRef = useRef('');
     const hiddenSocketDisconnectTimerRef = useRef<number | null>(null);
+    const pwaUpdateReloadTimerRef = useRef<number | null>(null);
+    const pwaUpdateReloadingRef = useRef(false);
     const lastUiControlsRefreshAtRef = useRef(0);
     const { ref: chatListViewportRef, size: chatListViewport } = useElementSize<HTMLDivElement>();
     const { ref: messageViewportRef, size: messageViewport } = useElementSize<HTMLDivElement>();
@@ -2024,6 +2063,28 @@ export default function App() {
         });
     }, []);
 
+    const clearPwaUpdateReloadTimer = useCallback(() => {
+        if (pwaUpdateReloadTimerRef.current !== null) {
+            window.clearTimeout(pwaUpdateReloadTimerRef.current);
+            pwaUpdateReloadTimerRef.current = null;
+        }
+    }, []);
+
+    const handleApplyPwaUpdate = useCallback(() => {
+        const waitingWorker = pwaUpdateRegistration?.waiting;
+        if (!waitingWorker) {
+            setShowPwaUpdateBanner(false);
+            return;
+        }
+        pwaUpdateReloadingRef.current = true;
+        setShowPwaUpdateBanner(false);
+        waitingWorker.postMessage({ type: 'SKIP_WAITING' });
+        clearPwaUpdateReloadTimer();
+        pwaUpdateReloadTimerRef.current = window.setTimeout(() => {
+            window.location.reload();
+        }, 3200);
+    }, [clearPwaUpdateReloadTimer, pwaUpdateRegistration]);
+
     useEffect(() => {
         if (!appToast) return;
         const timer = window.setTimeout(() => {
@@ -2031,6 +2092,12 @@ export default function App() {
         }, 2400);
         return () => window.clearTimeout(timer);
     }, [appToast]);
+
+    useEffect(() => {
+        return () => {
+            clearPwaUpdateReloadTimer();
+        };
+    }, [clearPwaUpdateReloadTimer]);
 
     const handleInstallOnboardingDecision = useCallback((decision: InstallOnboardingDecision) => {
         persistInstallOnboardingDecision(decision);
@@ -2090,12 +2157,23 @@ export default function App() {
 
         const onBeforeInstallPrompt = (event: Event) => {
             const installEvent = event as BeforeInstallPromptEvent;
+            const shouldUseCustomInstallFlow =
+                installPlatform === 'android'
+                && isMobileDevice()
+                && !isStandaloneMode()
+                && !installOnboardingDecision;
+            if (!shouldUseCustomInstallFlow) {
+                setDeferredInstallPrompt(null);
+                return;
+            }
             installEvent.preventDefault();
             setDeferredInstallPrompt(installEvent);
+            setInstallOnboardingOpen(true);
         };
         const onAppInstalled = () => {
             syncStandaloneState();
             setDeferredInstallPrompt(null);
+            setInstallOnboardingOpen(false);
             handleInstallOnboardingDecision('done');
         };
 
@@ -2118,7 +2196,34 @@ export default function App() {
                 displayModeMedia.removeListener(onDisplayModeChange);
             }
         };
-    }, [handleInstallOnboardingDecision]);
+    }, [handleInstallOnboardingDecision, installOnboardingDecision, installPlatform]);
+
+    useEffect(() => {
+        if (!('serviceWorker' in navigator)) return;
+
+        const onPwaUpdateAvailable = (event: Event) => {
+            const customEvent = event as CustomEvent<ServiceWorkerRegistration>;
+            const registration = customEvent.detail;
+            if (!registration?.waiting) return;
+            setPwaUpdateRegistration(registration);
+            setShowPwaUpdateBanner(true);
+        };
+
+        const onControllerChange = () => {
+            if (!pwaUpdateReloadingRef.current) return;
+            pwaUpdateReloadingRef.current = false;
+            clearPwaUpdateReloadTimer();
+            window.location.reload();
+        };
+
+        window.addEventListener(PWA_UPDATE_AVAILABLE_EVENT, onPwaUpdateAvailable as EventListener);
+        navigator.serviceWorker.addEventListener('controllerchange', onControllerChange);
+
+        return () => {
+            window.removeEventListener(PWA_UPDATE_AVAILABLE_EVENT, onPwaUpdateAvailable as EventListener);
+            navigator.serviceWorker.removeEventListener('controllerchange', onControllerChange);
+        };
+    }, [clearPwaUpdateReloadTimer]);
 
     useEffect(() => {
         const syncPermission = () => setNotificationPermissionState(getNotificationPermissionState());
@@ -2776,36 +2881,53 @@ export default function App() {
     }, [chatReadCursorByChat]);
 
     useEffect(() => {
+        if (Object.keys(chatReadCursorByChat).length === 0) return;
+        if (Object.keys(unreadMessagesByChat).length === 0) return;
+
+        const latestInboundByChat: Record<string, number> = {};
+        allMessages.forEach((msg) => {
+            if (msg?.key?.fromMe) return;
+            const jid = canonicalContactJid(msg?.key?.remoteJid || '');
+            if (!jid) return;
+            const ts = Number(msg?.messageTimestamp || 0);
+            if (!Number.isFinite(ts) || ts <= 0) return;
+            latestInboundByChat[jid] = Math.max(latestInboundByChat[jid] || 0, ts);
+        });
+
+        setUnreadMessagesByChat((prev) => {
+            let changed = false;
+            const next: Record<string, number> = {};
+            Object.entries(prev).forEach(([jid, count]) => {
+                const normalizedCount = Math.max(0, Number(count) || 0);
+                if (normalizedCount <= 0) {
+                    changed = true;
+                    return;
+                }
+                const readCursor = Number(chatReadCursorByChat[jid] || 0);
+                const latestInboundTs = Number(latestInboundByChat[jid] || 0);
+                if (readCursor > 0 && latestInboundTs > 0 && latestInboundTs <= readCursor) {
+                    changed = true;
+                    return;
+                }
+                next[jid] = normalizedCount;
+            });
+            return changed ? next : prev;
+        });
+    }, [allMessages, chatReadCursorByChat, unreadMessagesByChat]);
+
+    useEffect(() => {
         contactsRef.current = contacts;
     }, [contacts]);
 
     useEffect(() => {
         if (!activeProfileId) {
             setChatReadCursorByChat({});
+            chatReadCursorByChatRef.current = {};
             return;
         }
-        try {
-            const raw = window.localStorage.getItem(`${CHAT_READ_CURSOR_STORAGE_PREFIX}${activeProfileId}`);
-            if (!raw) {
-                setChatReadCursorByChat({});
-                return;
-            }
-            const parsed = JSON.parse(raw);
-            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-                setChatReadCursorByChat({});
-                return;
-            }
-            const next: Record<string, number> = {};
-            Object.entries(parsed as Record<string, unknown>).forEach(([jid, ts]) => {
-                const canonical = canonicalContactJid(jid);
-                const numericTs = Number(ts);
-                if (!canonical || !Number.isFinite(numericTs) || numericTs <= 0) return;
-                next[canonical] = Math.floor(numericTs);
-            });
-            setChatReadCursorByChat(next);
-        } catch {
-            setChatReadCursorByChat({});
-        }
+        const next = readChatReadCursorFromStorage(activeProfileId);
+        chatReadCursorByChatRef.current = next;
+        setChatReadCursorByChat(next);
     }, [activeProfileId]);
 
     useEffect(() => {
@@ -3106,6 +3228,70 @@ export default function App() {
         setChatListFilter('all');
     }, [isMobile, chatListFilter]);
 
+    const mobileSwipeSectionOrder = useMemo<Array<'team-inbox' | 'automations' | 'contacts' | 'more'>>(() => {
+        if (uiControlsLoading) return ['team-inbox', 'automations', 'contacts', 'more'];
+        const ordered: Array<'team-inbox' | 'automations' | 'contacts' | 'more'> = ['team-inbox', 'automations', 'contacts', 'more'];
+        return ordered.filter((section) => !isUiFeatureHidden(UI_FEATURE_KEY_BY_WORKSPACE_SECTION[section]));
+    }, [isUiFeatureHidden, uiControlsLoading]);
+
+    const switchMobileWorkspaceBySwipe = useCallback((nextSection: 'team-inbox' | 'automations' | 'contacts' | 'more') => {
+        setShowContactInfo(false);
+        if (nextSection === 'more') {
+            setShowAnalytics(true);
+            return;
+        }
+        setShowAnalytics(false);
+        if (nextSection === 'team-inbox') {
+            setSelectedChatId(null);
+        }
+        setWorkspaceSection(nextSection);
+    }, []);
+
+    const handleMobileWorkspaceTouchStart = useCallback((event: React.TouchEvent) => {
+        if (!isMobile || activeView !== 'dashboard') return;
+        if (event.touches.length !== 1) return;
+        if (workspaceSection === 'team-inbox' && Boolean(selectedChatId)) return;
+        const target = event.target as HTMLElement | null;
+        if (target?.closest('input, textarea, select, button, [contenteditable=\"true\"]')) return;
+        if (target?.closest('.mobile-horizontal-scroll')) return;
+        const touch = event.touches[0];
+        mobileSwipeStartRef.current = {
+            x: touch.clientX,
+            y: touch.clientY,
+            at: Date.now()
+        };
+    }, [activeView, isMobile, selectedChatId, workspaceSection]);
+
+    const handleMobileWorkspaceTouchEnd = useCallback((event: React.TouchEvent) => {
+        if (!isMobile || activeView !== 'dashboard') return;
+        if (workspaceSection === 'team-inbox' && Boolean(selectedChatId)) return;
+        const start = mobileSwipeStartRef.current;
+        mobileSwipeStartRef.current = null;
+        if (!start || event.changedTouches.length === 0) return;
+
+        const touch = event.changedTouches[0];
+        const deltaX = touch.clientX - start.x;
+        const deltaY = touch.clientY - start.y;
+        const elapsedMs = Date.now() - start.at;
+        const absX = Math.abs(deltaX);
+        const absY = Math.abs(deltaY);
+
+        if (elapsedMs > 700) return;
+        if (absX < 72) return;
+        if (absY > 64) return;
+        if (absX <= absY) return;
+
+        const activeSection = showAnalytics ? 'more' : workspaceSection;
+        const currentIndex = mobileSwipeSectionOrder.findIndex((section) => section === activeSection);
+        if (currentIndex < 0) return;
+
+        const step = deltaX < 0 ? 1 : -1;
+        const nextIndex = currentIndex + step;
+        if (nextIndex < 0 || nextIndex >= mobileSwipeSectionOrder.length) return;
+
+        switchMobileWorkspaceBySwipe(mobileSwipeSectionOrder[nextIndex]);
+    }, [activeView, isMobile, mobileSwipeSectionOrder, selectedChatId, showAnalytics, switchMobileWorkspaceBySwipe, workspaceSection]);
+
 
     const handleSignOut = async () => {
         clearAllDrafts();
@@ -3300,9 +3486,12 @@ export default function App() {
         }, 50);
 
         newSocket.on('connect', () => {
-            if (activeProfileIdRef.current) {
-                newSocket.emit('switchProfile', activeProfileIdRef.current);
+            const profileId = activeProfileIdRef.current;
+            if (profileId) {
+                newSocket.emit('switchProfile', profileId);
+                newSocket.emit('refreshMessages', profileId);
             }
+            lastRealtimeEventAtRef.current = Date.now();
         });
 
         newSocket.on('profiles.update', (data) => {
@@ -3340,6 +3529,13 @@ export default function App() {
 
         newSocket.on('connection.update', (update) => {
             if (update.profileId === activeProfileIdRef.current) setConnectionStatus(update.connection);
+            if (update.connection === 'open' && update.profileId === activeProfileIdRef.current) {
+                const profileId = activeProfileIdRef.current;
+                if (profileId && newSocket.connected) {
+                    newSocket.emit('refreshMessages', profileId);
+                    lastRealtimeEventAtRef.current = Date.now();
+                }
+            }
             if (update.connection === 'close') {
                 pushLog('WABA connection closed.', 'info');
             }
@@ -3347,7 +3543,7 @@ export default function App() {
 
         const notifyIncomingMessages = async (incomingMessages: Message[]) => {
             if (!Array.isArray(incomingMessages) || incomingMessages.length === 0) return;
-            if (!('Notification' in window) || Notification.permission !== 'granted') return;
+            const canShowSystemNotification = 'Notification' in window && Notification.permission === 'granted';
 
             const visibleChatKey = canonicalContactJid(selectedChatIdRef.current || '');
             const notificationCandidates: Message[] = [];
@@ -3388,6 +3584,13 @@ export default function App() {
             const body = notificationCandidates.length > 1
                 ? `${baseBody} (+${notificationCandidates.length - 1} more)`
                 : baseBody;
+
+            if (document.visibilityState === 'visible') {
+                showToast(`${senderName}: ${body}`, 'success');
+            }
+
+            if (!canShowSystemNotification) return;
+
             const options: NotificationOptions = {
                 body,
                 icon: '/icons/icon-192.png',
@@ -3420,18 +3623,32 @@ export default function App() {
 
         newSocket.on('messages.upsert', (data) => {
             if (data.profileId === activeProfileIdRef.current) {
+                lastRealtimeEventAtRef.current = Date.now();
                 const incomingMessages = Array.isArray(data?.messages) ? data.messages : [];
                 setAllMessages((prev) => [...incomingMessages, ...prev]);
                 setLoadingChats(false);
                 if (incomingMessages.length === 0) return;
                 void notifyIncomingMessages(incomingMessages);
                 const activeChatKey = canonicalContactJid(selectedChatIdRef.current || '');
+                const effectiveReadCursor = resolveRealtimeReadCursor(
+                    activeProfileIdRef.current,
+                    chatReadCursorByChatRef.current
+                );
+                if (
+                    Object.keys(chatReadCursorByChatRef.current).length === 0
+                    && Object.keys(effectiveReadCursor).length > 0
+                ) {
+                    chatReadCursorByChatRef.current = effectiveReadCursor;
+                    setChatReadCursorByChat((prev) => (
+                        Object.keys(prev).length === 0 ? effectiveReadCursor : prev
+                    ));
+                }
                 setUnreadMessagesByChat((prev) => {
                     const unreadDeltaByChat = collectUnreadDeltaFromIncomingUpsert(
                         incomingMessages,
                         activeChatKey,
                         seenIncomingMessageKeysRef.current,
-                        chatReadCursorByChatRef.current
+                        effectiveReadCursor
                     );
                     return mergeUnreadDelta(prev, unreadDeltaByChat);
                 });
@@ -3440,16 +3657,30 @@ export default function App() {
 
         newSocket.on('messages.history', (data) => {
             if (data.profileId === activeProfileIdRef.current) {
+                lastRealtimeEventAtRef.current = Date.now();
                 const historyMessages = Array.isArray(data?.messages) ? data.messages : [];
                 setAllMessages(historyMessages);
                 setLoadingChats(false);
                 const previousSeen = seenIncomingMessageKeysRef.current;
                 const activeChatKey = canonicalContactJid(selectedChatIdRef.current || '');
+                const effectiveReadCursor = resolveRealtimeReadCursor(
+                    activeProfileIdRef.current,
+                    chatReadCursorByChatRef.current
+                );
+                if (
+                    Object.keys(chatReadCursorByChatRef.current).length === 0
+                    && Object.keys(effectiveReadCursor).length > 0
+                ) {
+                    chatReadCursorByChatRef.current = effectiveReadCursor;
+                    setChatReadCursorByChat((prev) => (
+                        Object.keys(prev).length === 0 ? effectiveReadCursor : prev
+                    ));
+                }
                 const { nextSeen, unreadDeltaByChat } = collectUnreadDeltaFromHistory(
                     historyMessages,
                     activeChatKey,
                     previousSeen,
-                    chatReadCursorByChatRef.current
+                    effectiveReadCursor
                 );
                 seenIncomingMessageKeysRef.current = nextSeen;
                 if (Object.keys(unreadDeltaByChat).length > 0) {
@@ -3459,6 +3690,7 @@ export default function App() {
         });
 
         newSocket.on('server.stats', (stats) => {
+            lastRealtimeEventAtRef.current = Date.now();
             setServerStats(stats);
         });
 
@@ -3526,6 +3758,7 @@ export default function App() {
 
         newSocket.on('contacts.update', (data) => {
             if (data.profileId === activeProfileIdRef.current) {
+                lastRealtimeEventAtRef.current = Date.now();
                 setContacts(prev => {
                     const next = { ...prev };
                     data.contacts.forEach((c: any) => {
@@ -3564,6 +3797,7 @@ export default function App() {
                     });
                     return next;
                 });
+                scheduleActiveProfileRefresh(180);
             }
         });
 
@@ -3665,6 +3899,18 @@ export default function App() {
             if (document.visibilityState !== 'visible') return;
             if (!newSocket.connected || !activeProfileIdRef.current) return;
             newSocket.emit('refreshMessages', activeProfileIdRef.current);
+            lastRealtimeEventAtRef.current = Date.now();
+        };
+        let refreshDebounceTimer: number | null = null;
+
+        const scheduleActiveProfileRefresh = (delayMs = 300) => {
+            if (typeof refreshDebounceTimer === 'number') {
+                window.clearTimeout(refreshDebounceTimer);
+            }
+            refreshDebounceTimer = window.setTimeout(() => {
+                refreshDebounceTimer = null;
+                requestActiveProfileRefresh();
+            }, delayMs);
         };
 
         const clearHiddenDisconnectTimer = () => {
@@ -3677,7 +3923,7 @@ export default function App() {
             if (document.visibilityState === 'visible') {
                 clearHiddenDisconnectTimer();
                 if (!newSocket.connected) newSocket.connect();
-                requestActiveProfileRefresh();
+                scheduleActiveProfileRefresh(80);
                 return;
             }
             clearHiddenDisconnectTimer();
@@ -3691,8 +3937,22 @@ export default function App() {
         const handleWindowFocus = () => requestActiveProfileRefresh();
         const handleOnline = () => {
             if (!newSocket.connected) newSocket.connect();
-            requestActiveProfileRefresh();
+            scheduleActiveProfileRefresh(120);
         };
+
+        const staleRefreshTimer = window.setInterval(() => {
+            if (document.visibilityState !== 'visible') return;
+            const profileId = activeProfileIdRef.current;
+            if (!profileId) return;
+            if (!newSocket.connected) {
+                newSocket.connect();
+                return;
+            }
+            const staleForMs = Date.now() - lastRealtimeEventAtRef.current;
+            if (staleForMs < 12_000) return;
+            newSocket.emit('refreshMessages', profileId);
+            lastRealtimeEventAtRef.current = Date.now();
+        }, 12_000);
 
         document.addEventListener('visibilitychange', handleVisibilityChange);
         window.addEventListener('focus', handleWindowFocus);
@@ -3700,6 +3960,10 @@ export default function App() {
 
         return () => {
             disposed = true;
+            window.clearInterval(staleRefreshTimer);
+            if (typeof refreshDebounceTimer === 'number') {
+                window.clearTimeout(refreshDebounceTimer);
+            }
             document.removeEventListener('visibilitychange', handleVisibilityChange);
             window.removeEventListener('focus', handleWindowFocus);
             window.removeEventListener('online', handleOnline);
@@ -5410,48 +5674,76 @@ export default function App() {
         { id: 'broadcast-history', label: 'Broadcast History' },
         { id: 'scheduled-broadcasts', label: 'Scheduled Broadcasts' }
     ];
+    const mobileSafeInsetsStyle: React.CSSProperties | undefined = isMobile
+        ? {
+            paddingLeft: 'max(env(safe-area-inset-left), 0px)',
+            paddingRight: 'max(env(safe-area-inset-right), 0px)'
+        }
+        : undefined;
+    const mobileHeaderOffsetStyle: React.CSSProperties | undefined = isMobile
+        ? {
+            paddingLeft: 'max(env(safe-area-inset-left), 0px)',
+            paddingRight: 'max(env(safe-area-inset-right), 0px)',
+            paddingTop: 'calc(64px + env(safe-area-inset-top))'
+        }
+        : undefined;
 
     return (
         <>
             {isOffline && (
                 <>
-                    <div className="fixed top-0 inset-x-0 z-[260] bg-[#111b21] text-white border-b border-[#2f3b42]">
+                    <div
+                        className="fixed top-0 inset-x-0 z-[260] bg-[#111b21] text-white border-b border-[#2f3b42]"
+                        style={{
+                            paddingTop: 'max(env(safe-area-inset-top), 0px)',
+                            paddingLeft: 'max(env(safe-area-inset-left), 0px)',
+                            paddingRight: 'max(env(safe-area-inset-right), 0px)'
+                        }}
+                    >
                         <div className="h-11 px-4 flex items-center justify-center gap-2 text-[12px] font-bold tracking-wide">
                             <span className="px-2 py-0.5 rounded-full bg-rose-500/90 text-[10px] uppercase">Offline</span>
-                            <span>No internet connection. Reconnecting…</span>
+                            <span>No internet connection. Reconnecting...</span>
                         </div>
                     </div>
-                    <div className="fixed left-1/2 -translate-x-1/2 bottom-5 z-[260] pointer-events-none">
-                        <div className="offline-dino-card">
-                            <div className="offline-dino-stage">
-                                <div className="offline-dino-runner" role="img" aria-label="Running dinosaur">🦖</div>
-                                <div className="offline-dino-ground" />
-                            </div>
-                            <div className="offline-dino-label">
-                                Waiting for internet
-                                <span className="offline-dino-dots" aria-hidden="true">
-                                    <span>.</span>
-                                    <span>.</span>
-                                    <span>.</span>
-                                </span>
+                    {!isMobile && (
+                        <div className="fixed left-1/2 -translate-x-1/2 bottom-5 z-[260] pointer-events-none">
+                            <div className="offline-dino-card">
+                                <div className="offline-dino-stage">
+                                    <div className="offline-dino-runner" role="img" aria-label="Running dinosaur">🦖</div>
+                                    <div className="offline-dino-ground" />
+                                </div>
+                                <div className="offline-dino-label">
+                                    Waiting for internet
+                                    <span className="offline-dino-dots" aria-hidden="true">
+                                        <span>.</span>
+                                        <span>.</span>
+                                        <span>.</span>
+                                    </span>
+                                </div>
                             </div>
                         </div>
-                    </div>
+                    )}
                 </>
             )}
             {!hideGlobalHeaderOnMobileInbox && (
-            <header className="fixed top-0 inset-x-0 z-[120] h-[64px] lg:h-[72px] bg-white border-b border-[#eceff1]">
+            <header
+                className="fixed top-0 inset-x-0 z-[120] h-[64px] lg:h-[72px] bg-white border-b border-[#eceff1]"
+                style={isMobile ? {
+                    minHeight: 'calc(64px + env(safe-area-inset-top))',
+                    paddingTop: 'max(env(safe-area-inset-top), 0px)',
+                    paddingLeft: 'max(env(safe-area-inset-left), 0px)',
+                    paddingRight: 'max(env(safe-area-inset-right), 0px)'
+                } : undefined}
+            >
                 <div className="h-full px-3 sm:px-4 lg:px-5 flex items-center justify-between gap-3 lg:gap-4">
                     <div className="flex items-center gap-5 min-w-0 flex-1">
                         <div className="flex items-center gap-2 shrink-0">
-                            <div className="h-8 min-w-[96px] max-w-[170px] px-3 rounded-lg border border-[#eceff1] bg-[#f8f9fa] flex items-center justify-center overflow-hidden">
-                                <img
-                                    src={appLogoUrl || qmessageLogo}
-                                    alt="QMessage logo"
-                                    className="h-6 w-auto max-w-[150px] object-contain"
-                                    loading="lazy"
-                                />
-                            </div>
+                            <img
+                                src={appLogoUrl || qmessageLogo}
+                                alt="QMessage logo"
+                                className="h-8 w-auto max-w-[170px] object-contain"
+                                loading="lazy"
+                            />
                         </div>
                         <div className="hidden xl:block w-px h-8 bg-[#eceff1]" />
                         <div className="lg:hidden min-w-0">
@@ -5534,19 +5826,22 @@ export default function App() {
             )}
 
             {workspaceSection === 'team-inbox' ? (
-                <div className={`flex h-screen ${hideGlobalHeaderOnMobileInbox ? 'pt-0' : 'pt-[64px] lg:pt-[72px]'} bg-[#f8f9fa] overflow-hidden text-[#111b21] font-sans ${shouldShowMobileBottomNav ? 'pb-[76px]' : ''}`}>
+                <div
+                    className={`flex h-screen ${hideGlobalHeaderOnMobileInbox ? 'pt-0' : 'pt-[64px] lg:pt-[72px]'} bg-[#f8f9fa] overflow-hidden text-[#111b21] font-sans ${shouldShowMobileBottomNav ? 'pb-[76px]' : ''}`}
+                    style={hideGlobalHeaderOnMobileInbox ? mobileSafeInsetsStyle : mobileHeaderOffsetStyle}
+                    onTouchStart={handleMobileWorkspaceTouchStart}
+                    onTouchEnd={handleMobileWorkspaceTouchEnd}
+                >
             <div className={`${isMobileChatOpen ? 'hidden' : 'flex'} w-full lg:w-[400px] border-r border-[#eceff1] flex-col bg-white`}>
                 <div className={`px-3 py-2 border-b border-[#f0f2f5] ${hideGlobalHeaderOnMobileInbox ? 'pt-[max(env(safe-area-inset-top),0.35rem)]' : ''}`}>
                     <div className="flex items-center gap-2">
                         <div className="flex items-center gap-1.5">
                             {isMobile ? (
-                                <div className="w-9 h-9 rounded-xl bg-white border border-[#e5ebf0] shadow-[0_4px_12px_rgba(0,0,0,0.08)] overflow-hidden flex items-center justify-center">
-                                    <img
-                                        src={appLogoUrl || qmessageLogo}
-                                        alt="QMessage logo"
-                                        className="w-full h-full object-cover"
-                                    />
-                                </div>
+                                <img
+                                    src={appLogoUrl || qmessageLogo}
+                                    alt="QMessage logo"
+                                    className="w-9 h-9 rounded-lg object-cover"
+                                />
                             ) : (
                                 <button
                                     type="button"
@@ -7116,10 +7411,16 @@ export default function App() {
             }
 
             {showAnalytics && (
-                <div className="fixed inset-0 bg-[#f8f9fa] z-[160] flex flex-col">
-                    <header className="h-[70px] bg-[#f0f2f5] px-6 flex items-center justify-between border-b border-[#eceff1]">
+                <div className="fixed inset-0 bg-[#f8f9fa] z-[160] flex flex-col" style={mobileSafeInsetsStyle}>
+                    <header
+                        className="h-[70px] bg-[#f0f2f5] px-6 flex items-center justify-between border-b border-[#eceff1]"
+                        style={isMobile ? {
+                            minHeight: 'calc(70px + env(safe-area-inset-top))',
+                            paddingTop: 'max(env(safe-area-inset-top), 0px)'
+                        } : undefined}
+                    >
                         <div className="flex items-center gap-4">
-                            <CircleDashed className="text-[#00a884] w-7 h-7" />
+                            <BarChart3 className="text-[#00a884] w-7 h-7" />
                             <h1 className="text-xl font-bold text-[#111b21]">Analytics</h1>
                         </div>
                         <button onClick={() => setShowAnalytics(false)} className="p-2 hover:bg-white rounded-xl transition-all">
@@ -7557,38 +7858,49 @@ export default function App() {
             ` }} />
                 </div>
             ) : workspaceSection === 'broadcast' ? (
-                <BroadcastView
-                    broadcastNav={broadcastNav}
-                    broadcastSection={broadcastSection}
-                    setBroadcastSection={setBroadcastSection}
-                    activeProfileId={activeProfileId}
-                    sessionToken={session?.access_token || null}
-                    BroadcastTemplateBuilder={LazyBroadcastTemplateBuilder}
-                    BroadcastTemplatesList={LazyBroadcastTemplatesList}
-                />
+                <div onTouchStart={handleMobileWorkspaceTouchStart} onTouchEnd={handleMobileWorkspaceTouchEnd}>
+                    <BroadcastView
+                        broadcastNav={broadcastNav}
+                        broadcastSection={broadcastSection}
+                        setBroadcastSection={setBroadcastSection}
+                        activeProfileId={activeProfileId}
+                        sessionToken={session?.access_token || null}
+                        BroadcastTemplateBuilder={LazyBroadcastTemplateBuilder}
+                        BroadcastTemplatesList={LazyBroadcastTemplatesList}
+                    />
+                </div>
             ) : workspaceSection === 'automations' ? (
-                <AutomationsView
-                    workflows={automationWorkflows}
-                    workflowsLoading={workflowsLoading}
-                    isMobileView={isMobile}
-                    profileId={activeProfileId}
-                    sessionToken={session?.access_token || null}
-                    apiBaseUrl={SOCKET_URL}
-                    onOpenBuilder={openAutomationBuilder}
-                    onCreateWorkflow={handleCreateAutomation}
-                    onToggleWorkflowEnabled={handleToggleAutomationEnabled}
-                    onCopyWorkflow={handleCopyAutomation}
-                    onQuickRepliesUpdated={fetchQuickReplies}
-                    onSaveWorkflowTrigger={handleSaveWorkflowTrigger}
-                />
+                <div onTouchStart={handleMobileWorkspaceTouchStart} onTouchEnd={handleMobileWorkspaceTouchEnd}>
+                    <AutomationsView
+                        workflows={automationWorkflows}
+                        workflowsLoading={workflowsLoading}
+                        isMobileView={isMobile}
+                        profileId={activeProfileId}
+                        sessionToken={session?.access_token || null}
+                        apiBaseUrl={SOCKET_URL}
+                        onOpenBuilder={openAutomationBuilder}
+                        onCreateWorkflow={handleCreateAutomation}
+                        onToggleWorkflowEnabled={handleToggleAutomationEnabled}
+                        onCopyWorkflow={handleCopyAutomation}
+                        onQuickRepliesUpdated={fetchQuickReplies}
+                        onSaveWorkflowTrigger={handleSaveWorkflowTrigger}
+                    />
+                </div>
             ) : workspaceSection === 'chatbots' ? (
-                <ChatbotsView
-                    profileId={activeProfileId}
-                    sessionToken={session?.access_token || null}
-                    apiBaseUrl={SOCKET_URL}
-                />
+                <div onTouchStart={handleMobileWorkspaceTouchStart} onTouchEnd={handleMobileWorkspaceTouchEnd}>
+                    <ChatbotsView
+                        profileId={activeProfileId}
+                        sessionToken={session?.access_token || null}
+                        apiBaseUrl={SOCKET_URL}
+                    />
+                </div>
             ) : workspaceSection === 'more' ? (
-                <div className={`h-screen pt-[64px] lg:pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans ${shouldShowMobileBottomNav ? 'pb-[76px]' : ''}`}>
+                <div
+                    className={`h-screen pt-[64px] lg:pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans ${shouldShowMobileBottomNav ? 'pb-[76px]' : ''}`}
+                    style={mobileHeaderOffsetStyle}
+                    onTouchStart={handleMobileWorkspaceTouchStart}
+                    onTouchEnd={handleMobileWorkspaceTouchEnd}
+                >
                     <div className="h-full p-6 overflow-y-auto custom-scrollbar">
                         <div className="max-w-3xl mx-auto space-y-4">
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -7618,7 +7930,7 @@ export default function App() {
                                     >
                                         <div className="flex items-center gap-3 mb-2">
                                             <div className="w-9 h-9 rounded-xl bg-[#111b21]/5 border border-[#111b21]/10 text-[#111b21] flex items-center justify-center">
-                                                <CircleDashed className="w-5 h-5" />
+                                                <BarChart3 className="w-5 h-5" />
                                             </div>
                                             <div className="text-lg font-black text-[#111b21]">Analytics</div>
                                         </div>
@@ -7632,25 +7944,32 @@ export default function App() {
                     </div>
                 </div>
             ) : workspaceSection === 'contacts' ? (
-                <ContactsView
-                    contactsList={contactsList}
-                    isMobileView={isMobile}
-                    teamUsersLoading={teamUsersLoading}
-                    teamUsers={teamUsers}
-                    contactsSearchQuery={contactsSearchQuery}
-                    onContactsSearchChange={setContactsSearchQuery}
-                    assigningContactId={assigningContactId}
-                    onToggleAssignMenu={(contactId) => {
-                        if (!teamUsers.length && !teamUsersLoading) fetchTeamUsers();
-                        setAssignMenuContactId(prev => (prev === contactId ? null : contactId));
-                    }}
-                    onOpenChat={(contactId) => {
-                        handleOpenChat(contactId);
-                        setWorkspaceSection(defaultWorkspaceSection);
-                    }}
-                />
+                <div onTouchStart={handleMobileWorkspaceTouchStart} onTouchEnd={handleMobileWorkspaceTouchEnd}>
+                    <ContactsView
+                        contactsList={contactsList}
+                        isMobileView={isMobile}
+                        teamUsersLoading={teamUsersLoading}
+                        teamUsers={teamUsers}
+                        contactsSearchQuery={contactsSearchQuery}
+                        onContactsSearchChange={setContactsSearchQuery}
+                        assigningContactId={assigningContactId}
+                        onToggleAssignMenu={(contactId) => {
+                            if (!teamUsers.length && !teamUsersLoading) fetchTeamUsers();
+                            setAssignMenuContactId(prev => (prev === contactId ? null : contactId));
+                        }}
+                        onOpenChat={(contactId) => {
+                            handleOpenChat(contactId);
+                            setWorkspaceSection(defaultWorkspaceSection);
+                        }}
+                    />
+                </div>
             ) : (
-                <div className={`h-screen pt-[64px] lg:pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans ${shouldShowMobileBottomNav ? 'pb-[76px]' : ''}`}>
+                <div
+                    className={`h-screen pt-[64px] lg:pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans ${shouldShowMobileBottomNav ? 'pb-[76px]' : ''}`}
+                    style={mobileHeaderOffsetStyle}
+                    onTouchStart={handleMobileWorkspaceTouchStart}
+                    onTouchEnd={handleMobileWorkspaceTouchEnd}
+                >
                     <div className="h-full flex items-center justify-center p-6">
                         <div className="w-full max-w-xl bg-white border border-[#eceff1] rounded-3xl p-8 shadow-[0_12px_40px_rgba(0,0,0,0.06)]">
                             <h2 className="text-2xl font-black text-[#111b21] mb-3">{activeWorkspaceLabel}</h2>
@@ -7690,6 +8009,33 @@ export default function App() {
                         setWorkspaceSection(id as typeof workspaceSection);
                     }}
                 />
+            )}
+
+            {showPwaUpdateBanner && (
+                <div className="fixed left-0 right-0 top-0 z-[320] pointer-events-none px-3 pt-[calc(env(safe-area-inset-top,0px)+12px)]">
+                    <div className="mx-auto max-w-md pointer-events-auto rounded-2xl border border-white/15 bg-[#111b21] px-4 py-3 text-white shadow-[0_12px_34px_rgba(0,0,0,0.34)]">
+                        <div className="text-[13px] font-bold">New update available</div>
+                        <div className="mt-1 text-[11px] text-white/80">
+                            A newer version is ready. Update now for the latest fixes.
+                        </div>
+                        <div className="mt-3 flex items-center justify-end gap-2">
+                            <button
+                                type="button"
+                                onClick={() => setShowPwaUpdateBanner(false)}
+                                className="px-3 py-1.5 rounded-lg border border-white/20 text-[11px] font-semibold text-white/85 hover:bg-white/10 transition-all"
+                            >
+                                Later
+                            </button>
+                            <button
+                                type="button"
+                                onClick={handleApplyPwaUpdate}
+                                className="px-3 py-1.5 rounded-lg bg-[#00a884] text-[11px] font-semibold text-white hover:bg-[#008f72] transition-all"
+                            >
+                                Update now
+                            </button>
+                        </div>
+                    </div>
+                </div>
             )}
 
             <MobileInstallOnboarding
@@ -7785,7 +8131,14 @@ export default function App() {
                 </div>
             )}
             {appToast && (
-                <div className="fixed top-4 right-4 z-[280] max-w-[360px]">
+                <div
+                    className="fixed top-4 right-4 z-[280] max-w-[360px]"
+                    style={{
+                        top: 'max(calc(env(safe-area-inset-top) + 0.5rem), 1rem)',
+                        right: 'max(calc(env(safe-area-inset-right) + 0.5rem), 1rem)',
+                        left: isMobile ? 'max(env(safe-area-inset-left), 0.75rem)' : undefined
+                    }}
+                >
                     <div
                         className={`rounded-xl border px-4 py-2.5 text-sm font-semibold shadow-lg ${appToast.tone === 'success'
                                 ? 'bg-emerald-50 border-emerald-200 text-emerald-700'

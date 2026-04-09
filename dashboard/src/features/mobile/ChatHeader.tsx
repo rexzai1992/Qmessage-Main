@@ -21,7 +21,15 @@ export default function ChatHeader({
     rightSlot
 }: ChatHeaderProps) {
     return (
-        <header className="h-[60px] shrink-0 bg-[#f0f2f5] px-3 flex items-center justify-between z-10 border-b border-[#eceff1] lg:border-b-0 lg:border-l">
+        <header
+            className="h-[60px] shrink-0 bg-[#f0f2f5] px-3 flex items-center justify-between z-10 border-b border-[#eceff1] lg:border-b-0 lg:border-l"
+            style={{
+                minHeight: 'calc(60px + env(safe-area-inset-top))',
+                paddingTop: 'max(env(safe-area-inset-top), 0px)',
+                paddingLeft: 'max(env(safe-area-inset-left), 0.75rem)',
+                paddingRight: 'max(env(safe-area-inset-right), 0.75rem)'
+            }}
+        >
             <div className="flex items-center gap-3 min-w-0">
                 {showBack && (
                     <button

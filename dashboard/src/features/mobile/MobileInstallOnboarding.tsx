@@ -49,9 +49,18 @@ export default function MobileInstallOnboarding({
     onDismiss,
     onRequestNotifications
 }: MobileInstallOnboardingProps) {
-    if (!open) return null;
-
     const canRequestNotifications = notificationPermission === 'default';
+    const [showNotificationPrompt, setShowNotificationPrompt] = React.useState(false);
+
+    React.useEffect(() => {
+        if (!open) {
+            setShowNotificationPrompt(false);
+            return;
+        }
+        setShowNotificationPrompt(canRequestNotifications);
+    }, [canRequestNotifications, open]);
+
+    if (!open) return null;
 
     return (
         <div className="fixed inset-0 z-[290] bg-black/40 backdrop-blur-[2px] flex items-end" onClick={onDismiss}>
@@ -91,6 +100,39 @@ export default function MobileInstallOnboarding({
                 <div className="mt-3">
                     <PlatformHint platform={platform} />
                 </div>
+
+                {showNotificationPrompt && canRequestNotifications && (
+                    <div className="mt-3 rounded-2xl border border-[#d8e5ec] bg-[#f2fbf8] px-3 py-3">
+                        <div className="flex items-start gap-2">
+                            <Bell className="w-4 h-4 text-[#00a884] mt-0.5" />
+                            <div className="flex-1 min-w-0">
+                                <p className="text-[12px] font-black text-[#111b21]">Allow notifications?</p>
+                                <p className="text-[11px] text-[#54656f] mt-0.5">
+                                    Get instant incoming chat alerts when your app is open or in the background.
+                                </p>
+                            </div>
+                        </div>
+                        <div className="mt-2 flex items-center gap-2">
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    onRequestNotifications();
+                                    setShowNotificationPrompt(false);
+                                }}
+                                className="flex-1 h-9 rounded-lg bg-[#00a884] text-white text-[12px] font-black"
+                            >
+                                Allow
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setShowNotificationPrompt(false)}
+                                className="flex-1 h-9 rounded-lg border border-[#dce4e8] bg-white text-[#54656f] text-[12px] font-bold"
+                            >
+                                Later
+                            </button>
+                        </div>
+                    </div>
+                )}
 
                 {canRequestNotifications && (
                     <button
