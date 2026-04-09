@@ -16,7 +16,7 @@ type ContactListItemProps = {
     onClick: () => void;
 };
 
-export default function ContactListItem({
+function ContactListItem({
     id,
     name,
     preview,
@@ -30,10 +30,18 @@ export default function ContactListItem({
     assignee,
     onClick
 }: ContactListItemProps) {
+    const handleKeyDown = React.useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        onClick();
+    }, [onClick]);
+
     return (
-        <button
-            type="button"
+        <div
+            role="button"
+            tabIndex={0}
             onClick={onClick}
+            onKeyDown={handleKeyDown}
             className={`w-full flex items-start px-3 py-2.5 text-left cursor-pointer hover:bg-[#f5f6f6] transition-colors border-b border-[#fcfdfd] ${
                 isSelected ? 'bg-[#f0f2f5]' : ''
             }`}
@@ -76,7 +84,10 @@ export default function ContactListItem({
                     </div>
                 </div>
             </div>
-        </button>
+        </div>
     );
 }
 
+ContactListItem.displayName = 'ContactListItem';
+
+export default React.memo(ContactListItem);
