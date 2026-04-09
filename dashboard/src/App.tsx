@@ -309,6 +309,7 @@ type MessageVirtualRow =
 
 const CHAT_ROW_HEIGHT = 102;
 const MESSAGE_DRAFT_STORAGE_PREFIX = 'draftMessage:';
+const CHAT_READ_CURSOR_STORAGE_PREFIX = 'chatReadCursor:';
 const ONBOARDING_TOUR_STORAGE_PREFIX = 'onboardingTourSeen:';
 const ONBOARDING_TOUR_VERSION = 'v1';
 const ENABLE_FIRST_TIME_SETUP = false;
@@ -652,7 +653,6 @@ export default function App() {
     const [chatListFilter, setChatListFilter] = useState<'all' | 'tagged' | 'untagged' | 'assigned' | 'unassigned'>('all');
     const [mobileChatQuickFilter, setMobileChatQuickFilter] = useState<'all' | 'unread'>('all');
     const [mobileTagFilter, setMobileTagFilter] = useState('');
-    const [showMobileTagFilterMenu, setShowMobileTagFilterMenu] = useState(false);
     const [contactsSearchQuery, setContactsSearchQuery] = useState('');
     const [teamUsers, setTeamUsers] = useState<TeamUserLite[]>([]);
     const [teamUsersLoading, setTeamUsersLoading] = useState(false);
@@ -664,6 +664,7 @@ export default function App() {
     const [mediaCache, setMediaCache] = useState<Record<string, MediaData>>({});
     const [mediaDownloadProgress, setMediaDownloadProgress] = useState<Record<string, MediaDownloadProgressState>>({});
     const [unreadMessagesByChat, setUnreadMessagesByChat] = useState<Record<string, number>>({});
+    const [chatReadCursorByChat, setChatReadCursorByChat] = useState<Record<string, number>>({});
     const [showContactInfo, setShowContactInfo] = useState(false);
     const [showNewChatModal, setShowNewChatModal] = useState(false);
     const [newPhoneNumber, setNewPhoneNumber] = useState('');
@@ -721,12 +722,11 @@ export default function App() {
     const [workflowEditorMode, setWorkflowEditorMode] = useState<'visual' | 'json'>('visual');
     const menuRef = useRef<HTMLDivElement>(null);
     const profileMenuRef = useRef<HTMLDivElement>(null);
-    const mobileTagFilterMenuRef = useRef<HTMLDivElement>(null);
     const messageInputRef = useRef<HTMLTextAreaElement>(null);
     const composerFileInputRef = useRef<HTMLInputElement>(null);
     const activeProfileIdRef = useRef<string | null>(null);
     const selectedChatIdRef = useRef<string | null>(null);
-    const isMobileRef = useRef(false);
+    const chatReadCursorByChatRef = useRef<Record<string, number>>({});
     const lastRecoverAtRef = useRef(0);
     const lastInboundRef = useRef<number | null>(null);
     const requestedMediaRef = useRef<Set<string>>(new Set());
@@ -1757,6 +1757,30 @@ export default function App() {
         }
     }, [normalizeHiddenFeatureList, session?.access_token]);
 
+    const markChatAsRead = useCallback((chatId: string | null | undefined) => {
+        const chatKey = canonicalContactJid(chatId || '');
+        if (!chatKey) return;
+        setUnreadMessagesByChat((prev) => {
+            if (!(chatKey in prev)) return prev;
+            const next = { ...prev };
+            delete next[chatKey];
+            return next;
+        });
+        const latestTs = allMessages.reduce((maxTs, msg) => {
+            const jid = canonicalContactJid(msg.key?.remoteJid || '');
+            if (jid !== chatKey) return maxTs;
+            return Math.max(maxTs, Number(msg?.messageTimestamp || 0));
+        }, 0);
+        const readUntilTs = Math.max(latestTs, Math.floor(Date.now() / 1000));
+        setChatReadCursorByChat((prev) => {
+            if ((prev[chatKey] || 0) >= readUntilTs) return prev;
+            return {
+                ...prev,
+                [chatKey]: readUntilTs
+            };
+        });
+    }, [allMessages]);
+
     useEffect(() => {
         activeProfileIdRef.current = activeProfileId;
     }, [activeProfileId]);
@@ -1766,8 +1790,51 @@ export default function App() {
     }, [selectedChatId]);
 
     useEffect(() => {
-        isMobileRef.current = isMobile;
-    }, [isMobile]);
+        chatReadCursorByChatRef.current = chatReadCursorByChat;
+    }, [chatReadCursorByChat]);
+
+    useEffect(() => {
+        if (!activeProfileId) {
+            setChatReadCursorByChat({});
+            return;
+        }
+        try {
+            const raw = window.localStorage.getItem(`${CHAT_READ_CURSOR_STORAGE_PREFIX}${activeProfileId}`);
+            if (!raw) {
+                setChatReadCursorByChat({});
+                return;
+            }
+            const parsed = JSON.parse(raw);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                setChatReadCursorByChat({});
+                return;
+            }
+            const next: Record<string, number> = {};
+            Object.entries(parsed as Record<string, unknown>).forEach(([jid, ts]) => {
+                const canonical = canonicalContactJid(jid);
+                const numericTs = Number(ts);
+                if (!canonical || !Number.isFinite(numericTs) || numericTs <= 0) return;
+                next[canonical] = Math.floor(numericTs);
+            });
+            setChatReadCursorByChat(next);
+        } catch {
+            setChatReadCursorByChat({});
+        }
+    }, [activeProfileId]);
+
+    useEffect(() => {
+        if (!activeProfileId) return;
+        try {
+            const storageKey = `${CHAT_READ_CURSOR_STORAGE_PREFIX}${activeProfileId}`;
+            if (Object.keys(chatReadCursorByChat).length === 0) {
+                window.localStorage.removeItem(storageKey);
+                return;
+            }
+            window.localStorage.setItem(storageKey, JSON.stringify(chatReadCursorByChat));
+        } catch {
+            // ignore storage errors
+        }
+    }, [activeProfileId, chatReadCursorByChat]);
 
     useEffect(() => {
         try {
@@ -1894,13 +1961,13 @@ export default function App() {
     useEffect(() => {
         const chatKey = canonicalContactJid(selectedChatId || '');
         if (!chatKey) return;
-        setUnreadMessagesByChat((prev) => {
-            if (!(chatKey in prev)) return prev;
-            const next = { ...prev };
-            delete next[chatKey];
-            return next;
-        });
-    }, [selectedChatId]);
+        markChatAsRead(chatKey);
+    }, [selectedChatId, markChatAsRead]);
+
+    useEffect(() => {
+        if (!selectedChatId) return;
+        markChatAsRead(selectedChatId);
+    }, [selectedChatId, allMessages.length, markChatAsRead]);
 
     useEffect(() => {
         setShowWorkflowStarter(false);
@@ -1908,7 +1975,6 @@ export default function App() {
 
     useEffect(() => {
         setShowMobileComposerMenu(false);
-        setShowMobileTagFilterMenu(false);
     }, [selectedChatId, workspaceSection, isMobile, showMediaComposer, showTemplateComposer]);
 
     useEffect(() => {
@@ -1935,9 +2001,6 @@ export default function App() {
             }
             if (profileMenuRef.current && !profileMenuRef.current.contains(event.target as Node)) {
                 setShowProfileMenu(false);
-            }
-            if (mobileTagFilterMenuRef.current && !mobileTagFilterMenuRef.current.contains(event.target as Node)) {
-                setShowMobileTagFilterMenu(false);
             }
         };
         document.addEventListener('mousedown', handleClickOutside);
@@ -2045,6 +2108,7 @@ export default function App() {
         clearAllDrafts();
         setMessageText('');
         setUnreadMessagesByChat({});
+        setChatReadCursorByChat({});
         seenIncomingMessageKeysRef.current.clear();
         setHostAuthError(null);
         setShowOnboardingTutorial(false);
@@ -2265,10 +2329,12 @@ export default function App() {
                         if (!jid) return;
                         const rawId = typeof msg?.key?.id === 'string' ? msg.key.id.trim() : '';
                         const ts = Number(msg?.messageTimestamp || 0);
+                        const readCursor = Number(chatReadCursorByChatRef.current[jid] || 0);
+                        if (readCursor > 0 && (!ts || ts <= readCursor)) return;
                         const dedupeKey = `${jid}:${rawId || `ts-${ts}-idx-${index}`}`;
                         if (seenIncomingMessageKeysRef.current.has(dedupeKey)) return;
                         seenIncomingMessageKeysRef.current.add(dedupeKey);
-                        if (isMobileRef.current && activeChatKey && jid === activeChatKey) return;
+                        if (activeChatKey && jid === activeChatKey) return;
                         if (!changed) {
                             next = { ...prev };
                             changed = true;
@@ -2295,10 +2361,12 @@ export default function App() {
                     if (!jid) return;
                     const rawId = typeof msg?.key?.id === 'string' ? msg.key.id.trim() : '';
                     const ts = Number(msg?.messageTimestamp || 0);
+                    const readCursor = Number(chatReadCursorByChatRef.current[jid] || 0);
+                    if (readCursor > 0 && (!ts || ts <= readCursor)) return;
                     const dedupeKey = `${jid}:${rawId || `ts-${ts}-idx-${index}`}`;
                     nextSeen.add(dedupeKey);
                     if (previousSeen.has(dedupeKey)) return;
-                    if (isMobileRef.current && activeChatKey && jid === activeChatKey) return;
+                    if (activeChatKey && jid === activeChatKey) return;
                     unreadDeltaByChat[jid] = (unreadDeltaByChat[jid] || 0) + 1;
                 });
                 seenIncomingMessageKeysRef.current = nextSeen;
@@ -4462,6 +4530,7 @@ export default function App() {
         setContacts({});
         setSelectedChatId(null);
         setUnreadMessagesByChat({});
+        setChatReadCursorByChat({});
         seenIncomingMessageKeysRef.current.clear();
         setShowTemplateComposer(false);
         setConnectionStatus('connecting'); // Anticipate status update
@@ -4510,17 +4579,9 @@ export default function App() {
 
     const handleOpenChat = useCallback((chatId: string) => {
         setSelectedChatId(chatId);
-        const chatKey = canonicalContactJid(chatId);
-        if (chatKey) {
-            setUnreadMessagesByChat((prev) => {
-                if (!(chatKey in prev)) return prev;
-                const next = { ...prev };
-                delete next[chatKey];
-                return next;
-            });
-        }
+        markChatAsRead(chatId);
         setChatOpenNonce((prev) => prev + 1);
-    }, []);
+    }, [markChatAsRead]);
 
     const handleNewChat = () => {
         if (!newPhoneNumber.trim()) return;
@@ -4768,30 +4829,24 @@ export default function App() {
                 <div className={`px-3 py-2 border-b border-[#f0f2f5] ${hideGlobalHeaderOnMobileInbox ? 'pt-[max(env(safe-area-inset-top),0.35rem)]' : ''}`}>
                     <div className="flex items-center gap-2">
                         <div className="flex items-center gap-1.5">
-                            <button
-                                type="button"
-                                onClick={() => setShowNewChatModal(true)}
-                                className="w-8 h-8 rounded-lg bg-[#00a884]/12 border border-[#00a884]/25 text-[#00a884] flex items-center justify-center hover:bg-[#00a884]/18 transition-all"
-                                title="Start new chat"
-                            >
-                                <MessageSquare className="w-4 h-4" />
-                            </button>
-                            <button
-                                type="button"
-                                onClick={() => setShowNewChatModal(true)}
-                                className="w-8 h-8 rounded-lg bg-[#2563eb]/12 border border-[#2563eb]/25 text-[#2563eb] flex items-center justify-center hover:bg-[#2563eb]/18 transition-all"
-                                title="Start new chat"
-                            >
-                                <MessageSquare className="w-4 h-4" />
-                            </button>
-                            <button
-                                type="button"
-                                onClick={() => setShowNewChatModal(true)}
-                                className="w-8 h-8 rounded-lg bg-[#ec4899]/12 border border-[#ec4899]/25 text-[#ec4899] flex items-center justify-center hover:bg-[#ec4899]/18 transition-all"
-                                title="Start new chat"
-                            >
-                                <MessageSquare className="w-4 h-4" />
-                            </button>
+                            {isMobile ? (
+                                <div className="w-9 h-9 rounded-xl bg-white border border-[#e5ebf0] shadow-[0_4px_12px_rgba(0,0,0,0.08)] overflow-hidden flex items-center justify-center">
+                                    <img
+                                        src={appLogoUrl || qmessageLogo}
+                                        alt="QMessage logo"
+                                        className="w-full h-full object-cover"
+                                    />
+                                </div>
+                            ) : (
+                                <button
+                                    type="button"
+                                    onClick={() => setShowNewChatModal(true)}
+                                    className="w-8 h-8 rounded-lg bg-[#00a884]/12 border border-[#00a884]/25 text-[#00a884] flex items-center justify-center hover:bg-[#00a884]/18 transition-all"
+                                    title="Start new chat"
+                                >
+                                    <Plus className="w-4 h-4" />
+                                </button>
+                            )}
                         </div>
                         <div className="flex-1 bg-[#f0f2f5] rounded-xl flex items-center px-4 py-2 focus-within:bg-white focus-within:ring-1 focus-within:ring-[#00a884]/20 transition-all">
                             <Search className="w-4 h-4 text-[#54656f] mr-4" />
@@ -4842,52 +4897,20 @@ export default function App() {
                             >
                                 Unread {mobileUnreadChatCount > 0 ? `(${mobileUnreadChatCount})` : ''}
                             </button>
-                            <div className="relative" ref={mobileTagFilterMenuRef}>
-                                <button
-                                    type="button"
-                                    onClick={() => setShowMobileTagFilterMenu((prev) => !prev)}
-                                    className={`h-8 px-3 rounded-full text-[11px] font-bold border whitespace-nowrap transition-all flex items-center gap-1.5 ${mobileTagFilter
-                                            ? 'bg-[#ecfdf3] border-[#bbf7d0] text-[#166534]'
-                                            : 'bg-[#f7f9fa] border-[#e2e8ee] text-[#54656f]'
-                                        }`}
+                            <div className={`h-8 rounded-full border whitespace-nowrap transition-all flex items-center gap-1.5 pl-2 pr-2 ${mobileTagFilter ? 'bg-[#ecfdf3] border-[#bbf7d0] text-[#166534]' : 'bg-[#f7f9fa] border-[#e2e8ee] text-[#54656f]'}`}>
+                                <Plus className="w-3.5 h-3.5 shrink-0" />
+                                <select
+                                    value={mobileTagFilter}
+                                    onChange={(e) => setMobileTagFilter(e.target.value)}
+                                    className="bg-transparent text-[11px] font-bold focus:outline-none pr-1"
                                 >
-                                    <Plus className="w-3.5 h-3.5" />
-                                    {mobileTagFilter ? `Tag: ${mobileTagFilter}` : '+ Tag'}
-                                </button>
-                                {showMobileTagFilterMenu && (
-                                    <div className="absolute left-0 top-full mt-2 min-w-[190px] max-h-56 overflow-y-auto rounded-2xl border border-[#e5ebf0] bg-white shadow-[0_12px_28px_rgba(0,0,0,0.14)] p-1.5 z-30">
-                                        <button
-                                            type="button"
-                                            onClick={() => {
-                                                setMobileTagFilter('');
-                                                setShowMobileTagFilterMenu(false);
-                                            }}
-                                            className={`w-full text-left rounded-xl px-2.5 py-2 text-[11px] font-semibold transition-all ${mobileTagFilter ? 'text-[#0f172a] hover:bg-[#f1f5f9]' : 'text-[#00a884] bg-[#e9f7f4]'}`}
-                                        >
-                                            All tags
-                                        </button>
-                                        {mobileChatFilterTags.length === 0 ? (
-                                            <div className="px-2.5 py-2 text-[11px] text-[#94a3b8]">No tags yet</div>
-                                        ) : (
-                                            mobileChatFilterTags.map((tag) => (
-                                                <button
-                                                    type="button"
-                                                    key={`mobile-filter-tag-${tag}`}
-                                                    onClick={() => {
-                                                        setMobileTagFilter(tag);
-                                                        setShowMobileTagFilterMenu(false);
-                                                    }}
-                                                    className={`w-full text-left rounded-xl px-2.5 py-2 text-[11px] font-semibold transition-all ${mobileTagFilter.trim().toLowerCase() === tag.toLowerCase()
-                                                            ? 'bg-[#e9f7f4] text-[#008f6f]'
-                                                            : 'text-[#334155] hover:bg-[#f8fafc]'
-                                                        }`}
-                                                >
-                                                    {tag}
-                                                </button>
-                                            ))
-                                        )}
-                                    </div>
-                                )}
+                                    <option value="">+ Tag</option>
+                                    {mobileChatFilterTags.map((tag) => (
+                                        <option key={`mobile-filter-tag-${tag}`} value={tag}>
+                                            {tag}
+                                        </option>
+                                    ))}
+                                </select>
                             </div>
                         </div>
                     )}
