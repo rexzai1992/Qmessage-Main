@@ -44,6 +44,16 @@ type CallSettingsFormState = {
     restrictToUserCountries: string;
 };
 
+type BusinessProfileFormState = {
+    about: string;
+    address: string;
+    description: string;
+    email: string;
+    websites: string;
+    vertical: string;
+    profilePictureUrl: string;
+};
+
 const TEAM_DEPARTMENT_OPTIONS: Array<{ value: TeamDepartment; label: string }> = [
     { value: 'finance', label: 'Finance' },
     { value: 'sales', label: 'Sales' },
@@ -230,6 +240,21 @@ export default function WebhookView({
         callbackPermissionStatus: 'DISABLED',
         restrictToUserCountries: ''
     });
+    const [businessProfileLoading, setBusinessProfileLoading] = useState(Boolean(sessionToken));
+    const [businessProfileSaving, setBusinessProfileSaving] = useState(false);
+    const [businessProfileUploading, setBusinessProfileUploading] = useState(false);
+    const [businessProfileError, setBusinessProfileError] = useState<string | null>(null);
+    const [businessProfileNotice, setBusinessProfileNotice] = useState<string | null>(null);
+    const [businessProfilePhoneNumberId, setBusinessProfilePhoneNumberId] = useState('');
+    const [businessProfileForm, setBusinessProfileForm] = useState<BusinessProfileFormState>({
+        about: '',
+        address: '',
+        description: '',
+        email: '',
+        websites: '',
+        vertical: '',
+        profilePictureUrl: ''
+    });
     const [quickRepliesDraft, setQuickRepliesDraft] = useState<QuickReply[]>([]);
     const [connectLoading, setConnectLoading] = useState(false);
     const [connectError, setConnectError] = useState<string | null>(null);
@@ -296,6 +321,7 @@ export default function WebhookView({
   "vertical": "OTHER"
 }`);
     const [registrationBusy, setRegistrationBusy] = useState<null | 'request' | 'verify' | 'register' | 'profile'>(null);
+    const businessProfileFileInputRef = useRef<HTMLInputElement>(null);
     const appLogoFileInputRef = useRef<HTMLInputElement>(null);
     const [appLogoLoading, setAppLogoLoading] = useState(Boolean(sessionToken));
     const [appLogoUploading, setAppLogoUploading] = useState(false);
@@ -325,6 +351,7 @@ export default function WebhookView({
             if (showCallSettings) {
                 fetchCallSettings();
             }
+            fetchBusinessProfile();
         }
         onRefreshQuickReplies();
     }, [profileId, onRefreshQuickReplies, isAdmin, sessionToken, showCallSettings]);
@@ -798,6 +825,234 @@ export default function WebhookView({
             setRegistrationError(err?.message || 'Failed to update business profile');
         } finally {
             setRegistrationBusy(null);
+        }
+    };
+
+    const parseBusinessProfileError = (data: any, fallback: string): string => {
+        const message = readTrimmed(data?.error) || fallback;
+        const details = Array.isArray(data?.details)
+            ? data.details.map((item: any) => readTrimmed(item)).filter(Boolean)
+            : [];
+        if (!details.length) return message;
+        return `${message} (${details.join(', ')})`;
+    };
+
+    const applyBusinessProfilePayload = (payload: any) => {
+        const root = payload && typeof payload === 'object' ? payload : {};
+        const candidates = Array.isArray(root?.data)
+            ? root.data
+            : Array.isArray(root)
+                ? root
+                : [];
+        const first = candidates.length > 0 && candidates[0] && typeof candidates[0] === 'object'
+            ? candidates[0]
+            : root;
+        const websites = Array.isArray(first?.websites)
+            ? first.websites.map((item: any) => readTrimmed(item)).filter(Boolean)
+            : typeof first?.websites === 'string'
+                ? first.websites.split(/[\n,;]+/).map((item: string) => readTrimmed(item)).filter(Boolean)
+                : [];
+
+        setBusinessProfileForm({
+            about: readTrimmed(first?.about),
+            address: readTrimmed(first?.address),
+            description: readTrimmed(first?.description),
+            email: readTrimmed(first?.email),
+            websites: websites.join('\n'),
+            vertical: readTrimmed(first?.vertical),
+            profilePictureUrl: readTrimmed(first?.profile_picture_url)
+        });
+    };
+
+    const fetchBusinessProfile = async () => {
+        if (!sessionToken || !profileId) {
+            setBusinessProfileForm({
+                about: '',
+                address: '',
+                description: '',
+                email: '',
+                websites: '',
+                vertical: '',
+                profilePictureUrl: ''
+            });
+            setBusinessProfileError(null);
+            setBusinessProfileNotice(null);
+            setBusinessProfileLoading(false);
+            return;
+        }
+
+        setBusinessProfileLoading(true);
+        setBusinessProfileError(null);
+        try {
+            const params = new URLSearchParams();
+            params.set('profileId', profileId);
+            if (businessProfilePhoneNumberId.trim()) {
+                params.set('phoneNumberId', businessProfilePhoneNumberId.trim());
+            }
+            params.set('fields', 'about,address,description,email,profile_picture_url,websites,vertical');
+
+            const res = await fetch(`${SOCKET_URL}/api/waba/business-profile?${params.toString()}`, {
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`
+                }
+            });
+            const text = await res.text();
+            let data: any = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch {
+                data = null;
+            }
+
+            if (!res.ok || !data?.success) {
+                throw new Error(parseBusinessProfileError(data, 'Failed to load business profile.'));
+            }
+
+            applyBusinessProfilePayload(data?.data || {});
+        } catch (error: any) {
+            setBusinessProfileError(error?.message || 'Failed to load business profile.');
+        } finally {
+            setBusinessProfileLoading(false);
+        }
+    };
+
+    const handleSaveBusinessProfile = async () => {
+        if (!sessionToken || !profileId) return;
+        setBusinessProfileSaving(true);
+        setBusinessProfileError(null);
+        setBusinessProfileNotice(null);
+        try {
+            const websites = businessProfileForm.websites
+                .split(/[\n,;]+/)
+                .map((item) => readTrimmed(item))
+                .filter(Boolean);
+            const payload: any = {};
+
+            const about = readTrimmed(businessProfileForm.about);
+            const address = readTrimmed(businessProfileForm.address);
+            const description = readTrimmed(businessProfileForm.description);
+            const email = readTrimmed(businessProfileForm.email);
+            const vertical = readTrimmed(businessProfileForm.vertical).toUpperCase();
+
+            if (about) payload.about = about;
+            if (address) payload.address = address;
+            if (description) payload.description = description;
+            if (email) payload.email = email;
+            if (vertical) payload.vertical = vertical;
+            payload.websites = websites;
+
+            const body: any = {
+                profileId,
+                ...payload
+            };
+            if (businessProfilePhoneNumberId.trim()) {
+                body.phoneNumberId = businessProfilePhoneNumberId.trim();
+            }
+
+            const res = await fetch(`${SOCKET_URL}/api/waba/business-profile`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(body)
+            });
+            const text = await res.text();
+            let data: any = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch {
+                data = null;
+            }
+
+            if (!res.ok || !data?.success) {
+                throw new Error(parseBusinessProfileError(data, 'Failed to update business profile.'));
+            }
+
+            setBusinessProfileNotice('Business profile updated.');
+            await fetchBusinessProfile();
+        } catch (error: any) {
+            setBusinessProfileError(error?.message || 'Failed to update business profile.');
+        } finally {
+            setBusinessProfileSaving(false);
+        }
+    };
+
+    const uploadBusinessProfilePictureHandle = async (file: File): Promise<string> => {
+        if (!sessionToken) {
+            throw new Error('You must be logged in to upload profile picture.');
+        }
+        const params = new URLSearchParams();
+        params.set('profileId', profileId);
+        params.set('kind', 'image');
+        const res = await fetch(`${SOCKET_URL}/api/waba/template-media/upload-handle?${params.toString()}`, {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${sessionToken}`,
+                'Content-Type': 'application/octet-stream',
+                'x-file-name': file.name || 'profile_picture',
+                'x-file-type': file.type || 'application/octet-stream'
+            },
+            body: file
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.success) {
+            throw new Error(data?.error || 'Failed to upload profile picture.');
+        }
+        const handle = readTrimmed(data?.data?.headerHandle);
+        if (!handle) {
+            throw new Error('Upload completed but profile picture handle was not returned.');
+        }
+        return handle;
+    };
+
+    const handleUploadBusinessProfilePicture = async (file: File | null) => {
+        if (!file || !sessionToken || !profileId) return;
+        if (!file.type || !file.type.toLowerCase().startsWith('image/')) {
+            setBusinessProfileError('Please select an image file.');
+            return;
+        }
+        const maxBytes = 10 * 1024 * 1024;
+        if (file.size > maxBytes) {
+            setBusinessProfileError('Profile picture must be 10MB or smaller.');
+            return;
+        }
+
+        setBusinessProfileUploading(true);
+        setBusinessProfileError(null);
+        setBusinessProfileNotice(null);
+        try {
+            const profilePictureHandle = await uploadBusinessProfilePictureHandle(file);
+            const body: any = {
+                profileId,
+                profile_picture_handle: profilePictureHandle
+            };
+            if (businessProfilePhoneNumberId.trim()) {
+                body.phoneNumberId = businessProfilePhoneNumberId.trim();
+            }
+
+            const res = await fetch(`${SOCKET_URL}/api/waba/business-profile`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(body)
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data?.success) {
+                throw new Error(parseBusinessProfileError(data, 'Failed to update profile picture.'));
+            }
+
+            setBusinessProfileNotice('Profile picture updated.');
+            await fetchBusinessProfile();
+        } catch (error: any) {
+            setBusinessProfileError(error?.message || 'Failed to upload profile picture.');
+        } finally {
+            setBusinessProfileUploading(false);
+            if (businessProfileFileInputRef.current) {
+                businessProfileFileInputRef.current.value = '';
+            }
         }
     };
 
@@ -1901,6 +2156,173 @@ export default function WebhookView({
                     </div>
                 </div>
                 )}
+
+                <div id="settings-business-profile" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                    <div className="flex items-center justify-between gap-3 mb-5">
+                        <div>
+                            <h3 className="text-xl text-[#111b21] font-bold">Business Profile</h3>
+                            <p className="text-sm text-[#54656f] font-medium mt-1">
+                                Edit your WhatsApp business status/about, address, description, email, websites and category.
+                            </p>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={fetchBusinessProfile}
+                            disabled={businessProfileLoading || businessProfileSaving || businessProfileUploading || !sessionToken}
+                            className="text-xs font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-3 py-2 rounded-xl hover:bg-[#00a884]/5 transition-all disabled:opacity-50"
+                        >
+                            Refresh
+                        </button>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                        <div className="lg:col-span-2">
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Phone Number ID (optional)</label>
+                            <input
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20 focus:border-[#00a884] text-[#111b21] font-bold placeholder-[#aebac1]"
+                                placeholder="Leave empty to use phoneNumberId from profile config"
+                                value={businessProfilePhoneNumberId}
+                                onChange={e => setBusinessProfilePhoneNumberId(e.target.value)}
+                                disabled={businessProfileSaving || businessProfileUploading}
+                            />
+                        </div>
+
+                        <div>
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Status / About</label>
+                            <input
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                placeholder="Available now"
+                                value={businessProfileForm.about}
+                                onChange={e => setBusinessProfileForm(prev => ({ ...prev, about: e.target.value }))}
+                                disabled={businessProfileLoading || businessProfileSaving || businessProfileUploading}
+                            />
+                        </div>
+
+                        <div>
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Email</label>
+                            <input
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                placeholder="support@company.com"
+                                value={businessProfileForm.email}
+                                onChange={e => setBusinessProfileForm(prev => ({ ...prev, email: e.target.value }))}
+                                disabled={businessProfileLoading || businessProfileSaving || businessProfileUploading}
+                            />
+                        </div>
+
+                        <div className="lg:col-span-2">
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Address</label>
+                            <input
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                placeholder="1 Hacker Way, Menlo Park, CA"
+                                value={businessProfileForm.address}
+                                onChange={e => setBusinessProfileForm(prev => ({ ...prev, address: e.target.value }))}
+                                disabled={businessProfileLoading || businessProfileSaving || businessProfileUploading}
+                            />
+                        </div>
+
+                        <div className="lg:col-span-2">
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Description</label>
+                            <textarea
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884] min-h-[96px]"
+                                placeholder="Tell customers about your business."
+                                value={businessProfileForm.description}
+                                onChange={e => setBusinessProfileForm(prev => ({ ...prev, description: e.target.value }))}
+                                disabled={businessProfileLoading || businessProfileSaving || businessProfileUploading}
+                            />
+                        </div>
+
+                        <div>
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Vertical</label>
+                            <input
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                placeholder="RETAIL"
+                                value={businessProfileForm.vertical}
+                                onChange={e => setBusinessProfileForm(prev => ({ ...prev, vertical: e.target.value.toUpperCase() }))}
+                                disabled={businessProfileLoading || businessProfileSaving || businessProfileUploading}
+                            />
+                        </div>
+
+                        <div className="lg:col-span-2">
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Current Profile Picture</label>
+                            <div className="mt-3 h-40 w-full rounded-2xl border border-[#eceff1] bg-[#f8f9fa] flex items-center justify-center overflow-hidden">
+                                {businessProfileForm.profilePictureUrl ? (
+                                    <img
+                                        src={businessProfileForm.profilePictureUrl}
+                                        alt="Current WhatsApp profile picture"
+                                        className="h-full w-auto max-w-full object-contain"
+                                        loading="lazy"
+                                    />
+                                ) : (
+                                    <span className="text-[11px] font-bold uppercase tracking-widest text-[#8696a0]">No Profile Picture</span>
+                                )}
+                            </div>
+                            <input
+                                ref={businessProfileFileInputRef}
+                                type="file"
+                                accept="image/*"
+                                className="hidden"
+                                onChange={(event) => {
+                                    const file = event.target.files?.[0] || null;
+                                    void handleUploadBusinessProfilePicture(file);
+                                }}
+                            />
+                            <div className="mt-3 flex items-center gap-3">
+                                <button
+                                    type="button"
+                                    onClick={() => businessProfileFileInputRef.current?.click()}
+                                    disabled={!sessionToken || businessProfileLoading || businessProfileSaving || businessProfileUploading}
+                                    className="bg-[#00a884] hover:bg-[#008f6f] text-white px-4 py-2.5 rounded-xl font-bold transition-all disabled:opacity-50"
+                                >
+                                    {businessProfileUploading ? 'Uploading...' : 'Upload Picture'}
+                                </button>
+                                <span className="text-[11px] text-[#8696a0] font-medium">JPG/PNG/WebP, max 10MB</span>
+                            </div>
+                            <p className="mt-2 text-[11px] text-[#8696a0] break-all">
+                                URL: <span className="font-mono">{businessProfileForm.profilePictureUrl || '—'}</span>
+                            </p>
+                        </div>
+
+                        <div className="lg:col-span-2">
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Websites (one per line)</label>
+                            <textarea
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884] min-h-[90px]"
+                                placeholder="https://company.com"
+                                value={businessProfileForm.websites}
+                                onChange={e => setBusinessProfileForm(prev => ({ ...prev, websites: e.target.value }))}
+                                disabled={businessProfileLoading || businessProfileSaving || businessProfileUploading}
+                            />
+                        </div>
+                    </div>
+
+                    <p className="mt-3 text-[11px] text-[#8696a0] leading-relaxed">
+                        Display/verified name is managed in WhatsApp Manager (Meta), not from this form.
+                    </p>
+
+                    {businessProfileError && (
+                        <div className="mt-4 bg-rose-50 border border-rose-200 text-rose-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                            {businessProfileError}
+                        </div>
+                    )}
+                    {businessProfileNotice && (
+                        <div className="mt-4 bg-emerald-50 border border-emerald-200 text-emerald-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                            {businessProfileNotice}
+                        </div>
+                    )}
+
+                    <div className="mt-5 flex items-center gap-3">
+                        <button
+                            type="button"
+                            onClick={handleSaveBusinessProfile}
+                            disabled={!sessionToken || businessProfileLoading || businessProfileSaving || businessProfileUploading}
+                            className="bg-[#111b21] hover:bg-[#202c33] text-white px-5 py-3 rounded-2xl font-bold transition-all disabled:opacity-50"
+                        >
+                            {businessProfileSaving ? 'Saving...' : 'Save Business Profile'}
+                        </button>
+                        {businessProfileLoading && (
+                            <span className="text-xs text-[#8696a0] font-semibold uppercase tracking-widest">Loading profile...</span>
+                        )}
+                    </div>
+                </div>
 
                 <div id="settings-branding" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
                     <div className="flex items-center justify-between gap-3 mb-5">

@@ -21,7 +21,13 @@ export type ContactMetaLike = {
 
 export const getCleanId = (jid: string | undefined): string => {
     if (!jid) return '';
-    return jid.split('@')[0].split(':')[0];
+    const value = jid.trim();
+    if (!value) return '';
+    const atIndex = value.indexOf('@');
+    const local = atIndex >= 0 ? value.slice(0, atIndex) : value;
+    const domain = atIndex >= 0 ? value.slice(atIndex + 1).toLowerCase() : '';
+    if (domain === 'g.us') return local;
+    return local.split(':')[0];
 };
 
 export const formatPhoneNumber = (id: string): string => {

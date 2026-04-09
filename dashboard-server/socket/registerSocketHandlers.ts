@@ -42,6 +42,27 @@ export function registerSocketHandlers(io: Server, ctx: any) {
         deleteMessagesForUser
     } = ctx
 
+    const isLikelyGroupTarget = (value: string | null | undefined): boolean => {
+        const raw = typeof value === 'string' ? value.trim() : ''
+        if (!raw) return false
+        const lower = raw.toLowerCase()
+        if (lower.endsWith('@g.us')) return true
+        if (lower.endsWith('@s.whatsapp.net') || lower.endsWith('@lid')) return false
+        return lower.startsWith('y2fwav9ncm91cd') || raw.includes(':')
+    }
+
+    const toChatJid = (value: string | null | undefined): string => {
+        const raw = typeof value === 'string' ? value.trim() : ''
+        if (!raw) return ''
+        const lower = raw.toLowerCase()
+        if (lower.endsWith('@g.us') || lower.endsWith('@s.whatsapp.net') || lower.endsWith('@lid')) {
+            return raw
+        }
+        const normalized = normalizePhoneNumber(raw)
+        if (!normalized) return ''
+        return isLikelyGroupTarget(raw) ? `${normalized}@g.us` : `${normalized}@s.whatsapp.net`
+    }
+
 // Auth Middleware for Socket.io
 io.use(async (socket, next) => {
     try {
@@ -645,7 +666,11 @@ io.on('connection', async (socket) => {
             if (typeof ack === 'function') ack({ success: false, error: 'jid is required.' })
             return
         }
-        if (!jid.includes('@')) jid = `${jid}@s.whatsapp.net`
+        jid = toChatJid(jid)
+        if (!jid) {
+            if (typeof ack === 'function') ack({ success: false, error: 'Invalid jid.' })
+            return
+        }
         try {
             const resolvedProfile = await resolveConfiguredProfileForCompany(profileId)
             if (!resolvedProfile) {
@@ -656,8 +681,9 @@ io.on('connection', async (socket) => {
             profileId = resolvedProfile.profileId
             const client = resolvedProfile.client
             const resolvedCompanyId = resolvedProfile.companyId
-            const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
-            const user = await findOrCreateUser(resolvedCompanyId, phoneNumber)
+            const recipientId = normalizePhoneNumber(jid)
+            const isGroup = jid.endsWith('@g.us')
+            const user = await findOrCreateUser(resolvedCompanyId, recipientId)
             if (!user) {
                 socket.emit('profile.error', { message: 'Failed to resolve user.' })
                 if (typeof ack === 'function') ack({ success: false, error: 'Failed to resolve user.' })
@@ -666,21 +692,27 @@ io.on('connection', async (socket) => {
             const actor = buildAgentIdentity(socket.data.user)
             const messageText = typeof text === 'string' ? text.trim() : ''
             const mediaType = typeof media?.type === 'string' ? media.type.toLowerCase() : ''
+            const mediaId = typeof media?.id === 'string' ? media.id.trim() : ''
             const mediaUrl = typeof media?.url === 'string' ? media.url.trim() : ''
             const mediaAssetKey = typeof media?.assetKey === 'string' ? media.assetKey.trim() : ''
             const mediaFilename = typeof media?.filename === 'string' ? media.filename.trim() : ''
             let mediaLink = mediaUrl
-            if ((mediaType === 'image' || mediaType === 'video' || mediaType === 'document') && mediaAssetKey) {
+            if (
+                !mediaId
+                && (mediaType === 'image' || mediaType === 'video' || mediaType === 'document')
+                && mediaAssetKey
+            ) {
                 mediaLink = await createDownloadUrl({
                     companyId: resolvedCompanyId,
                     assetKey: mediaAssetKey
                 })
             }
             const normalizedMedia =
-                (mediaType === 'image' || mediaType === 'video' || mediaType === 'document') && mediaLink
+                (mediaType === 'image' || mediaType === 'video' || mediaType === 'document')
+                    && (mediaId || mediaLink)
                     ? {
                         type: mediaType,
-                        link: mediaLink,
+                        ...(mediaId ? { id: mediaId } : { link: mediaLink }),
                         ...(mediaAssetKey ? { assetKey: mediaAssetKey } : {}),
                         ...(mediaType === 'document' && mediaFilename ? { filename: mediaFilename } : {})
                     }
@@ -693,7 +725,7 @@ io.on('connection', async (socket) => {
             const sent = await sendWhatsAppMessage({
                 client,
                 userId: user.id,
-                to: phoneNumber,
+                to: recipientId,
                 type: 'text',
                 content: {
                     text: messageText,
@@ -706,7 +738,7 @@ io.on('connection', async (socket) => {
                     success: true,
                     data: {
                         messageId: sent?.messageId || null,
-                        jid: `${phoneNumber}@s.whatsapp.net`,
+                        jid,
                         profileId,
                         clientTempId: typeof clientTempId === 'string' ? clientTempId : null
                     }
@@ -720,7 +752,7 @@ io.on('connection', async (socket) => {
             if (assigned) {
                 io.to(getCompanyRoom(resolvedCompanyId)).emit('contacts.update', {
                     profileId,
-                    contacts: [{ ...buildContactPayload(assigned), id: `${phoneNumber}@s.whatsapp.net` }]
+                    contacts: [{ ...buildContactPayload(assigned), id: isGroup ? `${recipientId}@g.us` : `${recipientId}@s.whatsapp.net` }]
                 })
             }
         } catch (error: any) {
@@ -732,7 +764,8 @@ io.on('connection', async (socket) => {
     socket.on('startWorkflow', async (data) => {
         let { profileId, jid, workflowId } = data || {}
         if (!profileId || !jid || !workflowId) return
-        if (!jid.includes('@')) jid = `${jid}@s.whatsapp.net`
+        jid = toChatJid(jid)
+        if (!jid) return
         if (jid.endsWith('@g.us')) {
             socket.emit('profile.error', { message: 'Workflows are not supported for groups.' })
             return
@@ -748,7 +781,7 @@ io.on('connection', async (socket) => {
             const client = resolvedProfile.client
             const resolvedCompanyId = resolvedProfile.companyId
 
-            const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
+            const phoneNumber = normalizePhoneNumber(jid)
             const result = await workflowEngine.startWorkflow(
                 {
                     companyId: resolvedCompanyId,
@@ -774,7 +807,8 @@ io.on('connection', async (socket) => {
     socket.on('sendTemplate', async (data) => {
         let { profileId, jid, name, language, components, bodyAttributes } = data
         if (!jid || !name) return
-        if (!jid.includes('@')) jid = `${jid}@s.whatsapp.net`
+        jid = toChatJid(jid)
+        if (!jid) return
 
         try {
             const resolvedProfile = await resolveConfiguredProfileForCompany(profileId)
@@ -785,8 +819,9 @@ io.on('connection', async (socket) => {
             profileId = resolvedProfile.profileId
             const client = resolvedProfile.client
             const resolvedCompanyId = resolvedProfile.companyId
-            const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
-            const user = await findOrCreateUser(resolvedCompanyId, phoneNumber)
+            const recipientId = normalizePhoneNumber(jid)
+            const isGroup = jid.endsWith('@g.us')
+            const user = await findOrCreateUser(resolvedCompanyId, recipientId)
             if (!user) {
                 socket.emit('profile.error', { message: 'Failed to resolve user.' })
                 return
@@ -796,7 +831,7 @@ io.on('connection', async (socket) => {
             await sendWhatsAppMessage({
                 client,
                 userId: user.id,
-                to: phoneNumber,
+                to: recipientId,
                 type: 'template',
                 content: {
                     name,
@@ -821,7 +856,7 @@ io.on('connection', async (socket) => {
             if (assigned) {
                 io.to(getCompanyRoom(resolvedCompanyId)).emit('contacts.update', {
                     profileId,
-                    contacts: [{ ...buildContactPayload(assigned), id: `${phoneNumber}@s.whatsapp.net` }]
+                    contacts: [{ ...buildContactPayload(assigned), id: isGroup ? `${recipientId}@g.us` : `${recipientId}@s.whatsapp.net` }]
                 })
             }
         } catch (error: any) {

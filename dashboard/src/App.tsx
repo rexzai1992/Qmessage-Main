@@ -71,7 +71,7 @@ import {
     textColor,
     withHexAlpha
 } from './features/chat/utils';
-import { uploadFileToCompanyStorage } from './features/media/uploadToCompanyStorage';
+import { uploadFileToWabaMedia } from './features/media/uploadToWabaMedia';
 
 
 const SOCKET_URL = getSocketUrl();
@@ -358,7 +358,16 @@ const splitContactTags = (value: unknown): { labelTags: string[]; systemTags: st
 const buildContactJidVariants = (jid: string | null | undefined): string[] => {
     const value = typeof jid === 'string' ? jid.trim() : '';
     if (!value) return [];
+    if (value.endsWith('@g.us')) {
+        const cleanGroupId = getCleanId(value);
+        const variants = [value, cleanGroupId ? `${cleanGroupId}@g.us` : '', cleanGroupId].filter(Boolean);
+        return Array.from(new Set(variants));
+    }
     const clean = getCleanId(value);
+    if (clean.includes(':') || clean.toLowerCase().startsWith('y2fwav9ncm91cd')) {
+        const variants = [value, `${clean}@g.us`, clean].filter(Boolean);
+        return Array.from(new Set(variants));
+    }
     const digits = clean.replace(/\D/g, '');
     const normalized = (digits.length >= 6 ? digits : clean.toLowerCase()).trim();
     const variants = [
@@ -378,6 +387,9 @@ const canonicalContactJid = (jid: string | null | undefined): string => {
     if (!value) return '';
     if (value.endsWith('@g.us')) return value;
     const clean = getCleanId(value);
+    if (clean.includes(':') || clean.toLowerCase().startsWith('y2fwav9ncm91cd')) {
+        return `${clean}@g.us`;
+    }
     const digits = clean.replace(/\D/g, '');
     if (digits.length >= 6) return `${digits}@s.whatsapp.net`;
     const normalized = clean.toLowerCase().trim();
@@ -575,11 +587,13 @@ export default function App() {
     const [messageText, setMessageText] = useState('');
     const [composerMediaType, setComposerMediaType] = useState<'none' | 'image' | 'video' | 'document'>('none');
     const [composerMediaUrl, setComposerMediaUrl] = useState('');
+    const [composerMediaId, setComposerMediaId] = useState('');
     const [composerMediaAssetKey, setComposerMediaAssetKey] = useState('');
     const [composerMediaMimeType, setComposerMediaMimeType] = useState('');
     const [composerMediaSizeBytes, setComposerMediaSizeBytes] = useState<number | null>(null);
     const [composerMediaFilename, setComposerMediaFilename] = useState('');
     const [composerMediaUploading, setComposerMediaUploading] = useState(false);
+    const [composerDragActive, setComposerDragActive] = useState(false);
     const [composerMediaError, setComposerMediaError] = useState<string | null>(null);
     const [showMediaComposer, setShowMediaComposer] = useState(false);
     const [templateName, setTemplateName] = useState('');
@@ -731,6 +745,7 @@ export default function App() {
                         ? []
                         : [{ id: 'settings-calls', label: 'Call Settings' }]
                 ),
+                { id: 'settings-business-profile', label: 'Business Profile' },
                 { id: 'settings-branding', label: 'App Logo' }
             ]
         },
@@ -1776,12 +1791,14 @@ export default function App() {
                 if (prev.startsWith('blob:')) URL.revokeObjectURL(prev);
                 return '';
             });
+            setComposerMediaId('');
             setComposerMediaAssetKey('');
             setComposerMediaMimeType('');
             setComposerMediaSizeBytes(null);
             setComposerMediaFilename('');
             setComposerMediaError(null);
             setComposerMediaUploading(false);
+            setComposerDragActive(false);
             setShowMediaComposer(false);
             return;
         }
@@ -1794,12 +1811,14 @@ export default function App() {
                     if (prev.startsWith('blob:')) URL.revokeObjectURL(prev);
                     return '';
                 });
+                setComposerMediaId('');
                 setComposerMediaAssetKey('');
                 setComposerMediaMimeType('');
                 setComposerMediaSizeBytes(null);
                 setComposerMediaFilename('');
                 setComposerMediaError(null);
                 setComposerMediaUploading(false);
+                setComposerDragActive(false);
                 setShowMediaComposer(false);
                 return;
             }
@@ -3177,6 +3196,12 @@ export default function App() {
     useEffect(() => {
         if (!selectedChatId) return;
         currentChatMessages.forEach((msg) => {
+            const hasDirectMediaUrl = Boolean(
+                msg.message?.imageMessage?.url ||
+                msg.message?.documentMessage?.url ||
+                msg.message?.videoMessage?.url
+            );
+            if (hasDirectMediaUrl) return;
             const imageMediaId = msg.message?.imageMessage?.mediaId;
             const docMediaId = msg.message?.documentMessage?.mediaId;
             const docName = msg.message?.documentMessage?.fileName || '';
@@ -3247,7 +3272,11 @@ export default function App() {
     const ctaFreeWindowOpen = ctaFreeWindowRemainingMs !== null && ctaFreeWindowRemainingMs > 0;
     const canSendText = windowOpen && !forceTemplateMode;
     const hasComposerMedia = composerMediaType !== 'none'
-        && (composerMediaAssetKey.trim().length > 0 || composerMediaUrl.trim().length > 0);
+        && (
+            composerMediaId.trim().length > 0
+            || composerMediaAssetKey.trim().length > 0
+            || composerMediaUrl.trim().length > 0
+        );
     const quickReplyQuery = useMemo(() => {
         const trimmed = messageText.trim();
         if (!trimmed.startsWith('/')) return null;
@@ -3372,12 +3401,14 @@ export default function App() {
             }
             return '';
         });
+        setComposerMediaId('');
         setComposerMediaAssetKey('');
         setComposerMediaMimeType('');
         setComposerMediaSizeBytes(null);
         setComposerMediaFilename('');
         setComposerMediaError(null);
         setComposerMediaUploading(false);
+        setComposerDragActive(false);
         setComposerMediaType(nextType);
         if (nextType === 'none') {
             setShowMediaComposer(false);
@@ -3402,12 +3433,10 @@ export default function App() {
         setComposerMediaUploading(true);
         setComposerMediaError(null);
         try {
-            const uploaded = await uploadFileToCompanyStorage({
+            const uploaded = await uploadFileToWabaMedia({
                 apiBaseUrl: SOCKET_URL,
                 profileId: activeProfileId,
                 sessionToken: session.access_token,
-                purpose: 'chat_message',
-                messageType: requestedType,
                 file
             });
             const previewUrl = URL.createObjectURL(file);
@@ -3417,12 +3446,14 @@ export default function App() {
                 }
                 return previewUrl;
             });
-            setComposerMediaAssetKey(uploaded.assetKey);
+            setComposerMediaId(uploaded.mediaId);
+            setComposerMediaAssetKey('');
             setComposerMediaMimeType(uploaded.mimeType);
             setComposerMediaSizeBytes(uploaded.sizeBytes);
             setComposerMediaFilename(requestedType === 'document' ? (uploaded.fileName || 'document') : '');
         } catch (error: any) {
             setComposerMediaError(error?.message || 'Upload failed.');
+            setComposerMediaId('');
             setComposerMediaAssetKey('');
             setComposerMediaMimeType('');
             setComposerMediaSizeBytes(null);
@@ -3441,6 +3472,35 @@ export default function App() {
                 : inferComposerMediaType(file);
         void uploadComposerMediaFile(file, messageType);
     }, [composerMediaType, inferComposerMediaType, uploadComposerMediaFile]);
+
+    const handleComposerDragOver = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+        if (!canSendText) return;
+        const hasFiles = Array.from(event.dataTransfer?.types || []).includes('Files');
+        if (!hasFiles) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (!composerDragActive) {
+            setComposerDragActive(true);
+        }
+    }, [canSendText, composerDragActive]);
+
+    const handleComposerDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+        setComposerDragActive(false);
+    }, []);
+
+    const handleComposerDrop = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+        if (!canSendText) return;
+        event.preventDefault();
+        event.stopPropagation();
+        setComposerDragActive(false);
+        const file = event.dataTransfer?.files?.[0] || null;
+        if (!file) return;
+        const messageType = inferComposerMediaType(file);
+        void uploadComposerMediaFile(file, messageType);
+    }, [canSendText, inferComposerMediaType, uploadComposerMediaFile]);
 
     const openComposerMediaPicker = useCallback((messageType: 'image' | 'video' | 'document') => {
         setShowMediaComposer(true);
@@ -3471,6 +3531,7 @@ export default function App() {
         } else {
             setComposerMediaType(quickReplyType);
             setComposerMediaUrl(mediaUrl);
+            setComposerMediaId('');
             setComposerMediaAssetKey(mediaStorage === 'r2' ? mediaAssetKey : '');
             setComposerMediaMimeType(mediaMimeType);
             setComposerMediaSizeBytes(mediaSizeBytes);
@@ -3497,7 +3558,7 @@ export default function App() {
 
     const buildOutgoingPayloadFromMessage = useCallback((msg: Message): {
         text: string;
-        media?: { type: 'image' | 'video' | 'document'; url?: string; assetKey?: string; filename?: string };
+        media?: { type: 'image' | 'video' | 'document'; id?: string; url?: string; assetKey?: string; filename?: string };
     } | null => {
         if (!msg?.key?.fromMe) return null;
         const text =
@@ -3506,36 +3567,50 @@ export default function App() {
                 : typeof msg?.message?.extendedTextMessage?.text === 'string'
                     ? msg.message.extendedTextMessage.text.trim()
                     : '';
+        const imageMediaId =
+            typeof msg?.message?.imageMessage?.mediaId === 'string'
+                ? msg.message.imageMessage.mediaId.trim()
+                : '';
         const imageUrl = typeof msg?.message?.imageMessage?.url === 'string' ? msg.message.imageMessage.url.trim() : '';
         const imageAssetKey = typeof msg?.message?.imageMessage?.assetKey === 'string' ? msg.message.imageMessage.assetKey.trim() : '';
-        if (imageUrl || imageAssetKey) {
+        if (imageMediaId || imageUrl || imageAssetKey) {
             return {
                 text,
                 media: {
                     type: 'image',
+                    ...(imageMediaId ? { id: imageMediaId } : {}),
                     ...(imageUrl ? { url: imageUrl } : {}),
                     ...(imageAssetKey ? { assetKey: imageAssetKey } : {})
                 }
             };
         }
+        const videoMediaId =
+            typeof msg?.message?.videoMessage?.mediaId === 'string'
+                ? msg.message.videoMessage.mediaId.trim()
+                : '';
         const videoUrl = typeof msg?.message?.videoMessage?.url === 'string' ? msg.message.videoMessage.url.trim() : '';
         const videoAssetKey = typeof msg?.message?.videoMessage?.assetKey === 'string' ? msg.message.videoMessage.assetKey.trim() : '';
-        if (videoUrl || videoAssetKey) {
+        if (videoMediaId || videoUrl || videoAssetKey) {
             return {
                 text,
                 media: {
                     type: 'video',
+                    ...(videoMediaId ? { id: videoMediaId } : {}),
                     ...(videoUrl ? { url: videoUrl } : {}),
                     ...(videoAssetKey ? { assetKey: videoAssetKey } : {})
                 }
             };
         }
+        const documentMediaId =
+            typeof msg?.message?.documentMessage?.mediaId === 'string'
+                ? msg.message.documentMessage.mediaId.trim()
+                : '';
         const documentUrl = typeof msg?.message?.documentMessage?.url === 'string' ? msg.message.documentMessage.url.trim() : '';
         const documentAssetKey =
             typeof msg?.message?.documentMessage?.assetKey === 'string'
                 ? msg.message.documentMessage.assetKey.trim()
                 : '';
-        if (documentUrl || documentAssetKey) {
+        if (documentMediaId || documentUrl || documentAssetKey) {
             const filename =
                 typeof msg?.message?.documentMessage?.fileName === 'string'
                     ? msg.message.documentMessage.fileName.trim()
@@ -3544,6 +3619,7 @@ export default function App() {
                 text,
                 media: {
                     type: 'document',
+                    ...(documentMediaId ? { id: documentMediaId } : {}),
                     ...(documentUrl ? { url: documentUrl } : {}),
                     ...(documentAssetKey ? { assetKey: documentAssetKey } : {}),
                     ...(filename ? { filename } : {})
@@ -3616,15 +3692,17 @@ export default function App() {
         if (!socket || !activeProfileId || !selectedChatId) return;
         if (composerMediaUploading) return;
         const outgoingText = messageText.trim();
+        const mediaId = composerMediaId.trim();
         const mediaUrl = composerMediaUrl.trim();
         const mediaAssetKey = composerMediaAssetKey.trim();
         const mediaType = composerMediaType;
         const mediaFilename = composerMediaFilename.trim();
         const tempMessageId = `tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const sendMedia =
-            (mediaType === 'image' || mediaType === 'video' || mediaType === 'document') && (mediaUrl || mediaAssetKey)
+            (mediaType === 'image' || mediaType === 'video' || mediaType === 'document') && (mediaId || mediaUrl || mediaAssetKey)
                 ? {
                     type: mediaType,
+                    ...(mediaId ? { id: mediaId } : {}),
                     ...(mediaUrl ? { url: mediaUrl } : {}),
                     ...(mediaAssetKey ? { assetKey: mediaAssetKey } : {}),
                     ...(mediaType === 'document' && mediaFilename ? { filename: mediaFilename } : {})
@@ -3672,6 +3750,7 @@ export default function App() {
                     return {
                         ...(outgoingText ? { conversation: outgoingText } : {}),
                         imageMessage: {
+                            mediaId: sendMedia.id,
                             caption: outgoingText,
                             assetKey: sendMedia.assetKey,
                             url: sendMedia.url
@@ -3682,6 +3761,7 @@ export default function App() {
                     return {
                         ...(outgoingText ? { conversation: outgoingText } : {}),
                         videoMessage: {
+                            mediaId: sendMedia.id,
                             caption: outgoingText,
                             assetKey: sendMedia.assetKey,
                             url: sendMedia.url
@@ -3691,6 +3771,7 @@ export default function App() {
                 return {
                     ...(outgoingText ? { conversation: outgoingText } : {}),
                     documentMessage: {
+                        mediaId: sendMedia.id,
                         caption: outgoingText,
                         assetKey: sendMedia.assetKey,
                         fileName: sendMedia.filename || 'document',
@@ -5228,7 +5309,19 @@ export default function App() {
                             </button>
                         </div>
                         {workflowStarter}
-                        <div className="flex-1 mx-1 relative">
+                        <div
+                            className="flex-1 mx-1 relative"
+                            onDragOver={handleComposerDragOver}
+                            onDragLeave={handleComposerDragLeave}
+                            onDrop={handleComposerDrop}
+                        >
+                            {canSendText && composerDragActive && (
+                                <div className="absolute inset-0 z-40 rounded-xl border-2 border-dashed border-[#00a884] bg-[#00a884]/10 backdrop-blur-[1px] pointer-events-none flex items-center justify-center">
+                                    <span className="px-3 py-1 rounded-full bg-white/90 text-[#006f57] text-xs font-bold uppercase tracking-wide">
+                                        Drop file to attach
+                                    </span>
+                                </div>
+                            )}
                             {!canSendText && (
                                 <div className="absolute -top-8 left-0 px-3 py-1.5 rounded-lg bg-[#fff3e0] text-[#a16207] text-[11px] font-bold border border-[#fde68a]">
                                     24h window closed for free text. Template message can still be sent anytime.

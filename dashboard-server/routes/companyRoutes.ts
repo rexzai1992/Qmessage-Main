@@ -16,6 +16,7 @@ const UI_FEATURE_KEYS = new Set([
     'broadcast',
     'chatbots',
     'contacts',
+    'calls',
     'analytics',
     'settings'
 ])

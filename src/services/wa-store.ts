@@ -65,9 +65,40 @@ const TEMPLATE_ATTRIBUTE_LANGUAGE_MAX_LENGTH = 24
 const TEMPLATE_ATTRIBUTE_KEY_MAX_LENGTH = 120
 const TEMPLATE_ATTRIBUTE_VALUE_MAX_LENGTH = 400
 
+export function isGroupIdentifier(input: string | null | undefined): boolean {
+    if (!input) return false
+    const raw = String(input).trim()
+    if (!raw) return false
+
+    const lower = raw.toLowerCase()
+    const atIndex = lower.indexOf('@')
+    const domain = atIndex >= 0 ? lower.slice(atIndex + 1) : ''
+    const localPart = atIndex >= 0 ? raw.slice(0, atIndex) : raw
+    const localLower = localPart.toLowerCase()
+
+    if (!localPart) return false
+    if (domain === 'g.us') return true
+    if (domain === 's.whatsapp.net' || domain === 'lid') return false
+
+    return localLower.startsWith('y2fwav9ncm91cd') || localPart.includes(':')
+}
+
 export function normalizePhoneNumber(input: string | null | undefined): string {
     if (!input) return ''
-    return input.replace(/@s\.whatsapp\.net$/, '').replace(/\D/g, '')
+    const raw = String(input).trim()
+    if (!raw) return ''
+
+    const lower = raw.toLowerCase()
+    const atIndex = lower.indexOf('@')
+    const domain = atIndex >= 0 ? lower.slice(atIndex + 1) : ''
+    const localPart = (atIndex >= 0 ? raw.slice(0, atIndex) : raw).trim()
+    if (!localPart) return ''
+
+    if (domain === 'g.us') return localPart
+    if (isGroupIdentifier(raw)) return localPart
+
+    const withoutDevice = localPart.includes(':') ? (localPart.split(':')[0] || '') : localPart
+    return withoutDevice.replace(/\D/g, '')
 }
 
 function sanitizeTemplateAttributeText(value: any, maxLength: number): string {
@@ -191,8 +222,15 @@ export async function findOrCreateUser(companyId: string, phoneNumber: string): 
         return null
     }
 
-    const legacy = `${normalized}@s.whatsapp.net`
-    const candidates = legacy === normalized ? [normalized] : [normalized, legacy]
+    const groupJid = `${normalized}@g.us`
+    const individualJid = `${normalized}@s.whatsapp.net`
+    const candidates = Array.from(
+        new Set(
+            isGroupIdentifier(phoneNumber) || isGroupIdentifier(normalized)
+                ? [normalized, groupJid]
+                : [normalized, individualJid]
+        )
+    )
 
     const { data: existing, error: fetchError } = await supabase
         .from('users')
@@ -238,8 +276,15 @@ export async function findOrCreateUser(companyId: string, phoneNumber: string): 
 export async function getUserByPhone(companyId: string, phoneNumber: string): Promise<User | null> {
     const normalized = normalizePhoneNumber(phoneNumber)
     if (!normalized) return null
-    const legacy = `${normalized}@s.whatsapp.net`
-    const candidates = legacy === normalized ? [normalized] : [normalized, legacy]
+    const groupJid = `${normalized}@g.us`
+    const individualJid = `${normalized}@s.whatsapp.net`
+    const candidates = Array.from(
+        new Set(
+            isGroupIdentifier(phoneNumber) || isGroupIdentifier(normalized)
+                ? [normalized, groupJid]
+                : [normalized, individualJid]
+        )
+    )
 
     const { data, error } = await supabase
         .from('users')
@@ -802,7 +847,47 @@ export async function updateUserLastInbound(userId: string, inboundAt?: string |
     }
 }
 
-export async function updateMessageStatusByMessageId(messageId: string, status: string): Promise<MessageRecord | null> {
+function shouldAdvanceMessageStatus(currentStatus: string, nextStatus: string): boolean {
+    const current = (currentStatus || '').toLowerCase().trim()
+    const next = (nextStatus || '').toLowerCase().trim()
+    if (!next) return false
+    if (!current) return true
+    if (current === next) return false
+
+    // Never downgrade from final positive delivery states.
+    if (current === 'read') return false
+    if (current === 'delivered' && (next === 'sent' || next === 'failed' || next === 'pending')) return false
+
+    const rank: Record<string, number> = {
+        pending: 0,
+        sent: 1,
+        failed: 1,
+        delivered: 2,
+        read: 3
+    }
+    const currentRank = rank[current] ?? -1
+    const nextRank = rank[next] ?? -1
+
+    const sentRank = rank.sent ?? 1
+    if (current === 'failed' && nextRank >= sentRank) return true
+    return nextRank >= currentRank
+}
+
+type StatusUpdateMeta = {
+    timestamp?: number
+    recipientId?: string
+    recipientType?: string
+    recipientParticipantId?: string
+    participantRecipientId?: string
+    conversation?: any
+    pricing?: any
+}
+
+export async function updateMessageStatusByMessageId(
+    messageId: string,
+    status: string,
+    meta: StatusUpdateMeta = {}
+): Promise<MessageRecord | null> {
     if (!messageId) return null
 
     const { data: existing, error: fetchError } = await supabase
@@ -820,9 +905,50 @@ export async function updateMessageStatusByMessageId(messageId: string, status: 
 
     if (!existing) return null
 
-    const nextContent = {
-        ...(existing.content || {}),
-        status
+    const currentContent = (existing.content && typeof existing.content === 'object') ? existing.content : {}
+    const currentStatus = typeof currentContent.status === 'string' ? currentContent.status : ''
+    const shouldUpdateStatus = shouldAdvanceMessageStatus(currentStatus, status)
+    const participantId = meta.recipientParticipantId || meta.participantRecipientId || ''
+    const timestamp = Number.isFinite(Number(meta.timestamp)) ? Number(meta.timestamp) : 0
+
+    const groupStatusesRaw =
+        currentContent.group_statuses && typeof currentContent.group_statuses === 'object'
+            ? currentContent.group_statuses
+            : {}
+    const groupStatuses = { ...groupStatusesRaw } as Record<string, any>
+    if ((meta.recipientType || '').toLowerCase() === 'group') {
+        const participantKey = participantId || 'group'
+        const previous = groupStatuses[participantKey]
+        const previousStatus = typeof previous?.status === 'string' ? previous.status : ''
+        if (!previousStatus || shouldAdvanceMessageStatus(previousStatus, status)) {
+            groupStatuses[participantKey] = {
+                status,
+                timestamp: timestamp || previous?.timestamp || 0,
+                recipient_id: meta.recipientId || null,
+                recipient_type: meta.recipientType || null,
+                recipient_participant_id: participantId || null,
+                conversation: meta.conversation || null,
+                pricing: meta.pricing || null
+            }
+        }
+    }
+
+    const nextContent: Record<string, any> = {
+        ...currentContent,
+        ...(shouldUpdateStatus ? { status } : {}),
+        ...(Object.keys(groupStatuses).length > 0 ? { group_statuses: groupStatuses } : {})
+    }
+
+    if (meta.recipientId || meta.recipientType || participantId || meta.conversation || meta.pricing || timestamp) {
+        nextContent.last_status_event = {
+            status,
+            timestamp: timestamp || null,
+            recipient_id: meta.recipientId || null,
+            recipient_type: meta.recipientType || null,
+            recipient_participant_id: participantId || null,
+            conversation: meta.conversation || null,
+            pricing: meta.pricing || null
+        }
     }
 
     const { data, error } = await supabase

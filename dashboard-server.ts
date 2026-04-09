@@ -13,8 +13,8 @@ import { resolvePath } from './src/config'
 import { supabase, supabaseAuth } from './src/supabase'
 import { WabaRegistry } from './src/waba/registry'
 import { parseWabaWebhook, verifyWabaSignature } from './src/waba/webhook'
-import type { WabaInboundMessage, WabaStatus, WabaConfig } from './src/waba/types'
-import { resolveCompanyId, findOrCreateUser, getMessagesForUsers, getUsersForCompany, insertMessage, getUserByPhone, deleteMessagesForUser, normalizePhoneNumber, updateMessageStatusByMessageId, updateUserName, setUserTags, getUsersWithExpiringWindow, updateUserWindowReminder, activateUserCtaFreeWindow, getUserById, assignUserToAgentIfUnassigned, setUserAssignee, hasHumanTakeover, setUserHumanTakeover, setUserTemplateAttributes } from './src/services/wa-store'
+import type { WabaInboundMessage, WabaStatus, WabaConfig, WabaCallUpdate } from './src/waba/types'
+import { resolveCompanyId, findOrCreateUser, getMessagesForUsers, getUsersForCompany, insertMessage, getUserByPhone, deleteMessagesForUser, normalizePhoneNumber, isGroupIdentifier, updateMessageStatusByMessageId, updateUserName, setUserTags, getUsersWithExpiringWindow, updateUserWindowReminder, activateUserCtaFreeWindow, getUserById, assignUserToAgentIfUnassigned, setUserAssignee, hasHumanTakeover, setUserHumanTakeover, setUserTemplateAttributes } from './src/services/wa-store'
 import type { MessageRecord, User as WaStoreUser } from './src/services/wa-store'
 import { sendWhatsAppMessage } from './src/services/whatsapp'
 import { createDownloadUrl, isR2Configured } from './src/services/r2-storage'
@@ -215,8 +215,10 @@ function normalizeTemplateAttributesForContact(value: any): Array<{
 
 function buildContactPayload(user: any) {
     const phone = normalizePhoneNumber(user?.phone_number)
+    const jidDomain = isGroupIdentifier(user?.phone_number || phone) ? '@g.us' : '@s.whatsapp.net'
+    const jid = phone ? `${phone}${jidDomain}` : `${user?.phone_number || ''}${jidDomain}`
     return {
-        id: phone ? `${phone}@s.whatsapp.net` : `${user?.phone_number || ''}@s.whatsapp.net`,
+        id: jid,
         name: user?.name || phone || user?.phone_number || '',
         lastInboundAt: user?.last_inbound_at || null,
         tags: user?.tags || [],
@@ -2717,8 +2719,20 @@ app.post('/api/send-message', verifyApiKey, async (req: any, res: any) => {
             })
         }
 
-        // Format phone number
-        let jid = phone.includes('@') ? phone : `${phone.replace(/\D/g, '')}@s.whatsapp.net`
+        const rawTarget = typeof phone === 'string' ? phone.trim() : ''
+        const isGroupTarget = isGroupIdentifier(rawTarget) || rawTarget.includes(':')
+        const normalizedTarget = normalizePhoneNumber(rawTarget)
+        const jid = rawTarget.includes('@')
+            ? rawTarget
+            : normalizedTarget
+                ? buildChatJid(normalizedTarget, isGroupTarget)
+                : ''
+        if (!jid) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid phone/group target'
+            })
+        }
 
         const client = await wabaRegistry.getClientByProfile(profileId)
         if (!client) {
@@ -2734,8 +2748,8 @@ app.post('/api/send-message', verifyApiKey, async (req: any, res: any) => {
             return res.status(400).json({ success: false, error: 'Company not found' })
         }
 
-        const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
-        const user = await findOrCreateUser(companyId, phoneNumber)
+        const recipientId = normalizePhoneNumber(jid)
+        const user = await findOrCreateUser(companyId, recipientId)
         if (!user) {
             return res.status(500).json({ success: false, error: 'Failed to resolve user' })
         }
@@ -2743,7 +2757,7 @@ app.post('/api/send-message', verifyApiKey, async (req: any, res: any) => {
         const { messageId } = await sendWhatsAppMessage({
             client,
             userId: user.id,
-            to: phoneNumber,
+            to: recipientId,
             type: 'text',
             content: {
                 text: cleanMessage,
@@ -2784,8 +2798,20 @@ app.post('/api/send-image', verifyApiKey, async (req: any, res: any) => {
             })
         }
 
-        // Format phone number
-        let jid = phone.includes('@') ? phone : `${phone.replace(/\D/g, '')}@s.whatsapp.net`
+        const rawTarget = typeof phone === 'string' ? phone.trim() : ''
+        const isGroupTarget = isGroupIdentifier(rawTarget) || rawTarget.includes(':')
+        const normalizedTarget = normalizePhoneNumber(rawTarget)
+        const jid = rawTarget.includes('@')
+            ? rawTarget
+            : normalizedTarget
+                ? buildChatJid(normalizedTarget, isGroupTarget)
+                : ''
+        if (!jid) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid phone/group target'
+            })
+        }
 
         const client = await wabaRegistry.getClientByProfile(profileId)
         if (!client) {
@@ -2801,13 +2827,13 @@ app.post('/api/send-image', verifyApiKey, async (req: any, res: any) => {
             return res.status(400).json({ success: false, error: 'Company not found' })
         }
 
-        const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
-        const user = await findOrCreateUser(companyId, phoneNumber)
+        const recipientId = normalizePhoneNumber(jid)
+        const user = await findOrCreateUser(companyId, recipientId)
         if (!user) {
             return res.status(500).json({ success: false, error: 'Failed to resolve user' })
         }
 
-        const response = await client.sendImage(phoneNumber, imageUrl, caption || '')
+        const response = await client.sendImage(recipientId, imageUrl, caption || '')
         const messageId = response?.messages?.[0]?.id
 
         await insertMessage({
@@ -2815,7 +2841,7 @@ app.post('/api/send-image', verifyApiKey, async (req: any, res: any) => {
             direction: 'out',
             content: {
                 type: 'image',
-                to: phoneNumber,
+                to: recipientId,
                 message_id: messageId,
                 image_url: imageUrl,
                 caption: caption || '',
@@ -2975,7 +3001,7 @@ app.post('/webhook', async (req: any, res: any) => {
             return res.status(401).send('Invalid signature')
         }
 
-        const { messages, statuses } = parseWabaWebhook(req.body || {})
+        const { messages, statuses, calls } = parseWabaWebhook(req.body || {})
 
         for (const msg of messages) {
             const config = await wabaRegistry.getConfigByPhoneNumberId(msg.phoneNumberId)
@@ -2990,6 +3016,12 @@ app.post('/webhook', async (req: any, res: any) => {
             const config = await wabaRegistry.getConfigByPhoneNumberId(status.phoneNumberId)
             if (!config) continue
             await handleStatusUpdate(config, status)
+        }
+
+        for (const call of calls) {
+            const config = await wabaRegistry.getConfigByPhoneNumberId(call.phoneNumberId)
+            if (!config) continue
+            await handleCallUpdate(config, call)
         }
 
         return res.sendStatus(200)
@@ -3174,6 +3206,7 @@ const UI_FEATURE_KEYS = new Set([
     'broadcast',
     'chatbots',
     'contacts',
+    'calls',
     'analytics',
     'settings'
 ])
@@ -3733,6 +3766,7 @@ app.get('/myadmin', (_req: any, res: any) => {
       { key: 'broadcast', label: 'Broadcast' },
       { key: 'chatbots', label: 'Chatbot' },
       { key: 'contacts', label: 'Contacts' },
+      { key: 'calls', label: 'Calls' },
       { key: 'analytics', label: 'Analytics' },
       { key: 'settings', label: 'Settings' }
     ];
@@ -4144,9 +4178,19 @@ app.use(
     )
 )
 
+function buildChatJid(target: string | null | undefined, preferGroup = false) {
+    const normalized = normalizePhoneNumber(target)
+    if (!normalized) return ''
+    if (preferGroup || isGroupIdentifier(target || normalized)) {
+        return `${normalized}@g.us`
+    }
+    return `${normalized}@s.whatsapp.net`
+}
+
 function buildSyntheticMessage(inbound: WabaInboundMessage) {
-    const from = (inbound.from || '').replace(/\D/g, '')
-    const remoteJid = `${from}@s.whatsapp.net`
+    const from = normalizePhoneNumber(inbound.from || '')
+    const groupId = normalizePhoneNumber(inbound.groupId || '')
+    const remoteJid = groupId ? buildChatJid(groupId, true) : buildChatJid(from)
     const timestamp = inbound.timestamp ? Number(inbound.timestamp) : Math.floor(Date.now() / 1000)
 
     let text = inbound.text?.body || ''
@@ -4192,7 +4236,8 @@ function buildSyntheticMessage(inbound: WabaInboundMessage) {
         key: {
             remoteJid,
             fromMe: false,
-            id: inbound.id
+            id: inbound.id,
+            ...(groupId && from ? { participant: buildChatJid(from) } : {})
         },
         messageTimestamp: timestamp,
         pushName: inbound.contactName,
@@ -4211,7 +4256,7 @@ async function recordToSyntheticMessage(
     const cleanPhone = normalizePhoneNumber(info?.phone || '')
     if (!cleanPhone) return null
 
-    const remoteJid = `${cleanPhone}@s.whatsapp.net`
+    const remoteJid = buildChatJid(cleanPhone, isGroupIdentifier(info?.phone || cleanPhone))
     const timestamp = Math.floor(new Date(record.created_at).getTime() / 1000)
     const content = record.content || {}
     const type = content.type || content.payload?.type || 'text'
@@ -4431,7 +4476,8 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
     const profileId = config.profileId
     const profileCompanyId = await getCompanyIdForProfile(profileId)
     const companyId = profileCompanyId || await resolveCompanyId(config.companyId || profileId)
-    const phoneNumber = remoteJid.replace(/@s\\.whatsapp\\.net$/, '')
+    const phoneNumber = normalizePhoneNumber(remoteJid)
+    const isGroupMessage = Boolean(inbound.groupId || remoteJid.endsWith('@g.us'))
 
     const client = await wabaRegistry.getClientByProfile(profileId)
     if (!client || !companyId) {
@@ -4447,7 +4493,7 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
         profileId,
         client,
         phoneNumber,
-        automationDisabled: humanTakeoverActive,
+        automationDisabled: humanTakeoverActive || isGroupMessage,
         messageType: inbound.type,
         text,
         buttonId: inbound.buttonReplyId,
@@ -4457,7 +4503,7 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
     })
 
     const user = (await getUserByPhone(companyId, phoneNumber)) || baseUser
-    if (user && inbound.contactName) {
+    if (user && inbound.contactName && !isGroupMessage) {
         const trimmedName = inbound.contactName.trim()
         const nameDigits = trimmedName.replace(/\D/g, '')
         const looksLikePhone = nameDigits.length >= 6 && nameDigits === phoneNumber
@@ -4495,7 +4541,7 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
                 phoneNumber,
                 inboundType: inbound.type,
                 inboundText: text || '',
-                workflowHandled: Boolean(workflowResult?.handled && workflowResult?.replied)
+                workflowHandled: isGroupMessage || Boolean(workflowResult?.handled && workflowResult?.replied)
             })
             if (aiResult.sent) {
                 console.log(`[${profileId}] Auto AI reply sent to ${phoneNumber}`)
@@ -4517,7 +4563,7 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
             }
             : {
                 id: remoteJid,
-                name: inbound.contactName || phoneNumber,
+                name: isGroupMessage ? `Group ${phoneNumber}` : (inbound.contactName || phoneNumber),
                 lastInboundAt: inboundAt,
                 tags: [],
                 assigneeUserId: null,
@@ -4547,6 +4593,8 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
             jid: remoteJid,
             name: inbound.contactName || null
         },
+        group_id: inbound.groupId || null,
+        participant_wa_id: inbound.from || null,
         referral: inbound.referral || null,
         button_reply: buttonReply,
         interactive: inbound.interactive || null,
@@ -4556,6 +4604,8 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
     addon.webhookService.trigger(profileId, 'message_received', {
         messageId: inbound.id,
         from: remoteJid,
+        groupId: inbound.groupId || null,
+        participantWaId: inbound.from || null,
         message: text || inbound.type,
         type: inbound.type,
         timestamp: inbound.timestamp,
@@ -4584,7 +4634,16 @@ async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
 
     if (!eventName) return
 
-    const updatedMessage = await updateMessageStatusByMessageId(status.id, statusName)
+    const recipientParticipantId = status.recipientParticipantId || status.participantRecipientId || null
+    const updatedMessage = await updateMessageStatusByMessageId(status.id, statusName, {
+        timestamp: status.timestamp,
+        recipientId: status.recipientId,
+        recipientType: status.recipientType,
+        recipientParticipantId: status.recipientParticipantId,
+        participantRecipientId: status.participantRecipientId,
+        conversation: status.conversation,
+        pricing: status.pricing
+    })
 
     if (statusName === 'delivered' && updatedMessage?.content?.cta_entry_candidate) {
         const deliveredAt = status.timestamp
@@ -4604,7 +4663,10 @@ async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
         io.to(room).emit('message.status', {
             profileId,
             messageId: status.id,
-            status: statusName
+            status: statusName,
+            recipientId: status.recipientId || null,
+            recipientType: status.recipientType || null,
+            recipientParticipantId
         })
 
         if (statusName === 'delivered' && updatedMessage?.user_id) {
@@ -4622,11 +4684,54 @@ async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
     addon.webhookService.trigger(profileId, eventName, {
         messageId: status.id,
         to: status.recipientId,
+        recipientType: status.recipientType || null,
+        recipientParticipantId,
         status: statusName,
         timestamp: status.timestamp,
         conversation: status.conversation,
         pricing: status.pricing
     })
+}
+
+async function handleCallUpdate(config: WabaConfig, call: WabaCallUpdate) {
+    const profileId = config.profileId
+    const companyId = await resolveCompanyId(config.companyId || profileId)
+    if (!companyId) return
+
+    const room = getCompanyRoom(companyId)
+    const eventName = readTrimmed(call.event).toLowerCase()
+    const payload = {
+        profileId,
+        callId: call.id,
+        event: eventName || call.event || 'unknown',
+        phoneNumberId: call.phoneNumberId,
+        from: call.from || null,
+        to: call.to || null,
+        direction: call.direction || null,
+        timestamp: call.timestamp || 0,
+        status: Array.isArray(call.status) ? call.status : [],
+        startTime: call.startTime || null,
+        endTime: call.endTime || null,
+        duration: call.duration ?? null,
+        deeplinkPayload: call.deeplinkPayload || null,
+        ctaPayload: call.ctaPayload || null,
+        bizOpaqueCallbackData: call.bizOpaqueCallbackData || null,
+        session: call.session || null,
+        contactName: call.contactName || null,
+        errors: Array.isArray(call.errors) ? call.errors : [],
+        raw: call.raw
+    }
+
+    io.to(room).emit('calls.update', payload)
+
+    const statusSummary = payload.status.length > 0 ? ` [${payload.status.join(', ')}]` : ''
+    console.log(
+        `[${profileId}] [Calls] ${payload.event.toUpperCase()} id=${payload.callId} from=${payload.from || '-'} to=${payload.to || '-'}${statusSummary}`
+    )
+
+    webhookStore.send(profileId, 'call', payload)
+
+    addon.webhookService.trigger(profileId, `call_${payload.event}`, payload)
 }
 
 registerSocketHandlers(io, {

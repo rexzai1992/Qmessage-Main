@@ -13,7 +13,7 @@ import { resolvePath } from './config'
 import { supabase } from '../src/supabase'
 import { WabaRegistry } from '../src/waba/registry'
 import { parseWabaWebhook, verifyWabaSignature } from '../src/waba/webhook'
-import type { WabaInboundMessage, WabaStatus, WabaConfig } from '../src/waba/types'
+import type { WabaInboundMessage, WabaStatus, WabaConfig, WabaCallUpdate } from '../src/waba/types'
 import { resolveCompanyId, findOrCreateUser, getMessagesForUsers, getUsersForCompany, insertMessage, getUserByPhone, deleteMessagesForUser, normalizePhoneNumber, updateMessageStatusByMessageId, updateUserName, setUserTags, getUsersWithExpiringWindow, updateUserWindowReminder, activateUserCtaFreeWindow, getUserById, assignUserToAgentIfUnassigned, setUserAssignee, hasHumanTakeover, setUserHumanTakeover, setUserTemplateAttributes } from '../src/services/wa-store'
 import type { MessageRecord, User as WaStoreUser } from '../src/services/wa-store'
 import { sendWhatsAppMessage } from '../src/services/whatsapp'
@@ -2983,7 +2983,7 @@ app.post('/webhook', async (req: any, res: any) => {
             return res.status(401).send('Invalid signature')
         }
 
-        const { messages, statuses } = parseWabaWebhook(req.body || {})
+        const { messages, statuses, calls } = parseWabaWebhook(req.body || {})
 
         for (const msg of messages) {
             const config = await wabaRegistry.getConfigByPhoneNumberId(msg.phoneNumberId)
@@ -2998,6 +2998,12 @@ app.post('/webhook', async (req: any, res: any) => {
             const config = await wabaRegistry.getConfigByPhoneNumberId(status.phoneNumberId)
             if (!config) continue
             await handleStatusUpdate(config, status)
+        }
+
+        for (const call of calls) {
+            const config = await wabaRegistry.getConfigByPhoneNumberId(call.phoneNumberId)
+            if (!config) continue
+            await handleCallUpdate(config, call)
         }
 
         return res.sendStatus(200)
@@ -4212,7 +4218,16 @@ async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
 
     if (!eventName) return
 
-    const updatedMessage = await updateMessageStatusByMessageId(status.id, statusName)
+    const recipientParticipantId = status.recipientParticipantId || status.participantRecipientId || null
+    const updatedMessage = await updateMessageStatusByMessageId(status.id, statusName, {
+        timestamp: status.timestamp,
+        recipientId: status.recipientId,
+        recipientType: status.recipientType,
+        recipientParticipantId: status.recipientParticipantId,
+        participantRecipientId: status.participantRecipientId,
+        conversation: status.conversation,
+        pricing: status.pricing
+    })
 
     if (statusName === 'delivered' && updatedMessage?.content?.cta_entry_candidate) {
         const deliveredAt = status.timestamp
@@ -4232,7 +4247,10 @@ async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
         io.to(room).emit('message.status', {
             profileId,
             messageId: status.id,
-            status: statusName
+            status: statusName,
+            recipientId: status.recipientId || null,
+            recipientType: status.recipientType || null,
+            recipientParticipantId
         })
 
         if (statusName === 'delivered' && updatedMessage?.user_id) {
@@ -4250,11 +4268,54 @@ async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
     addon.webhookService.trigger(profileId, eventName, {
         messageId: status.id,
         to: status.recipientId,
+        recipientType: status.recipientType || null,
+        recipientParticipantId,
         status: statusName,
         timestamp: status.timestamp,
         conversation: status.conversation,
         pricing: status.pricing
     })
+}
+
+async function handleCallUpdate(config: WabaConfig, call: WabaCallUpdate) {
+    const profileId = config.profileId
+    const companyId = await resolveCompanyId(config.companyId || profileId)
+    if (!companyId) return
+
+    const room = getCompanyRoom(companyId)
+    const eventName = readTrimmed(call.event).toLowerCase()
+    const payload = {
+        profileId,
+        callId: call.id,
+        event: eventName || call.event || 'unknown',
+        phoneNumberId: call.phoneNumberId,
+        from: call.from || null,
+        to: call.to || null,
+        direction: call.direction || null,
+        timestamp: call.timestamp || 0,
+        status: Array.isArray(call.status) ? call.status : [],
+        startTime: call.startTime || null,
+        endTime: call.endTime || null,
+        duration: call.duration ?? null,
+        deeplinkPayload: call.deeplinkPayload || null,
+        ctaPayload: call.ctaPayload || null,
+        bizOpaqueCallbackData: call.bizOpaqueCallbackData || null,
+        session: call.session || null,
+        contactName: call.contactName || null,
+        errors: Array.isArray(call.errors) ? call.errors : [],
+        raw: call.raw
+    }
+
+    io.to(room).emit('calls.update', payload)
+
+    const statusSummary = payload.status.length > 0 ? ` [${payload.status.join(', ')}]` : ''
+    console.log(
+        `[${profileId}] [Calls] ${payload.event.toUpperCase()} id=${payload.callId} from=${payload.from || '-'} to=${payload.to || '-'}${statusSummary}`
+    )
+
+    webhookStore.send(profileId, 'call', payload)
+
+    addon.webhookService.trigger(profileId, `call_${payload.event}`, payload)
 }
 
 registerSocketHandlers(io, {
