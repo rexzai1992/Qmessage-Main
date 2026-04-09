@@ -72,6 +72,7 @@ import {
     withHexAlpha
 } from './features/chat/utils';
 import { uploadFileToWabaMedia } from './features/media/uploadToWabaMedia';
+import qmessageLogo from './assets/qmessage-logo.jpg';
 
 
 const SOCKET_URL = getSocketUrl();
@@ -4511,16 +4512,12 @@ export default function App() {
                     <div className="flex items-center gap-5 min-w-0 flex-1">
                         <div className="flex items-center gap-2 shrink-0">
                             <div className="h-8 min-w-[96px] max-w-[170px] px-3 rounded-lg border border-[#eceff1] bg-[#f8f9fa] flex items-center justify-center overflow-hidden">
-                                {appLogoUrl ? (
-                                    <img
-                                        src={appLogoUrl}
-                                        alt="App logo"
-                                        className="h-6 w-auto max-w-[150px] object-contain"
-                                        loading="lazy"
-                                    />
-                                ) : (
-                                    <span className="text-[10px] font-black uppercase tracking-widest text-[#8696a0]">Logo</span>
-                                )}
+                                <img
+                                    src={appLogoUrl || qmessageLogo}
+                                    alt="QMessage logo"
+                                    className="h-6 w-auto max-w-[150px] object-contain"
+                                    loading="lazy"
+                                />
                             </div>
                         </div>
                         <div className="hidden xl:block w-px h-8 bg-[#eceff1]" />
@@ -5897,9 +5894,9 @@ export default function App() {
                             </div>
                         )}
                         <div className="mb-12 flex justify-center scale-110">
-                            <img src="https://static.whatsapp.net/rsrc.php/v4/y6/r/wa699kaDcnU.png" className="w-[300px] opacity-80" />
+                            <img src={qmessageLogo} alt="QMessage logo" className="w-[230px] opacity-90 rounded-3xl" />
                         </div>
-                        <h1 className="text-[32px] font-bold text-[#111b21] mb-2 tracking-tight">Nexus WABA Console</h1>
+                        <h1 className="text-[32px] font-bold text-[#111b21] mb-2 tracking-tight">QMessage Console</h1>
                         <p className="text-[#54656f] text-[15px] leading-relaxed mb-12 max-w-sm mx-auto font-medium">
                             Manage WhatsApp Business API conversations in one clean dashboard.
                         </p>

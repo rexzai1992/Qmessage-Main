@@ -4,13 +4,8 @@ import type { Session } from '@supabase/supabase-js'
 import { supabase } from './supabase'
 import DebugButton from './DebugButton'
 import { getSocketUrl, resolveCompanyIdFromLocation } from './runtimeConfig'
+import qmessageLogo from './assets/qmessage-logo.jpg'
 import {
-    MessageSquare,
-    Zap,
-    ShieldCheck,
-    Globe,
-    Cpu,
-    Layers,
     ArrowRight,
     CheckCircle2
 } from 'lucide-react'
@@ -18,6 +13,22 @@ import {
 const OAUTH_PENDING_COMPANY_KEY = 'pendingOAuthCompanyId'
 const COMPANY_ID_REGEX = /^[a-z0-9-]{3,63}$/
 const RESERVED_COMPANY_IDS = new Set(['www', 'admin', 'myadmin'])
+
+function GoogleLogo() {
+    return (
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 48 48"
+            className="w-5 h-5"
+            aria-hidden="true"
+        >
+            <path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9 3.5l6.7-6.7C35.8 2.8 30.3.5 24 .5 14.8.5 6.9 5.8 3.1 13.5l7.8 6.1C12.8 13.6 17.9 9.5 24 9.5z" />
+            <path fill="#4285F4" d="M46.5 24.5c0-1.5-.1-2.6-.4-3.9H24v7.4h12.9c-.3 1.8-1.8 4.4-5.1 6.2l7.9 6.1c4.8-4.4 7.8-10.8 7.8-18.8z" />
+            <path fill="#FBBC05" d="M10.9 28.4c-.5-1.4-.8-2.8-.8-4.4s.3-3 .8-4.4l-7.8-6.1C1.4 16.8.5 20.3.5 24s.9 7.2 2.6 10.5l7.8-6.1z" />
+            <path fill="#34A853" d="M24 47.5c6.3 0 11.6-2.1 15.5-5.7l-7.9-6.1c-2.1 1.5-4.9 2.5-7.6 2.5-6.1 0-11.2-4.1-13.1-9.7l-7.8 6.1C6.9 42.2 14.8 47.5 24 47.5z" />
+        </svg>
+    )
+}
 
 export default function Login({
     onLogin,
@@ -161,85 +172,23 @@ export default function Login({
 
     const activeMessage = msg || forcedMessage || ''
 
-    const services = [
-        {
-            icon: <Layers className="w-5 h-5 text-[#00a884]" />,
-            title: "WABA Cloud Infrastructure",
-            desc: "Run official Meta WhatsApp Business API profiles with zero lag."
-        },
-        {
-            icon: <Cpu className="w-5 h-5 text-[#00a884]" />,
-            title: "AI Chat Flow Assistant",
-            desc: "Visual drag & drop builder for complex automated conversations."
-        },
-        {
-            icon: <Zap className="w-5 h-5 text-[#00a884]" />,
-            title: "Real-time Webhooks",
-            desc: "Instant data synchronization with your existing CRM and API."
-        },
-        {
-            icon: <ShieldCheck className="w-5 h-5 text-[#00a884]" />,
-            title: "SaaS Admin Console",
-            desc: "Full visibility and management over every connected profile."
-        }
-    ]
-
     return (
-        <div className="min-h-screen bg-[#fcfdfd] text-[#111b21] flex overflow-hidden font-sans">
-            {/* Left Side: Service Presentation (Light Mode) */}
-            <div className={`hidden lg:flex lg:w-1/2 flex-col justify-center px-16 xl:px-24 bg-white border-r border-[#eceff1] transition-all duration-1000 ${isVisible ? 'opacity-100 translate-x-0' : 'opacity-0 -translate-x-12'}`}>
-                <div className="mb-12">
-                    <div className="flex items-center gap-3 mb-6">
-                        <div className="bg-[#00a884] p-2 rounded-xl shadow-[0_8px_20px_rgba(0,168,132,0.15)]">
-                            <MessageSquare className="w-8 h-8 text-white" />
-                        </div>
-                        <h1 className="text-3xl font-bold tracking-tight text-[#111b21]">Nexus WA <span className="text-[#00a884]">SaaS</span></h1>
-                    </div>
-                    <h2 className="text-5xl font-light leading-tight mb-6 text-[#111b21]">
-                        The Operating System for <span className="font-bold border-b-4 border-[#00a884]">WhatsApp</span> Business.
-                    </h2>
-                    <p className="text-[#54656f] text-lg max-w-lg leading-relaxed">
-                        Scale your customer engagement with the world's most powerful WhatsApp automation infrastructure.
-                    </p>
-                </div>
-
-                <div className="grid gap-8">
-                    {services.map((s, i) => (
-                        <div key={i} className="flex gap-4 group">
-                            <div className="flex-shrink-0 mt-1 bg-[#f0f2f5] p-3 rounded-lg group-hover:bg-[#00a884]/10 transition-colors">
-                                {s.icon}
-                            </div>
-                            <div>
-                                <h3 className="font-bold text-lg mb-1 text-[#111b21]">{s.title}</h3>
-                                <p className="text-[#54656f] text-sm leading-relaxed">{s.desc}</p>
-                            </div>
-                        </div>
-                    ))}
-                </div>
-
-                <div className="mt-16 pt-8 border-t border-[#eceff1] flex items-center gap-8 text-[#54656f]">
-                    <div className="flex items-center gap-2">
-                        <CheckCircle2 className="w-4 h-4 text-[#00a884]" />
-                        <span className="text-xs uppercase tracking-widest font-bold">End-to-End Encrypted</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                        <Globe className="w-4 h-4 text-[#00a884]" />
-                        <span className="text-xs uppercase tracking-widest font-bold">Global Scale</span>
-                    </div>
-                </div>
-            </div>
-
-            {/* Right Side: Authentication (Light Mode) */}
-            <div className="w-full lg:w-1/2 flex flex-col justify-center items-center px-6 relative bg-[#fcfdfd]">
+        <div className="min-h-screen bg-[#fcfdfd] text-[#111b21] flex items-center justify-center overflow-hidden font-sans px-6 relative">
+            <div className="w-full max-w-md flex flex-col items-center">
                 {/* Decorative background elements - lighter flow */}
                 <div className="absolute top-1/4 left-1/4 w-64 h-64 bg-[#00a884] rounded-full filter blur-[120px] opacity-5 animate-pulse"></div>
 
-                <div className={`w-full max-w-md transition-all duration-1000 delay-300 ${isVisible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-12'}`}>
-                    <div className="lg:hidden flex items-center gap-3 mb-12 justify-center">
-                        <div className="bg-[#00a884] p-2 rounded-xl">
-                            <MessageSquare className="w-8 h-8 text-white" />
+                <div className={`w-full transition-all duration-1000 delay-300 ${isVisible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-12'}`}>
+                    <div className="flex items-center gap-3 mb-10 justify-center">
+                        <div className="h-11 w-11 rounded-xl bg-white border border-[#eceff1] shadow-[0_6px_20px_rgba(0,0,0,0.06)] p-1.5 overflow-hidden">
+                            <img
+                                src={qmessageLogo}
+                                alt="QMessage logo"
+                                className="h-full w-full object-contain"
+                                loading="eager"
+                            />
                         </div>
-                        <h1 className="text-2xl font-bold tracking-tight">Nexus WA <span className="text-[#00a884]">SaaS</span></h1>
+                        <h1 className="text-2xl font-bold tracking-tight">QMessage <span className="text-[#00a884]">SaaS</span></h1>
                     </div>
 
                     <div className="bg-white p-10 rounded-3xl border border-[#eceff1] shadow-[0_20px_50px_rgba(0,0,0,0.04)] relative">
@@ -248,7 +197,7 @@ export default function Login({
                                 {mode === 'login' ? 'Welcome Back' : 'Create Company Account'}
                             </h2>
                             <p className="text-[#54656f]">
-                                {mode === 'login' ? 'Manage your WABA profiles with Nexus WA.' : 'Create your company owner account to begin.'}
+                                {mode === 'login' ? 'Manage your WABA profiles with QMessage.' : 'Create your company owner account to begin.'}
                             </p>
                         </div>
 
@@ -360,7 +309,7 @@ export default function Login({
                                         <div className="w-5 h-5 border-2 border-[#9aa7b2] border-t-[#111b21] rounded-full animate-spin"></div>
                                     ) : (
                                         <>
-                                            <span className="inline-block w-5 h-5 rounded-full border border-[#d7dee3] bg-white text-[11px] leading-5 text-center font-black text-[#ea4335]">G</span>
+                                            <GoogleLogo />
                                             <span>Sign in with Google</span>
                                         </>
                                     )}
