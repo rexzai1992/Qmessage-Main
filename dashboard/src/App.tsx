@@ -353,6 +353,9 @@ type AppToast = {
     id: number;
     message: string;
     tone: 'success' | 'error';
+    variant?: 'default' | 'chat';
+    title?: string;
+    avatarLabel?: string;
 };
 
 type OnboardingStepId = 'welcome' | 'waba_id' | 'phone_number_id' | 'access_token' | 'verify_token' | 'connect';
@@ -2166,7 +2169,21 @@ export default function App() {
         setAppToast({
             id: Date.now(),
             message,
-            tone
+            tone,
+            variant: 'default'
+        });
+    }, []);
+
+    const showChatToast = useCallback((title: string, message: string) => {
+        const safeTitle = title.trim() || 'New message';
+        const safeMessage = message.trim() || 'New message';
+        setAppToast({
+            id: Date.now(),
+            title: safeTitle,
+            message: safeMessage,
+            tone: 'success',
+            variant: 'chat',
+            avatarLabel: getInitials(safeTitle)
         });
     }, []);
 
@@ -2301,9 +2318,10 @@ export default function App() {
 
     useEffect(() => {
         if (!appToast) return;
+        const dismissAfterMs = appToast.variant === 'chat' ? 3200 : 2400;
         const timer = window.setTimeout(() => {
             setAppToast((current) => (current?.id === appToast.id ? null : current));
-        }, 2400);
+        }, dismissAfterMs);
         return () => window.clearTimeout(timer);
     }, [appToast]);
 
@@ -4196,7 +4214,7 @@ export default function App() {
 
 
             if (document.visibilityState === 'visible') {
-                showToast(`${senderName}: ${body}`, 'success');
+                showChatToast(senderName, body);
             }
 
             if (!canShowSystemNotification) return;
@@ -4341,7 +4359,7 @@ export default function App() {
                 ? payload.body.trim()
                 : 'Cross-device notification test';
 
-            showToast(`[Test] ${body}`, 'success');
+            showChatToast(title, body);
             void playNotificationGlassSound();
 
             const canShowSystemNotification = 'Notification' in window && Notification.permission === 'granted';
@@ -6361,7 +6379,7 @@ export default function App() {
 
     const activeWorkspaceLabel = workspaceTabs.find(tab => tab.id === workspaceSection)?.label || 'Workspace';
     const defaultWorkspaceSection = workspaceTabs[0]?.id || 'team-inbox';
-    const hideGlobalHeaderOnMobileInbox = isMobile && workspaceSection === 'team-inbox';
+    const hideGlobalHeaderOnMobileInbox = isMobile && workspaceSection === 'team-inbox' && !showAnalytics;
     const shouldShowMobileBottomNav = isMobile
         && activeView === 'dashboard'
         && (showAnalytics || !(workspaceSection === 'team-inbox' && Boolean(selectedChatId)))
@@ -8144,7 +8162,7 @@ export default function App() {
 
             {showAnalytics && (
                 <div
-                    className="fixed inset-0 z-[160] bg-[#f8f9fa] text-[#111b21] font-sans pt-[64px] lg:pt-[72px]"
+                    className="fixed inset-0 z-[110] bg-[#f8f9fa] text-[#111b21] font-sans pt-[64px] lg:pt-[72px]"
                     style={{
                         ...(mobileHeaderOffsetStyle || {}),
                         ...(mobileBottomNavPaddingStyle || {})
@@ -8905,14 +8923,35 @@ export default function App() {
                         left: isMobile ? 'max(env(safe-area-inset-left), 0.75rem)' : undefined
                     }}
                 >
-                    <div
-                        className={`rounded-xl border px-4 py-2.5 text-sm font-semibold shadow-lg ${appToast.tone === 'success'
-                                ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
-                                : 'bg-rose-50 border-rose-200 text-rose-700'
-                            }`}
-                    >
-                        {appToast.message}
-                    </div>
+                    {appToast.variant === 'chat' ? (
+                        <div className="rounded-2xl border border-[#d8e1e6] bg-white px-3.5 py-3 shadow-[0_12px_30px_rgba(0,0,0,0.18)]">
+                            <div className="flex items-start gap-3">
+                                <div className="w-10 h-10 rounded-full bg-[#dcf8c6] border border-[#b9e3ad] text-[#128c7e] text-xs font-black flex items-center justify-center shrink-0">
+                                    {appToast.avatarLabel || getInitials(appToast.title || 'M')}
+                                </div>
+                                <div className="min-w-0">
+                                    <div className="flex items-center gap-2">
+                                        <p className="text-[13px] font-bold text-[#111b21] truncate">
+                                            {appToast.title || 'New message'}
+                                        </p>
+                                        <span className="text-[10px] font-bold text-[#00a884] uppercase tracking-wide">Now</span>
+                                    </div>
+                                    <p className="mt-0.5 text-[12px] leading-5 text-[#54656f] break-words">
+                                        {appToast.message}
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                    ) : (
+                        <div
+                            className={`rounded-xl border px-4 py-2.5 text-sm font-semibold shadow-lg ${appToast.tone === 'success'
+                                    ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                                    : 'bg-rose-50 border-rose-200 text-rose-700'
+                                }`}
+                        >
+                            {appToast.message}
+                        </div>
+                    )}
                 </div>
             )}
         </>
