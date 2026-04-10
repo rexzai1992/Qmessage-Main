@@ -8,6 +8,7 @@ import path from 'path'
 import os from 'os'
 import { createHash, randomBytes } from 'crypto'
 import type { Socket as NetSocket } from 'net'
+import webpush from 'web-push'
 import * as addon from './src/addon'
 import { resolvePath } from './src/config'
 import { supabase, supabaseAuth } from './src/supabase'
@@ -32,6 +33,7 @@ import { registerStoreRoutes } from './dashboard-server/routes/storeRoutes'
 import { registerAiRoutes } from './dashboard-server/routes/aiRoutes'
 import { getCompanyAiSettings } from './dashboard-server/services/aiSettingsSupabase'
 import { loadOpenAiMemoryForUser, requestOpenAiCompletion, type OpenAiChatMessage } from './dashboard-server/services/openaiAssistant'
+import { createPushSubscriptionStore } from './dashboard-server/services/pushSubscriptionStore'
 import { registerSocketHandlers } from './dashboard-server/socket/registerSocketHandlers'
 import { errorHandler } from './dashboard-server/middleware/error'
 import { requireSupabaseUser } from './dashboard-server/middleware/auth'
@@ -2702,6 +2704,314 @@ function resolveOauthMode(configId?: string | null) {
 
 const requireSupabaseUserMiddleware = requireSupabaseUser(getSupabaseUserFromRequest)
 
+const WEB_PUSH_VAPID_FILE = resolvePath('webpush_vapid.json')
+const WEB_PUSH_SUBSCRIPTIONS_FILE = resolvePath('push_subscriptions.json')
+const WEB_PUSH_NOTIFICATION_ICON = '/icons/icon-192.png'
+const WEB_PUSH_NOTIFICATION_BADGE = '/icons/icon-192.png'
+
+const pushSubscriptionStore = createPushSubscriptionStore(WEB_PUSH_SUBSCRIPTIONS_FILE)
+
+type WebPushVapidDetails = {
+    publicKey: string
+    privateKey: string
+    subject: string
+}
+
+type SendPushNotificationInput = {
+    companyId: string
+    userIds: string[]
+    title: string
+    body: string
+    url?: string
+    tag?: string
+    icon?: string
+    badge?: string
+    data?: Record<string, any>
+    ttlSeconds?: number
+}
+
+const normalizeWebPushSubject = (value: string | null | undefined): string => {
+    const raw = typeof value === 'string' ? value.trim() : ''
+    if (!raw) return `mailto:no-reply@${TENANT_ROOT_DOMAIN}`
+    if (raw.startsWith('mailto:')) return raw
+    if (/^https?:\/\//i.test(raw)) return raw
+    if (raw.includes('@')) return `mailto:${raw}`
+    return `mailto:${raw}`
+}
+
+const loadOrCreateWebPushVapidDetails = (): WebPushVapidDetails | null => {
+    const envPublic = typeof process.env.WEB_PUSH_VAPID_PUBLIC_KEY === 'string' ? process.env.WEB_PUSH_VAPID_PUBLIC_KEY.trim() : ''
+    const envPrivate = typeof process.env.WEB_PUSH_VAPID_PRIVATE_KEY === 'string' ? process.env.WEB_PUSH_VAPID_PRIVATE_KEY.trim() : ''
+    const envSubject = normalizeWebPushSubject(process.env.WEB_PUSH_VAPID_SUBJECT || process.env.WEB_PUSH_SUBJECT || '')
+
+    if (envPublic && envPrivate) {
+        return {
+            publicKey: envPublic,
+            privateKey: envPrivate,
+            subject: envSubject
+        }
+    }
+
+    if (envPublic || envPrivate) {
+        console.warn('[push] WEB_PUSH_VAPID_PUBLIC_KEY / WEB_PUSH_VAPID_PRIVATE_KEY must both be set. Web push is disabled.')
+        return null
+    }
+
+    try {
+        if (fs.existsSync(WEB_PUSH_VAPID_FILE)) {
+            const raw = JSON.parse(fs.readFileSync(WEB_PUSH_VAPID_FILE, 'utf-8')) as any
+            const filePublic = typeof raw?.publicKey === 'string' ? raw.publicKey.trim() : ''
+            const filePrivate = typeof raw?.privateKey === 'string' ? raw.privateKey.trim() : ''
+            const fileSubject = normalizeWebPushSubject(raw?.subject || envSubject)
+            if (filePublic && filePrivate) {
+                return {
+                    publicKey: filePublic,
+                    privateKey: filePrivate,
+                    subject: fileSubject
+                }
+            }
+        }
+    } catch (error: any) {
+        console.warn('[push] Failed to read persisted VAPID key file:', error?.message || error)
+    }
+
+    try {
+        const generated = webpush.generateVAPIDKeys()
+        const subject = envSubject
+        const payload = {
+            publicKey: generated.publicKey,
+            privateKey: generated.privateKey,
+            subject,
+            createdAt: new Date().toISOString()
+        }
+        fs.writeFileSync(WEB_PUSH_VAPID_FILE, JSON.stringify(payload, null, 2))
+        console.log(`[push] Generated VAPID key pair at ${WEB_PUSH_VAPID_FILE}`)
+        return {
+            publicKey: generated.publicKey,
+            privateKey: generated.privateKey,
+            subject
+        }
+    } catch (error: any) {
+        console.warn('[push] Failed to generate VAPID keys. Web push is disabled.', error?.message || error)
+        return null
+    }
+}
+
+const webPushVapidDetails = loadOrCreateWebPushVapidDetails()
+if (webPushVapidDetails) {
+    try {
+        webpush.setVapidDetails(
+            webPushVapidDetails.subject,
+            webPushVapidDetails.publicKey,
+            webPushVapidDetails.privateKey
+        )
+    } catch (error: any) {
+        console.warn('[push] Failed to configure web-push VAPID details. Web push is disabled.', error?.message || error)
+    }
+}
+
+const getCompanyRecipientUserIdsForPush = async (companyId: string, fallbackUserId?: string | null): Promise<string[]> => {
+    const result = new Set<string>()
+    const normalizedCompanyId = normalizeCompanyId(companyId)
+    if (!normalizedCompanyId) return []
+
+    try {
+        const { data: roleRows, error: roleError } = await supabase
+            .from('user_roles')
+            .select('user_id')
+            .eq('company_id', normalizedCompanyId)
+
+        if (roleError) {
+            console.warn(`[push] Failed to load user_roles for company ${normalizedCompanyId}:`, roleError.message)
+        } else {
+            ;(roleRows || []).forEach((row: any) => {
+                const userId = typeof row?.user_id === 'string' ? row.user_id.trim() : ''
+                if (userId) result.add(userId)
+            })
+        }
+    } catch (error: any) {
+        console.warn(`[push] Failed to query user roles for company ${normalizedCompanyId}:`, error?.message || error)
+    }
+
+    if (result.size === 0) {
+        try {
+            const { data: profileRows, error: profileError } = await supabase
+                .from('profiles')
+                .select('user_id')
+                .eq('company_id', normalizedCompanyId)
+
+            if (profileError) {
+                console.warn(`[push] Failed to load profiles for company ${normalizedCompanyId}:`, profileError.message)
+            } else {
+                ;(profileRows || []).forEach((row: any) => {
+                    const userId = typeof row?.user_id === 'string' ? row.user_id.trim() : ''
+                    if (userId) result.add(userId)
+                })
+            }
+        } catch (error: any) {
+            console.warn(`[push] Failed to query profiles for company ${normalizedCompanyId}:`, error?.message || error)
+        }
+    }
+
+    const fallback = typeof fallbackUserId === 'string' ? fallbackUserId.trim() : ''
+    if (fallback) result.add(fallback)
+    return Array.from(result)
+}
+
+const sendPushNotificationToUsers = async (input: SendPushNotificationInput): Promise<void> => {
+    if (!webPushVapidDetails) return
+
+    const userIds = Array.from(new Set((Array.isArray(input.userIds) ? input.userIds : [])
+        .map((value) => (typeof value === 'string' ? value.trim() : ''))
+        .filter(Boolean)))
+    if (userIds.length === 0) return
+
+    const companyId = normalizeCompanyId(input.companyId)
+    if (!companyId) return
+
+    const subscriptions = pushSubscriptionStore.getByUsers(userIds, companyId)
+    if (subscriptions.length === 0) {
+        console.log(`[push] No active subscriptions for company ${companyId} (${userIds.length} user target(s)).`)
+        return
+    }
+    const startedAt = Date.now()
+
+    const payload = JSON.stringify({
+        title: (input.title || 'QMessage').slice(0, 120),
+        body: (input.body || 'New WhatsApp update available.').slice(0, 240),
+        icon: input.icon || WEB_PUSH_NOTIFICATION_ICON,
+        badge: input.badge || WEB_PUSH_NOTIFICATION_BADGE,
+        tag: input.tag || `company:${companyId}`,
+        url: input.url || '/',
+        data: {
+            ...(input.data || {})
+        }
+    })
+
+    const staleEndpoints: string[] = []
+    let deliveredCount = 0
+    await Promise.all(subscriptions.map(async (entry) => {
+        try {
+            await webpush.sendNotification(
+                {
+                    endpoint: entry.endpoint,
+                    expirationTime: entry.expirationTime ?? null,
+                    keys: entry.keys
+                },
+                payload,
+                {
+                    TTL: Math.max(30, Math.min(3600, Math.floor(input.ttlSeconds || 120))),
+                    urgency: 'high'
+                }
+            )
+            deliveredCount += 1
+        } catch (error: any) {
+            const statusCode = Number(error?.statusCode || error?.status || 0)
+            if (statusCode === 404 || statusCode === 410) {
+                staleEndpoints.push(entry.endpoint)
+                return
+            }
+            console.warn('[push] Failed to send push notification:', error?.message || error)
+        }
+    }))
+
+    if (staleEndpoints.length > 0) {
+        pushSubscriptionStore.removeManyByEndpoint(staleEndpoints)
+    }
+
+    const durationMs = Date.now() - startedAt
+    const summary = `[push] Delivered ${deliveredCount}/${subscriptions.length} push notification(s) in ${durationMs}ms.`
+    if (durationMs > 1500) {
+        console.warn(summary)
+    } else {
+        console.log(summary)
+    }
+}
+
+const getInboundNotificationPreview = (inbound: WabaInboundMessage, text: string): string => {
+    const normalizedText = typeof text === 'string' ? text.trim() : ''
+    if (normalizedText) return normalizedText
+    if (inbound.image) return 'Photo'
+    if (inbound.video) return 'Video'
+    if (inbound.document) return 'Document'
+    if (inbound.audio) return 'Voice message'
+    if (inbound.buttonReplyTitle) return inbound.buttonReplyTitle
+    if (inbound.buttonReplyId) return `Button response: ${inbound.buttonReplyId}`
+    return 'New message'
+}
+
+app.get('/api/push/public-key', requireSupabaseUserMiddleware, async (_req: any, res: any) => {
+    return res.json({
+        success: true,
+        enabled: Boolean(webPushVapidDetails),
+        publicKey: webPushVapidDetails?.publicKey || null
+    })
+})
+
+app.post('/api/push/subscribe', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    if (!webPushVapidDetails) {
+        return res.status(503).json({
+            success: false,
+            error: 'Push notifications are not configured on the server.'
+        })
+    }
+
+    const baseUser = req?.supabaseUser
+    if (!baseUser) {
+        return res.status(401).json({ success: false, error: 'Authentication required.' })
+    }
+
+    const { user, companyId } = await ensureUserCompanyId(baseUser)
+    const normalizedCompanyId = normalizeCompanyId(companyId || getUserCompanyId(user))
+    if (!normalizedCompanyId) {
+        return res.status(400).json({ success: false, error: 'Company ID is missing for this account.' })
+    }
+
+    const input = req?.body?.subscription || req?.body
+    const result = pushSubscriptionStore.upsert(input, {
+        userId: user.id,
+        companyId: normalizedCompanyId,
+        userAgent: typeof req?.headers?.['user-agent'] === 'string' ? req.headers['user-agent'] : null
+    })
+
+    if (!result.success) {
+        return res.status(400).json({ success: false, error: result.error })
+    }
+
+    return res.json({
+        success: true,
+        endpoint: result.endpoint
+    })
+})
+
+app.post('/api/push/unsubscribe', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    const baseUser = req?.supabaseUser
+    if (!baseUser) {
+        return res.status(401).json({ success: false, error: 'Authentication required.' })
+    }
+
+    const { user, companyId } = await ensureUserCompanyId(baseUser)
+    const normalizedCompanyId = normalizeCompanyId(companyId || getUserCompanyId(user))
+    const endpoint = typeof req?.body?.endpoint === 'string'
+        ? req.body.endpoint.trim()
+        : typeof req?.body?.subscription?.endpoint === 'string'
+            ? req.body.subscription.endpoint.trim()
+            : ''
+
+    if (!endpoint) {
+        return res.status(400).json({ success: false, error: 'Push subscription endpoint is required.' })
+    }
+
+    const userSubscriptions = pushSubscriptionStore.getByUser(user.id, normalizedCompanyId)
+    const belongsToUser = userSubscriptions.some((item) => item.endpoint === endpoint)
+    if (!belongsToUser) {
+        return res.status(404).json({ success: false, error: 'Subscription not found for this user.' })
+    }
+
+    const removed = pushSubscriptionStore.removeByEndpoint(endpoint)
+    return res.json({ success: true, removed })
+})
+
 registerFlowRoutes(app, {
     supabase,
     parseDateInput,
@@ -4889,6 +5199,27 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
     })
 
     io.to(getCompanyRoom(companyId)).emit('messages.upsert', { profileId, messages: [syntheticMsg], type: 'notify' })
+
+    const notificationRecipientUserIds = await getCompanyRecipientUserIdsForPush(companyId)
+    const senderName =
+        (contact && typeof contact.name === 'string' && contact.name.trim())
+        || (typeof inbound.contactName === 'string' && inbound.contactName.trim())
+        || (isGroupMessage ? `Group ${phoneNumber}` : phoneNumber)
+        || 'New message'
+
+    void sendPushNotificationToUsers({
+        companyId,
+        userIds: notificationRecipientUserIds,
+        title: senderName,
+        body: getInboundNotificationPreview(inbound, text),
+        url: `/?chat=${encodeURIComponent(remoteJid)}`,
+        tag: `chat:${remoteJid}`,
+        data: {
+            profileId,
+            chat: remoteJid
+        },
+        ttlSeconds: 120
+    })
 }
 
 async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
@@ -5042,7 +5373,8 @@ registerSocketHandlers(io, {
     resolveCompanyId,
     hasRoleAtLeast,
     normalizeTeamRole,
-    deleteMessagesForUser
+    deleteMessagesForUser,
+    sendPushNotificationToUsers
 })
 
 app.use(errorHandler)

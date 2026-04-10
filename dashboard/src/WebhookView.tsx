@@ -1,6 +1,6 @@
 
 import React, { useEffect, useRef, useState } from 'react';
-import { Plus, Trash2, Globe, Shield, PhoneCall } from 'lucide-react';
+import { Plus, Trash2, Globe, Shield, PhoneCall, Bell } from 'lucide-react';
 import { getSocketUrl } from './runtimeConfig';
 import { supabase } from './supabase';
 import { uploadFileToCompanyStorage } from './features/media/uploadToCompanyStorage';
@@ -178,6 +178,11 @@ type WebhookViewProps = {
     onSaveQuickReplies: (items: QuickReply[]) => void;
     onRefreshUiControls: () => void;
     showCallSettings?: boolean;
+    notificationPermission: NotificationPermission | 'unsupported';
+    notificationSoundEnabled: boolean;
+    onToggleNotificationSound: (enabled: boolean) => void;
+    onRequestNotifications: () => void;
+    onTestNotificationSound: () => void;
 };
 
 export default function WebhookView({
@@ -192,7 +197,12 @@ export default function WebhookView({
     onRefreshQuickReplies,
     onSaveQuickReplies,
     onRefreshUiControls,
-    showCallSettings = true
+    showCallSettings = true,
+    notificationPermission,
+    notificationSoundEnabled,
+    onToggleNotificationSound,
+    onRequestNotifications,
+    onTestNotificationSound
 }: WebhookViewProps) {
     const [webhooks, setWebhooks] = useState<any[]>([]);
     const [webhookError, setWebhookError] = useState<string | null>(null);
@@ -1786,6 +1796,22 @@ export default function WebhookView({
         }
     };
 
+    const notificationPermissionLabel =
+        notificationPermission === 'granted'
+            ? 'Browser notifications: allowed'
+            : notificationPermission === 'denied'
+                ? 'Browser notifications: blocked'
+                : notificationPermission === 'default'
+                    ? 'Browser notifications: not requested'
+                    : 'Browser notifications: unsupported';
+
+    const notificationPermissionToneClass =
+        notificationPermission === 'granted'
+            ? 'text-emerald-700 bg-emerald-50 border-emerald-200'
+            : notificationPermission === 'denied'
+                ? 'text-rose-700 bg-rose-50 border-rose-200'
+                : 'text-[#54656f] bg-[#f0f2f5] border-[#eceff1]';
+
     return (
         <div className="flex-1 bg-[#fcfdfd] p-10 overflow-y-auto text-[#111b21] h-full font-sans">
             <h2 className="text-3xl font-black mb-10 flex items-center gap-4 tracking-tight">
@@ -2014,6 +2040,59 @@ export default function WebhookView({
                             {loading ? <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" /> : <Plus className="w-5 h-5" />}
                             Register Webhook
                         </button>
+                    </div>
+                </div>
+
+                <div id="settings-notifications" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                    <div className="flex items-center justify-between gap-4 mb-5">
+                        <div className="flex items-center gap-3">
+                            <Bell className="w-6 h-6 text-[#00a884]" />
+                            <div>
+                                <h3 className="text-xl text-[#111b21] font-bold">Notifications</h3>
+                                <p className="text-sm text-[#54656f] font-medium mt-1">
+                                    Control browser alerts and iPhone Glass sound for new messages.
+                                </p>
+                            </div>
+                        </div>
+                        <div className={`text-[11px] font-bold px-3 py-2 rounded-xl border ${notificationPermissionToneClass}`}>
+                            {notificationPermissionLabel}
+                        </div>
+                    </div>
+
+                    <div className="bg-[#fcfdfd] border border-[#eceff1] rounded-2xl p-5">
+                        <div className="flex items-center justify-between gap-4">
+                            <div>
+                                <p className="text-sm font-bold text-[#111b21]">iPhone Glass Sound</p>
+                                <p className="text-xs text-[#54656f] font-medium mt-1">
+                                    Play the chime when incoming chat notifications arrive.
+                                </p>
+                            </div>
+                            <input
+                                type="checkbox"
+                                checked={notificationSoundEnabled}
+                                onChange={(e) => onToggleNotificationSound(e.target.checked)}
+                                className="w-4 h-4 accent-[#00a884]"
+                            />
+                        </div>
+                    </div>
+
+                    <div className="mt-5 flex flex-wrap items-center gap-3">
+                        <button
+                            type="button"
+                            onClick={onTestNotificationSound}
+                            className="bg-[#111b21] hover:bg-[#202c33] text-white px-4 py-2.5 rounded-xl text-xs font-bold uppercase tracking-widest transition-all"
+                        >
+                            Test iPhone Glass Sound
+                        </button>
+                        {notificationPermission !== 'granted' && notificationPermission !== 'unsupported' && (
+                            <button
+                                type="button"
+                                onClick={onRequestNotifications}
+                                className="text-xs font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-3 py-2 rounded-xl hover:bg-[#00a884]/5 transition-all"
+                            >
+                                Enable Browser Notifications
+                            </button>
+                        )}
                     </div>
                 </div>
 

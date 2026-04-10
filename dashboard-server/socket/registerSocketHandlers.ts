@@ -40,7 +40,8 @@ export function registerSocketHandlers(io: Server, ctx: any) {
         resolveCompanyId,
         hasRoleAtLeast,
         normalizeTeamRole,
-        deleteMessagesForUser
+        deleteMessagesForUser,
+        sendPushNotificationToUsers
     } = ctx
 
     const isLikelyGroupTarget = (value: string | null | undefined): boolean => {
@@ -62,6 +63,66 @@ export function registerSocketHandlers(io: Server, ctx: any) {
         const normalized = normalizePhoneNumber(raw)
         if (!normalized) return ''
         return isLikelyGroupTarget(raw) ? `${normalized}@g.us` : `${normalized}@s.whatsapp.net`
+    }
+
+    const buildOutgoingSyntheticMessage = (params: {
+        jid: string
+        messageId: string
+        actor?: { user_id: string; name: string; color: string } | null
+        text?: string
+        media?: {
+            type?: string
+            id?: string
+            link?: string
+            assetKey?: string
+            filename?: string
+        } | null
+        fallbackLabel?: string
+        workflowState?: any | null
+    }) => {
+        const message: any = {}
+        const text = typeof params.text === 'string' ? params.text.trim() : ''
+        const mediaType = typeof params.media?.type === 'string' ? params.media.type.toLowerCase() : ''
+
+        if (mediaType === 'image') {
+            message.imageMessage = {
+                ...(text ? { caption: text } : {}),
+                ...(params.media?.id ? { mediaId: params.media.id } : {}),
+                ...(params.media?.assetKey ? { assetKey: params.media.assetKey } : {}),
+                ...(params.media?.link ? { url: params.media.link } : {})
+            }
+        } else if (mediaType === 'video') {
+            message.videoMessage = {
+                ...(text ? { caption: text } : {}),
+                ...(params.media?.id ? { mediaId: params.media.id } : {}),
+                ...(params.media?.assetKey ? { assetKey: params.media.assetKey } : {}),
+                ...(params.media?.link ? { url: params.media.link } : {})
+            }
+        } else if (mediaType === 'document') {
+            message.documentMessage = {
+                ...(text ? { caption: text } : {}),
+                ...(params.media?.id ? { mediaId: params.media.id } : {}),
+                ...(params.media?.filename ? { fileName: params.media.filename } : {}),
+                ...(params.media?.assetKey ? { assetKey: params.media.assetKey } : {}),
+                ...(params.media?.link ? { url: params.media.link } : {})
+            }
+        } else {
+            message.conversation = text || params.fallbackLabel || 'Message sent'
+        }
+
+        return {
+            key: {
+                remoteJid: params.jid,
+                fromMe: true,
+                id: params.messageId
+            },
+            status: 'sent',
+            messageTimestamp: Math.floor(Date.now() / 1000),
+            pushName: params.actor?.name || normalizePhoneNumber(params.jid),
+            message,
+            agent: params.actor || null,
+            workflowState: params.workflowState ?? null
+        }
     }
 
     const parseBoundedLimit = (value: unknown, fallback: number, min: number, max: number): number => {
@@ -541,6 +602,19 @@ io.on('connection', async (socket) => {
             // Broadcast only to the same signed-in user on other devices (B/C),
             // not to every teammate in the company room.
             socket.to(userId).emit('notification.test', eventPayload)
+            await sendPushNotificationToUsers({
+                companyId,
+                userIds: [userId],
+                title: eventPayload.title,
+                body: eventPayload.body,
+                url: '/',
+                tag: `test-notification:${eventPayload.id}`,
+                data: {
+                    type: 'test',
+                    fromUserId: userId
+                },
+                ttlSeconds: 120
+            })
             if (typeof ack === 'function') {
                 ack({ success: true, data: eventPayload })
             }
@@ -953,6 +1027,28 @@ io.on('connection', async (socket) => {
                 },
                 actor
             })
+            const syntheticOutgoing = buildOutgoingSyntheticMessage({
+                jid,
+                messageId: sent?.messageId || `out-${Date.now()}`,
+                actor,
+                text: messageText,
+                media: normalizedMedia
+                    ? {
+                        type: normalizedMedia.type,
+                        ...(normalizedMedia.id ? { id: normalizedMedia.id } : {}),
+                        ...(normalizedMedia.link ? { link: normalizedMedia.link } : {}),
+                        ...(normalizedMedia.assetKey ? { assetKey: normalizedMedia.assetKey } : {}),
+                        ...(normalizedMedia.filename ? { filename: normalizedMedia.filename } : {})
+                    }
+                    : null
+            })
+            // Current sender socket already renders optimistic message locally.
+            // Broadcast real outbound update to other sockets for live cross-device sync.
+            socket.to(getCompanyRoom(resolvedCompanyId)).emit('messages.upsert', {
+                profileId,
+                messages: [syntheticOutgoing],
+                type: 'notify'
+            })
             if (typeof ack === 'function') {
                 ack({
                     success: true,
@@ -1025,7 +1121,7 @@ io.on('connection', async (socket) => {
         }
     })
 
-    socket.on('sendTemplate', async (data) => {
+    socket.on('sendTemplate', async (data, ack) => {
         let { profileId, jid, name, language, components, bodyAttributes } = data
         if (!jid || !name) return
         jid = toChatJid(jid)
@@ -1049,7 +1145,7 @@ io.on('connection', async (socket) => {
             }
             const actor = buildAgentIdentity(socket.data.user)
 
-            await sendWhatsAppMessage({
+            const sent = await sendWhatsAppMessage({
                 client,
                 userId: user.id,
                 to: recipientId,
@@ -1060,6 +1156,19 @@ io.on('connection', async (socket) => {
                     components: Array.isArray(components) && components.length > 0 ? components : undefined
                 },
                 actor
+            })
+            const syntheticOutgoing = buildOutgoingSyntheticMessage({
+                jid,
+                messageId: sent?.messageId || `tpl-${Date.now()}`,
+                actor,
+                fallbackLabel: `Template: ${name}`
+            })
+            // Template sends do not use optimistic local rendering in the UI,
+            // so publish to all clients, including the sender socket.
+            io.to(getCompanyRoom(resolvedCompanyId)).emit('messages.upsert', {
+                profileId,
+                messages: [syntheticOutgoing],
+                type: 'notify'
             })
             if (Array.isArray(bodyAttributes) && bodyAttributes.length > 0) {
                 await setUserTemplateAttributes(
@@ -1081,8 +1190,21 @@ io.on('connection', async (socket) => {
                     contacts: [{ ...buildContactPayload(assigned), id: isGroup ? `${recipientId}@g.us` : `${recipientId}@s.whatsapp.net` }]
                 })
             }
+            if (typeof ack === 'function') {
+                ack({
+                    success: true,
+                    data: {
+                        messageId: sent?.messageId || null,
+                        jid,
+                        profileId
+                    }
+                })
+            }
         } catch (error: any) {
             socket.emit('profile.error', { message: error.message || 'Failed to send template' })
+            if (typeof ack === 'function') {
+                ack({ success: false, error: error?.message || 'Failed to send template' })
+            }
         }
     })
 

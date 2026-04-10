@@ -28,6 +28,11 @@ type SettingsViewProps = {
     onSaveQuickReplies: (items: any[]) => void;
     onRefreshUiControls: () => void;
     showCallSettings?: boolean;
+    notificationPermission: NotificationPermission | 'unsupported';
+    notificationSoundEnabled: boolean;
+    onToggleNotificationSound: (enabled: boolean) => void;
+    onRequestNotifications: () => void;
+    onTestNotificationSound: () => void;
     WebhookViewComponent: React.ComponentType<any>;
 };
 
@@ -48,6 +53,11 @@ export default function SettingsView({
     onSaveQuickReplies,
     onRefreshUiControls,
     showCallSettings,
+    notificationPermission,
+    notificationSoundEnabled,
+    onToggleNotificationSound,
+    onRequestNotifications,
+    onTestNotificationSound,
     WebhookViewComponent
 }: SettingsViewProps) {
     return (
@@ -114,6 +124,11 @@ export default function SettingsView({
                             onSaveQuickReplies={onSaveQuickReplies}
                             onRefreshUiControls={onRefreshUiControls}
                             showCallSettings={showCallSettings}
+                            notificationPermission={notificationPermission}
+                            notificationSoundEnabled={notificationSoundEnabled}
+                            onToggleNotificationSound={onToggleNotificationSound}
+                            onRequestNotifications={onRequestNotifications}
+                            onTestNotificationSound={onTestNotificationSound}
                         />
                     </Suspense>
                 </div>

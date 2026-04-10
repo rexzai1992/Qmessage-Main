@@ -106,6 +106,32 @@ const PROFILE_SYNC_TIMEOUT_MS = 20_000;
 const CHAT_SYNC_TIMEOUT_MS = 24_000;
 const SOCKET_STALE_REFRESH_INTERVAL_MS = 90_000;
 const QUICK_REPLIES_PREFETCH_DELAY_MS = 220;
+const NOTIFICATION_SOUND_PREF_KEY = 'qmessage.notification.sound.enabled.v1';
+
+const readNotificationSoundPreference = (): boolean => {
+    if (typeof window === 'undefined') return true;
+    try {
+        const raw = window.localStorage.getItem(NOTIFICATION_SOUND_PREF_KEY);
+        if (!raw) return true;
+        const normalized = raw.trim().toLowerCase();
+        return !(normalized === '0' || normalized === 'false' || normalized === 'off');
+    } catch {
+        return true;
+    }
+};
+
+const urlBase64ToUint8Array = (value: string): ArrayBuffer => {
+    const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+    const padding = '='.repeat((4 - (normalized.length % 4)) % 4);
+    const base64 = normalized + padding;
+    const raw = window.atob(base64);
+    const output = new Uint8Array(raw.length);
+    for (let index = 0; index < raw.length; index += 1) {
+        output[index] = raw.charCodeAt(index);
+    }
+    return output.buffer;
+};
+
 
 const LazyWebhookView = lazy(() => import('./WebhookView'));
 const LazyBroadcastTemplateBuilder = lazy(() => import('./BroadcastTemplateBuilder'));
@@ -720,6 +746,16 @@ const getIncomingNotificationPreview = (msg: Message): string => {
     if (msg.message?.documentMessage) return 'Document';
     if (msg.message?.audioMessage) return 'Voice message';
     return 'New message';
+};
+
+const MAX_NOTIFICATION_BODY_LENGTH = 120;
+
+const truncateNotificationBody = (value: string, maxLength = MAX_NOTIFICATION_BODY_LENGTH): string => {
+    const normalized = value.replace(/\s+/g, ' ').trim();
+    if (!normalized) return 'New message';
+    if (maxLength <= 3) return normalized.slice(0, Math.max(0, maxLength));
+    if (normalized.length <= maxLength) return normalized;
+    return `${normalized.slice(0, maxLength - 3)}...`;
 };
 
 const normalizeChatDisplayName = (rawName: string, jid: string): string => {
@@ -1648,6 +1684,9 @@ export default function App() {
     const [notificationPermissionState, setNotificationPermissionState] = useState<NotificationPermission | 'unsupported'>(
         () => getNotificationPermissionState()
     );
+    const [notificationSoundEnabled, setNotificationSoundEnabled] = useState<boolean>(
+        () => readNotificationSoundPreference()
+    );
     const [sendingTestNotification, setSendingTestNotification] = useState(false);
     const [pwaUpdateRegistration, setPwaUpdateRegistration] = useState<ServiceWorkerRegistration | null>(null);
     const [showPwaUpdateBanner, setShowPwaUpdateBanner] = useState(false);
@@ -1716,6 +1755,11 @@ export default function App() {
     const refreshSessionPromiseRef = useRef<Promise<string | null> | null>(null);
     const refreshAccessTokenRef = useRef<(() => Promise<string | null>) | null>(null);
     const lastTestNotificationTriggerAtRef = useRef(0);
+    const notificationAudioContextRef = useRef<AudioContext | null>(null);
+    const notificationSoundEnabledRef = useRef(notificationSoundEnabled);
+    const pushSubscriptionEndpointRef = useRef('');
+    const pushSubscriptionUserIdRef = useRef<string | null>(null);
+    const pushSubscriptionSyncingRef = useRef(false);
     const hiddenSocketDisconnectTimerRef = useRef<number | null>(null);
     const pwaUpdateReloadTimerRef = useRef<number | null>(null);
     const pwaUpdateReloadingRef = useRef(false);
@@ -1776,6 +1820,7 @@ export default function App() {
             group: 'Connectivity',
             items: [
                 { id: 'settings-webhooks', label: 'Outgoing Webhooks' },
+                { id: 'settings-notifications', label: 'Notifications' },
                 ...(
                     hiddenUiFeatures.some((feature) => String(feature).trim().toLowerCase() === 'calls')
                         ? []
@@ -2125,6 +2170,113 @@ export default function App() {
         });
     }, []);
 
+    const playNotificationGlassSound = useCallback(async (force = false): Promise<boolean> => {
+        if (!force && !notificationSoundEnabledRef.current) return false;
+        if (typeof window === 'undefined') return false;
+
+        const AudioContextCtor = window.AudioContext || (window as any).webkitAudioContext;
+        if (!AudioContextCtor) return false;
+
+        const ctx: AudioContext = notificationAudioContextRef.current || new AudioContextCtor();
+        notificationAudioContextRef.current = ctx;
+
+        if (ctx.state === 'suspended') {
+            try {
+                await ctx.resume();
+            } catch {
+                return false;
+            }
+        }
+
+        if (ctx.state !== 'running') return false;
+
+        const startAt = ctx.currentTime + 0.01;
+        const master = ctx.createGain();
+        master.gain.setValueAtTime(0.0001, startAt);
+        master.connect(ctx.destination);
+
+        const tones = [
+            { frequency: 1318.51, at: 0.0, gain: 0.18, decay: 0.28 },
+            { frequency: 1760.0, at: 0.045, gain: 0.14, decay: 0.26 },
+            { frequency: 2349.32, at: 0.09, gain: 0.11, decay: 0.22 }
+        ];
+
+        tones.forEach((tone) => {
+            const baseOsc = ctx.createOscillator();
+            baseOsc.type = 'triangle';
+            baseOsc.frequency.setValueAtTime(tone.frequency, startAt + tone.at);
+
+            const sparkleOsc = ctx.createOscillator();
+            sparkleOsc.type = 'sine';
+            sparkleOsc.frequency.setValueAtTime(tone.frequency * 2, startAt + tone.at);
+
+            const highpass = ctx.createBiquadFilter();
+            highpass.type = 'highpass';
+            highpass.frequency.setValueAtTime(780, startAt);
+
+            const baseGain = ctx.createGain();
+            baseGain.gain.setValueAtTime(0.0001, startAt + tone.at);
+            baseGain.gain.exponentialRampToValueAtTime(tone.gain, startAt + tone.at + 0.016);
+            baseGain.gain.exponentialRampToValueAtTime(0.0001, startAt + tone.at + tone.decay);
+
+            const sparkleGain = ctx.createGain();
+            sparkleGain.gain.setValueAtTime(0.0001, startAt + tone.at);
+            sparkleGain.gain.exponentialRampToValueAtTime(tone.gain * 0.35, startAt + tone.at + 0.012);
+            sparkleGain.gain.exponentialRampToValueAtTime(0.0001, startAt + tone.at + tone.decay);
+
+            baseOsc.connect(baseGain);
+            sparkleOsc.connect(sparkleGain);
+            baseGain.connect(highpass);
+            sparkleGain.connect(highpass);
+            highpass.connect(master);
+
+            baseOsc.start(startAt + tone.at);
+            sparkleOsc.start(startAt + tone.at);
+            baseOsc.stop(startAt + tone.at + tone.decay + 0.05);
+            sparkleOsc.stop(startAt + tone.at + tone.decay + 0.05);
+        });
+
+        master.gain.exponentialRampToValueAtTime(0.65, startAt + 0.03);
+        master.gain.exponentialRampToValueAtTime(0.0001, startAt + 0.72);
+
+        return true;
+    }, []);
+
+    const handleToggleNotificationSound = useCallback((enabled: boolean) => {
+        setNotificationSoundEnabled(enabled);
+        if (enabled) {
+            void playNotificationGlassSound(true);
+        }
+    }, [playNotificationGlassSound]);
+
+    const handleTestNotificationSound = useCallback(async () => {
+        const played = await playNotificationGlassSound(true);
+        if (played) {
+            showToast('Playing iPhone Glass notification sound.', 'success');
+            return;
+        }
+        showToast('Unable to play notification sound on this device right now.', 'error');
+    }, [playNotificationGlassSound, showToast]);
+
+    useEffect(() => {
+        notificationSoundEnabledRef.current = notificationSoundEnabled;
+        try {
+            window.localStorage.setItem(NOTIFICATION_SOUND_PREF_KEY, notificationSoundEnabled ? '1' : '0');
+        } catch {
+            // ignore persistence failures
+        }
+    }, [notificationSoundEnabled]);
+
+    useEffect(() => {
+        return () => {
+            const ctx = notificationAudioContextRef.current;
+            notificationAudioContextRef.current = null;
+            if (ctx) {
+                void ctx.close().catch(() => undefined);
+            }
+        };
+    }, []);
+
     const clearPwaUpdateReloadTimer = useCallback(() => {
         if (pwaUpdateReloadTimerRef.current !== null) {
             window.clearTimeout(pwaUpdateReloadTimerRef.current);
@@ -2178,6 +2330,9 @@ export default function App() {
             setNotificationPermissionState(permission);
             if (permission === 'granted') {
                 showToast('Notifications enabled for incoming chat alerts.', 'success');
+                window.setTimeout(() => {
+                    void syncWebPushSubscription(true);
+                }, 0);
                 return;
             }
             if (permission === 'denied') {
@@ -2546,6 +2701,131 @@ export default function App() {
         [refreshAccessToken, session?.access_token]
     );
 
+    const syncWebPushSubscription = useCallback(async (force = false): Promise<boolean> => {
+        const currentUserId = typeof session?.user?.id === 'string' ? session.user.id.trim() : '';
+        if (!currentUserId || !session?.access_token) return false;
+        if (typeof window === 'undefined') return false;
+        if (!window.isSecureContext) return false;
+        if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) return false;
+        if (Notification.permission !== 'granted') return false;
+
+        if (pushSubscriptionUserIdRef.current !== currentUserId) {
+            pushSubscriptionUserIdRef.current = currentUserId;
+            pushSubscriptionEndpointRef.current = '';
+        }
+
+        if (pushSubscriptionSyncingRef.current) return false;
+        pushSubscriptionSyncingRef.current = true;
+
+        try {
+            let registration: ServiceWorkerRegistration | null = null;
+            try {
+                registration = (await navigator.serviceWorker.getRegistration()) || null;
+            } catch {
+                registration = null;
+            }
+
+            if (!registration) {
+                try {
+                    registration = await navigator.serviceWorker.register('/sw.js');
+                } catch {
+                    registration = null;
+                }
+            }
+
+            if (!registration) {
+                const readyRegistration = await Promise.race<ServiceWorkerRegistration | null>([
+                    navigator.serviceWorker.ready,
+                    new Promise<null>((resolve) => {
+                        window.setTimeout(() => resolve(null), 2400);
+                    })
+                ]);
+                registration = readyRegistration;
+            }
+
+            if (!registration?.pushManager) return false;
+
+            const keyRes = await fetchWithSessionAuth(SOCKET_URL + '/api/push/public-key');
+            const keyData = await keyRes.json().catch(() => null);
+            const publicKey = typeof keyData?.publicKey === 'string' ? keyData.publicKey.trim() : '';
+            if (!keyRes.ok || !keyData?.success || !keyData?.enabled || !publicKey) {
+                return false;
+            }
+
+            let subscription = await registration.pushManager.getSubscription();
+            if (!subscription) {
+                subscription = await registration.pushManager.subscribe({
+                    userVisibleOnly: true,
+                    applicationServerKey: urlBase64ToUint8Array(publicKey)
+                });
+            }
+            if (!subscription) return false;
+
+            const payload = subscription.toJSON();
+            const endpoint = typeof payload?.endpoint === 'string' ? payload.endpoint.trim() : '';
+            if (!endpoint) return false;
+
+            if (!force && endpoint === pushSubscriptionEndpointRef.current) {
+                return true;
+            }
+
+            const subscribeRes = await fetchWithSessionAuth(SOCKET_URL + '/api/push/subscribe', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ subscription: payload })
+            });
+            const subscribeData = await subscribeRes.json().catch(() => null);
+            if (!subscribeRes.ok || !subscribeData?.success) {
+                throw new Error(subscribeData?.error || 'Failed to register push subscription.');
+            }
+
+            pushSubscriptionEndpointRef.current = endpoint;
+            pushSubscriptionUserIdRef.current = currentUserId;
+            return true;
+        } catch (error) {
+            console.warn('[push] Failed to sync browser push subscription:', error);
+            return false;
+        } finally {
+            pushSubscriptionSyncingRef.current = false;
+        }
+    }, [fetchWithSessionAuth, session?.access_token, session?.user?.id]);
+
+    useEffect(() => {
+        if (!session?.access_token || !session?.user?.id) {
+            pushSubscriptionEndpointRef.current = '';
+            pushSubscriptionUserIdRef.current = null;
+            return;
+        }
+        if (notificationPermissionState !== 'granted') return;
+        if (typeof window === 'undefined') return;
+        if (!window.isSecureContext) return;
+        if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+
+        let cancelled = false;
+        let retryTimer: number | null = null;
+        let attempts = 0;
+        const maxAttempts = 8;
+
+        const attemptSync = async (force = false) => {
+            attempts += 1;
+            const synced = await syncWebPushSubscription(force);
+            if (cancelled || synced || attempts >= maxAttempts) return;
+            retryTimer = window.setTimeout(() => {
+                void attemptSync();
+            }, 1200);
+        };
+
+        void attemptSync();
+
+        return () => {
+            cancelled = true;
+            if (retryTimer !== null) {
+                window.clearTimeout(retryTimer);
+            }
+        };
+    }, [notificationPermissionState, session?.access_token, session?.user?.id, syncWebPushSubscription]);
     const fetchTeamUsers = useCallback(async () => {
         if (!session?.access_token) return;
         setTeamUsersLoading(true);
@@ -3904,10 +4184,16 @@ export default function App() {
                 || (typeof latest?.pushName === 'string' && latest.pushName.trim())
                 || fallbackName
                 || 'New message';
-            const baseBody = getIncomingNotificationPreview(latest);
-            const body = notificationCandidates.length > 1
-                ? `${baseBody} (+${notificationCandidates.length - 1} more)`
-                : baseBody;
+            const notificationSuffix = notificationCandidates.length > 1
+                ? ` (+${notificationCandidates.length - 1} more)`
+                : '';
+            const body = `${truncateNotificationBody(
+                getIncomingNotificationPreview(latest),
+                Math.max(24, MAX_NOTIFICATION_BODY_LENGTH - notificationSuffix.length)
+            )}${notificationSuffix}`;
+
+            void playNotificationGlassSound();
+
 
             if (document.visibilityState === 'visible') {
                 showToast(`${senderName}: ${body}`, 'success');
@@ -4056,6 +4342,7 @@ export default function App() {
                 : 'Cross-device notification test';
 
             showToast(`[Test] ${body}`, 'success');
+            void playNotificationGlassSound();
 
             const canShowSystemNotification = 'Notification' in window && Notification.permission === 'granted';
             if (!canShowSystemNotification) return;
@@ -7841,6 +8128,15 @@ export default function App() {
                         onSaveQuickReplies={saveQuickReplies}
                         onRefreshUiControls={fetchUiControls}
                         showCallSettings={!isUiFeatureHidden('calls')}
+                        notificationPermission={notificationPermissionState}
+                        notificationSoundEnabled={notificationSoundEnabled}
+                        onToggleNotificationSound={handleToggleNotificationSound}
+                        onRequestNotifications={() => {
+                            void handleRequestNotificationPermission();
+                        }}
+                        onTestNotificationSound={() => {
+                            void handleTestNotificationSound();
+                        }}
                         WebhookViewComponent={LazyWebhookView}
                     />
                 )
@@ -7907,7 +8203,7 @@ export default function App() {
                                             disabled={analyticsLoading}
                                             className="h-10 px-4 rounded-lg bg-[#00a884] text-white text-[11px] font-semibold uppercase tracking-wide hover:bg-[#008f6f] transition-all disabled:opacity-60"
                                         >
-                                            {analyticsLoading ? 'Loading…' : 'Apply'}
+                                            {analyticsLoading ? 'Loading...' : 'Apply'}
                                         </button>
                                     </div>
                                 </div>
