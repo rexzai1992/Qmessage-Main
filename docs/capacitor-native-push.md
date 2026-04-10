@@ -78,10 +78,26 @@ Send `data.url` or `data.chat`:
 }
 ```
 
-## Next backend step (required for production)
+## Backend status in this repo
 
-Current bridge logs native token in-app.  
-To deliver native push, add backend endpoints for device token registration and push fan-out via:
+Native push backend is now wired:
 
-- Firebase Admin SDK (Android/iOS via FCM)
-- APNs directly (optional if not using FCM for iOS)
+- Token register route: `POST /api/push/native/register`
+- Token unregister route: `POST /api/push/native/unregister`
+- Token storage file: `native_push_tokens.json`
+- FCM fan-out is sent for background/offline users on inbound messages.
+- Android push channel + sound used in payload:
+  - `channel_id: "qmessage-chat"`
+  - `sound: "iphone_glass"`
+
+### Required backend env vars
+
+Set one credential method:
+
+- `FCM_SERVICE_ACCOUNT_JSON` (raw service account JSON)
+- `FCM_SERVICE_ACCOUNT_BASE64` (base64 of service account JSON)
+- `FCM_SERVICE_ACCOUNT_FILE` (absolute path)
+
+Optional:
+
+- `FCM_PROJECT_ID` (overrides detected project id)

@@ -13,6 +13,7 @@ export const NATIVE_PUSH_ACTION_EVENT = 'qmessage:native-push-action';
 
 export type NativePushTokenEventDetail = {
     value: string;
+    platform: 'android' | 'ios' | '';
 };
 
 export type NativePushReceivedEventDetail = {
@@ -39,6 +40,8 @@ const dispatchWindowEvent = <T>(eventName: string, detail: T) => {
 const ensureAndroidNotificationChannel = async () => {
     if (Capacitor.getPlatform() !== 'android') return;
     try {
+        // Recreate the channel so updated custom sound assets are picked up.
+        await PushNotifications.deleteChannel({ id: NATIVE_PUSH_CHANNEL_ID }).catch(() => undefined);
         await PushNotifications.createChannel({
             id: NATIVE_PUSH_CHANNEL_ID,
             name: 'Chat Messages',
@@ -57,7 +60,9 @@ const attachPushListeners = async () => {
         await PushNotifications.addListener('registration', (token: Token) => {
             const value = typeof token?.value === 'string' ? token.value.trim() : '';
             if (!value) return;
-            dispatchWindowEvent<NativePushTokenEventDetail>(NATIVE_PUSH_TOKEN_EVENT, { value });
+            const platformRaw = Capacitor.getPlatform();
+            const platform = platformRaw === 'android' || platformRaw === 'ios' ? platformRaw : '';
+            dispatchWindowEvent<NativePushTokenEventDetail>(NATIVE_PUSH_TOKEN_EVENT, { value, platform });
         })
     );
 

@@ -41,8 +41,13 @@ export function registerSocketHandlers(io: Server, ctx: any) {
         hasRoleAtLeast,
         normalizeTeamRole,
         deleteMessagesForUser,
-        sendPushNotificationToUsers
+        sendPushNotificationToUsers,
+        sendNativePushNotificationToUsers
     } = ctx
+
+    const sendNativePushSafe: (input: any) => Promise<void> = typeof sendNativePushNotificationToUsers === 'function'
+        ? sendNativePushNotificationToUsers
+        : async () => { }
 
     const isLikelyGroupTarget = (value: string | null | undefined): boolean => {
         const raw = typeof value === 'string' ? value.trim() : ''
@@ -343,6 +348,7 @@ io.on('connection', async (socket) => {
     // Join user-specific room for private emits
     socket.join(userId)
     socket.join(getCompanyRoom(companyId))
+    socket.data.appVisibility = 'visible'
 
     if (lastServerStats) {
         socket.emit('server.stats', lastServerStats)
@@ -615,6 +621,19 @@ io.on('connection', async (socket) => {
                 },
                 ttlSeconds: 120
             })
+            await sendNativePushSafe({
+                companyId,
+                userIds: [userId],
+                title: eventPayload.title,
+                body: eventPayload.body,
+                url: '/',
+                tag: `test-notification:${eventPayload.id}`,
+                data: {
+                    type: 'test',
+                    fromUserId: userId
+                },
+                ttlSeconds: 120
+            })
             if (typeof ack === 'function') {
                 ack({ success: true, data: eventPayload })
             }
@@ -623,6 +642,16 @@ io.on('connection', async (socket) => {
                 ack({ success: false, error: error?.message || 'Failed to send notification test.' })
             }
         }
+    })
+
+    socket.on('presence.visibility', (payload) => {
+        const rawVisibility = typeof payload === 'string'
+            ? payload
+            : typeof payload?.visibility === 'string'
+                ? payload.visibility
+                : ''
+        const normalizedVisibility = rawVisibility.trim().toLowerCase()
+        socket.data.appVisibility = normalizedVisibility === 'visible' ? 'visible' : 'hidden'
     })
 
     socket.on('contact.update', async ({ profileId, jid, name, tags }) => {

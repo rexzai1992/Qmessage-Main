@@ -2,6 +2,7 @@
 import React, { Suspense, lazy, useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { List, useDynamicRowHeight, useListRef } from 'react-window';
 import { io, Socket } from 'socket.io-client';
+import { Capacitor } from '@capacitor/core';
 import {
     Search,
     MoreVertical,
@@ -1702,6 +1703,13 @@ export default function App() {
     const [sendingTestNotification, setSendingTestNotification] = useState(false);
     const [pwaUpdateRegistration, setPwaUpdateRegistration] = useState<ServiceWorkerRegistration | null>(null);
     const [showPwaUpdateBanner, setShowPwaUpdateBanner] = useState(false);
+    const [nativePushTokenState, setNativePushTokenState] = useState<{
+        token: string;
+        platform: 'android' | 'ios' | '';
+    }>({
+        token: '',
+        platform: ''
+    });
 
     const [activeView, setActiveView] = useState<'dashboard' | 'chatflow' | 'settings' | 'admin'>('dashboard');
     const [workspaceSection, setWorkspaceSection] = useState<
@@ -1772,6 +1780,10 @@ export default function App() {
     const pushSubscriptionEndpointRef = useRef('');
     const pushSubscriptionUserIdRef = useRef<string | null>(null);
     const pushSubscriptionSyncingRef = useRef(false);
+    const nativePushSyncedTokenRef = useRef('');
+    const nativePushSyncedPlatformRef = useRef<'android' | 'ios' | ''>('');
+    const nativePushSyncedUserIdRef = useRef<string | null>(null);
+    const nativePushTokenSyncingRef = useRef(false);
     const hiddenSocketDisconnectTimerRef = useRef<number | null>(null);
     const pwaUpdateReloadTimerRef = useRef<number | null>(null);
     const pwaUpdateReloadingRef = useRef(false);
@@ -2277,8 +2289,19 @@ export default function App() {
         const handleNativePushToken = (event: Event) => {
             const detail = (event as CustomEvent<NativePushTokenEventDetail>).detail;
             const token = typeof detail?.value === 'string' ? detail.value.trim() : '';
+            const platform = detail?.platform === 'android' || detail?.platform === 'ios'
+                ? detail.platform
+                : '';
             if (!token) return;
-            pushLog(`[Native Push] Device token ready (${token.slice(0, 10)}...).`, 'info');
+            setNativePushTokenState((prev) => (
+                prev.token === token && prev.platform === platform
+                    ? prev
+                    : { token, platform }
+            ));
+            pushLog(
+                `[Native Push] Device token ready (${token.slice(0, 10)}...)${platform ? ` [${platform}]` : ''}.`,
+                'info'
+            );
         };
 
         window.addEventListener(NATIVE_PUSH_TOKEN_EVENT, handleNativePushToken as EventListener);
@@ -2892,6 +2915,100 @@ export default function App() {
             }
         };
     }, [notificationPermissionState, session?.access_token, session?.user?.id, syncWebPushSubscription]);
+
+    const syncNativePushToken = useCallback(async (force = false): Promise<boolean> => {
+        const currentUserId = typeof session?.user?.id === 'string' ? session.user.id.trim() : '';
+        const accessToken = typeof session?.access_token === 'string' ? session.access_token.trim() : '';
+        if (!currentUserId || !accessToken) return false;
+        if (!Capacitor.isNativePlatform()) return false;
+
+        const token = typeof nativePushTokenState.token === 'string' ? nativePushTokenState.token.trim() : '';
+        const platformFromState = nativePushTokenState.platform;
+        const platformRaw = platformFromState || Capacitor.getPlatform();
+        const platform = platformRaw === 'android' || platformRaw === 'ios' ? platformRaw : '';
+
+        if (!token || !platform) return false;
+
+        if (nativePushSyncedUserIdRef.current !== currentUserId) {
+            nativePushSyncedTokenRef.current = '';
+            nativePushSyncedPlatformRef.current = '';
+            nativePushSyncedUserIdRef.current = currentUserId;
+        }
+
+        if (
+            !force
+            && nativePushSyncedTokenRef.current === token
+            && nativePushSyncedPlatformRef.current === platform
+            && nativePushSyncedUserIdRef.current === currentUserId
+        ) {
+            return true;
+        }
+
+        if (nativePushTokenSyncingRef.current) return false;
+        nativePushTokenSyncingRef.current = true;
+
+        try {
+            const registerRes = await fetchWithSessionAuth(`${SOCKET_URL}/api/push/native/register`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    token,
+                    platform,
+                    appId: 'com.qmessage.app'
+                })
+            });
+            const registerData = await registerRes.json().catch(() => null);
+            if (!registerRes.ok || !registerData?.success) {
+                throw new Error(registerData?.error || 'Failed to register native push token.');
+            }
+
+            nativePushSyncedTokenRef.current = token;
+            nativePushSyncedPlatformRef.current = platform;
+            nativePushSyncedUserIdRef.current = currentUserId;
+            return true;
+        } catch (error) {
+            console.warn('[native-push] Failed to sync native push token:', error);
+            return false;
+        } finally {
+            nativePushTokenSyncingRef.current = false;
+        }
+    }, [fetchWithSessionAuth, nativePushTokenState.platform, nativePushTokenState.token, session?.access_token, session?.user?.id]);
+
+    useEffect(() => {
+        if (!session?.access_token || !session?.user?.id) {
+            nativePushSyncedTokenRef.current = '';
+            nativePushSyncedPlatformRef.current = '';
+            nativePushSyncedUserIdRef.current = null;
+            return;
+        }
+        if (!Capacitor.isNativePlatform()) return;
+
+        let cancelled = false;
+        let retryTimer: number | null = null;
+        let attempts = 0;
+        const maxAttempts = 5;
+
+        const attemptSync = async (force = false) => {
+            attempts += 1;
+            const synced = await syncNativePushToken(force);
+            if (cancelled || synced || attempts >= maxAttempts) return;
+            retryTimer = window.setTimeout(() => {
+                void attemptSync();
+            }, 1400);
+        };
+
+        void attemptSync();
+
+        return () => {
+            cancelled = true;
+            if (retryTimer !== null) {
+                window.clearTimeout(retryTimer);
+            }
+        };
+    }, [session?.access_token, session?.user?.id, syncNativePushToken]);
+
     const fetchTeamUsers = useCallback(async () => {
         if (!session?.access_token) return;
         setTeamUsersLoading(true);
@@ -4146,6 +4263,12 @@ export default function App() {
             lastRealtimeEventAtRef.current = nowMs;
         };
 
+        const emitPresenceVisibility = () => {
+            if (!newSocket.connected) return;
+            const visibility = document.visibilityState === 'visible' ? 'visible' : 'hidden';
+            newSocket.emit('presence.visibility', { visibility });
+        };
+
         newSocket.on('connect', () => {
             const profileId = activeProfileIdRef.current;
             if (profileId) {
@@ -4156,6 +4279,7 @@ export default function App() {
                 });
             }
             lastRealtimeEventAtRef.current = Date.now();
+            emitPresenceVisibility();
         });
 
         newSocket.on('profiles.update', (data) => {
@@ -4706,6 +4830,7 @@ export default function App() {
         };
 
         const handleVisibilityChange = () => {
+            emitPresenceVisibility();
             if (document.visibilityState === 'visible') {
                 clearHiddenDisconnectTimer();
                 if (!newSocket.connected) newSocket.connect();

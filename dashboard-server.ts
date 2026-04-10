@@ -34,6 +34,8 @@ import { registerAiRoutes } from './dashboard-server/routes/aiRoutes'
 import { getCompanyAiSettings } from './dashboard-server/services/aiSettingsSupabase'
 import { loadOpenAiMemoryForUser, requestOpenAiCompletion, type OpenAiChatMessage } from './dashboard-server/services/openaiAssistant'
 import { createPushSubscriptionStore } from './dashboard-server/services/pushSubscriptionStore'
+import { createNativePushTokenStore } from './dashboard-server/services/nativePushTokenStore'
+import { createNativeFcmPushSender } from './dashboard-server/services/fcmNativePush'
 import { registerSocketHandlers } from './dashboard-server/socket/registerSocketHandlers'
 import { errorHandler } from './dashboard-server/middleware/error'
 import { requireSupabaseUser } from './dashboard-server/middleware/auth'
@@ -2708,8 +2710,13 @@ const WEB_PUSH_VAPID_FILE = resolvePath('webpush_vapid.json')
 const WEB_PUSH_SUBSCRIPTIONS_FILE = resolvePath('push_subscriptions.json')
 const WEB_PUSH_NOTIFICATION_ICON = '/icons/icon-192.png'
 const WEB_PUSH_NOTIFICATION_BADGE = '/icons/icon-192.png'
+const NATIVE_PUSH_TOKENS_FILE = resolvePath('native_push_tokens.json')
+const NATIVE_PUSH_CHANNEL_ID = 'qmessage-chat'
+const NATIVE_PUSH_SOUND = 'iphone_glass'
 
 const pushSubscriptionStore = createPushSubscriptionStore(WEB_PUSH_SUBSCRIPTIONS_FILE)
+const nativePushTokenStore = createNativePushTokenStore(NATIVE_PUSH_TOKENS_FILE)
+const nativeFcmPushSender = createNativeFcmPushSender(console)
 
 type WebPushVapidDetails = {
     publicKey: string
@@ -2858,6 +2865,37 @@ const getCompanyRecipientUserIdsForPush = async (companyId: string, fallbackUser
     return Array.from(result)
 }
 
+const getPushPresenceForUserId = (userId: string): 'active' | 'background' | 'offline' => {
+    const normalizedUserId = typeof userId === 'string' ? userId.trim() : ''
+    if (!normalizedUserId) return 'offline'
+
+    const room = io.sockets.adapter.rooms.get(normalizedUserId)
+    if (!room || room.size === 0) return 'offline'
+
+    for (const socketId of room) {
+        const socket = io.sockets.sockets.get(socketId)
+        if (!socket) continue
+        const visibility = typeof socket.data?.appVisibility === 'string'
+            ? socket.data.appVisibility.trim().toLowerCase()
+            : ''
+        if (visibility === 'visible' || !visibility) {
+            return 'active'
+        }
+    }
+
+    return 'background'
+}
+
+const selectBackgroundPushUserIds = (userIds: string[]): string[] => {
+    const uniqueUserIds = Array.from(new Set(
+        (Array.isArray(userIds) ? userIds : [])
+            .map((value) => (typeof value === 'string' ? value.trim() : ''))
+            .filter(Boolean)
+    ))
+    if (uniqueUserIds.length === 0) return []
+    return uniqueUserIds.filter((userId) => getPushPresenceForUserId(userId) !== 'active')
+}
+
 const sendPushNotificationToUsers = async (input: SendPushNotificationInput): Promise<void> => {
     if (!webPushVapidDetails) return
 
@@ -2921,6 +2959,52 @@ const sendPushNotificationToUsers = async (input: SendPushNotificationInput): Pr
 
     const durationMs = Date.now() - startedAt
     const summary = `[push] Delivered ${deliveredCount}/${subscriptions.length} push notification(s) in ${durationMs}ms.`
+    if (durationMs > 1500) {
+        console.warn(summary)
+    } else {
+        console.log(summary)
+    }
+}
+
+const sendNativePushNotificationToUsers = async (input: SendPushNotificationInput): Promise<void> => {
+    if (!nativeFcmPushSender.enabled) return
+
+    const userIds = Array.from(new Set((Array.isArray(input.userIds) ? input.userIds : [])
+        .map((value) => (typeof value === 'string' ? value.trim() : ''))
+        .filter(Boolean)))
+    if (userIds.length === 0) return
+
+    const companyId = normalizeCompanyId(input.companyId)
+    if (!companyId) return
+
+    const deviceTokens = nativePushTokenStore.getByUsers(userIds, companyId)
+    if (deviceTokens.length === 0) return
+
+    const startedAt = Date.now()
+    const tokens = Array.from(new Set(deviceTokens.map((entry) => entry.token).filter(Boolean)))
+    if (tokens.length === 0) return
+
+    const sendResult = await nativeFcmPushSender.send({
+        tokens,
+        title: (input.title || 'QMessage').slice(0, 120),
+        body: (input.body || 'New WhatsApp update available.').slice(0, 240),
+        ttlSeconds: Math.max(30, Math.min(3600, Math.floor(input.ttlSeconds || 120))),
+        channelId: NATIVE_PUSH_CHANNEL_ID,
+        sound: NATIVE_PUSH_SOUND,
+        iosCategory: 'QMESSAGE_CHAT',
+        tag: input.tag || `company:${companyId}`,
+        data: {
+            url: input.url || '/',
+            ...(input.data || {})
+        }
+    })
+
+    if (sendResult.staleTokens.length > 0) {
+        nativePushTokenStore.removeManyByToken(sendResult.staleTokens)
+    }
+
+    const durationMs = Date.now() - startedAt
+    const summary = `[native-push] Delivered ${sendResult.successCount}/${sendResult.attempted} FCM push notification(s) in ${durationMs}ms.`
     if (durationMs > 1500) {
         console.warn(summary)
     } else {
@@ -3009,6 +3093,64 @@ app.post('/api/push/unsubscribe', requireSupabaseUserMiddleware, async (req: any
     }
 
     const removed = pushSubscriptionStore.removeByEndpoint(endpoint)
+    return res.json({ success: true, removed })
+})
+
+app.post('/api/push/native/register', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    const baseUser = req?.supabaseUser
+    if (!baseUser) {
+        return res.status(401).json({ success: false, error: 'Authentication required.' })
+    }
+
+    const { user, companyId } = await ensureUserCompanyId(baseUser)
+    const normalizedCompanyId = normalizeCompanyId(companyId || getUserCompanyId(user))
+    if (!normalizedCompanyId) {
+        return res.status(400).json({ success: false, error: 'Company ID is missing for this account.' })
+    }
+
+    const input = req?.body?.device || req?.body
+    const result = nativePushTokenStore.upsert(input, {
+        userId: user.id,
+        companyId: normalizedCompanyId,
+        userAgent: typeof req?.headers?.['user-agent'] === 'string' ? req.headers['user-agent'] : null
+    })
+
+    if (!result.success) {
+        return res.status(400).json({ success: false, error: result.error })
+    }
+
+    return res.json({
+        success: true,
+        token: result.token,
+        platform: result.platform
+    })
+})
+
+app.post('/api/push/native/unregister', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    const baseUser = req?.supabaseUser
+    if (!baseUser) {
+        return res.status(401).json({ success: false, error: 'Authentication required.' })
+    }
+
+    const { user, companyId } = await ensureUserCompanyId(baseUser)
+    const normalizedCompanyId = normalizeCompanyId(companyId || getUserCompanyId(user))
+    const token = typeof req?.body?.token === 'string'
+        ? req.body.token.trim()
+        : typeof req?.body?.device?.token === 'string'
+            ? req.body.device.token.trim()
+            : ''
+
+    if (!token) {
+        return res.status(400).json({ success: false, error: 'Native push token is required.' })
+    }
+
+    const userTokens = nativePushTokenStore.getByUser(user.id, normalizedCompanyId)
+    const belongsToUser = userTokens.some((entry) => entry.token === token)
+    if (!belongsToUser) {
+        return res.status(404).json({ success: false, error: 'Native token not found for this user.' })
+    }
+
+    const removed = nativePushTokenStore.removeByToken(token)
     return res.json({ success: true, removed })
 })
 
@@ -5201,6 +5343,7 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
     io.to(getCompanyRoom(companyId)).emit('messages.upsert', { profileId, messages: [syntheticMsg], type: 'notify' })
 
     const notificationRecipientUserIds = await getCompanyRecipientUserIdsForPush(companyId)
+    const backgroundNotificationRecipientUserIds = selectBackgroundPushUserIds(notificationRecipientUserIds)
     const senderName =
         (contact && typeof contact.name === 'string' && contact.name.trim())
         || (typeof inbound.contactName === 'string' && inbound.contactName.trim())
@@ -5210,6 +5353,20 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
     void sendPushNotificationToUsers({
         companyId,
         userIds: notificationRecipientUserIds,
+        title: senderName,
+        body: getInboundNotificationPreview(inbound, text),
+        url: `/?chat=${encodeURIComponent(remoteJid)}`,
+        tag: `chat:${remoteJid}`,
+        data: {
+            profileId,
+            chat: remoteJid
+        },
+        ttlSeconds: 120
+    })
+
+    void sendNativePushNotificationToUsers({
+        companyId,
+        userIds: backgroundNotificationRecipientUserIds,
         title: senderName,
         body: getInboundNotificationPreview(inbound, text),
         url: `/?chat=${encodeURIComponent(remoteJid)}`,
@@ -5374,7 +5531,8 @@ registerSocketHandlers(io, {
     hasRoleAtLeast,
     normalizeTeamRole,
     deleteMessagesForUser,
-    sendPushNotificationToUsers
+    sendPushNotificationToUsers,
+    sendNativePushNotificationToUsers
 })
 
 app.use(errorHandler)
