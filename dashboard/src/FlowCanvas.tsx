@@ -496,6 +496,91 @@ const nodeTypes = {
             <Handle type="source" position={Position.Bottom} className="w-3 h-3 bg-emerald-500 border-2 border-white" />
         </div>
     ),
+    SIMULATE_PAYMENT: (props: any) => (
+        <div className="bg-white border border-[#eceff1] p-5 rounded-2xl shadow-[0_8px_30px_rgba(0,0,0,0.06)] w-[360px] text-[#111b21] group hover:border-teal-500/30 transition-all">
+            <Handle type="target" position={Position.Top} className="w-3 h-3 bg-[#aebac1] border-2 border-white" />
+            <div className="flex items-center gap-3 mb-3">
+                <div className="w-8 h-8 rounded-full bg-teal-50 flex items-center justify-center text-teal-600">
+                    <LinkIcon className="w-4 h-4" />
+                </div>
+                <span className="font-black text-[10px] uppercase tracking-widest text-teal-600">Simulate Payment</span>
+                <button onClick={() => props.data.onDelete(props.id)} className="ml-auto opacity-0 group-hover:opacity-100 text-rose-500 hover:bg-rose-50 p-1.5 rounded-lg transition-all">
+                    <Trash2 className="w-3.5 h-3.5" />
+                </button>
+            </div>
+            <textarea
+                className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl p-3 text-xs h-20 resize-none focus:outline-none focus:border-teal-400 font-medium"
+                value={props.data.body || ''}
+                onChange={(e) => props.data.onChange(props.id, { body: e.target.value })}
+                placeholder="Payment instruction text..."
+            />
+            <div className="grid grid-cols-1 gap-2 mt-3">
+                <input
+                    className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-[11px] focus:outline-none focus:border-teal-400 font-bold"
+                    value={props.data.buttonText || ''}
+                    onChange={(e) => props.data.onChange(props.id, { buttonText: e.target.value })}
+                    placeholder="Button label (e.g. Pay now)"
+                />
+                <input
+                    className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-[10px] focus:outline-none focus:border-teal-400 font-mono"
+                    value={props.data.url || ''}
+                    onChange={(e) => props.data.onChange(props.id, { url: e.target.value })}
+                    placeholder="Payment URL (https://...)"
+                />
+                <div className="grid grid-cols-2 gap-2">
+                    <input
+                        className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-[10px] focus:outline-none focus:border-teal-400 font-medium"
+                        value={props.data.amount || ''}
+                        onChange={(e) => props.data.onChange(props.id, { amount: e.target.value })}
+                        placeholder="Amount (e.g. 59.90)"
+                    />
+                    <input
+                        className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-[10px] focus:outline-none focus:border-teal-400 font-medium uppercase"
+                        value={props.data.currency || ''}
+                        onChange={(e) => props.data.onChange(props.id, { currency: e.target.value.toUpperCase() })}
+                        placeholder="Currency (USD)"
+                    />
+                </div>
+                <input
+                    className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-[10px] focus:outline-none focus:border-teal-400 font-medium"
+                    value={props.data.successKeywords || ''}
+                    onChange={(e) => props.data.onChange(props.id, { successKeywords: e.target.value })}
+                    placeholder='Success keywords (e.g. payment_success, paid)'
+                />
+                <input
+                    className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-[10px] focus:outline-none focus:border-teal-400 font-medium"
+                    value={props.data.pendingText || ''}
+                    onChange={(e) => props.data.onChange(props.id, { pendingText: e.target.value })}
+                    placeholder='Pending reply when not paid'
+                />
+                <input
+                    className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-[10px] focus:outline-none focus:border-teal-400 font-medium"
+                    value={props.data.receiptText || ''}
+                    onChange={(e) => props.data.onChange(props.id, { receiptText: e.target.value })}
+                    placeholder='Receipt text after success (supports {{receipt_id}})'
+                />
+                <input
+                    className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-[10px] focus:outline-none focus:border-teal-400 font-medium"
+                    value={props.data.expiredText || ''}
+                    onChange={(e) => props.data.onChange(props.id, { expiredText: e.target.value })}
+                    placeholder="Expiry message (optional)"
+                />
+                <input
+                    type="number"
+                    min={1}
+                    max={10080}
+                    className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-3 py-2 text-[10px] focus:outline-none focus:border-teal-400 font-medium"
+                    value={props.data.expiresInMinutes ?? ''}
+                    onChange={(e) => {
+                        const raw = e.target.value;
+                        props.data.onChange(props.id, { expiresInMinutes: raw === '' ? '' : Number(raw) });
+                    }}
+                    placeholder="Expiry minutes (optional)"
+                />
+            </div>
+            <Handle type="source" position={Position.Bottom} className="w-3 h-3 bg-teal-500 border-2 border-white" />
+        </div>
+    ),
     IMAGE: (props: any) => (
         <div className="bg-white border border-[#eceff1] p-5 rounded-2xl shadow-[0_8px_30px_rgba(0,0,0,0.06)] w-64 text-[#111b21] group hover:border-orange-500/30 transition-all">
             <Handle type="target" position={Position.Top} className="w-3 h-3 bg-[#aebac1] border-2 border-white" />
@@ -1023,9 +1108,26 @@ export default function FlowCanvas({
                 onDelete: handleNodeDelete,
                 options: type === 'QUESTION' ? ['View Menu', 'Support'] : [],
                 sections: type === 'LIST' ? [{ title: '', rows: [{ title: 'New option', description: '', id: '' }] }] : [],
-                body: type === 'CTA_URL' ? 'Tap below to continue.' : (type === 'LIST' ? 'Please choose an option:' : ''),
-                buttonText: type === 'CTA_URL' ? 'Open' : (type === 'LIST' ? 'View options' : ''),
-                url: type === 'CTA_URL' ? 'https://example.com' : '',
+                body:
+                    type === 'SIMULATE_PAYMENT'
+                        ? 'Please complete your payment using the link below.'
+                        : type === 'CTA_URL'
+                            ? 'Tap below to continue.'
+                            : (type === 'LIST' ? 'Please choose an option:' : ''),
+                buttonText:
+                    type === 'SIMULATE_PAYMENT'
+                        ? 'Pay now'
+                        : type === 'CTA_URL'
+                            ? 'Open'
+                            : (type === 'LIST' ? 'View options' : ''),
+                url: type === 'SIMULATE_PAYMENT' ? 'https://pay.example/checkout/INV-1001' : (type === 'CTA_URL' ? 'https://example.com' : ''),
+                amount: type === 'SIMULATE_PAYMENT' ? '59.90' : '',
+                currency: type === 'SIMULATE_PAYMENT' ? 'USD' : '',
+                successKeywords: type === 'SIMULATE_PAYMENT' ? 'payment_success, paid, done' : '',
+                pendingText: type === 'SIMULATE_PAYMENT' ? 'I still have not received payment. Please complete payment and tap "Payment Success".' : '',
+                receiptText: type === 'SIMULATE_PAYMENT' ? 'Payment received. Receipt ID: {{receipt_id}}.' : '',
+                expiredText: type === 'SIMULATE_PAYMENT' ? 'This payment link has expired.' : '',
+                expiresInMinutes: type === 'SIMULATE_PAYMENT' ? '' : '',
                 headerText: '',
                 footerText: '',
                 fallbackText: '',
@@ -1103,6 +1205,9 @@ export default function FlowCanvas({
                     <button onClick={() => addNode('CTA_URL')} className="w-full px-3 py-2.5 bg-white hover:bg-[#00a884]/5 text-[#111b21] text-xs font-bold border border-[#eceff1] rounded-xl transition-all flex items-center gap-2">
                         <LinkIcon className="w-4 h-4 text-emerald-600" /> CTA URL
                     </button>
+                    <button onClick={() => addNode('SIMULATE_PAYMENT')} className="w-full px-3 py-2.5 bg-white hover:bg-[#00a884]/5 text-[#111b21] text-xs font-bold border border-[#eceff1] rounded-xl transition-all flex items-center gap-2">
+                        <LinkIcon className="w-4 h-4 text-teal-600" /> Simulate Payment
+                    </button>
                     <button onClick={() => addNode('END')} className="w-full px-3 py-2.5 bg-white hover:bg-rose-50 text-rose-500 text-xs font-bold border border-rose-100 rounded-xl transition-all flex items-center gap-2">
                         <Square className="w-4 h-4" /> End
                     </button>
@@ -1131,6 +1236,7 @@ export default function FlowCanvas({
                             if (n.type === 'ASK') return '#7c3aed';
                             if (n.type === 'ATTR_CONFIRM') return '#059669';
                             if (n.type === 'CTA_URL') return '#10b981';
+                            if (n.type === 'SIMULATE_PAYMENT') return '#0d9488';
                             if (n.type === 'LIST') return '#0ea5e9';
                             if (n.type === 'CONDITION') return '#eab308';
                             if (n.type === 'TAG') return '#c026d3';

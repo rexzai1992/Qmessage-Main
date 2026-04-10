@@ -183,7 +183,7 @@ export default function ChatflowView({
                                             JSON Actions
                                         </button>
                                         <span className="text-[11px] text-[#8696a0]">
-                                            Visual builder supports send message, ask question (save variable), confirm attributes, question choices, list, condition, CTA URL, template send, add tags, assign staff, and trigger workflow.
+                                            Visual builder supports send message, ask question (save variable), confirm attributes, question choices, list, condition, CTA URL, simulate payment, template send, add tags, assign staff, and trigger workflow.
                                         </span>
                                     </div>
                                     {workflowEditorMode === 'visual' ? (

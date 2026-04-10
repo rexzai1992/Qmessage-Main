@@ -43,6 +43,19 @@ export type WorkflowAction =
           template?: { name: string; language?: string; components?: any[] }
       }
     | {
+          type: 'simulate_payment'
+          body: string
+          payment_url: string
+          button_text?: string
+          amount?: string
+          currency?: string
+          success_keywords?: string[]
+          pending_text?: string
+          receipt_text?: string
+          expired_text?: string
+          expires_in_minutes?: number
+      }
+    | {
           type: 'send_image'
           link: string
           caption?: string
@@ -134,6 +147,20 @@ export type WorkflowState = {
         fallback_text?: string
         retry_limit?: number
         edit_prompt?: string
+    }
+    awaiting_payment?: {
+        body?: string
+        payment_url: string
+        button_text?: string
+        amount?: string
+        currency?: string
+        success_keywords?: string[]
+        pending_text?: string
+        receipt_text?: string
+        expired_text?: string
+        expires_at?: string
+        next_step?: number
+        expired_notified?: boolean
     }
     fallback_count?: number
 }

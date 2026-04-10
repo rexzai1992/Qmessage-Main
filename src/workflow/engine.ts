@@ -153,6 +153,30 @@ type AwaitingConfirmationState = {
     edit_prompt?: string
 }
 
+type AwaitingPaymentState = {
+    body?: string
+    payment_url: string
+    button_text?: string
+    amount?: string
+    currency?: string
+    success_keywords?: string[]
+    pending_text?: string
+    receipt_text?: string
+    expired_text?: string
+    expires_at?: string
+    next_step?: number
+    expired_notified?: boolean
+}
+
+const PAYMENT_SUCCESS_BUTTON_ID = 'payment_success'
+const PAYMENT_NOT_SUCCESS_BUTTON_ID = 'payment_not_success'
+const PAYMENT_SUCCESS_BUTTON_TITLE = 'Payment Success'
+const PAYMENT_NOT_SUCCESS_BUTTON_TITLE = 'Payment Not Success'
+const DEFAULT_PAYMENT_SUCCESS_KEYWORDS = [PAYMENT_SUCCESS_BUTTON_ID, 'paid', 'done', 'payment_done', 'success']
+const DEFAULT_PAYMENT_PENDING_TEXT = 'I still have not received payment. Please complete payment and tap "Payment Success".'
+const DEFAULT_PAYMENT_RECEIPT_TEXT = 'Payment received. Receipt ID: {{receipt_id}}.'
+const DEFAULT_PAYMENT_EXPIRED_TEXT = 'This payment link has expired.'
+
 function humanizeVariableLabel(key: string): string {
     const normalized = normalizeVariableKey(key)
     if (!normalized) return ''
@@ -317,6 +341,106 @@ function normalizeChoiceKey(value: unknown): string {
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '_')
         .replace(/^_+|_+$/g, '')
+}
+
+function normalizePaymentKeywords(raw: unknown): string[] {
+    if (Array.isArray(raw)) {
+        const cleaned = raw
+            .map((value) => normalizeChoiceKey(value))
+            .filter(Boolean)
+        return cleaned.length > 0 ? Array.from(new Set(cleaned)) : [...DEFAULT_PAYMENT_SUCCESS_KEYWORDS]
+    }
+    if (typeof raw === 'string') {
+        const cleaned = raw
+            .split(',')
+            .map((value) => normalizeChoiceKey(value))
+            .filter(Boolean)
+        return cleaned.length > 0 ? Array.from(new Set(cleaned)) : [...DEFAULT_PAYMENT_SUCCESS_KEYWORDS]
+    }
+    return [...DEFAULT_PAYMENT_SUCCESS_KEYWORDS]
+}
+
+function parsePositiveInt(value: unknown): number | null {
+    const parsed = Number(value)
+    if (!Number.isFinite(parsed)) return null
+    const rounded = Math.floor(parsed)
+    if (rounded <= 0) return null
+    return rounded
+}
+
+function sanitizeAwaitingPayment(raw: any): AwaitingPaymentState | undefined {
+    if (!raw || typeof raw !== 'object') return undefined
+    const paymentUrl = typeof raw.payment_url === 'string' ? raw.payment_url.trim() : ''
+    if (!paymentUrl) return undefined
+    const expiresAt = (() => {
+        if (typeof raw.expires_at !== 'string' || !raw.expires_at.trim()) return undefined
+        const parsed = new Date(raw.expires_at)
+        if (Number.isNaN(parsed.getTime())) return undefined
+        return parsed.toISOString()
+    })()
+
+    return {
+        payment_url: paymentUrl,
+        body: typeof raw.body === 'string' ? raw.body : undefined,
+        button_text: typeof raw.button_text === 'string' ? raw.button_text : undefined,
+        amount: typeof raw.amount === 'string' ? raw.amount.trim() : undefined,
+        currency: typeof raw.currency === 'string' ? raw.currency.trim().toUpperCase() : undefined,
+        success_keywords: normalizePaymentKeywords(raw.success_keywords),
+        pending_text: typeof raw.pending_text === 'string' ? raw.pending_text : undefined,
+        receipt_text: typeof raw.receipt_text === 'string' ? raw.receipt_text : undefined,
+        expired_text: typeof raw.expired_text === 'string' ? raw.expired_text : undefined,
+        expires_at: expiresAt,
+        next_step: typeof raw.next_step === 'number' && Number.isFinite(raw.next_step) ? raw.next_step : undefined,
+        expired_notified: Boolean(raw.expired_notified)
+    }
+}
+
+function hasPaymentExpired(expiresAt?: string): boolean {
+    if (!expiresAt) return false
+    const parsed = new Date(expiresAt).getTime()
+    if (!Number.isFinite(parsed)) return false
+    return Date.now() >= parsed
+}
+
+function isPaymentSuccessReply(answer: string, keywords: string[]): boolean {
+    const normalizedAnswer = normalizeChoiceKey(answer)
+    if (!normalizedAnswer) return false
+    const keys = normalizePaymentKeywords(keywords)
+    if (keys.includes(normalizedAnswer)) return true
+    const tokens = normalizedAnswer.split('_').filter(Boolean)
+    return tokens.some((token) => keys.includes(token))
+}
+
+function generateReceiptId(): string {
+    const stamp = new Date().toISOString().replace(/\D/g, '').slice(0, 14)
+    const randomSuffix = Math.floor(1000 + Math.random() * 9000)
+    return `RCP-${stamp}-${randomSuffix}`
+}
+
+function buildSimulatedPaymentPrompt(
+    body: string,
+    paymentUrl: string,
+    amount?: string,
+    currency?: string
+): string {
+    const cleanedBody = body.trim() || 'Please complete your payment using the link below.'
+    const normalizedAmount = (amount || '').trim()
+    const normalizedCurrency = (currency || '').trim().toUpperCase()
+    const lines = [cleanedBody]
+    if (normalizedAmount) {
+        lines.push(`Amount: ${normalizedCurrency ? `${normalizedCurrency} ` : ''}${normalizedAmount}`)
+    }
+    lines.push(`Payment link: ${paymentUrl}`)
+    lines.push('Testing simulation: tap one button below.')
+    return lines.join('\n')
+}
+
+function isPaymentNotSuccessReply(answer: string): boolean {
+    const normalized = normalizeChoiceKey(answer)
+    return normalized === PAYMENT_NOT_SUCCESS_BUTTON_ID
+        || normalized === 'payment_failed'
+        || normalized === 'not_paid'
+        || normalized === 'failed'
 }
 
 function resolveAwaitingButtonId(
@@ -499,6 +623,7 @@ export class WorkflowEngine {
                 currentState.qa_history = sanitizeQaHistory(memory.qa_history)
             }
             currentState.awaiting_confirmation = sanitizeAwaitingConfirmation(currentState.awaiting_confirmation)
+            currentState.awaiting_payment = sanitizeAwaitingPayment((currentState as any).awaiting_payment)
         }
         const isFirstMessage = !lastMessage
         const matchedIncomingButtonId = resolveAwaitingButtonId(ctx, currentState?.awaiting_buttons)
@@ -534,9 +659,10 @@ export class WorkflowEngine {
         const canContinueAwaitingConfirmation = Boolean(
             currentState?.awaiting_confirmation?.fields?.length && inboundAnswer
         )
+        const canContinueAwaitingPayment = Boolean(currentState?.awaiting_payment?.payment_url)
         const canContinueActiveWorkflow =
             Boolean(currentState?.workflow_id) &&
-            (canContinueAwaitingButtons || canContinueAwaitingInput || canContinueAwaitingConfirmation)
+            (canContinueAwaitingButtons || canContinueAwaitingInput || canContinueAwaitingConfirmation || canContinueAwaitingPayment)
 
         // Human takeover pauses new automation while still allowing active workflow replies to complete.
         if (ctx.automationDisabled && !canContinueActiveWorkflow) {
@@ -561,7 +687,8 @@ export class WorkflowEngine {
             const awaiting = Boolean(
                 (state?.awaiting_buttons && state.awaiting_buttons.length > 0) ||
                 state?.awaiting_input?.save_as ||
-                (state?.awaiting_confirmation && state.awaiting_confirmation.fields?.length > 0)
+                (state?.awaiting_confirmation && state.awaiting_confirmation.fields?.length > 0) ||
+                state?.awaiting_payment?.payment_url
             )
             const completed =
                 actions.length === 0 ||
@@ -572,6 +699,147 @@ export class WorkflowEngine {
             }
         } else {
             state = null
+        }
+
+        if (state?.awaiting_payment?.payment_url) {
+            const awaitingPayment = sanitizeAwaitingPayment(state.awaiting_payment)
+            if (!awaitingPayment) {
+                state.awaiting_payment = undefined
+            } else {
+                state.awaiting_payment = awaitingPayment
+                const answer = getInboundAnswer(ctx)
+                const success = Boolean(answer) && isPaymentSuccessReply(answer, awaitingPayment.success_keywords || [])
+                const notSuccess = Boolean(answer) && isPaymentNotSuccessReply(answer)
+
+                if (success) {
+                    const paidAt = new Date().toISOString()
+                    const receiptId = generateReceiptId()
+                    state.vars = {
+                        ...sanitizeVars(state.vars),
+                        payment_status: 'paid',
+                        payment_link: awaitingPayment.payment_url,
+                        payment_paid_at: paidAt,
+                        receipt_id: receiptId,
+                        ...(awaitingPayment.amount ? { payment_amount: awaitingPayment.amount } : {}),
+                        ...(awaitingPayment.currency ? { payment_currency: awaitingPayment.currency } : {})
+                    }
+                    state.awaiting_payment = undefined
+                    if (typeof awaitingPayment.next_step === 'number' && Number.isFinite(awaitingPayment.next_step)) {
+                        state.step_index = awaitingPayment.next_step
+                    }
+                    state.fallback_count = 0
+
+                    const receiptTemplate = awaitingPayment.receipt_text || DEFAULT_PAYMENT_RECEIPT_TEXT
+                    const receiptText = renderDynamicText(receiptTemplate, state, user, ctx).trim() || DEFAULT_PAYMENT_RECEIPT_TEXT
+                    let sentReceipt = false
+                    try {
+                        await sendWhatsAppMessage({
+                            client: ctx.client,
+                            userId: user.id,
+                            to: ctx.phoneNumber,
+                            type: 'text',
+                            content: { text: receiptText },
+                            workflowState: state
+                        })
+                        sentReceipt = true
+                    } catch (error: any) {
+                        console.warn('[Workflow] simulate_payment receipt failed:', error?.message || error)
+                    }
+
+                    if (inboundRecord?.id) {
+                        await updateMessageWorkflowState(inboundRecord.id, state)
+                    }
+
+                    if (workflow) {
+                        const continued = await this.runWorkflowActions(ctx, user, workflow, state)
+                        return continued.error
+                            ? { error: continued.error, handled: true, replied: sentReceipt || continued.replied }
+                            : { handled: true, replied: sentReceipt || continued.replied }
+                    }
+
+                    return { handled: true, replied: sentReceipt }
+                }
+
+                if (hasPaymentExpired(awaitingPayment.expires_at)) {
+                    state.awaiting_payment = undefined
+                    state.fallback_count = 0
+                    const workflowActions = workflow ? parseActions(workflow.actions) : []
+                    if (workflowActions.length > 0) {
+                        state.step_index = workflowActions.length
+                    }
+                    const expiredTemplate = awaitingPayment.expired_text || DEFAULT_PAYMENT_EXPIRED_TEXT
+                    const expiredMessage = renderDynamicText(expiredTemplate, state, user, ctx).trim() || DEFAULT_PAYMENT_EXPIRED_TEXT
+                    let sentExpired = false
+                    try {
+                        await sendWhatsAppMessage({
+                            client: ctx.client,
+                            userId: user.id,
+                            to: ctx.phoneNumber,
+                            type: 'text',
+                            content: { text: expiredMessage },
+                            workflowState: state
+                        })
+                        sentExpired = true
+                    } catch (error: any) {
+                        console.warn('[Workflow] simulate_payment expired message failed:', error?.message || error)
+                    }
+                    if (inboundRecord?.id) {
+                        await updateMessageWorkflowState(inboundRecord.id, state)
+                    }
+                    return { handled: true, replied: sentExpired }
+                }
+
+                const pendingTemplate = awaitingPayment.pending_text || DEFAULT_PAYMENT_PENDING_TEXT
+                const pendingIntroRaw = notSuccess
+                    ? 'Payment marked not successful. Please try again and tap "Payment Success" once paid.'
+                    : pendingTemplate
+                const pendingIntro = renderDynamicText(pendingIntroRaw, state, user, ctx).trim() || DEFAULT_PAYMENT_PENDING_TEXT
+                const pendingBody = buildSimulatedPaymentPrompt(
+                    pendingIntro,
+                    awaitingPayment.payment_url,
+                    awaitingPayment.amount,
+                    awaitingPayment.currency
+                )
+                let sentPending = false
+                try {
+                    await sendWhatsAppMessage({
+                        client: ctx.client,
+                        userId: user.id,
+                        to: ctx.phoneNumber,
+                        type: 'buttons',
+                        content: {
+                            text: pendingBody,
+                            buttons: normalizeButtons([
+                                { id: PAYMENT_SUCCESS_BUTTON_ID, title: PAYMENT_SUCCESS_BUTTON_TITLE },
+                                { id: PAYMENT_NOT_SUCCESS_BUTTON_ID, title: PAYMENT_NOT_SUCCESS_BUTTON_TITLE }
+                            ])
+                        },
+                        workflowState: state
+                    })
+                    sentPending = true
+                } catch (error: any) {
+                    console.warn('[Workflow] simulate_payment pending buttons failed:', error?.message || error)
+                    try {
+                        await sendWhatsAppMessage({
+                            client: ctx.client,
+                            userId: user.id,
+                            to: ctx.phoneNumber,
+                            type: 'text',
+                            content: {
+                                text: `${pendingBody}\n${awaitingPayment.payment_url}`
+                            },
+                            workflowState: state
+                        })
+                        sentPending = true
+                    } catch (textError: any) {
+                        console.warn('[Workflow] simulate_payment pending text failed:', textError?.message || textError)
+                    }
+                }
+                if (inboundRecord?.id) {
+                    await updateMessageWorkflowState(inboundRecord.id, state)
+                }
+                return { handled: true, replied: sentPending }
+            }
         }
 
         if (state?.awaiting_input?.save_as) {
@@ -955,6 +1223,7 @@ export class WorkflowEngine {
         state.vars = sanitizeVars(state.vars)
         state.qa_history = sanitizeQaHistory(state.qa_history)
         state.awaiting_confirmation = sanitizeAwaitingConfirmation(state.awaiting_confirmation)
+        state.awaiting_payment = sanitizeAwaitingPayment((state as any).awaiting_payment)
         let replied = false
 
         if (state.awaiting_buttons && state.awaiting_buttons.length > 0) {
@@ -974,6 +1243,9 @@ export class WorkflowEngine {
             return { handled: true, replied: false }
         }
         if (state.awaiting_confirmation?.fields?.length) {
+            return { handled: true, replied: false }
+        }
+        if (state.awaiting_payment?.payment_url) {
             return { handled: true, replied: false }
         }
 
@@ -1073,8 +1345,8 @@ export class WorkflowEngine {
                 const nextAction = actions[nextIndex]
                 const chainInteractive =
                     nextAction &&
-                    ['send_buttons', 'send_list', 'send_cta_url'].includes(nextAction.type)
-                if (chainInteractive || (nextAction && ['send_text', 'send_template', 'add_tags', 'assign_staff', 'ask_question', 'confirm_attributes', 'condition', 'set_tag', 'update_state'].includes(nextAction.type))) {
+                    ['send_buttons', 'send_list', 'send_cta_url', 'simulate_payment'].includes(nextAction.type)
+                if (chainInteractive || (nextAction && ['send_text', 'send_template', 'add_tags', 'assign_staff', 'ask_question', 'confirm_attributes', 'condition', 'set_tag', 'update_state', 'simulate_payment'].includes(nextAction.type))) {
                     index = nextIndex
                     continue
                 }
@@ -1410,6 +1682,85 @@ export class WorkflowEngine {
                     const msg = error?.message || String(error)
                     console.warn('[Workflow] send_cta_url failed:', msg)
                     lastError = `send_cta_url failed: ${msg}`
+                }
+                break
+            }
+
+            if (action.type === 'simulate_payment') {
+                const paymentUrl = renderDynamicText(action.payment_url || '', state, user, ctx).trim()
+                if (!paymentUrl) {
+                    lastError = 'simulate_payment failed: payment_url is required'
+                    break
+                }
+
+                const bodyTemplate =
+                    typeof action.body === 'string' && action.body.trim()
+                        ? action.body
+                        : 'Please complete your payment using the link below.'
+                const pendingTemplate =
+                    typeof action.pending_text === 'string' && action.pending_text.trim()
+                        ? action.pending_text
+                        : DEFAULT_PAYMENT_PENDING_TEXT
+                const receiptTemplate =
+                    typeof action.receipt_text === 'string' && action.receipt_text.trim()
+                        ? action.receipt_text
+                        : DEFAULT_PAYMENT_RECEIPT_TEXT
+                const expiredTemplate =
+                    typeof action.expired_text === 'string' && action.expired_text.trim()
+                        ? action.expired_text
+                        : DEFAULT_PAYMENT_EXPIRED_TEXT
+
+                const amount = typeof action.amount === 'string' ? renderDynamicText(action.amount, state, user, ctx).trim() : ''
+                const currencyRaw = typeof action.currency === 'string' ? renderDynamicText(action.currency, state, user, ctx).trim() : ''
+                const currency = currencyRaw ? currencyRaw.toUpperCase() : ''
+                const expiresInMinutes = parsePositiveInt(action.expires_in_minutes)
+                const nextStep =
+                    typeof (action as any).next_step === 'number' && (action as any).next_step > index
+                        ? (action as any).next_step
+                        : index + 1
+
+                state.awaiting_payment = {
+                    body: bodyTemplate,
+                    payment_url: paymentUrl,
+                    button_text: typeof action.button_text === 'string' ? action.button_text : 'Pay now',
+                    ...(amount ? { amount } : {}),
+                    ...(currency ? { currency } : {}),
+                    success_keywords: normalizePaymentKeywords(action.success_keywords),
+                    pending_text: pendingTemplate,
+                    receipt_text: receiptTemplate,
+                    expired_text: expiredTemplate,
+                    ...(expiresInMinutes ? { expires_at: new Date(Date.now() + (expiresInMinutes * 60 * 1000)).toISOString() } : {}),
+                    next_step: nextStep,
+                    expired_notified: false
+                }
+                state.fallback_count = 0
+                state.step_index = index
+
+                try {
+                    await sendWhatsAppMessage({
+                        client: ctx.client,
+                        userId: user.id,
+                        to: ctx.phoneNumber,
+                        type: 'buttons',
+                        content: {
+                            text: buildSimulatedPaymentPrompt(
+                                renderDynamicText(bodyTemplate, state, user, ctx),
+                                paymentUrl,
+                                amount,
+                                currency
+                            ),
+                            buttons: normalizeButtons([
+                                { id: PAYMENT_SUCCESS_BUTTON_ID, title: PAYMENT_SUCCESS_BUTTON_TITLE },
+                                { id: PAYMENT_NOT_SUCCESS_BUTTON_ID, title: PAYMENT_NOT_SUCCESS_BUTTON_TITLE }
+                            ])
+                        },
+                        workflowState: state
+                    })
+                    replied = true
+                } catch (error: any) {
+                    const msg = error?.message || String(error)
+                    console.warn('[Workflow] simulate_payment failed:', msg)
+                    lastError = `simulate_payment failed: ${msg}`
                 }
                 break
             }
