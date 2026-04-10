@@ -52,6 +52,142 @@ app.use(express.json({
 const httpServer = createServer(app)
 const activeSockets = new Set<NetSocket>()
 
+type ApiRequestSample = {
+    ts: number
+    route: string
+    status: number
+    durationMs: number
+    inBytes: number
+    outBytes: number
+}
+
+type ApiRouteAggregate = {
+    count: number
+    errorCount: number
+    totalDurationMs: number
+    maxDurationMs: number
+    inBytes: number
+    outBytes: number
+    lastStatus: number
+    lastHitAt: number
+}
+
+const API_MONITOR_WINDOW_MS = 5 * 60 * 1000
+const API_MONITOR_MAX_RECENT = 4000
+const apiMonitor = {
+    startedAt: Date.now(),
+    totalCalls: 0,
+    status2xx: 0,
+    status3xx: 0,
+    status4xx: 0,
+    status5xx: 0,
+    inBytes: 0,
+    outBytes: 0,
+    recent: [] as ApiRequestSample[],
+    routes: new Map<string, ApiRouteAggregate>()
+}
+
+let socketTrafficTotals = {
+    inBytes: 0,
+    outBytes: 0
+}
+
+function safeParseByteHeader(value: unknown): number {
+    if (typeof value === 'number') {
+        return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
+    }
+    if (typeof value === 'string') {
+        const parsed = Number.parseInt(value, 10)
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : 0
+    }
+    if (Array.isArray(value) && value.length > 0) {
+        return safeParseByteHeader(value[0])
+    }
+    return 0
+}
+
+function normalizeApiPathForMonitoring(pathname: string): string {
+    if (!pathname) return '/'
+    return pathname
+        .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/gi, ':uuid')
+        .replace(/\/\d+(?=\/|$)/g, '/:id')
+        .replace(/\/[A-Za-z0-9_-]{18,}(?=\/|$)/g, '/:token')
+}
+
+function pruneRecentApiMonitorSamples(now = Date.now()) {
+    const threshold = now - API_MONITOR_WINDOW_MS
+    while (apiMonitor.recent.length > 0 && apiMonitor.recent[0].ts < threshold) {
+        apiMonitor.recent.shift()
+    }
+    if (apiMonitor.recent.length > API_MONITOR_MAX_RECENT) {
+        apiMonitor.recent.splice(0, apiMonitor.recent.length - API_MONITOR_MAX_RECENT)
+    }
+}
+
+app.use((req: any, res: any, next: any) => {
+    const rawPath = typeof req.path === 'string' ? req.path : ''
+    const trackAsApi = rawPath.startsWith('/api/') || rawPath === '/health'
+    if (!trackAsApi) {
+        next()
+        return
+    }
+
+    const startedAt = Date.now()
+    const inBytes = safeParseByteHeader(req.headers?.['content-length'])
+    const method = typeof req.method === 'string' ? req.method.toUpperCase() : 'GET'
+    const route = `${method} ${normalizeApiPathForMonitoring(rawPath)}`
+
+    res.on('finish', () => {
+        const endedAt = Date.now()
+        const status = Number.isFinite(res.statusCode) ? Number(res.statusCode) : 0
+        const durationMs = Math.max(0, endedAt - startedAt)
+        const outBytes = safeParseByteHeader(res.getHeader?.('content-length'))
+
+        apiMonitor.totalCalls += 1
+        apiMonitor.inBytes += inBytes
+        apiMonitor.outBytes += outBytes
+        if (status >= 500) apiMonitor.status5xx += 1
+        else if (status >= 400) apiMonitor.status4xx += 1
+        else if (status >= 300) apiMonitor.status3xx += 1
+        else if (status >= 200) apiMonitor.status2xx += 1
+
+        apiMonitor.recent.push({
+            ts: endedAt,
+            route,
+            status,
+            durationMs,
+            inBytes,
+            outBytes
+        })
+        pruneRecentApiMonitorSamples(endedAt)
+
+        const previous = apiMonitor.routes.get(route)
+        if (previous) {
+            previous.count += 1
+            previous.totalDurationMs += durationMs
+            previous.maxDurationMs = Math.max(previous.maxDurationMs, durationMs)
+            previous.inBytes += inBytes
+            previous.outBytes += outBytes
+            previous.lastStatus = status
+            previous.lastHitAt = endedAt
+            if (status >= 500) previous.errorCount += 1
+        } else {
+            apiMonitor.routes.set(route, {
+                count: 1,
+                errorCount: status >= 500 ? 1 : 0,
+                totalDurationMs: durationMs,
+                maxDurationMs: durationMs,
+                inBytes,
+                outBytes,
+                lastStatus: status,
+                lastHitAt: endedAt
+            })
+        }
+    })
+
+    next()
+})
+
 httpServer.on('connection', (socket) => {
     activeSockets.add(socket)
     socket.on('close', () => {
@@ -293,6 +429,8 @@ function broadcastServerStats() {
         const elapsedSec = Math.max(1, (now - lastNetSnapshot.timestamp) / 1000)
         const inBytes = Math.max(0, netNow.bytesRead - lastNetSnapshot.bytesRead)
         const outBytes = Math.max(0, netNow.bytesWritten - lastNetSnapshot.bytesWritten)
+        socketTrafficTotals.inBytes += inBytes
+        socketTrafficTotals.outBytes += outBytes
         bandwidth = {
             inBps: inBytes / elapsedSec,
             outBps: outBytes / elapsedSec,
@@ -2711,7 +2849,7 @@ const WEB_PUSH_SUBSCRIPTIONS_FILE = resolvePath('push_subscriptions.json')
 const WEB_PUSH_NOTIFICATION_ICON = '/icons/icon-192.png'
 const WEB_PUSH_NOTIFICATION_BADGE = '/icons/icon-192.png'
 const NATIVE_PUSH_TOKENS_FILE = resolvePath('native_push_tokens.json')
-const NATIVE_PUSH_CHANNEL_ID = 'qmessage-chat'
+const NATIVE_PUSH_CHANNEL_ID = 'qmessage-chat-v4'
 const NATIVE_PUSH_SOUND = 'iphone_glass'
 
 const pushSubscriptionStore = createPushSubscriptionStore(WEB_PUSH_SUBSCRIPTIONS_FILE)
@@ -2866,6 +3004,7 @@ const getCompanyRecipientUserIdsForPush = async (companyId: string, fallbackUser
 }
 
 const getPushPresenceForUserId = (userId: string): 'active' | 'background' | 'offline' => {
+    const PUSH_ACTIVE_VISIBILITY_TTL_MS = 90_000
     const normalizedUserId = typeof userId === 'string' ? userId.trim() : ''
     if (!normalizedUserId) return 'offline'
 
@@ -2878,7 +3017,9 @@ const getPushPresenceForUserId = (userId: string): 'active' | 'background' | 'of
         const visibility = typeof socket.data?.appVisibility === 'string'
             ? socket.data.appVisibility.trim().toLowerCase()
             : ''
-        if (visibility === 'visible' || !visibility) {
+        const visibilityUpdatedAt = Number(socket.data?.appVisibilityUpdatedAt || 0)
+        const hasFreshVisibleState = visibilityUpdatedAt > 0 && (Date.now() - visibilityUpdatedAt) <= PUSH_ACTIVE_VISIBILITY_TTL_MS
+        if (visibility === 'visible' && hasFreshVisibleState) {
             return 'active'
         }
     }
@@ -3683,8 +3824,31 @@ app.get('/api/admin/api-keys', (req: any, res: any) => {
 })
 
 const SUPER_ADMIN_ROLE_VALUES = new Set(['super_admin', 'superadmin', 'super-admin'])
+const BUILT_IN_SUPER_ADMIN_EMAILS = ['izzulfitreee@gmail.com']
+
+function normalizeEmailAddress(value: unknown): string {
+    return typeof value === 'string' ? value.trim().toLowerCase() : ''
+}
+
+function parseSuperAdminEmailList(value: unknown): string[] {
+    if (typeof value !== 'string') return []
+    return value
+        .split(/[,\n;]/g)
+        .map((item) => normalizeEmailAddress(item))
+        .filter((item) => Boolean(item) && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(item))
+}
+
+const SUPER_ADMIN_EMAIL_ALLOWLIST = new Set<string>(
+    [
+        ...BUILT_IN_SUPER_ADMIN_EMAILS,
+        ...parseSuperAdminEmailList(process.env.SUPER_ADMIN_EMAILS || '')
+    ].map((item) => normalizeEmailAddress(item)).filter(Boolean)
+)
 
 function isSuperAdminUser(user: any): boolean {
+    const email = normalizeEmailAddress(user?.email)
+    if (email && SUPER_ADMIN_EMAIL_ALLOWLIST.has(email)) return true
+
     const userMeta = user?.user_metadata || {}
     const appMeta = user?.app_metadata || {}
     const roleCandidates = [
@@ -3853,13 +4017,31 @@ const UI_FEATURE_KEYS = new Set([
     'analytics',
     'settings'
 ])
+const UI_FEATURE_ALIASES: Record<string, string> = {
+    'team_inbox': 'team-inbox',
+    'teaminbox': 'team-inbox',
+    'inbox': 'team-inbox',
+    'automation': 'automations',
+    'broadcasts': 'broadcast',
+    'chatbot': 'chatbots',
+    'contact': 'contacts',
+    'call': 'calls',
+    'analytic': 'analytics',
+    'setting': 'settings',
+    'more': 'analytics',
+    'other': 'analytics'
+}
 
 const UI_HIDDEN_FEATURES_MISSING_MESSAGE =
     'UI controls are not initialized. Run migration 20260407_company_ui_hidden_features.sql.'
 
 function normalizeUiFeatureKey(value: unknown): string {
     if (typeof value !== 'string') return ''
-    const normalized = value.trim().toLowerCase().replace(/\s+/g, '-')
+    const raw = value.trim().toLowerCase()
+    const normalizedBase = raw.replace(/\s+/g, '-')
+    const normalized = UI_FEATURE_ALIASES[normalizedBase]
+        || UI_FEATURE_ALIASES[normalizedBase.replace(/-/g, '')]
+        || normalizedBase
     return UI_FEATURE_KEYS.has(normalized) ? normalized : ''
 }
 
@@ -3901,6 +4083,114 @@ function isUiHiddenFeaturesMissingError(error: any): boolean {
     const code = typeof error?.code === 'string' ? error.code.trim().toUpperCase() : ''
     const message = String(error?.message || '').toLowerCase()
     return code === '42703' && message.includes('ui_hidden_features')
+}
+
+function buildAdminMonitorPayload() {
+    const now = Date.now()
+    pruneRecentApiMonitorSamples(now)
+    const recent = [...apiMonitor.recent]
+
+    const windowCalls = recent.length
+    const window5xx = recent.filter((entry) => entry.status >= 500).length
+    const window4xx = recent.filter((entry) => entry.status >= 400 && entry.status < 500).length
+    const windowInBytes = recent.reduce((sum, entry) => sum + (entry.inBytes || 0), 0)
+    const windowOutBytes = recent.reduce((sum, entry) => sum + (entry.outBytes || 0), 0)
+    const windowAvgDurationMs = windowCalls > 0
+        ? recent.reduce((sum, entry) => sum + (entry.durationMs || 0), 0) / windowCalls
+        : 0
+    const sortedDurations = recent
+        .map((entry) => Number(entry.durationMs || 0))
+        .filter((value) => Number.isFinite(value))
+        .sort((a, b) => a - b)
+    const p95Index = sortedDurations.length > 0
+        ? Math.min(sortedDurations.length - 1, Math.floor((sortedDurations.length - 1) * 0.95))
+        : -1
+    const windowP95DurationMs = p95Index >= 0 ? sortedDurations[p95Index] : 0
+
+    const oldestWindowTs = recent.length > 0 ? recent[0].ts : now
+    const windowSpanSec = Math.max(1, (now - oldestWindowTs) / 1000)
+    const apiInBps = windowInBytes / windowSpanSec
+    const apiOutBps = windowOutBytes / windowSpanSec
+
+    const socketInBps = Number(lastServerStats?.bandwidth?.inBps || 0)
+    const socketOutBps = Number(lastServerStats?.bandwidth?.outBps || 0)
+
+    const topRoutes = Array.from(apiMonitor.routes.entries())
+        .map(([route, value]) => {
+            const calls = Number(value.count || 0)
+            const avgDurationMs = calls > 0 ? value.totalDurationMs / calls : 0
+            const errorRatePct = calls > 0 ? (value.errorCount / calls) * 100 : 0
+            return {
+                route,
+                calls,
+                errorCount: Number(value.errorCount || 0),
+                errorRatePct: Number(errorRatePct.toFixed(2)),
+                avgDurationMs: Number(avgDurationMs.toFixed(1)),
+                maxDurationMs: Number((value.maxDurationMs || 0).toFixed(1)),
+                inBytes: Number(value.inBytes || 0),
+                outBytes: Number(value.outBytes || 0),
+                lastStatus: Number(value.lastStatus || 0),
+                lastHitAt: value.lastHitAt ? new Date(value.lastHitAt).toISOString() : null
+            }
+        })
+        .sort((a, b) => {
+            if (b.calls !== a.calls) return b.calls - a.calls
+            return b.avgDurationMs - a.avgDurationMs
+        })
+        .slice(0, 12)
+
+    const memUsed = Number(lastServerStats?.memUsed || 0)
+    const memTotal = Number(lastServerStats?.memTotal || 0)
+    const memPct = memTotal > 0 ? (memUsed / memTotal) * 100 : Number(lastServerStats?.memPct || 0)
+
+    const totalInBytes = apiMonitor.inBytes + socketTrafficTotals.inBytes
+    const totalOutBytes = apiMonitor.outBytes + socketTrafficTotals.outBytes
+    const windowErrorRatePct = windowCalls > 0 ? (window5xx / windowCalls) * 100 : 0
+    const windowSuccessRatePct = windowCalls > 0 ? ((windowCalls - window5xx) / windowCalls) * 100 : 100
+
+    return {
+        generatedAt: new Date(now).toISOString(),
+        runtime: {
+            uptimeSec: Math.floor(process.uptime()),
+            activeSockets: activeSockets.size,
+            cpuPct: Number(lastServerStats?.cpu || 0),
+            memUsed,
+            memTotal,
+            memPct: Number(memPct.toFixed(1)),
+            heapUsed: Number(lastServerStats?.heapUsed || 0),
+            rss: Number(lastServerStats?.rss || 0)
+        },
+        api: {
+            windowMs: API_MONITOR_WINDOW_MS,
+            totalCalls: apiMonitor.totalCalls,
+            status2xx: apiMonitor.status2xx,
+            status3xx: apiMonitor.status3xx,
+            status4xx: apiMonitor.status4xx,
+            status5xx: apiMonitor.status5xx,
+            windowCalls,
+            window4xx,
+            window5xx,
+            windowErrorRatePct: Number(windowErrorRatePct.toFixed(2)),
+            windowSuccessRatePct: Number(windowSuccessRatePct.toFixed(2)),
+            windowAvgDurationMs: Number(windowAvgDurationMs.toFixed(1)),
+            windowP95DurationMs: Number(windowP95DurationMs.toFixed(1)),
+            topRoutes
+        },
+        traffic: {
+            apiInBytes: apiMonitor.inBytes,
+            apiOutBytes: apiMonitor.outBytes,
+            socketInBytes: socketTrafficTotals.inBytes,
+            socketOutBytes: socketTrafficTotals.outBytes,
+            totalInBytes,
+            totalOutBytes,
+            inBps: Number((apiInBps + socketInBps).toFixed(1)),
+            outBps: Number((apiOutBps + socketOutBps).toFixed(1)),
+            socketInBps: Number(socketInBps.toFixed(1)),
+            socketOutBps: Number(socketOutBps.toFixed(1)),
+            apiInBps: Number(apiInBps.toFixed(1)),
+            apiOutBps: Number(apiOutBps.toFixed(1))
+        }
+    }
 }
 
 async function buildAdminSummaryPayload() {
@@ -4096,7 +4386,11 @@ async function buildAdminSummaryPayload() {
         { companies: 0, profiles: 0, contacts: 0, workflows: 0, waba_configs: 0, waba_enabled: 0, waba_active: 0, messages: 0 }
     )
 
-    return { totals, companies: companyStats }
+    return {
+        totals,
+        monitor: buildAdminMonitorPayload(),
+        companies: companyStats
+    }
 }
 
 // ============================================
@@ -4395,6 +4689,10 @@ app.get('/myadmin', (_req: any, res: any) => {
 	    .problem-bad { color: #b42318; font-size: 11px; display: block; margin-bottom: 2px; }
 	    .btn-save { background: #111b21; color: #fff; padding: 8px 10px; border-radius: 8px; font-size: 11px; }
 	    .btn-save:disabled { opacity: 0.65; cursor: not-allowed; }
+	    .route-muted { color: #667085; font-size: 11px; }
+	    .ops-label { display: block; color: #54656f; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+	    .ops-value { display: block; font-size: 20px; font-weight: 800; margin-top: 4px; }
+	    .ops-meta { display: block; color: #667085; font-size: 11px; margin-top: 4px; }
 	  </style>
 </head>
 <body>
@@ -4423,6 +4721,26 @@ app.get('/myadmin', (_req: any, res: any) => {
 
       <div id="status" class="card status">Ready.</div>
       <div id="totals" class="card totals" style="display:none"></div>
+      <div id="opsMetrics" class="card totals" style="display:none"></div>
+
+      <div id="apiRoutesCard" class="card table-wrap" style="display:none">
+        <table>
+          <thead>
+            <tr>
+              <th>API Route</th>
+              <th class="right">Calls</th>
+              <th class="right">Error %</th>
+              <th class="right">Avg (ms)</th>
+              <th class="right">Avg/Max (ms)</th>
+              <th class="right">Traffic In</th>
+              <th class="right">Traffic Out</th>
+              <th>Last Status</th>
+              <th>Last Hit</th>
+            </tr>
+          </thead>
+          <tbody id="apiRouteRows"></tbody>
+        </table>
+      </div>
 
 	      <div class="card table-wrap">
 	        <table>
@@ -4467,6 +4785,9 @@ app.get('/myadmin', (_req: any, res: any) => {
     const logoutBtn = document.getElementById('logoutBtn');
     const statusEl = document.getElementById('status');
     const totalsEl = document.getElementById('totals');
+    const opsMetricsEl = document.getElementById('opsMetrics');
+    const apiRoutesCardEl = document.getElementById('apiRoutesCard');
+    const apiRouteRowsEl = document.getElementById('apiRouteRows');
     const rowsEl = document.getElementById('companyRows');
     const FEATURE_OPTIONS = [
       { key: 'team-inbox', label: 'Team Inbox' },
@@ -4479,6 +4800,20 @@ app.get('/myadmin', (_req: any, res: any) => {
       { key: 'settings', label: 'Settings' }
     ];
     const FEATURE_KEYS = new Set(FEATURE_OPTIONS.map(function(item) { return item.key; }));
+    const FEATURE_ALIASES = {
+      'team_inbox': 'team-inbox',
+      'teaminbox': 'team-inbox',
+      'inbox': 'team-inbox',
+      'automation': 'automations',
+      'broadcasts': 'broadcast',
+      'chatbot': 'chatbots',
+      'contact': 'contacts',
+      'call': 'calls',
+      'analytic': 'analytics',
+      'setting': 'settings',
+      'more': 'analytics',
+      'other': 'analytics'
+    };
 
     function setStatus(message, isError) {
       statusEl.textContent = message;
@@ -4578,7 +4913,9 @@ app.get('/myadmin', (_req: any, res: any) => {
       const output = [];
       const seen = new Set();
       const push = function(entry) {
-        const normalized = typeof entry === 'string' ? entry.trim().toLowerCase() : '';
+        const raw = typeof entry === 'string' ? entry.trim().toLowerCase() : '';
+        const normalizedBase = raw.replace(/\\s+/g, '-');
+        const normalized = FEATURE_ALIASES[normalizedBase] || FEATURE_ALIASES[normalizedBase.replace(/-/g, '')] || normalizedBase;
         if (!normalized || !FEATURE_KEYS.has(normalized) || seen.has(normalized)) return;
         seen.add(normalized);
         output.push(normalized);
@@ -4626,6 +4963,149 @@ app.get('/myadmin', (_req: any, res: any) => {
         box.appendChild(value);
         totalsEl.appendChild(box);
       });
+    }
+
+    function formatNumber(value) {
+      const num = Number(value || 0);
+      if (!Number.isFinite(num)) return '0';
+      return num.toLocaleString();
+    }
+
+    function formatBytes(value) {
+      const num = Number(value || 0);
+      if (!Number.isFinite(num) || num <= 0) return '0 B';
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let idx = 0;
+      let cur = num;
+      while (cur >= 1024 && idx < units.length - 1) {
+        cur = cur / 1024;
+        idx += 1;
+      }
+      return (cur >= 100 || idx === 0 ? cur.toFixed(0) : cur.toFixed(1)) + ' ' + units[idx];
+    }
+
+    function formatBps(value) {
+      return formatBytes(value) + '/s';
+    }
+
+    function formatDuration(seconds) {
+      const total = Math.max(0, Math.floor(Number(seconds || 0)));
+      const d = Math.floor(total / 86400);
+      const h = Math.floor((total % 86400) / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      if (d > 0) return d + 'd ' + h + 'h';
+      if (h > 0) return h + 'h ' + m + 'm';
+      if (m > 0) return m + 'm ' + s + 's';
+      return s + 's';
+    }
+
+    function renderMonitor(monitor) {
+      opsMetricsEl.innerHTML = '';
+      const runtime = monitor && monitor.runtime ? monitor.runtime : {};
+      const api = monitor && monitor.api ? monitor.api : {};
+      const traffic = monitor && monitor.traffic ? monitor.traffic : {};
+
+      const metricCards = [
+        {
+          label: 'API Calls (Total)',
+          value: formatNumber(api.totalCalls),
+          meta: '2xx ' + formatNumber(api.status2xx) + ' | 4xx ' + formatNumber(api.status4xx) + ' | 5xx ' + formatNumber(api.status5xx)
+        },
+        {
+          label: 'API Calls (5m)',
+          value: formatNumber(api.windowCalls),
+          meta: 'Err ' + String(Number(api.windowErrorRatePct || 0).toFixed(2)) + '% | Success ' + String(Number(api.windowSuccessRatePct || 0).toFixed(2)) + '%'
+        },
+        {
+          label: 'Latency (5m)',
+          value: String(Number(api.windowAvgDurationMs || 0).toFixed(1)) + ' ms',
+          meta: 'P95 ' + String(Number(api.windowP95DurationMs || 0).toFixed(1)) + ' ms'
+        },
+        {
+          label: 'Traffic In / Out',
+          value: formatBytes(traffic.totalInBytes) + ' / ' + formatBytes(traffic.totalOutBytes),
+          meta: formatBps(traffic.inBps) + ' in | ' + formatBps(traffic.outBps) + ' out'
+        },
+        {
+          label: 'CPU / RAM',
+          value: String(Number(runtime.cpuPct || 0).toFixed(1)) + '% / ' + String(Number(runtime.memPct || 0).toFixed(1)) + '%',
+          meta: formatBytes(runtime.memUsed) + ' of ' + formatBytes(runtime.memTotal)
+        },
+        {
+          label: 'Uptime / Sockets',
+          value: formatDuration(runtime.uptimeSec) + ' / ' + formatNumber(runtime.activeSockets),
+          meta: 'Generated ' + (monitor && monitor.generatedAt ? new Date(monitor.generatedAt).toLocaleString() : '-')
+        }
+      ];
+
+      metricCards.forEach(function(item) {
+        const box = document.createElement('div');
+        box.className = 'metric';
+
+        const label = document.createElement('span');
+        label.className = 'ops-label';
+        label.textContent = item.label;
+
+        const value = document.createElement('span');
+        value.className = 'ops-value';
+        value.textContent = item.value;
+
+        const meta = document.createElement('span');
+        meta.className = 'ops-meta';
+        meta.textContent = item.meta;
+
+        box.appendChild(label);
+        box.appendChild(value);
+        box.appendChild(meta);
+        opsMetricsEl.appendChild(box);
+      });
+
+      opsMetricsEl.style.display = 'grid';
+      renderApiRoutes(api.topRoutes);
+    }
+
+    function renderApiRoutes(routes) {
+      apiRouteRowsEl.innerHTML = '';
+      const list = Array.isArray(routes) ? routes : [];
+      if (list.length === 0) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 9;
+        td.className = 'route-muted';
+        td.textContent = 'No API route activity yet.';
+        tr.appendChild(td);
+        apiRouteRowsEl.appendChild(tr);
+        apiRoutesCardEl.style.display = 'block';
+        return;
+      }
+
+      list.forEach(function(route) {
+        const tr = document.createElement('tr');
+        const values = [
+          { v: route.route || '-', mono: true },
+          { v: formatNumber(route.calls), right: true },
+          { v: String(Number(route.errorRatePct || 0).toFixed(2)) + '%', right: true },
+          { v: String(Number(route.avgDurationMs || 0).toFixed(1)), right: true },
+          { v: 'Avg ' + String(Number(route.avgDurationMs || 0).toFixed(1)) + ' / Max ' + String(Number(route.maxDurationMs || 0).toFixed(1)), right: true },
+          { v: formatBytes(route.inBytes), right: true },
+          { v: formatBytes(route.outBytes), right: true },
+          { v: route.lastStatus == null ? '-' : String(route.lastStatus) },
+          { v: route.lastHitAt ? new Date(route.lastHitAt).toLocaleString() : '-' }
+        ];
+
+        values.forEach(function(item) {
+          const td = document.createElement('td');
+          td.textContent = item.v == null ? '-' : String(item.v);
+          if (item.mono) td.className = 'mono';
+          if (item.right) td.className = (td.className ? td.className + ' ' : '') + 'right';
+          tr.appendChild(td);
+        });
+
+        apiRouteRowsEl.appendChild(tr);
+      });
+
+      apiRoutesCardEl.style.display = 'block';
     }
 
     function renderRows(companies) {
@@ -4769,8 +5249,12 @@ app.get('/myadmin', (_req: any, res: any) => {
           throw new Error((data && data.error) || 'Failed to load admin summary');
         }
         renderTotals(data.totals || {});
+        renderMonitor(data.monitor || {});
         renderRows(Array.isArray(data.companies) ? data.companies : []);
-        setStatus('Loaded ' + String((data.totals && data.totals.companies) || 0) + ' companies.', false);
+        const companyCount = String((data.totals && data.totals.companies) || 0);
+        const apiCalls5m = String((data.monitor && data.monitor.api && data.monitor.api.windowCalls) || 0);
+        const errorRate = Number(data.monitor && data.monitor.api ? data.monitor.api.windowErrorRatePct || 0 : 0).toFixed(2);
+        setStatus('Loaded ' + companyCount + ' companies. API calls (5m): ' + apiCalls5m + ', 5xx error rate: ' + errorRate + '%.', false);
       } catch (err) {
         clearCreds();
         showLogin(err && err.message ? err.message : 'Session expired. Please login again.', true);
@@ -4851,6 +5335,10 @@ app.get('/myadmin', (_req: any, res: any) => {
       clearCreds();
       totalsEl.style.display = 'none';
       totalsEl.innerHTML = '';
+      opsMetricsEl.style.display = 'none';
+      opsMetricsEl.innerHTML = '';
+      apiRoutesCardEl.style.display = 'none';
+      apiRouteRowsEl.innerHTML = '';
       rowsEl.innerHTML = '';
       adminPasswordInput.value = '';
       showLogin('Logged out.', false);

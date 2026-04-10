@@ -3,6 +3,7 @@ import React, { Suspense, lazy, useEffect, useState, useRef, useCallback, useMem
 import { List, useDynamicRowHeight, useListRef } from 'react-window';
 import { io, Socket } from 'socket.io-client';
 import { Capacitor } from '@capacitor/core';
+import { PushNotifications } from '@capacitor/push-notifications';
 import {
     Search,
     MoreVertical,
@@ -94,14 +95,22 @@ import {
     type InstallOnboardingDecision
 } from './features/pwa/installUtils';
 import {
+    NATIVE_PUSH_CHANNEL_ID,
     NATIVE_PUSH_ACTION_EVENT,
+    NATIVE_PUSH_CHANNEL_STATUS_EVENT,
     NATIVE_PUSH_RECEIVED_EVENT,
     NATIVE_PUSH_TOKEN_EVENT,
     initializeNativePushBridge,
+    refreshNativePushChannelStatus,
     type NativePushActionEventDetail,
+    type NativePushChannelStatusEventDetail,
     type NativePushReceivedEventDetail,
     type NativePushTokenEventDetail
 } from './features/native/nativePushBridge';
+import {
+    openAndroidAppNotificationSettings,
+    openAndroidChannelNotificationSettings
+} from './features/native/nativeNotificationSettingsBridge';
 
 
 const SOCKET_URL = getSocketUrl();
@@ -117,6 +126,7 @@ const CHAT_SYNC_TIMEOUT_MS = 24_000;
 const SOCKET_STALE_REFRESH_INTERVAL_MS = 90_000;
 const QUICK_REPLIES_PREFETCH_DELAY_MS = 220;
 const NOTIFICATION_SOUND_PREF_KEY = 'qmessage.notification.sound.enabled.v1';
+const ANDROID_HEADS_UP_PROMPT_KEY = 'qmessage.native.android.headsup.prompted.v1';
 
 const readNotificationSoundPreference = (): boolean => {
     if (typeof window === 'undefined') return true;
@@ -127,6 +137,38 @@ const readNotificationSoundPreference = (): boolean => {
         return !(normalized === '0' || normalized === 'false' || normalized === 'off');
     } catch {
         return true;
+    }
+};
+
+const shouldPromptAndroidHeadsUpEnable = (): boolean => {
+    if (typeof window === 'undefined') return false;
+    try {
+        const raw = window.sessionStorage.getItem(ANDROID_HEADS_UP_PROMPT_KEY);
+        return raw !== '1';
+    } catch {
+        return true;
+    }
+};
+
+const markAndroidHeadsUpPrompted = () => {
+    if (typeof window === 'undefined') return;
+    try {
+        window.sessionStorage.setItem(ANDROID_HEADS_UP_PROMPT_KEY, '1');
+    } catch {
+        // ignore persistence failures
+    }
+};
+
+const shouldShowDebugOverlay = (): boolean => {
+    if (import.meta.env.DEV) return true;
+    if (Capacitor.isNativePlatform()) return true;
+    if (typeof window === 'undefined') return false;
+    const protocol = (window.location.protocol || '').toLowerCase();
+    if (protocol === 'capacitor:' || protocol === 'ionic:') return true;
+    try {
+        return new URLSearchParams(window.location.search).get('debug') === '1';
+    } catch {
+        return false;
     }
 };
 
@@ -2309,12 +2351,64 @@ export default function App() {
             window.removeEventListener(NATIVE_PUSH_TOKEN_EVENT, handleNativePushToken as EventListener);
         };
     }, [pushLog]);
+    useEffect(() => {
+        const handleNativePushChannelStatus = (event: Event) => {
+            if (!Capacitor.isNativePlatform() || Capacitor.getPlatform() !== 'android') return;
+
+            const detail = (event as CustomEvent<NativePushChannelStatusEventDetail>).detail;
+            pushLog(
+                `[Native Push] Channel ${detail?.id || 'unknown'} status: headsUp=${detail?.headsUpEnabled ? 'on' : 'off'} importance=${typeof detail?.importance === 'number' ? detail.importance : 'n/a'}.`,
+                detail?.headsUpEnabled ? 'info' : 'error'
+            );
+            if (detail?.headsUpEnabled) return;
+            if (!shouldPromptAndroidHeadsUpEnable()) return;
+
+            markAndroidHeadsUpPrompted();
+            showToast('Heads-up notifications are OFF. Enable Pop on screen for Chat Messages.', 'error');
+
+            const importanceLabel = typeof detail?.importance === 'number'
+                ? ' (importance ' + String(detail.importance) + ')'
+                : '';
+
+            window.setTimeout(() => {
+                const wantsHelp = window.confirm(
+                    'Heads-up alerts are disabled' + importanceLabel + '. Open notification settings and enable Pop on screen for Chat Messages?'
+                );
+                if (!wantsHelp) return;
+
+                void (async () => {
+                    const targetChannelId = (detail?.id || NATIVE_PUSH_CHANNEL_ID || '').trim();
+                    const openedChannelSettings = targetChannelId
+                        ? await openAndroidChannelNotificationSettings(targetChannelId)
+                        : false;
+                    if (openedChannelSettings) return;
+
+                    const openedAppSettings = await openAndroidAppNotificationSettings();
+                    if (openedAppSettings) return;
+
+                    window.alert(
+                        'Android steps:\\n1) Long-press QMessage app icon\\n2) App info\\n3) Notifications\\n4) Chat Messages\\n5) Enable Pop on screen, sound, and vibration'
+                    );
+                })();
+            }, 420);
+        };
+
+        window.addEventListener(NATIVE_PUSH_CHANNEL_STATUS_EVENT, handleNativePushChannelStatus as EventListener);
+        void refreshNativePushChannelStatus();
+        return () => {
+            window.removeEventListener(NATIVE_PUSH_CHANNEL_STATUS_EVENT, handleNativePushChannelStatus as EventListener);
+        };
+    }, [pushLog, showToast]);
 
     useEffect(() => {
         const handleNativePushForeground = (event: Event) => {
-            if (document.visibilityState !== 'visible') return;
             if (socketInstanceRef.current?.connected) return;
             const detail = (event as CustomEvent<NativePushReceivedEventDetail>).detail;
+            pushLog(
+                `[Native Push] Received app=${detail?.appVisibility || 'unknown'} payload=${detail?.payloadKind || 'unknown'} channel=${NATIVE_PUSH_CHANNEL_ID}.`,
+                'info'
+            );
+            if (document.visibilityState !== 'visible') return;
             const title = typeof detail?.title === 'string' ? detail.title.trim() : '';
             const body = typeof detail?.body === 'string' ? detail.body.trim() : '';
             showChatToast(
@@ -2328,7 +2422,7 @@ export default function App() {
         return () => {
             window.removeEventListener(NATIVE_PUSH_RECEIVED_EVENT, handleNativePushForeground as EventListener);
         };
-    }, [playNotificationGlassSound, showChatToast]);
+    }, [playNotificationGlassSound, pushLog, showChatToast]);
 
     const handleToggleNotificationSound = useCallback((enabled: boolean) => {
         setNotificationSoundEnabled(enabled);
@@ -2409,6 +2503,44 @@ export default function App() {
     }, []);
 
     const handleRequestNotificationPermission = useCallback(async () => {
+        if (Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android') {
+            try {
+                const current = await PushNotifications.checkPermissions();
+                let receiveStatus = current.receive;
+                pushLog(`[Native Push] POST_NOTIFICATIONS(check)=${receiveStatus}.`, 'info');
+
+                if (receiveStatus !== 'granted') {
+                    const requested = await PushNotifications.requestPermissions();
+                    receiveStatus = requested.receive;
+                    pushLog(`[Native Push] POST_NOTIFICATIONS(request)=${receiveStatus}.`, requested.receive === 'granted' ? 'info' : 'error');
+                }
+
+                if (receiveStatus === 'granted') {
+                    setNotificationPermissionState('granted');
+                    showToast('Notifications enabled for incoming chat alerts.', 'success');
+                    return;
+                }
+
+                setNotificationPermissionState('denied');
+                showToast('Android notifications are blocked. Open settings to enable them.', 'error');
+                const wantsSettings = window.confirm(
+                    'Android notification permission is blocked. Open app notification settings now?'
+                );
+                if (wantsSettings) {
+                    const opened = await openAndroidAppNotificationSettings();
+                    if (!opened) {
+                        window.alert(
+                            'Android steps:\\n1) Long-press QMessage app icon\\n2) App info\\n3) Notifications\\n4) Enable notifications for this app'
+                        );
+                    }
+                }
+                return;
+            } catch (error: any) {
+                showToast(error?.message || 'Failed to request Android notification permission.', 'error');
+                return;
+            }
+        }
+
         if (!('Notification' in window)) {
             setNotificationPermissionState('unsupported');
             showToast('This device does not support browser notifications.', 'error');
@@ -2430,7 +2562,7 @@ export default function App() {
         } catch (error: any) {
             showToast(error?.message || 'Failed to request notification permission.', 'error');
         }
-    }, [showToast]);
+    }, [pushLog, showToast]);
 
     const handleSendTestNotification = useCallback(async () => {
         if (!socket) {
@@ -3465,10 +3597,26 @@ export default function App() {
             'analytics',
             'settings'
         ]);
+        const aliases: Record<string, string> = {
+            'team_inbox': 'team-inbox',
+            'teaminbox': 'team-inbox',
+            'inbox': 'team-inbox',
+            'automation': 'automations',
+            'broadcasts': 'broadcast',
+            'chatbot': 'chatbots',
+            'contact': 'contacts',
+            'call': 'calls',
+            'analytic': 'analytics',
+            'setting': 'settings',
+            'more': 'analytics',
+            'other': 'analytics'
+        };
         const unique = new Set<string>();
         const push = (entry: unknown) => {
             if (typeof entry !== 'string') return;
-            const normalized = entry.trim().toLowerCase();
+            const raw = entry.trim().toLowerCase();
+            const normalizedBase = raw.replace(/\s+/g, '-');
+            const normalized = aliases[normalizedBase] || aliases[normalizedBase.replace(/-/g, '')] || normalizedBase;
             if (!normalized || !allowed.has(normalized)) return;
             unique.add(normalized);
         };
@@ -3529,8 +3677,8 @@ export default function App() {
             setAppLogoUrl(typeof data?.data?.app_logo_url === 'string' ? data.data.app_logo_url.trim() : '');
         } catch (error: any) {
             console.warn('Failed to load company UI controls:', error?.message || error);
-            setHiddenUiFeatures([]);
-            setAppLogoUrl('');
+            // Preserve previously loaded UI controls on transient/network failures
+            // so hidden features do not suddenly reappear.
         } finally {
             setUiControlsLoading(false);
         }
@@ -4222,9 +4370,11 @@ export default function App() {
         }
 
         setProfilesLoaded(false);
+        const isNativeSocketClient = Capacitor.isNativePlatform();
         const newSocket = io(SOCKET_URL, {
             auth: { token: socketAccessToken },
-            transports: ['websocket', 'polling'],
+            transports: isNativeSocketClient ? ['websocket'] : ['websocket', 'polling'],
+            rememberUpgrade: true,
             autoConnect: false,
             reconnection: true,
             reconnectionAttempts: Infinity,
@@ -4841,6 +4991,8 @@ export default function App() {
         };
 
         const handleWindowFocus = () => requestActiveProfileRefresh();
+        const handleWindowBlur = () => emitPresenceVisibility();
+        const handlePageHide = () => emitPresenceVisibility();
         const handleOnline = () => {
             if (!newSocket.connected) newSocket.connect();
             scheduleActiveProfileRefresh(120);
@@ -4858,19 +5010,27 @@ export default function App() {
             if (staleForMs < SOCKET_STALE_REFRESH_INTERVAL_MS) return;
             emitRefreshMessages();
         }, SOCKET_STALE_REFRESH_INTERVAL_MS);
+        const visibilityHeartbeatTimer = window.setInterval(() => {
+            emitPresenceVisibility();
+        }, 30_000);
 
         document.addEventListener('visibilitychange', handleVisibilityChange);
         window.addEventListener('focus', handleWindowFocus);
+        window.addEventListener('blur', handleWindowBlur);
+        window.addEventListener('pagehide', handlePageHide);
         window.addEventListener('online', handleOnline);
 
         return () => {
             disposed = true;
             window.clearInterval(staleRefreshTimer);
+            window.clearInterval(visibilityHeartbeatTimer);
             if (typeof refreshDebounceTimer === 'number') {
                 window.clearTimeout(refreshDebounceTimer);
             }
             document.removeEventListener('visibilitychange', handleVisibilityChange);
             window.removeEventListener('focus', handleWindowFocus);
+            window.removeEventListener('blur', handleWindowBlur);
+            window.removeEventListener('pagehide', handlePageHide);
             window.removeEventListener('online', handleOnline);
             clearHiddenDisconnectTimer();
             window.clearTimeout(connectTimer);
@@ -6440,6 +6600,10 @@ export default function App() {
 
         const handleNativePushAction = (event: Event) => {
             const detail = (event as CustomEvent<NativePushActionEventDetail>).detail;
+            pushLog(
+                `[Native Push] Action=${detail?.actionId || 'tap'} app=${detail?.appVisibility || 'unknown'} channel=${NATIVE_PUSH_CHANNEL_ID}.`,
+                'info'
+            );
             const payloadData = detail?.payload?.notification?.data as Record<string, unknown> | undefined;
             const urlFromData = typeof payloadData?.url === 'string' ? payloadData.url : '';
             const chatFromData = typeof payloadData?.chat === 'string' ? payloadData.chat : '';
@@ -6470,7 +6634,7 @@ export default function App() {
                 navigator.serviceWorker.removeEventListener('message', handleServiceWorkerMessage);
             }
         };
-    }, [handleOpenChat]);
+    }, [handleOpenChat, pushLog]);
 
     const handleNewChat = () => {
         if (!newPhoneNumber.trim()) return;
@@ -6569,6 +6733,7 @@ export default function App() {
         ];
 
     const showUiControlsSkeleton = Boolean(session?.access_token) && uiControlsLoading;
+    const showDebugOverlay = shouldShowDebugOverlay();
     const workspaceTabs = showUiControlsSkeleton
         ? []
         : baseWorkspaceTabs.filter((tab) => !isUiFeatureHidden(UI_FEATURE_KEY_BY_WORKSPACE_SECTION[tab.id]));
@@ -6800,6 +6965,17 @@ export default function App() {
                                 className="bg-transparent border-none text-[15px] w-full focus:outline-none placeholder:text-[#54656f]"
                             />
                         </div>
+                        {isMobile && !isUiFeatureHidden(SETTINGS_UI_FEATURE_KEY) && (
+                            <button
+                                type="button"
+                                onClick={openSettingsFromMore}
+                                className="w-10 h-10 rounded-xl bg-[#f0f2f5] border border-[#e1e8ed] text-[#54656f] flex items-center justify-center hover:bg-white hover:border-[#cdd8e0] transition-all"
+                                title="Open settings"
+                                aria-label="Open settings"
+                            >
+                                <Settings className="w-4 h-4" />
+                            </button>
+                        )}
                         {!isMobile && (
                             <div className="flex w-[108px] sm:w-[132px] bg-[#f0f2f5] rounded-xl items-center px-2.5 py-2 border border-transparent focus-within:border-[#00a884]/30 transition-all">
                                 <Filter className="w-3.5 h-3.5 text-[#54656f] mr-2" />
@@ -8665,50 +8841,53 @@ export default function App() {
 
             {/* Admin View is handled above - deleting redundant block if any */}
 
+            {showDebugOverlay && (
+                <DebugButton
+                    floating
+                    storageKey="qmessage.debug.position.app"
+                    payload={{
+                        ts: new Date().toISOString(),
+                        env: {
+                            mode: import.meta.env.MODE,
+                            socketUrl: SOCKET_URL
+                        },
+                        session: {
+                            userId: session.user.id,
+                            email: session.user.email || null,
+                            companyId:
+                                (session.user.user_metadata as any)?.company_id ||
+                                (session.user.app_metadata as any)?.company_id ||
+                                null,
+                            expiresAt: session.expires_at || null,
+                            accessToken: redactSecret(session.access_token)
+                        },
+                        socket: {
+                            connected: Boolean(socket?.connected),
+                            id: socket?.id || null
+                        },
+                        state: {
+                            isAdmin,
+                            activeView,
+                            activeProfileId: activeProfileId || null,
+                            connectionStatus,
+                            selectedChatId: selectedChatId || null,
+                            windowOpen,
+                            forceTemplateMode,
+                            lastProfileError
+                        },
+                        counts: {
+                            profiles: profiles.length,
+                            chats: chatList.length,
+                            messages: allMessages.length,
+                            logs: logEntries.length
+                        },
+                        serverStats
+                    }}
+                />
+            )}
+
             {!isMobile && (
             <div className="fixed bottom-6 right-6 z-[200] flex flex-col items-end gap-3">
-                {import.meta.env.DEV && (
-                    <DebugButton
-                        payload={{
-                            ts: new Date().toISOString(),
-                            env: {
-                                mode: import.meta.env.MODE,
-                                socketUrl: SOCKET_URL
-                            },
-                            session: {
-                                userId: session.user.id,
-                                email: session.user.email || null,
-                                companyId:
-                                    (session.user.user_metadata as any)?.company_id ||
-                                    (session.user.app_metadata as any)?.company_id ||
-                                    null,
-                                expiresAt: session.expires_at || null,
-                                accessToken: redactSecret(session.access_token)
-                            },
-                            socket: {
-                                connected: Boolean(socket?.connected),
-                                id: socket?.id || null
-                            },
-                            state: {
-                                isAdmin,
-                                activeView,
-                                activeProfileId: activeProfileId || null,
-                                connectionStatus,
-                                selectedChatId: selectedChatId || null,
-                                windowOpen,
-                                forceTemplateMode,
-                                lastProfileError
-                            },
-                            counts: {
-                                profiles: profiles.length,
-                                chats: chatList.length,
-                                messages: allMessages.length,
-                                logs: logEntries.length
-                            },
-                            serverStats
-                        }}
-                    />
-                )}
                 {logOpen && (
                     <div className="w-[360px] max-h-[60vh] bg-white border border-[#eceff1] rounded-2xl shadow-[0_12px_40px_rgba(0,0,0,0.12)] overflow-hidden">
                         <div className="px-4 py-3 border-b border-[#eceff1] flex items-center gap-2">
@@ -9153,4 +9332,10 @@ export default function App() {
         </>
     );
 }
+
+
+
+
+
+
 

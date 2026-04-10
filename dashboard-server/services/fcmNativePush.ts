@@ -145,7 +145,7 @@ export function createNativeFcmPushSender(logger: Pick<Console, 'log' | 'warn'> 
             const ttlSeconds = Math.max(30, Math.min(3600, Math.floor(Number(input.ttlSeconds || 120))))
             const sound = normalizeString(input.sound) || 'iphone_glass'
             const iosSound = normalizeString(input.iosSound) || `${sound}.caf`
-            const channelId = normalizeString(input.channelId) || 'qmessage-chat'
+            const channelId = normalizeString(input.channelId) || 'qmessage-chat-v4'
             const iosCategory = normalizeString(input.iosCategory) || 'QMESSAGE_CHAT'
             const normalizedData: Record<string, string> = {}
 
@@ -154,6 +154,9 @@ export function createNativeFcmPushSender(logger: Pick<Console, 'log' | 'warn'> 
                 if (!normalizedKey) return
                 normalizedData[normalizedKey] = normalizeDataValue(value).slice(0, 1024)
             })
+            const payloadKind = Object.keys(normalizedData).length > 0 ? 'mixed' : 'notification-only'
+            normalizedData._qmessage_payload_kind = payloadKind
+            normalizedData._qmessage_channel_id = channelId
 
             const chunks: string[][] = []
             for (let index = 0; index < tokens.length; index += 450) {
@@ -166,6 +169,9 @@ export function createNativeFcmPushSender(logger: Pick<Console, 'log' | 'warn'> 
             const staleTokens: string[] = []
 
             for (const chunk of chunks) {
+                logger.log(
+                    `[native-push] Dispatching FCM chunk size=${chunk.length} channel=${channelId} androidPriority=high payload=${payloadKind}.`
+                )
                 const message: MulticastMessage = {
                     tokens: chunk,
                     notification: {
@@ -179,6 +185,10 @@ export function createNativeFcmPushSender(logger: Pick<Console, 'log' | 'warn'> 
                         notification: {
                             channelId,
                             sound,
+                            priority: 'max',
+                            defaultSound: true,
+                            visibility: 'public',
+                            defaultVibrateTimings: true,
                             ...(input.tag ? { tag: normalizeString(input.tag).slice(0, 120) } : {})
                         }
                     },
