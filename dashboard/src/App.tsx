@@ -92,6 +92,15 @@ import {
     type BeforeInstallPromptEvent,
     type InstallOnboardingDecision
 } from './features/pwa/installUtils';
+import {
+    NATIVE_PUSH_ACTION_EVENT,
+    NATIVE_PUSH_RECEIVED_EVENT,
+    NATIVE_PUSH_TOKEN_EVENT,
+    initializeNativePushBridge,
+    type NativePushActionEventDetail,
+    type NativePushReceivedEventDetail,
+    type NativePushTokenEventDetail
+} from './features/native/nativePushBridge';
 
 
 const SOCKET_URL = getSocketUrl();
@@ -2258,6 +2267,45 @@ export default function App() {
 
         return true;
     }, []);
+
+    useEffect(() => {
+        if (!session?.access_token) return;
+        void initializeNativePushBridge();
+    }, [session?.access_token]);
+
+    useEffect(() => {
+        const handleNativePushToken = (event: Event) => {
+            const detail = (event as CustomEvent<NativePushTokenEventDetail>).detail;
+            const token = typeof detail?.value === 'string' ? detail.value.trim() : '';
+            if (!token) return;
+            pushLog(`[Native Push] Device token ready (${token.slice(0, 10)}...).`, 'info');
+        };
+
+        window.addEventListener(NATIVE_PUSH_TOKEN_EVENT, handleNativePushToken as EventListener);
+        return () => {
+            window.removeEventListener(NATIVE_PUSH_TOKEN_EVENT, handleNativePushToken as EventListener);
+        };
+    }, [pushLog]);
+
+    useEffect(() => {
+        const handleNativePushForeground = (event: Event) => {
+            if (document.visibilityState !== 'visible') return;
+            if (socketInstanceRef.current?.connected) return;
+            const detail = (event as CustomEvent<NativePushReceivedEventDetail>).detail;
+            const title = typeof detail?.title === 'string' ? detail.title.trim() : '';
+            const body = typeof detail?.body === 'string' ? detail.body.trim() : '';
+            showChatToast(
+                title || 'QMessage',
+                truncateNotificationBody(body || 'New message')
+            );
+            void playNotificationGlassSound();
+        };
+
+        window.addEventListener(NATIVE_PUSH_RECEIVED_EVENT, handleNativePushForeground as EventListener);
+        return () => {
+            window.removeEventListener(NATIVE_PUSH_RECEIVED_EVENT, handleNativePushForeground as EventListener);
+        };
+    }, [playNotificationGlassSound, showChatToast]);
 
     const handleToggleNotificationSound = useCallback((enabled: boolean) => {
         setNotificationSoundEnabled(enabled);
@@ -6265,14 +6313,37 @@ export default function App() {
 
         consumeNotificationChatParam(window.location.href);
 
-        if (!('serviceWorker' in navigator)) return;
+        const handleNativePushAction = (event: Event) => {
+            const detail = (event as CustomEvent<NativePushActionEventDetail>).detail;
+            const payloadData = detail?.payload?.notification?.data as Record<string, unknown> | undefined;
+            const urlFromData = typeof payloadData?.url === 'string' ? payloadData.url : '';
+            const chatFromData = typeof payloadData?.chat === 'string' ? payloadData.chat : '';
+
+            if (urlFromData) {
+                consumeNotificationChatParam(urlFromData);
+                return;
+            }
+            if (chatFromData) {
+                consumeNotificationChatParam(`/?chat=${encodeURIComponent(chatFromData)}`);
+            }
+        };
+
+        window.addEventListener(NATIVE_PUSH_ACTION_EVENT, handleNativePushAction as EventListener);
+
         const handleServiceWorkerMessage = (event: MessageEvent<any>) => {
             if (event?.data?.type !== 'notification-click') return;
             consumeNotificationChatParam(event.data?.url);
         };
-        navigator.serviceWorker.addEventListener('message', handleServiceWorkerMessage);
+
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.addEventListener('message', handleServiceWorkerMessage);
+        }
+
         return () => {
-            navigator.serviceWorker.removeEventListener('message', handleServiceWorkerMessage);
+            window.removeEventListener(NATIVE_PUSH_ACTION_EVENT, handleNativePushAction as EventListener);
+            if ('serviceWorker' in navigator) {
+                navigator.serviceWorker.removeEventListener('message', handleServiceWorkerMessage);
+            }
         };
     }, [handleOpenChat]);
 
