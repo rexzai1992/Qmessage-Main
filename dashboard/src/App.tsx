@@ -4662,6 +4662,13 @@ export default function App() {
                         if (!c.id) return;
                         const aliasKeys = buildContactJidVariants(c.id);
                         const canonicalKey = canonicalContactJid(c.id) || c.id;
+                        if (c.deleted === true) {
+                            aliasKeys.forEach((key) => {
+                                if (key in next) delete next[key];
+                            });
+                            if (canonicalKey in next) delete next[canonicalKey];
+                            return;
+                        }
                         const prevMeta = pickContactMetaByJid(next, canonicalKey) || {};
                         const incomingName = typeof c.name === 'string' ? c.name : (typeof c.notify === 'string' ? c.notify : '');
                         const resolvedName = pickContactName(incomingName, (prevMeta as any).name, c.id);

@@ -41,6 +41,7 @@ export function registerSocketHandlers(io: Server, ctx: any) {
         hasRoleAtLeast,
         normalizeTeamRole,
         deleteMessagesForUser,
+        deleteUserById,
         sendPushNotificationToUsers,
         sendNativePushNotificationToUsers
     } = ctx
@@ -901,9 +902,15 @@ io.on('connection', async (socket) => {
             const user = await getUserByPhone(companyId, phoneNumber)
             if (user) {
                 await deleteMessagesForUser(user.id)
+                await deleteUserById(user.id)
+                invalidateCompanySyncCache(companyId)
             }
 
             io.to(getCompanyRoom(companyId)).emit('messages.cleared', { profileId, jid })
+            io.to(getCompanyRoom(companyId)).emit('contacts.update', {
+                profileId,
+                contacts: [{ id: jid, deleted: true }]
+            })
         } catch (error: any) {
             console.error('Clear chat error:', error)
             socket.emit('profile.error', { message: error?.message || 'Failed to clear chat.' })

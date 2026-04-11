@@ -456,6 +456,21 @@ export async function deleteMessagesForUser(userId: string): Promise<boolean> {
     return true
 }
 
+export async function deleteUserById(userId: string): Promise<boolean> {
+    if (!userId) return false
+    const { error } = await supabase
+        .from('users')
+        .delete({ count: 'exact' })
+        .eq('id', userId)
+
+    if (error) {
+        console.warn('[DB] Failed to delete user:', error.message)
+        return false
+    }
+
+    return true
+}
+
 export async function updateUserTags(userId: string, tag: string): Promise<void> {
     const { data: existing, error } = await supabase
         .from('users')
