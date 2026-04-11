@@ -223,6 +223,14 @@ export default function AutomationsView({
         onTouchStart: () => runOncePerTap(fn)
     });
     const workflowSkeletonRows = [0, 1, 2, 3, 4];
+    const savedWorkflowCount = React.useMemo(
+        () => workflows.filter((wf: any) => Boolean(getWorkflowId(wf?.id))).length,
+        [workflows]
+    );
+    const activeWorkflowCount = React.useMemo(
+        () => workflows.filter((wf: any) => Boolean(getWorkflowId(wf?.id)) && wf?.enabled !== false).length,
+        [workflows]
+    );
 
     const triggerWorkflowChoices = React.useMemo(() => {
         return workflows
@@ -829,9 +837,14 @@ export default function AutomationsView({
     };
 
     return (
-        <div className="h-screen pt-[64px] lg:pt-[72px] pb-[76px] lg:pb-0 bg-[#f8f9fa] text-[#111b21] font-sans">
+        <div className={`h-screen pt-[64px] lg:pt-[72px] pb-[76px] lg:pb-0 text-[#111b21] font-sans ${isMobileView
+            ? 'bg-[linear-gradient(180deg,#f5f9ff_0%,#f8fafd_58%,#f6f8fb_100%)]'
+            : 'bg-[#f8f9fa]'
+            }`}>
             <div className={`h-full max-w-6xl mx-auto flex flex-col p-3 sm:p-4 md:p-6 gap-3 ${isMobileView ? 'overflow-y-auto custom-scrollbar' : 'overflow-hidden'}`}>
-                <div className={isMobileView ? 'px-1 py-1' : 'bg-white border border-[#e6ebef] rounded-2xl p-4 md:p-5'}>
+                <div className={isMobileView
+                    ? 'rounded-2xl border border-[#dbe6f3] bg-[linear-gradient(155deg,#ffffff_0%,#f4f9ff_100%)] p-4 shadow-[0_12px_34px_rgba(18,40,66,0.08)]'
+                    : 'rounded-2xl border border-[#dbe6f3] bg-[linear-gradient(155deg,#ffffff_0%,#f4f9ff_100%)] p-4 md:p-5 shadow-[0_12px_34px_rgba(18,40,66,0.06)]'}>
                     <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
                         <div>
                             <h2 className="text-lg md:text-xl font-semibold text-[#111b21] tracking-tight">Automations</h2>
@@ -860,9 +873,59 @@ export default function AutomationsView({
                             </div>
                         )}
                     </div>
+                    {isMobileView && (
+                        <>
+                            <div className="mt-3 grid grid-cols-2 gap-2">
+                                <div className="rounded-xl border border-[#d6e3f2] bg-white px-3 py-2">
+                                    <p className="text-[10px] font-black uppercase tracking-[0.12em] text-[#7a8b97]">Active</p>
+                                    <p className="mt-1 text-base font-extrabold text-[#111b21]">{activeWorkflowCount}</p>
+                                </div>
+                                <div className="rounded-xl border border-[#d6e3f2] bg-white px-3 py-2">
+                                    <p className="text-[10px] font-black uppercase tracking-[0.12em] text-[#7a8b97]">Saved</p>
+                                    <p className="mt-1 text-base font-extrabold text-[#111b21]">{savedWorkflowCount}</p>
+                                </div>
+                            </div>
+                            <div className="mt-3 grid grid-cols-2 gap-2">
+                                <button
+                                    type="button"
+                                    {...bindOpenHandlers(onCreateWorkflow)}
+                                    className="h-9 rounded-xl bg-[#00a884] text-white text-[11px] font-extrabold uppercase tracking-[0.08em] shadow-[0_8px_16px_rgba(0,168,132,0.26)]"
+                                >
+                                    + New
+                                </button>
+                                <button
+                                    type="button"
+                                    {...bindOpenHandlers(handleOpenWorkflowBuilder)}
+                                    className="h-9 rounded-xl border border-[#d5e0ee] bg-white text-[#1f2a33] text-[11px] font-extrabold uppercase tracking-[0.08em]"
+                                >
+                                    Open Builder
+                                </button>
+                            </div>
+                        </>
+                    )}
+                    {!isMobileView && (
+                        <div className="mt-4 grid grid-cols-3 gap-2.5">
+                            <div className="rounded-xl border border-[#d6e3f2] bg-white px-3 py-2.5">
+                                <p className="text-[10px] font-black uppercase tracking-[0.12em] text-[#7a8b97]">Active</p>
+                                <p className="mt-1 text-lg font-extrabold text-[#111b21]">{activeWorkflowCount}</p>
+                            </div>
+                            <div className="rounded-xl border border-[#d6e3f2] bg-white px-3 py-2.5">
+                                <p className="text-[10px] font-black uppercase tracking-[0.12em] text-[#7a8b97]">Saved</p>
+                                <p className="mt-1 text-lg font-extrabold text-[#111b21]">{savedWorkflowCount}</p>
+                            </div>
+                            <div className="rounded-xl border border-[#d6e3f2] bg-white px-3 py-2.5">
+                                <p className="text-[10px] font-black uppercase tracking-[0.12em] text-[#7a8b97]">Coverage</p>
+                                <p className="mt-1 text-lg font-extrabold text-[#111b21]">
+                                    {savedWorkflowCount > 0 ? `${Math.round((activeWorkflowCount / savedWorkflowCount) * 100)}%` : '0%'}
+                                </p>
+                            </div>
+                        </div>
+                    )}
                 </div>
 
-                <div className={isMobileView ? 'px-1 py-1' : 'bg-white border border-[#e6ebef] rounded-2xl p-4 md:p-5'}>
+                <div className={isMobileView
+                    ? 'rounded-2xl border border-[#dbe6f3] bg-white p-4 shadow-[0_10px_28px_rgba(18,40,66,0.06)]'
+                    : 'rounded-2xl border border-[#dbe6f3] bg-white p-4 md:p-5 shadow-[0_10px_28px_rgba(18,40,66,0.05)]'}>
                     <div className="flex items-center justify-between gap-3">
                         <div>
                             <h3 className="text-base md:text-lg font-semibold text-[#111b21] tracking-tight">Automation Tools</h3>
@@ -872,49 +935,64 @@ export default function AutomationsView({
                         </div>
                     </div>
 
-                    <div className="mt-3 flex flex-wrap gap-2">
+                    <div className={`mt-3 ${isMobileView ? 'grid grid-cols-2 gap-2.5' : 'grid grid-cols-2 xl:grid-cols-3 gap-2.5'}`}>
                         <button
                             type="button"
                             onClick={() => {
                                 setShowFallbackModal(true);
                                 fetchFallbackSettings();
                             }}
-                            className="h-8 px-3 rounded-lg border border-[#d8dee4] bg-white text-[#1f2a33] text-[10px] font-semibold uppercase tracking-wide hover:bg-[#f7f9fb] transition-all inline-flex items-center gap-1.5"
+                            className={isMobileView
+                                ? 'min-h-[74px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3 py-2.5 text-left inline-flex flex-col items-start justify-center gap-1.5'
+                                : 'min-h-[84px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3.5 py-3 text-left inline-flex flex-col items-start justify-center gap-1.5 transition-all hover:border-[#c9d9ec] hover:bg-white shadow-[0_6px_16px_rgba(20,36,60,0.05)]'}
                         >
                             <MessageSquare className="w-3.5 h-3.5" />
-                            Fallback Message
+                            <span className={`${isMobileView ? 'text-[11px] font-extrabold text-[#111b21]' : 'text-[11px] font-extrabold text-[#12253a]'}`}>Fallback Message</span>
+                            <span className="text-[10px] text-[#6c7f92]">Default invalid-option reply</span>
                         </button>
                         <button
                             type="button"
                             {...bindOpenHandlers(handleOpenTriggerModal)}
-                            className="h-8 px-3 rounded-lg border border-[#d8dee4] bg-white text-[#1f2a33] text-[10px] font-semibold uppercase tracking-wide hover:bg-[#f7f9fb] transition-all inline-flex items-center gap-1.5"
+                            className={isMobileView
+                                ? 'min-h-[74px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3 py-2.5 text-left inline-flex flex-col items-start justify-center gap-1.5'
+                                : 'min-h-[84px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3.5 py-3 text-left inline-flex flex-col items-start justify-center gap-1.5 transition-all hover:border-[#c9d9ec] hover:bg-white shadow-[0_6px_16px_rgba(20,36,60,0.05)]'}
                         >
                             <Workflow className="w-3.5 h-3.5" />
-                            Trigger
+                            <span className={`${isMobileView ? 'text-[11px] font-extrabold text-[#111b21]' : 'text-[11px] font-extrabold text-[#12253a]'}`}>Trigger</span>
+                            <span className="text-[10px] text-[#6c7f92]">Keyword and new-chat rules</span>
                         </button>
                         <button
                             type="button"
                             {...bindOpenHandlers(handleOpenConversationalModal)}
-                            className="h-8 px-3 rounded-lg border border-[#d8dee4] bg-white text-[#1f2a33] text-[10px] font-semibold uppercase tracking-wide hover:bg-[#f7f9fb] transition-all inline-flex items-center gap-1.5"
+                            className={isMobileView
+                                ? 'min-h-[74px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3 py-2.5 text-left inline-flex flex-col items-start justify-center gap-1.5'
+                                : 'min-h-[84px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3.5 py-3 text-left inline-flex flex-col items-start justify-center gap-1.5 transition-all hover:border-[#c9d9ec] hover:bg-white shadow-[0_6px_16px_rgba(20,36,60,0.05)]'}
                         >
                             <Settings2 className="w-3.5 h-3.5" />
-                            Conversational Components
+                            <span className={`${isMobileView ? 'text-[11px] font-extrabold text-[#111b21]' : 'text-[11px] font-extrabold text-[#12253a]'}`}>Components</span>
+                            <span className="text-[10px] text-[#6c7f92]">Welcome, prompts, commands</span>
                         </button>
                         <button
                             type="button"
                             {...bindOpenHandlers(handleOpenReminderModal)}
-                            className="h-8 px-3 rounded-lg border border-[#d8dee4] bg-white text-[#1f2a33] text-[10px] font-semibold uppercase tracking-wide hover:bg-[#f7f9fb] transition-all inline-flex items-center gap-1.5"
+                            className={isMobileView
+                                ? 'min-h-[74px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3 py-2.5 text-left inline-flex flex-col items-start justify-center gap-1.5'
+                                : 'min-h-[84px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3.5 py-3 text-left inline-flex flex-col items-start justify-center gap-1.5 transition-all hover:border-[#c9d9ec] hover:bg-white shadow-[0_6px_16px_rgba(20,36,60,0.05)]'}
                         >
                             <Settings2 className="w-3.5 h-3.5" />
-                            24h Window Reminder
+                            <span className={`${isMobileView ? 'text-[11px] font-extrabold text-[#111b21]' : 'text-[11px] font-extrabold text-[#12253a]'}`}>24h Reminder</span>
+                            <span className="text-[10px] text-[#6c7f92]">Window expiry nudges</span>
                         </button>
                         <button
                             type="button"
                             {...bindOpenHandlers(handleOpenQuickRepliesModal)}
-                            className="h-8 px-3 rounded-lg border border-[#d8dee4] bg-white text-[#1f2a33] text-[10px] font-semibold uppercase tracking-wide hover:bg-[#f7f9fb] transition-all inline-flex items-center gap-1.5"
+                            className={isMobileView
+                                ? 'col-span-2 min-h-[74px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3 py-2.5 text-left inline-flex flex-col items-start justify-center gap-1.5'
+                                : 'min-h-[84px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3.5 py-3 text-left inline-flex flex-col items-start justify-center gap-1.5 transition-all hover:border-[#c9d9ec] hover:bg-white shadow-[0_6px_16px_rgba(20,36,60,0.05)]'}
                         >
                             <Settings2 className="w-3.5 h-3.5" />
-                            Quick Reply
+                            <span className={`${isMobileView ? 'text-[11px] font-extrabold text-[#111b21]' : 'text-[11px] font-extrabold text-[#12253a]'}`}>Quick Reply</span>
+                            <span className="text-[10px] text-[#6c7f92]">Reusable text or media shortcuts</span>
                         </button>
                     </div>
                 </div>
@@ -959,7 +1037,15 @@ export default function AutomationsView({
                                     ? 'No automations configured yet.'
                                     : 'Create your first automation workflow in Chatflow builder.'}
                             </p>
-                            {!isMobileView && (
+                            {isMobileView ? (
+                                <button
+                                    type="button"
+                                    {...bindOpenHandlers(onCreateWorkflow)}
+                                    className="h-9 px-4 rounded-xl bg-[#00a884] text-white text-[11px] font-extrabold uppercase tracking-[0.08em] shadow-[0_8px_16px_rgba(0,168,132,0.26)]"
+                                >
+                                    Create Workflow
+                                </button>
+                            ) : (
                                 <button
                                     type="button"
                                     {...bindOpenHandlers(onCreateWorkflow)}
@@ -970,16 +1056,16 @@ export default function AutomationsView({
                             )}
                         </div>
                     ) : (
-                        <div className={isMobileView ? '' : 'h-full overflow-y-auto custom-scrollbar'}>
-                            <div className="hidden md:grid grid-cols-12 gap-2 px-4 py-2 border-b border-[#eef2f5] bg-[#fcfdfe]">
-                                <span className="col-span-3 text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">Workflow</span>
-                                <span className="col-span-3 text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">Trigger</span>
-                                <span className="col-span-1 text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">Steps</span>
-                                <span className="col-span-1 text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">Status</span>
-                                <span className="col-span-4 text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97] text-right">Actions</span>
+                        <div className={isMobileView ? '' : 'h-full overflow-y-auto custom-scrollbar p-3 md:p-4 bg-[linear-gradient(180deg,#fbfdff_0%,#f7faff_100%)]'}>
+                            <div className="mb-2 hidden md:grid grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)_84px_92px_minmax(0,1fr)] items-center gap-3 px-2 text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">
+                                <span>Workflow</span>
+                                <span>Trigger</span>
+                                <span>Steps</span>
+                                <span>Status</span>
+                                <span className="text-right">Actions</span>
                             </div>
 
-                            <div className="divide-y divide-[#eef2f5]">
+                            <div className="space-y-2.5">
                                 {workflows.map((wf: any, idx: number) => {
                                     const workflowId = getWorkflowId(wf?.id);
                                     const workflowName = getWorkflowName(wf?.name);
@@ -992,114 +1078,181 @@ export default function AutomationsView({
                                         else handleOpenWorkflowBuilder();
                                     };
                                     const rowHandlers = isMobileView ? {} : bindOpenHandlers(openRowBuilder);
+                                    if (isMobileView) {
+                                        return (
+                                            <div
+                                                key={`automation-workflow-${workflowLabel}-${idx}`}
+                                                className="rounded-2xl border border-[#dbe6f3] bg-white px-3 py-3 shadow-[0_10px_22px_rgba(16,35,58,0.06)]"
+                                            >
+                                                <div className="flex items-start justify-between gap-2">
+                                                    <div className="min-w-0">
+                                                        <p className="truncate text-[13px] font-extrabold text-[#111b21]">{workflowLabel}</p>
+                                                        <p className="mt-1 truncate text-[10px] font-semibold text-[#5d7285]">
+                                                            Trigger: {triggerKeyword || 'manual only'}
+                                                        </p>
+                                                    </div>
+                                                    <span className={`inline-flex h-5 items-center rounded-full border px-2 text-[9px] font-black uppercase tracking-[0.08em] ${isEnabled
+                                                        ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                                        : 'border-slate-200 bg-slate-50 text-slate-600'
+                                                        }`}>
+                                                        {isEnabled ? 'On' : 'Off'}
+                                                    </span>
+                                                </div>
+
+                                                <div className="mt-2 flex items-center gap-1.5">
+                                                    <span className="inline-flex h-5 items-center rounded-full border border-[#d9e4f2] bg-[#f3f8ff] px-2 text-[9px] font-black uppercase tracking-[0.08em] text-[#4b5c68]">
+                                                        Steps {actionCount}
+                                                    </span>
+                                                    <button
+                                                        type="button"
+                                                        disabled={!workflowId}
+                                                        onClick={() => {
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onCopyWorkflow(workflowId));
+                                                        }}
+                                                        className="inline-flex h-5 items-center gap-1 rounded-full border border-[#d9e4f2] bg-white px-2 text-[9px] font-black uppercase tracking-[0.08em] text-[#4b5c68] disabled:opacity-50"
+                                                    >
+                                                        <Copy className="w-2.5 h-2.5" />
+                                                        Copy
+                                                    </button>
+                                                </div>
+
+                                                <div className="mt-3 grid grid-cols-2 gap-2">
+                                                    <button
+                                                        type="button"
+                                                        disabled={!workflowId}
+                                                        onClick={() => {
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onOpenBuilder(workflowId));
+                                                        }}
+                                                        className="h-8 rounded-xl bg-[#00a884] text-white text-[10px] font-extrabold uppercase tracking-[0.08em] disabled:opacity-60"
+                                                    >
+                                                        Builder
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        disabled={!workflowId}
+                                                        onClick={() => {
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onToggleWorkflowEnabled(workflowId, !isEnabled));
+                                                        }}
+                                                        className={`h-8 rounded-xl border text-[10px] font-extrabold uppercase tracking-[0.08em] disabled:opacity-60 ${isEnabled
+                                                            ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                                            : 'border-slate-200 bg-white text-slate-700'
+                                                            }`}
+                                                    >
+                                                        {isEnabled ? 'Disable' : 'Enable'}
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        );
+                                    }
                                     return (
                                         <div
                                             key={`automation-workflow-${workflowLabel}-${idx}`}
                                             {...rowHandlers}
-                                            className={`grid grid-cols-12 gap-2 px-4 py-3 transition-colors ${isMobileView ? '' : 'hover:bg-[#fafcfd] cursor-pointer'}`}
+                                            className="rounded-2xl border border-[#dbe5f1] bg-white px-3.5 py-3 transition-all hover:border-[#c9d9ec] hover:shadow-[0_10px_22px_rgba(16,35,58,0.08)] cursor-pointer"
                                         >
-                                            <div className="col-span-12 md:col-span-3 min-w-0">
-                                                <p className="text-[12px] font-semibold text-[#111b21] truncate">{workflowLabel}</p>
-                                                {!workflowName && !isMobileView && (
-                                                    <p className="text-[10px] text-[#8c9aa4] mt-0.5">Set name in workflow builder</p>
-                                                )}
-                                            </div>
+                                            <div className="grid grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)_84px_92px_minmax(0,1fr)] items-center gap-3">
+                                                <div className="min-w-0">
+                                                    <p className="truncate text-[13px] font-extrabold text-[#111b21]">{workflowLabel}</p>
+                                                    {!workflowName && (
+                                                        <p className="mt-0.5 text-[10px] font-semibold text-[#8c9aa4]">Set name in workflow builder</p>
+                                                    )}
+                                                </div>
 
-                                            <div className="col-span-8 md:col-span-3 min-w-0">
-                                                <p className="text-[11px] text-[#4b5c68] truncate">{triggerKeyword || 'manual only'}</p>
-                                            </div>
+                                                <div className="min-w-0">
+                                                    <p className="truncate text-[11px] font-semibold text-[#4b5c68]">{triggerKeyword || 'manual only'}</p>
+                                                </div>
 
-                                            <div className="col-span-4 md:col-span-1">
-                                                <span className="inline-flex items-center text-[11px] text-[#4b5c68] font-medium">
-                                                    {actionCount}
-                                                </span>
-                                            </div>
+                                                <div>
+                                                    <span className="inline-flex h-6 items-center rounded-full border border-[#d9e4f2] bg-[#f3f8ff] px-2 text-[10px] font-black text-[#4b5c68]">
+                                                        {actionCount}
+                                                    </span>
+                                                </div>
 
-                                            <div className="col-span-6 md:col-span-1">
-                                                <span className={`inline-flex items-center px-2 py-0.5 rounded-full border text-[9px] font-semibold uppercase tracking-wide ${isEnabled
-                                                    ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
-                                                    : 'bg-slate-50 border-slate-200 text-slate-600'
-                                                    }`}>
-                                                    {isEnabled ? 'On' : 'Off'}
-                                                </span>
-                                            </div>
+                                                <div>
+                                                    <span className={`inline-flex h-6 items-center rounded-full border px-2 text-[10px] font-black uppercase tracking-[0.08em] ${isEnabled
+                                                        ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                                        : 'border-slate-200 bg-slate-50 text-slate-600'
+                                                        }`}>
+                                                        {isEnabled ? 'On' : 'Off'}
+                                                    </span>
+                                                </div>
 
-                                            <div className="col-span-6 md:col-span-4 flex items-center justify-start md:justify-end gap-1.5">
-                                                {!isMobileView && (
-                                                    <>
-                                                        <button
-                                                            type="button"
-                                                            disabled={!workflowId}
-                                                            onClick={(event) => {
-                                                                event.stopPropagation();
-                                                                if (!workflowId) return;
-                                                                runOncePerTap(() => onOpenBuilder(workflowId));
-                                                            }}
-                                                            onMouseDown={(event) => {
-                                                                event.stopPropagation();
-                                                                if (!workflowId) return;
-                                                                runOncePerTap(() => onOpenBuilder(workflowId));
-                                                            }}
-                                                            onTouchStart={(event) => {
-                                                                event.stopPropagation();
-                                                                if (!workflowId) return;
-                                                                runOncePerTap(() => onOpenBuilder(workflowId));
-                                                            }}
-                                                            className="h-7 px-2.5 rounded-md bg-[#00a884] text-white text-[9px] font-semibold uppercase tracking-wide hover:bg-[#008f6f] transition-all cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
-                                                        >
-                                                            Builder
-                                                        </button>
-                                                        <button
-                                                            type="button"
-                                                            disabled={!workflowId}
-                                                            onClick={(event) => {
-                                                                event.stopPropagation();
-                                                                if (!workflowId) return;
-                                                                runOncePerTap(() => onCopyWorkflow(workflowId));
-                                                            }}
-                                                            onMouseDown={(event) => {
-                                                                event.stopPropagation();
-                                                                if (!workflowId) return;
-                                                                runOncePerTap(() => onCopyWorkflow(workflowId));
-                                                            }}
-                                                            onTouchStart={(event) => {
-                                                                event.stopPropagation();
-                                                                if (!workflowId) return;
-                                                                runOncePerTap(() => onCopyWorkflow(workflowId));
-                                                            }}
-                                                            className="h-7 px-2.5 rounded-md border border-[#dbe2e8] bg-white text-[#334155] text-[9px] font-semibold uppercase tracking-wide transition-all inline-flex items-center justify-center gap-1 hover:bg-[#f8fafc] disabled:opacity-60 disabled:cursor-not-allowed"
-                                                        >
-                                                            <Copy className="w-3 h-3" />
-                                                            Copy
-                                                        </button>
-                                                    </>
-                                                )}
-                                                <button
-                                                    type="button"
-                                                    disabled={!workflowId}
-                                                    onClick={(event) => {
-                                                        event.stopPropagation();
-                                                        if (!workflowId) return;
-                                                        runOncePerTap(() => onToggleWorkflowEnabled(workflowId, !isEnabled));
-                                                    }}
-                                                    onMouseDown={(event) => {
-                                                        event.stopPropagation();
-                                                        if (!workflowId) return;
-                                                        runOncePerTap(() => onToggleWorkflowEnabled(workflowId, !isEnabled));
-                                                    }}
-                                                    onTouchStart={(event) => {
-                                                        event.stopPropagation();
-                                                        if (!workflowId) return;
-                                                        runOncePerTap(() => onToggleWorkflowEnabled(workflowId, !isEnabled));
-                                                    }}
-                                                    className={`h-7 px-2.5 rounded-md border text-[9px] font-semibold uppercase tracking-wide transition-all inline-flex items-center justify-center gap-1 disabled:opacity-60 disabled:cursor-not-allowed ${isEnabled
-                                                        ? 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
-                                                        : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
-                                                        } cursor-pointer`}
-                                                >
-                                                    <Check className="w-3 h-3" />
-                                                    {isEnabled ? 'Untick To Off' : 'Tick To Run'}
-                                                </button>
+                                                <div className="flex items-center justify-end gap-2">
+                                                    <button
+                                                        type="button"
+                                                        disabled={!workflowId}
+                                                        onClick={(event) => {
+                                                            event.stopPropagation();
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onOpenBuilder(workflowId));
+                                                        }}
+                                                        onMouseDown={(event) => {
+                                                            event.stopPropagation();
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onOpenBuilder(workflowId));
+                                                        }}
+                                                        onTouchStart={(event) => {
+                                                            event.stopPropagation();
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onOpenBuilder(workflowId));
+                                                        }}
+                                                        className="h-8 px-3 rounded-lg bg-[#00a884] text-white text-[10px] font-extrabold uppercase tracking-[0.08em] hover:bg-[#008f6f] transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                                                    >
+                                                        Builder
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        disabled={!workflowId}
+                                                        onClick={(event) => {
+                                                            event.stopPropagation();
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onCopyWorkflow(workflowId));
+                                                        }}
+                                                        onMouseDown={(event) => {
+                                                            event.stopPropagation();
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onCopyWorkflow(workflowId));
+                                                        }}
+                                                        onTouchStart={(event) => {
+                                                            event.stopPropagation();
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onCopyWorkflow(workflowId));
+                                                        }}
+                                                        className="h-8 px-3 rounded-lg border border-[#dbe2e8] bg-white text-[#334155] text-[10px] font-extrabold uppercase tracking-[0.08em] transition-all inline-flex items-center justify-center gap-1 hover:bg-[#f8fafc] disabled:opacity-60 disabled:cursor-not-allowed"
+                                                    >
+                                                        <Copy className="w-3 h-3" />
+                                                        Copy
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        disabled={!workflowId}
+                                                        onClick={(event) => {
+                                                            event.stopPropagation();
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onToggleWorkflowEnabled(workflowId, !isEnabled));
+                                                        }}
+                                                        onMouseDown={(event) => {
+                                                            event.stopPropagation();
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onToggleWorkflowEnabled(workflowId, !isEnabled));
+                                                        }}
+                                                        onTouchStart={(event) => {
+                                                            event.stopPropagation();
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onToggleWorkflowEnabled(workflowId, !isEnabled));
+                                                        }}
+                                                        className={`h-8 px-3 rounded-lg border text-[10px] font-extrabold uppercase tracking-[0.08em] transition-all inline-flex items-center justify-center gap-1 disabled:opacity-60 disabled:cursor-not-allowed ${isEnabled
+                                                            ? 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+                                                            : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                                                            }`}
+                                                    >
+                                                        <Check className="w-3 h-3" />
+                                                        {isEnabled ? 'Disable' : 'Enable'}
+                                                    </button>
+                                                </div>
                                             </div>
                                         </div>
                                     );

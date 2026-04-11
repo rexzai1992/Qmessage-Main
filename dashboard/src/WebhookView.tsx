@@ -1943,6 +1943,10 @@ export default function WebhookView({
             : notificationPermission === 'denied'
                 ? 'text-rose-700 bg-rose-50 border-rose-200'
                 : 'text-[#54656f] bg-[#f0f2f5] border-[#eceff1]';
+    const settingsSectionCardClass = 'bg-white rounded-[24px] border border-[#eceff1] p-6 sm:p-7 shadow-[0_8px_30px_rgba(0,0,0,0.04)]';
+    const settingsInnerPanelClass = 'bg-[#fcfdfd] border border-[#eceff1] rounded-[20px] p-5';
+    const settingsInnerPanelCompactClass = 'bg-[#fcfdfd] border border-[#eceff1] rounded-[20px] p-4';
+    const settingsInnerTableShellClass = 'bg-[#fcfdfd] border border-[#eceff1] rounded-[20px] overflow-hidden';
 
     return (
         <div className="flex-1 bg-[#fcfdfd] p-10 overflow-y-auto text-[#111b21] h-full font-sans">
@@ -1952,37 +1956,8 @@ export default function WebhookView({
             </h2>
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-10">
-                <div id="settings-onboard-wpa" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
-                    <div className="flex items-center justify-between gap-3 mb-4">
-                        <div className="flex items-center gap-3">
-                            <Shield className="w-6 h-6 text-[#00a884]" />
-                            <h3 className="text-xl text-[#111b21] font-bold">Onboard WPA</h3>
-                        </div>
-                        <span className="text-[10px] px-3 py-1 rounded-full bg-[#f0f2f5] text-[#54656f] font-black tracking-widest uppercase border border-[#eceff1]">
-                            Embedded Signup
-                        </span>
-                    </div>
-                    <p className="text-sm text-[#54656f] mb-6 font-medium">
-                        Start WhatsApp onboarding for this profile. This opens Meta Embedded Signup and links the account to your workspace.
-                    </p>
-                    <button
-                        onClick={handleConnectWhatsapp}
-                        disabled={connectLoading || !sessionToken}
-                        className="w-full lg:w-auto bg-[#00a884] hover:bg-[#019273] text-white font-black px-6 py-3.5 rounded-2xl transition-all flex items-center justify-center gap-3 shadow-[0_8px_20px_rgba(0,168,132,0.24)] disabled:opacity-50 active:scale-95"
-                    >
-                        {connectLoading ? <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" /> : <Globe className="w-5 h-5" />}
-                        Start WPA Onboarding
-                    </button>
-                    {connectError && (
-                        <p className="text-sm text-rose-600 mt-4 font-semibold">{connectError}</p>
-                    )}
-                    {!sessionToken && (
-                        <p className="text-xs text-[#aebac1] mt-3">Login required to start onboarding.</p>
-                    )}
-                </div>
-
                 {/* Embedded Signup Section */}
-                <div id="settings-connect" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                <div id="settings-connect" className={settingsSectionCardClass}>
                     <div className="flex items-center gap-3 mb-4">
                         <Shield className="w-6 h-6 text-[#00a884]" />
                         <h3 className="text-xl text-[#111b21] font-bold">Connect WhatsApp Business</h3>
@@ -2007,7 +1982,7 @@ export default function WebhookView({
                 </div>
 
                 {/* Manual Setup Section */}
-                <div id="settings-manual" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                <div id="settings-manual" className={settingsSectionCardClass}>
                     <div className="flex items-center gap-3 mb-4">
                         <Shield className="w-6 h-6 text-[#00a884]" />
                         <h3 className="text-xl text-[#111b21] font-bold">Manual WABA Setup</h3>
@@ -2103,7 +2078,7 @@ export default function WebhookView({
                 </div>
 
                 {/* Number Registration Section */}
-                <div id="settings-register" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                <div id="settings-register" className={settingsSectionCardClass}>
                     <div className="flex items-center gap-3 mb-4">
                         <Shield className="w-6 h-6 text-[#00a884]" />
                         <h3 className="text-xl text-[#111b21] font-bold">Register WhatsApp Number</h3>
@@ -2126,7 +2101,7 @@ export default function WebhookView({
                 </div>
 
                 {/* Webhooks Section */}
-                <div id="settings-webhooks" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                <div id="settings-webhooks" className={settingsSectionCardClass}>
                     <h3 className="text-xl mb-2 text-[#111b21] font-bold">Outgoing Webhooks</h3>
                     <p className="text-sm text-[#54656f] mb-2 font-medium">Configure endpoints to receive real-time updates from this profile.</p>
                     <p className="text-xs text-[#8696a0] mb-6 font-semibold">Active profile: {profileId}</p>
@@ -2150,7 +2125,7 @@ export default function WebhookView({
                             </div>
                         )}
                         {!webhookLoading && webhooksLoaded && webhooks.map((hook, i) => (
-                            <div key={i} className="bg-[#fcfdfd] p-5 rounded-2xl flex items-start justify-between border border-[#eceff1] group hover:border-[#00a884]/30 transition-all">
+                            <div key={i} className={`${settingsInnerPanelClass} flex items-start justify-between group hover:border-[#00a884]/30 transition-all`}>
                                 <div className="min-w-0 pr-4">
                                     <div className="font-mono text-sm break-all mb-2 text-[#111b21] font-bold leading-relaxed">{hook.url}</div>
                                     <div className="flex gap-2 flex-wrap">
@@ -2204,7 +2179,7 @@ export default function WebhookView({
                     </div>
                 </div>
 
-                <div id="settings-ads-shoot" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                <div id="settings-ads-shoot" className={settingsSectionCardClass}>
                     <div className="flex items-center justify-between gap-4 mb-5">
                         <div className="flex items-center gap-3">
                             <Globe className="w-6 h-6 text-[#00a884]" />
@@ -2224,7 +2199,7 @@ export default function WebhookView({
                         />
                     </div>
 
-                    <div className="bg-[#fcfdfd] border border-[#eceff1] rounded-2xl p-5">
+                    <div className={settingsInnerPanelClass}>
                         <p className="text-sm font-bold text-[#111b21]">Lead simulation examples</p>
                         <p className="text-xs text-[#54656f] font-medium mt-1">
                             "Hi, how much is monthly membership?", "Do you have free trial?", "Can I join tonight?", "Is there personal trainer?"
@@ -2267,7 +2242,7 @@ export default function WebhookView({
                     )}
                 </div>
 
-                <div id="settings-notifications" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                <div id="settings-notifications" className={settingsSectionCardClass}>
                     <div className="flex items-center justify-between gap-4 mb-5">
                         <div className="flex items-center gap-3">
                             <Bell className="w-6 h-6 text-[#00a884]" />
@@ -2283,7 +2258,7 @@ export default function WebhookView({
                         </div>
                     </div>
 
-                    <div className="bg-[#fcfdfd] border border-[#eceff1] rounded-2xl p-5">
+                    <div className={settingsInnerPanelClass}>
                         <div className="flex items-center justify-between gap-4">
                             <div>
                                 <p className="text-sm font-bold text-[#111b21]">iPhone Glass Sound</p>
@@ -2314,7 +2289,7 @@ export default function WebhookView({
                 </div>
 
                 {showCallSettings && (
-                <div id="settings-calls" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                <div id="settings-calls" className={settingsSectionCardClass}>
                     <div className="flex items-center justify-between gap-3 mb-5">
                         <div className="flex items-center gap-3">
                             <PhoneCall className="w-6 h-6 text-[#00a884]" />
@@ -2455,7 +2430,7 @@ export default function WebhookView({
                 </div>
                 )}
 
-                <div id="settings-business-profile" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                <div id="settings-business-profile" className={settingsSectionCardClass}>
                     <div className="flex items-center justify-between gap-3 mb-5">
                         <div>
                             <h3 className="text-xl text-[#111b21] font-bold">Business Profile</h3>
@@ -2474,6 +2449,63 @@ export default function WebhookView({
                     </div>
 
                     <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                        <div className="lg:col-span-2">
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Current Profile Picture</label>
+                            <div className="mt-3 h-40 w-full rounded-2xl border border-[#eceff1] bg-[#f8f9fa] flex items-center justify-center overflow-hidden">
+                                {businessProfileForm.profilePictureUrl ? (
+                                    <img
+                                        src={businessProfileForm.profilePictureUrl}
+                                        alt="Current WhatsApp profile picture"
+                                        className="h-full w-auto max-w-full object-contain"
+                                        loading="lazy"
+                                    />
+                                ) : (
+                                    <span className="text-[11px] font-bold uppercase tracking-widest text-[#8696a0]">No Profile Picture</span>
+                                )}
+                            </div>
+                            <input
+                                ref={businessProfileFileInputRef}
+                                type="file"
+                                accept="image/*"
+                                className="hidden"
+                                onChange={(event) => {
+                                    const file = event.target.files?.[0] || null;
+                                    void handleUploadBusinessProfilePicture(file);
+                                }}
+                            />
+                            <div className="mt-3 flex items-center gap-3">
+                                <button
+                                    type="button"
+                                    onClick={() => businessProfileFileInputRef.current?.click()}
+                                    disabled={!sessionToken || businessProfileLoading || businessProfileSaving || businessProfileUploading}
+                                    className="bg-[#00a884] hover:bg-[#008f6f] text-white px-4 py-2.5 rounded-xl font-bold transition-all disabled:opacity-50"
+                                >
+                                    {businessProfileUploading ? 'Uploading...' : 'Upload Picture'}
+                                </button>
+                                <span className="text-[11px] text-[#8696a0] font-medium">JPG/PNG/WebP, max 10MB</span>
+                            </div>
+                            <p className="mt-2 text-[11px] text-[#8696a0] break-all">
+                                URL: <span className="font-mono">{businessProfileForm.profilePictureUrl || '—'}</span>
+                            </p>
+                        </div>
+
+                        <div className="lg:col-span-2">
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Websites (one per line)</label>
+                            <textarea
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884] min-h-[90px]"
+                                placeholder="https://company.com"
+                                value={businessProfileForm.websites}
+                                onChange={e => setBusinessProfileForm(prev => ({ ...prev, websites: e.target.value }))}
+                                disabled={businessProfileLoading || businessProfileSaving || businessProfileUploading}
+                            />
+                        </div>
+
+                        <div className="lg:col-span-2">
+                            <p className="text-[11px] text-[#8696a0] leading-relaxed">
+                                Display/verified name is managed in WhatsApp Manager (Meta), not from this form.
+                            </p>
+                        </div>
+
                         <div className="lg:col-span-2">
                             <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Phone Number ID (optional)</label>
                             <input
@@ -2539,62 +2571,7 @@ export default function WebhookView({
                                 disabled={businessProfileLoading || businessProfileSaving || businessProfileUploading}
                             />
                         </div>
-
-                        <div className="lg:col-span-2">
-                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Current Profile Picture</label>
-                            <div className="mt-3 h-40 w-full rounded-2xl border border-[#eceff1] bg-[#f8f9fa] flex items-center justify-center overflow-hidden">
-                                {businessProfileForm.profilePictureUrl ? (
-                                    <img
-                                        src={businessProfileForm.profilePictureUrl}
-                                        alt="Current WhatsApp profile picture"
-                                        className="h-full w-auto max-w-full object-contain"
-                                        loading="lazy"
-                                    />
-                                ) : (
-                                    <span className="text-[11px] font-bold uppercase tracking-widest text-[#8696a0]">No Profile Picture</span>
-                                )}
-                            </div>
-                            <input
-                                ref={businessProfileFileInputRef}
-                                type="file"
-                                accept="image/*"
-                                className="hidden"
-                                onChange={(event) => {
-                                    const file = event.target.files?.[0] || null;
-                                    void handleUploadBusinessProfilePicture(file);
-                                }}
-                            />
-                            <div className="mt-3 flex items-center gap-3">
-                                <button
-                                    type="button"
-                                    onClick={() => businessProfileFileInputRef.current?.click()}
-                                    disabled={!sessionToken || businessProfileLoading || businessProfileSaving || businessProfileUploading}
-                                    className="bg-[#00a884] hover:bg-[#008f6f] text-white px-4 py-2.5 rounded-xl font-bold transition-all disabled:opacity-50"
-                                >
-                                    {businessProfileUploading ? 'Uploading...' : 'Upload Picture'}
-                                </button>
-                                <span className="text-[11px] text-[#8696a0] font-medium">JPG/PNG/WebP, max 10MB</span>
-                            </div>
-                            <p className="mt-2 text-[11px] text-[#8696a0] break-all">
-                                URL: <span className="font-mono">{businessProfileForm.profilePictureUrl || '—'}</span>
-                            </p>
-                        </div>
-
-                        <div className="lg:col-span-2">
-                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Websites (one per line)</label>
-                            <textarea
-                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884] min-h-[90px]"
-                                placeholder="https://company.com"
-                                value={businessProfileForm.websites}
-                                onChange={e => setBusinessProfileForm(prev => ({ ...prev, websites: e.target.value }))}
-                                disabled={businessProfileLoading || businessProfileSaving || businessProfileUploading}
-                            />
-                        </div>
                     </div>
-
-                    <p className="mt-3 text-[11px] text-[#8696a0] leading-relaxed">
-                        Display/verified name is managed in WhatsApp Manager (Meta), not from this form.
-                    </p>
 
                     {businessProfileError && (
                         <div className="mt-4 bg-rose-50 border border-rose-200 text-rose-700 rounded-2xl px-4 py-3 text-sm font-medium">
@@ -2622,7 +2599,7 @@ export default function WebhookView({
                     </div>
                 </div>
 
-                <div id="settings-branding" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                <div id="settings-branding" className={settingsSectionCardClass}>
                     <div className="flex items-center justify-between gap-3 mb-5">
                         <div>
                             <h3 className="text-xl text-[#111b21] font-bold">App Logo</h3>
@@ -2640,7 +2617,7 @@ export default function WebhookView({
                         </button>
                     </div>
 
-                    <div className="bg-[#fcfdfd] border border-[#eceff1] rounded-2xl p-4 mb-4">
+                    <div className={`${settingsInnerPanelCompactClass} mb-4`}>
                         <div className="text-[11px] font-bold uppercase tracking-widest text-[#54656f] mb-2">
                             Preview
                         </div>
@@ -2712,7 +2689,7 @@ export default function WebhookView({
                 </div>
 
                 {/* Conversational Components */}
-                <div id="settings-conversational" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                <div id="settings-conversational" className={`${settingsSectionCardClass} lg:col-span-2`}>
                     <div className="flex items-center justify-between mb-6">
                         <div>
                             <h3 className="text-xl text-[#111b21] font-bold">Conversational Components</h3>
@@ -2729,7 +2706,7 @@ export default function WebhookView({
                     </div>
 
                     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1]">
+                        <div className={settingsInnerPanelClass}>
                             <div className="flex items-center justify-between mb-3">
                                 <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Welcome Message</span>
                                 <input
@@ -2746,7 +2723,7 @@ export default function WebhookView({
                             </p>
                         </div>
 
-                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1]">
+                        <div className={settingsInnerPanelClass}>
                             <div className="flex items-center justify-between mb-3">
                                 <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Ice Breakers</span>
                                 <button
@@ -2792,7 +2769,7 @@ export default function WebhookView({
                             </div>
                         </div>
 
-                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1]">
+                        <div className={settingsInnerPanelClass}>
                             <div className="flex items-center justify-between mb-3">
                                 <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Commands</span>
                                 <button
@@ -2894,7 +2871,7 @@ export default function WebhookView({
                 {showLegacyAutomationSettings && (
                     <>
                 {/* 24h Window Reminder */}
-                <div id="settings-reminder" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                <div id="settings-reminder" className={`${settingsSectionCardClass} lg:col-span-2`}>
                     <div className="flex items-center justify-between mb-6">
                         <div>
                             <h3 className="text-xl text-[#111b21] font-bold">24h Window Reminder</h3>
@@ -2911,7 +2888,7 @@ export default function WebhookView({
                     </div>
 
                     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1] flex items-center justify-between">
+                        <div className={`${settingsInnerPanelClass} flex items-center justify-between`}>
                             <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Enabled</span>
                             <input
                                 type="checkbox"
@@ -2921,7 +2898,7 @@ export default function WebhookView({
                             />
                         </div>
 
-                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1]">
+                        <div className={settingsInnerPanelClass}>
                             <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Minutes Before Close</span>
                             <input
                                 type="number"
@@ -2937,7 +2914,7 @@ export default function WebhookView({
                             <p className="text-[11px] text-[#8696a0] mt-2">Set to the number of minutes before the window ends.</p>
                         </div>
 
-                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1] lg:col-span-1">
+                        <div className={`${settingsInnerPanelClass} lg:col-span-1`}>
                             <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Reminder Text</span>
                             <textarea
                                 className="mt-3 w-full bg-white border border-[#eceff1] rounded-xl px-3 py-2 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884] h-24 resize-none"
@@ -2960,7 +2937,7 @@ export default function WebhookView({
                 </div>
 
                 {/* Quick Replies */}
-                <div id="settings-quick-replies" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                <div id="settings-quick-replies" className={`${settingsSectionCardClass} lg:col-span-2`}>
                     <div className="flex items-center justify-between mb-6">
                         <div>
                             <h3 className="text-xl text-[#111b21] font-bold">Quick Replies</h3>
@@ -2994,7 +2971,7 @@ export default function WebhookView({
                             </div>
                         ) : (
                             quickRepliesDraft.map((item, index) => (
-                                <div key={`${item.id || 'new'}-${index}`} className="bg-[#fcfdfd] border border-[#eceff1] rounded-2xl p-5">
+                                <div key={`${item.id || 'new'}-${index}`} className={settingsInnerPanelClass}>
                                     <div className="grid grid-cols-1 lg:grid-cols-6 gap-4 items-start">
                                         <div className="lg:col-span-1">
                                             <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Shortcut</span>
@@ -3047,7 +3024,7 @@ export default function WebhookView({
                     </>
                 )}
 
-                <div id="settings-team-users" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                <div id="settings-team-users" className={`${settingsSectionCardClass} lg:col-span-2`}>
                     <div className="flex items-center justify-between mb-6">
                         <div>
                             <h3 className="text-xl text-[#111b21] font-bold">Team Users</h3>
@@ -3071,7 +3048,7 @@ export default function WebhookView({
                     )}
 
                     {canManageTeam && (
-                        <div className="mb-6 grid grid-cols-1 lg:grid-cols-6 gap-3 bg-[#fcfdfd] border border-[#eceff1] rounded-2xl p-4">
+                        <div className={`mb-6 grid grid-cols-1 lg:grid-cols-6 gap-3 ${settingsInnerPanelCompactClass}`}>
                             <input
                                 className="lg:col-span-2 bg-white border border-[#eceff1] rounded-xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884]"
                                 placeholder="agent@company.com"
@@ -3130,7 +3107,7 @@ export default function WebhookView({
                         </div>
                     )}
 
-                    <div className="mb-6 grid grid-cols-1 lg:grid-cols-5 gap-3 bg-[#fcfdfd] border border-[#eceff1] rounded-2xl p-4">
+                    <div className={`mb-6 grid grid-cols-1 lg:grid-cols-5 gap-3 ${settingsInnerPanelCompactClass}`}>
                         <input
                             type="password"
                             className="lg:col-span-2 bg-white border border-[#eceff1] rounded-xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884]"
@@ -3164,7 +3141,7 @@ export default function WebhookView({
                         )}
                     </div>
 
-                    <div className="bg-[#fcfdfd] rounded-2xl border border-[#eceff1] overflow-hidden">
+                    <div className={settingsInnerTableShellClass}>
                         <table className="w-full text-left">
                             <thead className="bg-white text-[#54656f] text-[10px] uppercase font-black tracking-widest border-b border-[#eceff1]">
                                 <tr>
@@ -3275,7 +3252,7 @@ export default function WebhookView({
                 </div>
 
                 {isSuperAdmin && (
-                    <div id="settings-connected-clients" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                    <div id="settings-connected-clients" className={`${settingsSectionCardClass} lg:col-span-2`}>
                         <div className="flex items-center justify-between mb-6">
                             <div>
                                 <h3 className="text-xl text-[#111b21] font-bold">Connected Clients</h3>
@@ -3298,7 +3275,7 @@ export default function WebhookView({
                             </div>
                         )}
 
-                        <div className="bg-[#fcfdfd] rounded-2xl border border-[#eceff1] overflow-hidden">
+                        <div className={settingsInnerTableShellClass}>
                             <table className="w-full text-left">
                                 <thead className="bg-white text-[#54656f] text-[10px] uppercase font-black tracking-widest border-b border-[#eceff1]">
                                     <tr>
@@ -3382,7 +3359,7 @@ export default function WebhookView({
                 )}
 
                 {isSuperAdmin && (
-                    <div id="settings-connected-businesses" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                    <div id="settings-connected-businesses" className={`${settingsSectionCardClass} lg:col-span-2`}>
                     <div className="flex items-center justify-between mb-6">
                         <div>
                             <h3 className="text-xl text-[#111b21] font-bold">Connected Businesses</h3>
@@ -3426,7 +3403,7 @@ export default function WebhookView({
                         </div>
                     )}
 
-                    <div className="bg-[#fcfdfd] rounded-2xl border border-[#eceff1] overflow-hidden">
+                    <div className={settingsInnerTableShellClass}>
                         <table className="w-full text-left">
                             <thead className="bg-white text-[#54656f] text-[10px] uppercase font-black tracking-widest border-b border-[#eceff1]">
                                 <tr>

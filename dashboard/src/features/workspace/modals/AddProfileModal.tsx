@@ -20,30 +20,38 @@ export default function AddProfileModal({
     if (!open) return null;
 
     return (
-        <div className="fixed inset-0 bg-white/60 backdrop-blur-md flex items-center justify-center z-[200]">
-            <div className="bg-white p-8 rounded-3xl w-full max-w-md shadow-[0_20px_60px_rgba(0,0,0,0.1)] border border-[#eceff1]">
-                <h2 className="text-2xl font-bold mb-6 text-[#111b21]">Add New Profile</h2>
-                <label className="block text-sm text-[#54656f] mb-2 font-medium">Profile Name</label>
-                <input
-                    type="text"
-                    placeholder="e.g. Sales Account, Support Bot"
-                    value={profileName}
-                    onChange={(e) => onProfileNameChange(e.target.value)}
-                    className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-4 py-4 mb-6 focus:border-[#00a884] outline-none text-[#111b21] font-medium"
-                    autoFocus
-                    onKeyDown={(e) => e.key === 'Enter' && onSubmit()}
-                />
-                <div className="flex justify-end gap-3">
+        <div className="fixed inset-0 z-[200] qm-modal-backdrop flex items-center justify-center p-4">
+            <div className="qm-modal-surface w-full max-w-md p-6 sm:p-7">
+                <p className="qm-eyebrow">Workspace Profile</p>
+                <h2 className="qm-section-title mt-1">Add New Profile</h2>
+                <p className="qm-section-copy mt-2">Create a new profile to separate team workflows and channel settings.</p>
+
+                <div className="mt-5">
+                    <label className="qm-label mb-2">Profile Name</label>
+                    <input
+                        type="text"
+                        placeholder="e.g. Sales Account, Support Bot"
+                        value={profileName}
+                        onChange={(e) => onProfileNameChange(e.target.value)}
+                        className="qm-input"
+                        autoFocus
+                        onKeyDown={(e) => e.key === 'Enter' && onSubmit()}
+                    />
+                </div>
+
+                <div className="mt-6 flex justify-end gap-2">
                     <button
+                        type="button"
                         onClick={onClose}
-                        className="px-6 py-3 text-[#54656f] font-bold hover:bg-[#f0f2f5] rounded-xl transition-all"
+                        className="qm-btn qm-btn-secondary h-10 px-4"
                     >
                         Cancel
                     </button>
                     <button
+                        type="button"
                         onClick={onSubmit}
                         disabled={isCreatingProfile || !profileName.trim()}
-                        className="bg-[#00a884] text-white px-8 py-3 rounded-xl font-bold shadow-[0_4px_12px_rgba(0,168,132,0.2)] hover:shadow-[0_8px_20px_rgba(0,168,132,0.3)] disabled:opacity-50 transition-all"
+                        className="qm-btn qm-btn-primary h-10 px-5"
                     >
                         {isCreatingProfile ? 'Creating...' : 'Create Profile'}
                     </button>

@@ -59,29 +59,25 @@ function ContactListItem({
                     <span className="text-[11px] font-medium text-[#54656f] shrink-0">{timestampLabel}</span>
                 </div>
                 {phoneLabel && <div className="text-[11px] text-[#00a884] font-bold leading-none mb-1">{phoneLabel}</div>}
-                <div className="flex items-center justify-between mt-0.5 gap-2">
-                    <div className="flex-1 min-w-0 flex items-center gap-1.5">
-                        <p className="truncate text-[13px] text-[#54656f] font-medium leading-tight flex-1 min-w-0">{preview}</p>
-                        {primaryTag && (
-                            <span
-                                className="max-w-[84px] truncate px-1.5 py-0.5 rounded-full bg-[#e8f5f1] border border-[#d1eee6] text-[9px] font-bold text-[#0f766e] uppercase tracking-wide"
-                                title={primaryTag}
-                            >
-                                {primaryTag}
-                            </span>
-                        )}
-                        {extraTagCount > 0 && (
-                            <span className="text-[9px] font-bold text-[#6b7280]">+{extraTagCount}</span>
-                        )}
-                    </div>
-                    <div className="ml-2 flex items-center gap-1.5 shrink-0">
-                        {badgeCount > 0 && (
-                            <span className="px-1.5 py-0.5 rounded-full bg-[#00a884] text-white text-[10px] font-black leading-4">
-                                {badgeCount}
-                            </span>
-                        )}
-                        {assignee}
-                    </div>
+                <p className="truncate text-[13px] text-[#54656f] font-medium leading-tight mt-0.5">{preview}</p>
+                <div className="mt-1.5 flex items-center gap-1.5 overflow-hidden whitespace-nowrap">
+                    {primaryTag && (
+                        <span
+                            className="max-w-[88px] shrink-0 truncate px-1.5 py-0.5 rounded-full bg-[#e8f5f1] border border-[#d1eee6] text-[9px] font-bold text-[#0f766e] uppercase tracking-wide"
+                            title={primaryTag}
+                        >
+                            {primaryTag}
+                        </span>
+                    )}
+                    {extraTagCount > 0 && (
+                        <span className="shrink-0 text-[9px] font-bold text-[#6b7280]">+{extraTagCount}</span>
+                    )}
+                    {assignee && (
+                        <span className="shrink-0">{assignee}</span>
+                    )}
+                    <span className="ml-auto shrink-0 px-1.5 py-0.5 rounded-full bg-[#edf2f7] border border-[#dbe4ee] text-[9px] font-black uppercase tracking-wide text-[#475569]">
+                        Open {badgeCount}
+                    </span>
                 </div>
             </div>
         </div>

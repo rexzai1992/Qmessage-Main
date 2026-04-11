@@ -264,12 +264,13 @@ export default function BroadcastView({
     };
 
     return (
-        <div className="h-screen pt-[64px] lg:pt-[72px] pb-[76px] lg:pb-0 bg-[#f1f3f6] text-[#111b21] font-sans">
-            <div className="h-full flex flex-col lg:flex-row">
-                <aside className="w-full lg:w-72 bg-white border-b lg:border-b-0 lg:border-r border-[#eceff1] p-3 lg:p-5">
+        <div className="qm-workspace-page qm-app-gradient text-[var(--qm-text)] font-sans">
+            <div className="qm-workspace-body">
+                <div className="mx-auto flex h-full w-full max-w-[1280px] flex-col gap-3 lg:flex-row">
+                <aside className="qm-workspace-panel w-full border-b p-3 lg:w-72 lg:border-b-0 lg:border-r lg:p-5">
                     <div className="mb-3 lg:mb-4">
-                        <h2 className="text-xl font-black text-[#111b21]">Broadcast</h2>
-                        <p className="text-xs text-[#6b7280] mt-1">Campaign and template workspace</p>
+                        <h2 className="qm-section-title">Broadcast</h2>
+                        <p className="qm-section-copy mt-1 text-xs">Campaign and template workspace</p>
                     </div>
                     <div className="flex lg:flex-col gap-2 overflow-x-auto pb-1">
                         {broadcastNav.map((item) => (
@@ -277,8 +278,8 @@ export default function BroadcastView({
                                 key={item.id}
                                 onClick={() => setBroadcastSection(item.id)}
                                 className={`shrink-0 w-auto lg:w-full text-left px-3 py-2.5 rounded-xl text-sm font-bold transition-all ${broadcastSection === item.id
-                                    ? 'bg-[#00a884]/10 text-[#00a884]'
-                                    : 'text-[#111b21] hover:bg-[#f3f4f6]'
+                                    ? 'bg-[#eaf3ff] text-[var(--qm-accent)] border border-[var(--qm-border-strong)] shadow-[var(--qm-shadow-sm)]'
+                                    : 'text-[var(--qm-text-muted)] hover:bg-[#f3f7fc] hover:text-[var(--qm-text)]'
                                     }`}
                             >
                                 {item.label}
@@ -287,7 +288,7 @@ export default function BroadcastView({
                     </div>
                 </aside>
 
-                <main className="flex-1 min-h-0 overflow-hidden">
+                <main className="qm-workspace-panel flex-1 min-h-0 overflow-hidden">
                     {broadcastSection === 'template-library' && (
                         <Suspense fallback={
                             <div className="p-4 md:p-8 animate-pulse space-y-4">
@@ -321,9 +322,9 @@ export default function BroadcastView({
                     )}
                     {broadcastSection === 'broadcast-history' && (
                         <div className="h-full p-3 sm:p-4 lg:p-6 overflow-y-auto custom-scrollbar">
-                            <div className="bg-white rounded-2xl lg:rounded-3xl border border-[#eceff1] p-5 lg:p-8 shadow-[0_10px_30px_rgba(0,0,0,0.05)]">
-                                <h3 className="text-2xl font-black text-[#111b21] mb-2">Broadcast History</h3>
-                                <p className="text-sm text-[#54656f]">
+                            <div className="qm-card p-5 lg:p-8">
+                                <h3 className="qm-section-title text-2xl mb-2">Broadcast History</h3>
+                                <p className="qm-section-copy text-sm">
                                     Broadcast send logs will appear here once you start campaigns.
                                 </p>
                             </div>
@@ -331,7 +332,7 @@ export default function BroadcastView({
                     )}
                     {broadcastSection === 'scheduled-broadcasts' && (
                         <div className="h-full p-3 sm:p-4 lg:p-6 overflow-y-auto custom-scrollbar">
-                            <div className="bg-white rounded-2xl lg:rounded-3xl border border-[#eceff1] p-5 lg:p-8 shadow-[0_10px_30px_rgba(0,0,0,0.05)]">
+                            <div className="qm-card p-5 lg:p-8">
                                 <div className="flex items-center justify-between gap-3 flex-wrap">
                                     <div>
                                         <h3 className="text-2xl font-black text-[#111b21] mb-1">Scheduled Broadcasts</h3>
@@ -343,14 +344,14 @@ export default function BroadcastView({
                                         type="button"
                                         onClick={() => void loadScheduledBroadcasts()}
                                         disabled={scheduledLoading || !canManageScheduled}
-                                        className="px-4 py-2 rounded-xl border border-[#e5e7eb] bg-white text-xs font-bold text-[#111b21] hover:bg-[#f9fafb] disabled:opacity-50"
+                                        className="qm-btn qm-btn-secondary h-10 px-4"
                                     >
                                         {scheduledLoading ? 'Refreshing...' : 'Refresh'}
                                     </button>
                                 </div>
 
                                 {!canManageScheduled ? (
-                                    <div className="mt-5 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                                    <div className="qm-status qm-status-warning mt-5">
                                         Select an active profile and sign in to manage scheduled broadcasts.
                                     </div>
                                 ) : (
@@ -504,6 +505,7 @@ export default function BroadcastView({
                         </div>
                     )}
                 </main>
+            </div>
             </div>
         </div>
     );

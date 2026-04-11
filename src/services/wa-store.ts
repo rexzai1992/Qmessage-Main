@@ -56,7 +56,8 @@ export type MessageRecord = {
 }
 
 export const HUMAN_TAKEOVER_TAG = 'human_takeover'
-export const ADS_SHOOT_SIMULATED_TAG = 'ads_shoot_simulated'
+export const ADS_SHOOT_SIMULATED_TAG = 'new_leads'
+export const LEGACY_ADS_SHOOT_SIMULATED_TAG = 'ads_shoot_simulated'
 
 const CTA_REPLY_WINDOW_MS = 24 * 60 * 60 * 1000
 const CTA_FREE_WINDOW_MS = 72 * 60 * 60 * 1000

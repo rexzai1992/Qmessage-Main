@@ -1,4 +1,5 @@
 import React from 'react';
+import { CheckCircle2, Circle, CircleCheck, ExternalLink, Sparkles } from 'lucide-react';
 
 type GuideLink = {
     label: string;
@@ -65,150 +66,196 @@ export default function OnboardingTutorialModal({
     if (!open) return null;
 
     return (
-        <div className="fixed inset-0 z-[320] bg-[#111b21]/50 backdrop-blur-[2px] flex items-center justify-center p-4">
-            <div className="w-full max-w-2xl bg-white border border-[#eceff1] rounded-3xl shadow-[0_24px_80px_rgba(17,27,33,0.35)] overflow-hidden">
-                <div className="px-6 pt-6 pb-5 border-b border-[#eceff1]">
-                    <div className="text-[10px] font-black uppercase tracking-[0.2em] text-[#00a884]">First-time setup</div>
-                    <h2 className="mt-2 text-2xl font-bold text-[#111b21]">{currentStep.title}</h2>
-                    <p className="mt-2 text-sm text-[#54656f] leading-relaxed">{currentStep.description}</p>
-                    <div className="mt-4 flex items-center gap-2">
-                        {steps.map((step, idx) => (
-                            <div
-                                key={`tour-step-${step.id}`}
-                                className={`h-1.5 flex-1 rounded-full ${idx <= stepIndex ? 'bg-[#00a884]' : 'bg-[#e5e7eb]'}`}
-                            />
-                        ))}
-                    </div>
-                    <div className="mt-2 text-[11px] text-[#8696a0] font-semibold">
-                        Step {Math.min(stepIndex + 1, steps.length)} of {steps.length}
-                    </div>
-                    <div className="mt-1 text-[10px] font-bold uppercase tracking-widest text-rose-500">
-                        Required setup for company admin account
-                    </div>
-                </div>
+        <div className="fixed inset-0 z-[320] qm-modal-backdrop flex items-center justify-center p-4 sm:p-5">
+            <div className="qm-modal-surface w-full max-w-4xl overflow-hidden">
+                <div className="grid lg:grid-cols-[0.95fr_1.05fr]">
+                    <aside className="border-b border-[var(--qm-border)] bg-[#f4f8ff] p-5 sm:p-6 lg:border-b-0 lg:border-r lg:p-7">
+                        <div className="inline-flex items-center gap-2 qm-badge qm-badge-brand">
+                            <Sparkles className="h-3.5 w-3.5" />
+                            WABA Connection Setup
+                        </div>
+                        <h2 className="mt-4 text-2xl font-extrabold text-[var(--qm-text)]">Connect your WhatsApp business environment</h2>
+                        <p className="mt-2 text-sm leading-relaxed text-[var(--qm-text-muted)]">
+                            Complete each setup step once. QMessage stores credentials securely and unlocks all operational workspace features after verification.
+                        </p>
 
-                <div className="px-6 py-5">
-                    <div className="rounded-2xl border border-[#eceff1] bg-[#f8f9fa] p-4">
-                        <div className="text-[11px] font-black uppercase tracking-widest text-[#54656f] mb-2">What to do here</div>
-                        <ul className="space-y-2">
-                            {currentStep.details.map((detail, idx) => (
-                                <li key={`tour-detail-${stepIndex}-${idx}`} className="text-sm text-[#1f2937] flex items-start gap-2">
-                                    <span className="mt-[7px] w-1.5 h-1.5 rounded-full bg-[#00a884] shrink-0" />
-                                    <span>{detail}</span>
-                                </li>
-                            ))}
-                        </ul>
-                    </div>
+                        <div className="mt-5 qm-checklist">
+                            {steps.map((step, idx) => {
+                                const done = idx < stepIndex;
+                                const current = idx === stepIndex;
+                                return (
+                                    <div
+                                        key={`tour-step-${step.id}`}
+                                        className={`qm-check-item ${current ? 'border-[var(--qm-border-strong)] bg-white' : ''}`}
+                                        data-complete={done ? 'true' : 'false'}
+                                    >
+                                        <span className="qm-check-icon">
+                                            {done ? <CircleCheck className="h-3.5 w-3.5" /> : current ? <Circle className="h-3.5 w-3.5" /> : idx + 1}
+                                        </span>
+                                        <div className="min-w-0">
+                                            <p className={`truncate text-sm font-bold ${current ? 'text-[var(--qm-text)]' : 'text-[var(--qm-text-muted)]'}`}>{step.title}</p>
+                                            <p className="mt-0.5 text-xs text-[var(--qm-text-soft)]">Step {idx + 1}</p>
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
 
-                    {currentStep.whereToGet && currentStep.whereToGet.length > 0 && (
-                        <div className="rounded-2xl border border-[#e5e7eb] bg-white p-4 mt-4">
-                            <div className="text-[11px] font-black uppercase tracking-widest text-[#54656f] mb-2">Where to get it</div>
+                        <div className="mt-6 qm-help-block">
+                            <p className="text-[11px] font-extrabold uppercase tracking-[0.15em] text-[var(--qm-text-soft)]">Progress</p>
+                            <div className="mt-2 h-2 overflow-hidden rounded-full bg-[#d9e6f5]">
+                                <div
+                                    className="h-full rounded-full bg-[var(--qm-brand)] transition-all duration-300"
+                                    style={{ width: `${Math.round(((stepIndex + 1) / Math.max(steps.length, 1)) * 100)}%` }}
+                                />
+                            </div>
+                            <p className="mt-2 text-xs font-semibold text-[var(--qm-text-muted)]">
+                                Step {Math.min(stepIndex + 1, steps.length)} of {steps.length}
+                            </p>
+                        </div>
+                    </aside>
+
+                    <section className="p-5 sm:p-6 lg:p-7">
+                        <div className="qm-section-heading">
+                            <div>
+                                <p className="qm-eyebrow">Setup Step</p>
+                                <h3 className="qm-section-title mt-1">{currentStep.title}</h3>
+                            </div>
+                        </div>
+
+                        <p className="qm-section-copy mb-4">{currentStep.description}</p>
+
+                        <div className="qm-card-soft p-4">
+                            <div className="mb-2 text-[11px] font-extrabold uppercase tracking-[0.16em] text-[var(--qm-text-soft)]">What to do</div>
                             <ul className="space-y-2">
-                                {currentStep.whereToGet.map((line, idx) => (
-                                    <li key={`onboarding-source-${currentStep.id}-${idx}`} className="text-sm text-[#1f2937] flex items-start gap-2">
-                                        <span className="mt-[7px] w-1.5 h-1.5 rounded-full bg-[#00a884] shrink-0" />
-                                        <span>{line}</span>
+                                {currentStep.details.map((detail, idx) => (
+                                    <li key={`tour-detail-${stepIndex}-${idx}`} className="flex items-start gap-2 text-sm text-[var(--qm-text)]">
+                                        <span className="mt-[7px] h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--qm-brand)]" />
+                                        <span>{detail}</span>
                                     </li>
                                 ))}
                             </ul>
-                            {currentStep.guideLinks && currentStep.guideLinks.length > 0 && (
-                                <div className="flex flex-wrap gap-2 mt-3">
-                                    {currentStep.guideLinks.map((link) => (
-                                        <a
-                                            key={`guide-link-${currentStep.id}-${link.href}`}
-                                            href={link.href}
-                                            target="_blank"
-                                            rel="noreferrer"
-                                            className="px-3 py-1.5 rounded-xl border border-[#d1d5db] bg-[#f9fafb] text-[#111b21] text-[11px] font-bold hover:bg-[#f3f4f6] transition-all"
-                                        >
-                                            {link.label}
-                                        </a>
+                        </div>
+
+                        {currentStep.whereToGet && currentStep.whereToGet.length > 0 && (
+                            <div className="qm-help-block mt-4">
+                                <div className="mb-2 text-[11px] font-extrabold uppercase tracking-[0.16em] text-[var(--qm-text-soft)]">Where to get it</div>
+                                <ul className="space-y-2">
+                                    {currentStep.whereToGet.map((line, idx) => (
+                                        <li key={`onboarding-source-${currentStep.id}-${idx}`} className="flex items-start gap-2 text-sm text-[var(--qm-text)]">
+                                            <span className="mt-[7px] h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--qm-accent)]" />
+                                            <span>{line}</span>
+                                        </li>
                                     ))}
-                                </div>
-                            )}
-                        </div>
-                    )}
-
-                    {currentStep.fieldKey && (
-                        <div className="mt-4">
-                            <label className="block text-[11px] font-black uppercase tracking-widest text-[#54656f] mb-2">
-                                {currentStep.fieldLabel}
-                            </label>
-                            <input
-                                type={currentStep.fieldType || 'text'}
-                                value={onboardingSetup[currentStep.fieldKey] || ''}
-                                onChange={(e) => onUpdateField(currentStep.fieldKey!, e.target.value)}
-                                placeholder={currentStep.fieldPlaceholder || ''}
-                                autoFocus
-                                className="w-full bg-white border border-[#dce3e8] rounded-xl px-4 py-3 text-sm text-[#111b21] focus:outline-none focus:border-[#00a884]"
-                            />
-                            {!isCurrentStepValid && (
-                                <div className="mt-2 text-xs text-[#b45309] font-semibold">
-                                    Enter a valid value to continue.
-                                </div>
-                            )}
-                        </div>
-                    )}
-
-                    {currentStep.id === 'connect' && (
-                        <div className="mt-4 flex flex-col gap-3">
-                            <div className="rounded-2xl border border-[#e5e7eb] bg-white p-4">
-                                <div className="text-[11px] font-black uppercase tracking-widest text-[#54656f] mb-2">Review</div>
-                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-sm">
-                                    <div className="text-[#54656f]">WABA ID</div>
-                                    <div className="font-bold text-[#111b21] break-all">{onboardingSetup.wabaId || '—'}</div>
-                                    <div className="text-[#54656f]">Phone Number ID</div>
-                                    <div className="font-bold text-[#111b21] break-all">{onboardingSetup.phoneNumberId || '—'}</div>
-                                    <div className="text-[#54656f]">Access Token</div>
-                                    <div className="font-bold text-[#111b21]">{onboardingSetup.accessToken ? 'Entered' : 'Missing'}</div>
-                                    <div className="text-[#54656f]">Verify Token</div>
-                                    <div className="font-bold text-[#111b21]">{onboardingSetup.verifyToken ? 'Entered' : 'Missing'}</div>
-                                </div>
+                                </ul>
+                                {currentStep.guideLinks && currentStep.guideLinks.length > 0 && (
+                                    <div className="mt-3 flex flex-wrap gap-2">
+                                        {currentStep.guideLinks.map((link) => (
+                                            <a
+                                                key={`guide-link-${currentStep.id}-${link.href}`}
+                                                href={link.href}
+                                                target="_blank"
+                                                rel="noreferrer"
+                                                className="qm-btn qm-btn-secondary h-9 px-3 text-[10px]"
+                                            >
+                                                {link.label}
+                                                <ExternalLink className="h-3.5 w-3.5" />
+                                            </a>
+                                        ))}
+                                    </div>
+                                )}
                             </div>
-                            <button
-                                onClick={onConnect}
-                                disabled={onboardingConnectLoading || !activeProfileId}
-                                className="px-5 py-2.5 rounded-xl bg-[#00a884] text-white hover:bg-[#008f6f] disabled:opacity-50 disabled:cursor-not-allowed text-xs font-bold uppercase tracking-widest transition-colors shadow-sm"
-                            >
-                                {onboardingConnectLoading ? 'Verifying...' : 'Save and verify connection'}
-                            </button>
-                            {!activeProfileId && (
-                                <div className="text-xs text-[#b45309] font-semibold">
-                                    Waiting for profile to load before verification.
+                        )}
+
+                        {currentStep.fieldKey && (
+                            <div className="mt-4">
+                                <label className="qm-label mb-2">
+                                    {currentStep.fieldLabel}
+                                </label>
+                                <input
+                                    type={currentStep.fieldType || 'text'}
+                                    value={onboardingSetup[currentStep.fieldKey] || ''}
+                                    onChange={(e) => onUpdateField(currentStep.fieldKey!, e.target.value)}
+                                    placeholder={currentStep.fieldPlaceholder || ''}
+                                    autoFocus
+                                    className="qm-input"
+                                />
+                                {!isCurrentStepValid && (
+                                    <div className="qm-status qm-status-warning mt-2">
+                                        Enter a valid value to continue.
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
+                        {currentStep.id === 'connect' && (
+                            <div className="mt-4 space-y-3">
+                                <div className="qm-card p-4">
+                                    <div className="mb-2 text-[11px] font-extrabold uppercase tracking-[0.16em] text-[var(--qm-text-soft)]">Review before verify</div>
+                                    <div className="grid grid-cols-1 gap-2 text-sm sm:grid-cols-2">
+                                        <div className="text-[var(--qm-text-muted)]">WABA ID</div>
+                                        <div className="break-all font-bold text-[var(--qm-text)]">{onboardingSetup.wabaId || '-'}</div>
+                                        <div className="text-[var(--qm-text-muted)]">Phone Number ID</div>
+                                        <div className="break-all font-bold text-[var(--qm-text)]">{onboardingSetup.phoneNumberId || '-'}</div>
+                                        <div className="text-[var(--qm-text-muted)]">Access Token</div>
+                                        <div className="font-bold text-[var(--qm-text)]">{onboardingSetup.accessToken ? 'Entered' : 'Missing'}</div>
+                                        <div className="text-[var(--qm-text-muted)]">Verify Token</div>
+                                        <div className="font-bold text-[var(--qm-text)]">{onboardingSetup.verifyToken ? 'Entered' : 'Missing'}</div>
+                                    </div>
                                 </div>
-                            )}
-                            {onboardingConnectError && (
-                                <div className="text-xs text-rose-600 font-semibold">{onboardingConnectError}</div>
-                            )}
-                            {onboardingConnectSuccess && (
-                                <div className="text-xs text-emerald-600 font-semibold">{onboardingConnectSuccess}</div>
-                            )}
+
+                                <button
+                                    type="button"
+                                    onClick={onConnect}
+                                    disabled={onboardingConnectLoading || !activeProfileId}
+                                    className="qm-btn qm-btn-primary h-11"
+                                >
+                                    {onboardingConnectLoading ? 'Verifying...' : 'Save and verify connection'}
+                                </button>
+
+                                {!activeProfileId && (
+                                    <div className="qm-status qm-status-warning">
+                                        Waiting for profile to load before verification.
+                                    </div>
+                                )}
+                                {onboardingConnectError && (
+                                    <div className="qm-status qm-status-error">{onboardingConnectError}</div>
+                                )}
+                                {onboardingConnectSuccess && (
+                                    <div className="qm-status qm-status-success flex items-center gap-2">
+                                        <CheckCircle2 className="h-4 w-4" />
+                                        {onboardingConnectSuccess}
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
+                        {onboardingValidationError && (
+                            <div className="qm-status qm-status-error mt-4">{onboardingValidationError}</div>
+                        )}
+
+                        <div className="mt-6 flex flex-wrap items-center justify-between gap-3">
+                            <div className="text-xs font-semibold text-[var(--qm-text-soft)]">Complete each step to unlock dashboard access.</div>
+                            <div className="flex items-center gap-2">
+                                <button
+                                    type="button"
+                                    onClick={onBack}
+                                    disabled={stepIndex === 0 || onboardingConnectLoading}
+                                    className="qm-btn qm-btn-secondary h-10 px-4"
+                                >
+                                    Back
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={onNext}
+                                    disabled={onboardingConnectLoading || !isCurrentStepValid}
+                                    className="qm-btn qm-btn-primary h-10 px-5"
+                                >
+                                    {isFinalStep ? 'Enter dashboard' : 'Next'}
+                                </button>
+                            </div>
                         </div>
-                    )}
-
-                    {onboardingValidationError && (
-                        <div className="mt-4 text-xs text-rose-600 font-semibold">{onboardingValidationError}</div>
-                    )}
-                </div>
-
-                <div className="px-6 pb-6 flex flex-wrap items-center justify-between gap-3">
-                    <div className="text-[11px] text-[#8696a0] font-semibold">Complete each step to unlock dashboard access.</div>
-                    <div className="flex items-center gap-2 ml-auto">
-                        <button
-                            onClick={onBack}
-                            disabled={stepIndex === 0 || onboardingConnectLoading}
-                            className="px-4 py-2 rounded-xl border border-[#eceff1] text-[#111b21] hover:bg-[#f8f9fa] disabled:opacity-40 disabled:cursor-not-allowed text-xs font-bold uppercase tracking-widest transition-all"
-                        >
-                            Back
-                        </button>
-                        <button
-                            onClick={onNext}
-                            disabled={onboardingConnectLoading || !isCurrentStepValid}
-                            className="px-5 py-2 rounded-xl bg-[#00a884] text-white hover:bg-[#008f6f] disabled:opacity-50 disabled:cursor-not-allowed text-xs font-bold uppercase tracking-widest transition-colors shadow-sm"
-                        >
-                            {isFinalStep ? 'Enter dashboard' : 'Next'}
-                        </button>
-                    </div>
+                    </section>
                 </div>
             </div>
         </div>

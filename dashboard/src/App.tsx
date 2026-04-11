@@ -39,7 +39,8 @@ import {
     ShieldCheck,
     Bug,
     Bot,
-    Bell
+    Bell,
+    LifeBuoy
 } from 'lucide-react';
 import Login from './Login';
 import { supabase } from './supabase';
@@ -446,12 +447,15 @@ type AnalyticsStaffRow = {
     name: string;
     color: string | null;
     sent: number;
+    total_messages: number;
     workflow_runs: number;
     expired_messages: number;
     contacts_messaged: number;
     inbound_contacts: number;
     replied_contacts: number;
     reply_rate: number;
+    avg_response_seconds: number;
+    is_online: boolean;
 };
 
 type AnalyticsPayload = {
@@ -729,12 +733,15 @@ const normalizeAnalyticsPayload = (payload: any): AnalyticsPayload => {
                 name: typeof row?.name === 'string' ? row.name : '',
                 color: typeof row?.color === 'string' ? row.color : null,
                 sent: toSafeAnalyticsCount(row?.sent),
+                total_messages: toSafeAnalyticsCount(row?.total_messages ?? row?.sent),
                 workflow_runs: toSafeAnalyticsCount(row?.workflow_runs),
                 expired_messages: toSafeAnalyticsCount(row?.expired_messages),
                 contacts_messaged: toSafeAnalyticsCount(row?.contacts_messaged),
                 inbound_contacts: toSafeAnalyticsCount(row?.inbound_contacts),
                 replied_contacts: toSafeAnalyticsCount(row?.replied_contacts),
-                reply_rate: toSafeAnalyticsRate(row?.reply_rate)
+                reply_rate: toSafeAnalyticsRate(row?.reply_rate),
+                avg_response_seconds: toSafeAnalyticsCount(row?.avg_response_seconds),
+                is_online: Boolean(row?.is_online)
             }))
             .filter((row: AnalyticsStaffRow) => Boolean(row.user_id))
         : [];
@@ -761,6 +768,17 @@ const formatAnalyticsDateShort = (value: string): string => {
     const parsed = new Date(`${value}T00:00:00`);
     if (Number.isNaN(parsed.getTime())) return value;
     return parsed.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+};
+
+const formatAnalyticsDuration = (seconds: number): string => {
+    const safeSeconds = Math.max(0, Math.floor(seconds));
+    if (safeSeconds < 60) return `${safeSeconds}s`;
+    const minutes = Math.floor(safeSeconds / 60);
+    const remainder = safeSeconds % 60;
+    if (minutes < 60) return `${minutes}m ${remainder}s`;
+    const hours = Math.floor(minutes / 60);
+    const remMinutes = minutes % 60;
+    return `${hours}h ${remMinutes}m`;
 };
 
 const getUnreadCountForChat = (unreadMessagesByChat: Record<string, number>, jidValue: string): number => {
@@ -1849,7 +1867,6 @@ export default function App() {
         {
             group: 'Onboarding',
             items: [
-                { id: 'settings-onboard-wpa', label: 'Onboard WPA' },
                 { id: 'settings-connect', label: 'Connect WhatsApp' },
                 { id: 'settings-manual', label: 'Manual Setup' },
                 { id: 'settings-register', label: 'Register Number' }
@@ -3254,6 +3271,31 @@ export default function App() {
             inboundShare
         };
     }, [analyticsData, analyticsRows]);
+
+    const analyticsStaffInsights = useMemo(() => {
+        const onlineCount = analyticsStaffRows.filter((row) => row.is_online).length;
+        const totalMessages = analyticsStaffRows.reduce((sum, row) => sum + toSafeAnalyticsCount(row.total_messages), 0);
+        const responseRows = analyticsStaffRows.filter((row) => row.avg_response_seconds > 0);
+        const weighted = responseRows.reduce(
+            (acc, row) => {
+                const weight = Math.max(1, toSafeAnalyticsCount(row.replied_contacts));
+                return {
+                    total: acc.total + (row.avg_response_seconds * weight),
+                    weight: acc.weight + weight
+                };
+            },
+            { total: 0, weight: 0 }
+        );
+        const averageResponseSeconds = weighted.weight > 0
+            ? Math.round(weighted.total / weighted.weight)
+            : 0;
+
+        return {
+            onlineCount,
+            totalMessages,
+            averageResponseSeconds
+        };
+    }, [analyticsStaffRows]);
 
     const normalizeQuickReplyShortcut = useCallback((value: string) => {
         if (!value) return '';
@@ -6618,7 +6660,10 @@ export default function App() {
 
     const activeWorkspaceLabel = workspaceTabs.find(tab => tab.id === workspaceSection)?.label || 'Workspace';
     const defaultWorkspaceSection = workspaceTabs[0]?.id || 'team-inbox';
-    const hideGlobalHeaderOnMobileInbox = isMobile && workspaceSection === 'team-inbox' && !showAnalytics;
+    const hideGlobalHeaderOnMobileInbox = isMobile
+        && activeView === 'dashboard'
+        && workspaceSection === 'team-inbox'
+        && !showAnalytics;
     const shouldShowMobileBottomNav = isMobile
         && activeView === 'dashboard'
         && (showAnalytics || !(workspaceSection === 'team-inbox' && Boolean(selectedChatId)))
@@ -6695,7 +6740,7 @@ export default function App() {
             )}
             {!hideGlobalHeaderOnMobileInbox && (
             <header
-                className="fixed top-0 inset-x-0 z-[120] h-[64px] lg:h-[72px] bg-white border-b border-[#eceff1]"
+                className="fixed top-0 inset-x-0 z-[120] h-[64px] lg:h-[72px] bg-white/92 backdrop-blur-md border-b border-[var(--qm-border)]"
                 style={isMobile ? {
                     minHeight: 'calc(64px + env(safe-area-inset-top))',
                     paddingTop: 'max(env(safe-area-inset-top), 0px)',
@@ -6736,9 +6781,10 @@ export default function App() {
                                                 openAnalyticsFromMore();
                                                 return;
                                             }
+                                            setShowAnalytics(false);
                                             setWorkspaceSection(tab.id);
                                         }}
-                                        className={`px-3 py-2 rounded-xl text-[16px] font-bold transition-all flex items-center gap-2 ${active ? 'text-[#00a884] bg-[#00a884]/10' : 'text-[#4a4a4a] hover:bg-[#f0f2f5]'}`}
+                                    className={`px-3 py-2 rounded-xl text-[16px] font-bold transition-all flex items-center gap-2 ${active ? 'text-[#00a884] bg-[#e8f8f2] border border-[#c7efdf]' : 'text-[#4a4a4a] hover:bg-[#f4f8ff]'}`}
                                     >
                                         <Icon className="w-4 h-4" />
                                         <span>{tab.label}</span>
@@ -6768,7 +6814,7 @@ export default function App() {
                                         setWorkspaceSection('team-inbox');
                                         if (isMobile) setSelectedChatId(null);
                                     }}
-                                    className="relative w-10 h-10 rounded-full bg-[#f3f4f6] text-[#00a884] flex items-center justify-center hover:bg-[#e8f5f1] transition-all"
+                                    className="relative w-10 h-10 rounded-full bg-[#edf4fb] text-[#00a884] border border-[var(--qm-border)] flex items-center justify-center hover:bg-[#e8f5f1] transition-all"
                                     title="Unread messages"
                                 >
                                     <MessageSquare className="w-5 h-5" />
@@ -6781,7 +6827,7 @@ export default function App() {
                                 {!isUiFeatureHidden(SETTINGS_UI_FEATURE_KEY) && (
                                     <button
                                         onClick={openSettingsFromMore}
-                                        className="hidden sm:flex w-10 h-10 rounded-full bg-[#f3f4f6] text-[#6b7280] items-center justify-center"
+                                        className="hidden sm:flex w-10 h-10 rounded-full bg-[#edf4fb] border border-[var(--qm-border)] text-[#6b7280] items-center justify-center"
                                     >
                                         <User className="w-5 h-5" />
                                     </button>
@@ -6795,7 +6841,7 @@ export default function App() {
 
             {workspaceSection === 'team-inbox' ? (
                 <div
-                    className={`flex ${isMobile ? 'h-[100dvh]' : 'h-screen'} ${hideGlobalHeaderOnMobileInbox ? 'pt-0' : 'pt-[64px] lg:pt-[72px]'} bg-[#f8f9fa] overflow-hidden text-[#111b21] font-sans`}
+                    className={`qm-app-gradient flex ${isMobile ? 'h-[100dvh]' : 'h-screen'} ${hideGlobalHeaderOnMobileInbox ? 'pt-0' : 'pt-[64px] lg:pt-[72px]'} overflow-hidden text-[#111b21] font-sans`}
                     style={{
                         ...(hideGlobalHeaderOnMobileInbox ? mobileSafeInsetsStyle : mobileHeaderOffsetStyle),
                         ...(mobileBottomNavPaddingStyle || {})
@@ -6803,8 +6849,8 @@ export default function App() {
                     onTouchStart={handleMobileWorkspaceTouchStart}
                     onTouchEnd={handleMobileWorkspaceTouchEnd}
                 >
-            <div className={`${isMobileChatOpen ? 'hidden' : 'flex'} w-full lg:w-[400px] border-r border-[#eceff1] flex-col bg-white`}>
-                <div className={`px-3 py-2 border-b border-[#f0f2f5] ${hideGlobalHeaderOnMobileInbox ? 'pt-[max(env(safe-area-inset-top),0.35rem)]' : ''}`}>
+            <div className={`${isMobileChatOpen ? 'hidden' : 'flex'} w-full lg:w-[400px] border-r border-[var(--qm-border)] flex-col bg-white/95`}>
+                <div className={`px-3 py-2 border-b border-[var(--qm-border)] ${hideGlobalHeaderOnMobileInbox ? 'pt-[max(env(safe-area-inset-top),0.35rem)]' : ''}`}>
                     <div className="flex items-center gap-2">
                         <div className="flex items-center gap-1.5">
                             {isMobile ? (
@@ -6824,7 +6870,7 @@ export default function App() {
                                 </button>
                             )}
                         </div>
-                        <div className="flex-1 bg-[#f0f2f5] rounded-xl flex items-center px-4 py-2 focus-within:bg-white focus-within:ring-1 focus-within:ring-[#00a884]/20 transition-all">
+                        <div className="flex-1 bg-[#f4f8ff] border border-transparent rounded-xl flex items-center px-4 py-2 focus-within:bg-white focus-within:border-[var(--qm-border)] focus-within:ring-1 focus-within:ring-[#00a884]/20 transition-all">
                             <Search className="w-4 h-4 text-[#54656f] mr-4" />
                             <input
                                 type="text"
@@ -6838,7 +6884,7 @@ export default function App() {
                             <button
                                 type="button"
                                 onClick={openSettingsFromMore}
-                                className="w-10 h-10 rounded-xl bg-[#f0f2f5] border border-[#e1e8ed] text-[#54656f] flex items-center justify-center hover:bg-white hover:border-[#cdd8e0] transition-all"
+                                className="w-10 h-10 rounded-xl bg-[#f4f8ff] border border-[var(--qm-border)] text-[#54656f] flex items-center justify-center hover:bg-white hover:border-[#cdd8e0] transition-all"
                                 title="Open settings"
                                 aria-label="Open settings"
                             >
@@ -6846,7 +6892,7 @@ export default function App() {
                             </button>
                         )}
                         {!isMobile && (
-                            <div className="flex w-[108px] sm:w-[132px] bg-[#f0f2f5] rounded-xl items-center px-2.5 py-2 border border-transparent focus-within:border-[#00a884]/30 transition-all">
+                            <div className="flex w-[108px] sm:w-[132px] bg-[#f4f8ff] rounded-xl items-center px-2.5 py-2 border border-transparent focus-within:border-[#00a884]/30 transition-all">
                                 <Filter className="w-3.5 h-3.5 text-[#54656f] mr-2" />
                                 <select
                                     value={chatListFilter}
@@ -7005,11 +7051,12 @@ export default function App() {
                                                     borderColor: withHexAlpha(assigneeColor, '66', '#d1d5db'),
                                                     color: textColor(assigneeColor, '#374151')
                                                 }}
+                                                title={`Staff ${assigneeName}`}
                                             >
-                                                {assigneeName}
+                                                <span className="inline-flex max-w-[110px] items-center truncate">Staff {assigneeName}</span>
                                             </button>
                                         ) : chat.id.endsWith('@g.us') ? (
-                                            <span className="px-1.5 py-0.5 bg-[#f0f2f5] text-[#54656f] text-[9px] rounded uppercase font-bold border border-[#eceff1] tracking-tight">Group</span>
+                                            <span className="px-1.5 py-0.5 bg-[#f0f2f5] text-[#54656f] text-[9px] rounded uppercase font-bold border border-[#eceff1] tracking-tight">Staff Group</span>
                                         ) : (
                                             <button
                                                 type="button"
@@ -7020,7 +7067,7 @@ export default function App() {
                                                 }}
                                                 className="px-1.5 py-0.5 bg-[#f8f9fa] text-[#9ca3af] text-[9px] rounded uppercase font-bold border border-[#eceff1] tracking-tight hover:bg-[#f0f2f5] transition-all"
                                             >
-                                                Unassigned
+                                                <span className="inline-flex max-w-[110px] items-center truncate">Staff Unassigned</span>
                                             </button>
                                         );
                                         return (
@@ -7055,7 +7102,24 @@ export default function App() {
             </div>
 
             {selectedChatId ? (
-                <div className="flex-1 min-w-0 flex bg-[#f0f2f5] relative overflow-hidden">
+                <div
+                    className="flex-1 min-w-0 flex bg-[#f3f8ff] relative overflow-hidden"
+                    onDragOver={handleComposerDragOver}
+                    onDragLeave={handleComposerDragLeave}
+                    onDrop={handleComposerDrop}
+                >
+                    {canSendText && composerDragActive && (
+                        <div className="absolute inset-0 z-30 pointer-events-none bg-[#00a884]/6 backdrop-blur-[1px]">
+                            <div className="absolute inset-x-0 top-0 h-[3px] bg-[#00a884]" />
+                            <div className="h-full w-full flex items-center justify-center">
+                                <div className="rounded-2xl border-2 border-dashed border-[#00a884]/50 bg-white/90 px-5 py-3 shadow-[0_10px_28px_rgba(0,0,0,0.12)]">
+                                    <p className="text-xs font-extrabold uppercase tracking-[0.14em] text-[#007f62]">
+                                        Drop image, video, or file to attach
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                    )}
                     <div className="flex-1 min-w-0 flex flex-col min-h-0 relative overflow-hidden">
                     <div className="absolute inset-0 opacity-[0.06] pointer-events-none bg-[url('https://web.whatsapp.com/img/bg-chat-tile-light_6860a4760a595861d83d.png')] bg-repeat" />
 
@@ -7097,7 +7161,7 @@ export default function App() {
                             )}
                         />
                     ) : (
-                    <header className="h-[60px] shrink-0 bg-[#f0f2f5] px-3 flex items-center justify-between z-10 border-l border-[#eceff1]">
+                    <header className="h-[60px] shrink-0 bg-[#f4f8ff] px-3 flex items-center justify-between z-10 border-l border-[var(--qm-border)]">
                         <div className="flex items-center gap-3 cursor-pointer" onClick={() => setShowContactInfo(true)}>
                             <div className="w-10 h-10 rounded-full bg-white flex items-center justify-center overflow-hidden border border-[#eceff1] shadow-sm">
                                 {selectedChat?.id.endsWith('@g.us') ? (
@@ -7589,13 +7653,6 @@ export default function App() {
                             onDragLeave={handleComposerDragLeave}
                             onDrop={handleComposerDrop}
                         >
-                            {canSendText && composerDragActive && (
-                                <div className="absolute inset-0 z-40 rounded-xl border-2 border-dashed border-[#00a884] bg-[#00a884]/10 backdrop-blur-[1px] pointer-events-none flex items-center justify-center">
-                                    <span className="px-3 py-1 rounded-full bg-white/90 text-[#006f57] text-xs font-bold uppercase tracking-wide">
-                                        Drop file to attach
-                                    </span>
-                                </div>
-                            )}
                             {!canSendText && !isMobile && (
                                 <div className="absolute -top-8 left-0 px-3 py-1.5 rounded-lg text-[11px] bg-[#fff3e0] text-[#a16207] font-bold border border-[#fde68a]">
                                     24h window closed. Use template message to reply.
@@ -7747,7 +7804,7 @@ export default function App() {
                                 </div>
                             ) : hasComposerMedia && (
                                 <div className="mt-1 text-[11px] font-bold text-[#00a884]">
-                                    Attachment ready: {composerMediaType}
+                                    Attachment ready: {composerMediaType}. Add text or tap send.
                                 </div>
                             )}
                         </div>
@@ -8261,29 +8318,64 @@ export default function App() {
                     )}
                 </div>
             ) : isMobile ? null : (
-                <div className="flex-1 flex flex-col items-center justify-center bg-[#fcfdfd] relative">
-                    <div className="absolute inset-x-0 bottom-0 h-1.5 bg-[#00a884] z-20" />
-                    <div className="text-center relative z-10 px-6">
-                        {loadingChats && (
-                            <div className="w-[280px] mx-auto mb-10 animate-pulse space-y-3">
-                                <div className="h-3 rounded bg-[#e8edf1]" />
-                                <div className="h-3 rounded bg-[#eef2f5] w-5/6 mx-auto" />
-                                <div className="h-3 rounded bg-[#eef2f5] w-3/4 mx-auto" />
+                <div className="qm-app-gradient flex-1 px-4 py-6 sm:px-6 lg:px-10">
+                    <div className="mx-auto flex h-full max-w-4xl flex-col justify-center">
+                        <div className="qm-shell p-6 sm:p-8 lg:p-10">
+                            {loadingChats && (
+                                <div className="mb-6 space-y-3">
+                                    <div className="qm-loading-block h-3.5 w-48 rounded-full" />
+                                    <div className="qm-loading-block h-3.5 w-80 rounded-full" />
+                                </div>
+                            )}
+                            <div className="flex flex-col gap-6 lg:flex-row lg:items-center">
+                                <div className="flex-1">
+                                    <p className="qm-eyebrow">Workspace Overview</p>
+                                    <h1 className="mt-2 text-3xl font-black tracking-tight text-[var(--qm-text)] lg:text-4xl">
+                                        Welcome to your QMessage command center
+                                    </h1>
+                                    <p className="mt-3 max-w-2xl text-sm leading-relaxed text-[var(--qm-text-muted)]">
+                                        Open a chat to start handling conversations, launch automation setup, or review delivery insights across your WABA operations.
+                                    </p>
+                                    <div className="mt-5 flex flex-wrap gap-2">
+                                        <button
+                                            type="button"
+                                            onClick={() => setShowNewChatModal(true)}
+                                            className="qm-btn qm-btn-primary h-10 px-4"
+                                        >
+                                            <Plus className="h-4 w-4" />
+                                            New Chat
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => setWorkspaceSection('automations')}
+                                            className="qm-btn qm-btn-secondary h-10 px-4"
+                                        >
+                                            <Workflow className="h-4 w-4" />
+                                            Open Automations
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div className="w-full max-w-[320px] shrink-0 space-y-2">
+                                    <div className="qm-kpi">
+                                        <div className="qm-kpi-label">Coverage</div>
+                                        <div className="qm-kpi-value">Inbox + Automation</div>
+                                    </div>
+                                    <div className="qm-kpi">
+                                        <div className="qm-kpi-label">Security</div>
+                                        <div className="qm-kpi-value flex items-center gap-2">
+                                            <ShieldCheck className="h-4 w-4 text-[var(--qm-brand)]" />
+                                            Company-isolated
+                                        </div>
+                                    </div>
+                                    <div className="qm-kpi">
+                                        <div className="qm-kpi-label">Operational Flow</div>
+                                        <div className="qm-kpi-value">Capture → Route → Respond</div>
+                                    </div>
+                                </div>
                             </div>
-                        )}
-                        <div className="mb-12 flex justify-center scale-110">
-                            <img src={qmessageLogo} alt="QMessage logo" className="w-[230px] opacity-90 rounded-3xl" />
-                        </div>
-                        <h1 className="text-[32px] font-bold text-[#111b21] mb-2 tracking-tight">QMessage Console</h1>
-                        <p className="text-[#54656f] text-[15px] leading-relaxed mb-12 max-w-sm mx-auto font-medium">
-                            Manage WhatsApp Business API conversations in one clean dashboard.
-                        </p>
-                        <div className="flex items-center justify-center gap-2 text-[#54656f] text-[12px] font-bold uppercase tracking-widest bg-[#f0f2f5] py-2 px-6 rounded-full w-fit mx-auto shadow-sm">
-                            <ShieldCheck className="w-4 h-4 text-[#00a884]" />
-                            Enterprise Grade Security
                         </div>
                     </div>
-
                 </div>
             )}
 
@@ -8502,6 +8594,28 @@ export default function App() {
                             </div>
                         </div>
 
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+                            <div className="bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                                <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-2">Staff Online</div>
+                                <div className="text-3xl font-black text-[#00a884]">{analyticsStaffInsights.onlineCount}</div>
+                                <div className="text-[11px] text-[#8696a0] mt-1">Active in last 10 minutes</div>
+                            </div>
+                            <div className="bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                                <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-2">Staff Response Time</div>
+                                <div className="text-3xl font-black text-[#111b21]">
+                                    {analyticsStaffInsights.averageResponseSeconds > 0
+                                        ? formatAnalyticsDuration(analyticsStaffInsights.averageResponseSeconds)
+                                        : '--'}
+                                </div>
+                                <div className="text-[11px] text-[#8696a0] mt-1">Weighted average reply time</div>
+                            </div>
+                            <div className="bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                                <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-2">Staff Total Message</div>
+                                <div className="text-3xl font-black text-[#111b21]">{analyticsStaffInsights.totalMessages}</div>
+                                <div className="text-[11px] text-[#8696a0] mt-1">Outbound messages by staff</div>
+                            </div>
+                        </div>
+
                         <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 mb-8">
                             <div className="xl:col-span-2 bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
                                 <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-5">
@@ -8624,6 +8738,9 @@ export default function App() {
                                     <thead className="bg-[#fcfdfd] text-[#54656f] text-[10px] uppercase font-black tracking-widest border-b border-[#eceff1]">
                                         <tr>
                                             <th className="px-6 py-4">Staff</th>
+                                            <th className="px-6 py-4">Online</th>
+                                            <th className="px-6 py-4">Response Time</th>
+                                            <th className="px-6 py-4">Total Messages</th>
                                             <th className="px-6 py-4">Sent</th>
                                             <th className="px-6 py-4">Reply Rate</th>
                                             <th className="px-6 py-4">Replied / Inbound</th>
@@ -8635,7 +8752,7 @@ export default function App() {
                                     <tbody className="divide-y divide-[#f0f2f5]">
                                         {analyticsStaffRows.length === 0 ? (
                                             <tr>
-                                                <td className="px-6 py-6 text-sm text-[#8696a0]" colSpan={7}>
+                                                <td className="px-6 py-6 text-sm text-[#8696a0]" colSpan={10}>
                                                     No staff analytics for this range yet.
                                                 </td>
                                             </tr>
@@ -8651,6 +8768,19 @@ export default function App() {
                                                             {row.name || row.user_id}
                                                         </span>
                                                     </td>
+                                                    <td className="px-6 py-4 text-sm font-medium">
+                                                        <span className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-black uppercase tracking-wide ${row.is_online
+                                                            ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                                            : 'border-slate-200 bg-slate-50 text-slate-600'
+                                                            }`}>
+                                                            <span className={`h-1.5 w-1.5 rounded-full ${row.is_online ? 'bg-emerald-500' : 'bg-slate-400'}`} />
+                                                            {row.is_online ? 'Online' : 'Offline'}
+                                                        </span>
+                                                    </td>
+                                                    <td className="px-6 py-4 text-sm text-[#54656f] font-medium">
+                                                        {row.avg_response_seconds > 0 ? formatAnalyticsDuration(row.avg_response_seconds) : '--'}
+                                                    </td>
+                                                    <td className="px-6 py-4 text-sm text-[#54656f] font-medium">{row.total_messages}</td>
                                                     <td className="px-6 py-4 text-sm text-[#54656f] font-medium">{row.sent}</td>
                                                     <td className="px-6 py-4 text-sm font-bold text-[#111b21]">{row.reply_rate.toFixed(1)}%</td>
                                                     <td className="px-6 py-4 text-sm text-[#54656f] font-medium">
@@ -8800,20 +8930,6 @@ export default function App() {
             </div>
             )}
 
-            <style dangerouslySetInnerHTML={{
-                __html: `
-                .custom-scrollbar::-webkit-scrollbar {
-                  width: 6px !important;
-                }
-                .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
-                .custom-scrollbar::-webkit-scrollbar-thumb { background: #ced0d6; border-radius: 10px; }
-                .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #aebac1; }
-                
-                input::placeholder { color: #54656f; opacity: 0.5; }
-                textarea::placeholder { color: #54656f; opacity: 0.5; }
-                
-                * { font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important; }
-            ` }} />
                 </div>
             ) : workspaceSection === 'broadcast' ? (
                 <div onTouchStart={handleMobileWorkspaceTouchStart} onTouchEnd={handleMobileWorkspaceTouchEnd}>
@@ -8854,7 +8970,7 @@ export default function App() {
                 </div>
             ) : workspaceSection === 'more' ? (
                 <div
-                    className={`${isMobile ? 'h-[100dvh]' : 'h-screen'} pt-[64px] lg:pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans`}
+                    className={`${isMobile ? 'h-[100dvh]' : 'h-screen'} qm-workspace-page qm-app-gradient text-[var(--qm-text)] font-sans`}
                     style={{
                         ...(mobileHeaderOffsetStyle || {}),
                         ...(mobileBottomNavPaddingStyle || {})
@@ -8862,23 +8978,23 @@ export default function App() {
                     onTouchStart={handleMobileWorkspaceTouchStart}
                     onTouchEnd={handleMobileWorkspaceTouchEnd}
                 >
-                    <div className="h-full p-6 overflow-y-auto custom-scrollbar">
+                    <div className="h-full qm-workspace-body overflow-y-auto custom-scrollbar">
                         <div className="max-w-3xl mx-auto space-y-4">
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 {!isUiFeatureHidden(SETTINGS_UI_FEATURE_KEY) && (
                                     <button
                                         type="button"
                                         onClick={openSettingsFromMore}
-                                        className="text-left bg-white border border-[#eceff1] rounded-2xl p-5 hover:bg-[#f8f9fa] transition-all cursor-pointer pointer-events-auto"
+                                        className="text-left qm-card p-5 hover:bg-[#f8fbff] transition-all cursor-pointer pointer-events-auto"
                                     >
                                         <div className="flex items-center gap-3 mb-2">
-                                            <div className="w-9 h-9 rounded-xl bg-[#00a884]/10 border border-[#00a884]/20 text-[#00a884] flex items-center justify-center">
+                                            <div className="w-9 h-9 rounded-xl bg-[var(--qm-brand-soft)] border border-[var(--qm-border)] text-[var(--qm-brand)] flex items-center justify-center">
                                                 <Settings className="w-5 h-5" />
                                             </div>
-                                            <div className="text-lg font-black text-[#111b21]">Settings</div>
+                                            <div className="text-lg font-black text-[var(--qm-text)]">Settings</div>
                                         </div>
-                                        <p className="text-sm text-[#54656f]">
-                                            Webhooks, onboarding, team users, and workspace configuration.
+                                        <p className="text-sm text-[var(--qm-text-muted)]">
+                                            Webhooks, team users, credentials, and workspace configuration.
                                         </p>
                                     </button>
                                 )}
@@ -8887,19 +9003,34 @@ export default function App() {
                                     <button
                                         type="button"
                                         onClick={openAnalyticsFromMore}
-                                        className="text-left bg-white border border-[#eceff1] rounded-2xl p-5 hover:bg-[#f8f9fa] transition-all cursor-pointer pointer-events-auto"
+                                        className="text-left qm-card p-5 hover:bg-[#f8fbff] transition-all cursor-pointer pointer-events-auto"
                                     >
                                         <div className="flex items-center gap-3 mb-2">
-                                            <div className="w-9 h-9 rounded-xl bg-[#111b21]/5 border border-[#111b21]/10 text-[#111b21] flex items-center justify-center">
+                                            <div className="w-9 h-9 rounded-xl bg-[#edf4ff] border border-[var(--qm-border)] text-[var(--qm-accent)] flex items-center justify-center">
                                                 <BarChart3 className="w-5 h-5" />
                                             </div>
-                                            <div className="text-lg font-black text-[#111b21]">Analytics</div>
+                                            <div className="text-lg font-black text-[var(--qm-text)]">Analytics</div>
                                         </div>
-                                        <p className="text-sm text-[#54656f]">
+                                        <p className="text-sm text-[var(--qm-text-muted)]">
                                             View message totals, workflow metrics, and date-based performance.
                                         </p>
                                     </button>
                                 )}
+
+                                <a
+                                    href="mailto:hello@2fast.xyz"
+                                    className="text-left qm-card p-5 hover:bg-[#f8fbff] transition-all cursor-pointer pointer-events-auto"
+                                >
+                                    <div className="flex items-center gap-3 mb-2">
+                                        <div className="w-9 h-9 rounded-xl bg-[#eef6ff] border border-[var(--qm-border)] text-[var(--qm-accent)] flex items-center justify-center">
+                                            <LifeBuoy className="w-5 h-5" />
+                                        </div>
+                                        <div className="text-lg font-black text-[var(--qm-text)]">Support</div>
+                                    </div>
+                                    <p className="text-sm text-[var(--qm-text-muted)]">
+                                        Need help with WABA setup, delivery issues, or account operations? Contact support directly.
+                                    </p>
+                                </a>
                             </div>
                         </div>
                     </div>

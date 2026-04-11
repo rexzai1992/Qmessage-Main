@@ -1,5 +1,5 @@
-import React, { Suspense } from 'react';
-import { LogOut, Settings, X } from 'lucide-react';
+import React, { Suspense, useEffect, useMemo, useState } from 'react';
+import { LogOut, Settings, ChevronRight } from 'lucide-react';
 
 type SettingsNavItem = {
     id: string;
@@ -60,77 +60,138 @@ export default function SettingsView({
     onTestNotificationSound,
     WebhookViewComponent
 }: SettingsViewProps) {
+    const firstNavItemId = useMemo(() => settingsNav.flatMap((section) => section.items)[0]?.id || '', [settingsNav]);
+    const mobileNavItems = useMemo(() => settingsNav.flatMap((section) => section.items), [settingsNav]);
+    const [activeItemId, setActiveItemId] = useState(firstNavItemId);
+
+    useEffect(() => {
+        if (!activeItemId && firstNavItemId) {
+            setActiveItemId(firstNavItemId);
+        }
+    }, [activeItemId, firstNavItemId]);
+
+    const handleScrollToSection = (id: string) => {
+        setActiveItemId(id);
+        onScrollToSettingsSection(id);
+    };
+
     return (
-        <div className="fixed inset-0 bg-[#f8f9fa] z-[150] flex flex-col">
-            <header className="h-[64px] lg:h-[70px] bg-[#f0f2f5] px-3 sm:px-4 lg:px-6 flex items-center justify-between border-b border-[#eceff1]">
-                <div className="flex items-center gap-4">
-                    <Settings className="text-[#00a884] w-6 h-6 lg:w-8 lg:h-8" />
-                    <h1 className="text-lg lg:text-xl font-bold text-[#111b21]">Settings</h1>
-                </div>
-                <div className="flex items-center gap-3">
-                    <button
-                        onClick={onSignOut}
-                        className="px-3 lg:px-4 py-2 rounded-xl bg-white text-rose-500 font-bold border border-[#eceff1] hover:bg-rose-50 transition-all flex items-center gap-2"
-                    >
-                        <LogOut className="w-4 h-4" />
-                        <span className="hidden sm:inline">Log Out</span>
-                    </button>
-                    <button onClick={onClose} className="p-2 hover:bg-white rounded-xl transition-all">
-                        <X className="w-6 h-6 text-[#54656f]" />
-                    </button>
-                </div>
-            </header>
-            <div className="flex-1 flex flex-col lg:flex-row overflow-hidden">
-                <aside className="w-full lg:w-64 bg-white border-b lg:border-b-0 lg:border-r border-[#eceff1] px-3 lg:px-5 py-3 lg:py-6 overflow-x-auto lg:overflow-y-auto">
-                    <p className="text-[10px] font-black uppercase tracking-widest text-[#54656f] mb-4">Settings</p>
-                    <div className="space-y-4 lg:space-y-6">
-                        {settingsNav.map((section) => (
-                            <div key={section.group}>
-                                <p className="text-[10px] font-black uppercase tracking-widest text-[#8696a0] mb-2">{section.group}</p>
-                                <div className="flex lg:flex-col gap-2 overflow-x-auto lg:overflow-visible pb-1 lg:pb-0">
-                                    {section.items.map((item) => (
-                                        <button
-                                            key={item.id}
-                                            onClick={() => onScrollToSettingsSection(item.id)}
-                                            className="text-left whitespace-nowrap px-3 py-2 rounded-xl text-sm font-bold text-[#111b21] hover:bg-[#f0f2f5] transition-all"
-                                        >
-                                            {item.label}
-                                        </button>
-                                    ))}
+        <div className="fixed inset-x-0 bottom-0 top-[64px] z-[110] flex flex-col qm-app-gradient lg:top-[72px]">
+            <div className="min-h-0 flex-1 p-2 sm:p-4 lg:p-5">
+                <div className="mx-auto flex h-full w-full max-w-[1480px] min-h-0 flex-col gap-3">
+                    <div className="qm-shell px-3 py-3 sm:px-5 sm:py-4">
+                        <div className="flex items-center justify-between gap-3">
+                            <div className="flex min-w-0 items-center gap-3">
+                                <div className="flex h-11 w-11 items-center justify-center rounded-2xl border border-[var(--qm-border)] bg-[var(--qm-brand-soft)] text-[var(--qm-brand)]">
+                                    <Settings className="h-5 w-5" />
+                                </div>
+                                <div className="min-w-0">
+                                    <p className="qm-eyebrow">Workspace Control</p>
+                                    <h1 className="truncate text-lg font-extrabold text-[var(--qm-text)]">Settings and Configuration</h1>
                                 </div>
                             </div>
-                        ))}
-                    </div>
-                </aside>
-                <div className="flex-1 overflow-y-auto">
-                    <Suspense fallback={
-                        <div className="p-6 md:p-8 animate-pulse space-y-4">
-                            <div className="h-4 w-40 rounded bg-[#e8edf1]" />
-                            <div className="h-24 rounded-2xl bg-white border border-[#eceff1]" />
-                            <div className="h-24 rounded-2xl bg-white border border-[#eceff1]" />
-                            <div className="h-24 rounded-2xl bg-white border border-[#eceff1]" />
+                            <div className="flex items-center gap-2">
+                                <button
+                                    type="button"
+                                    onClick={onSignOut}
+                                    className="qm-btn qm-btn-danger h-10 px-4"
+                                >
+                                    <LogOut className="h-4 w-4" />
+                                    <span className="hidden sm:inline">Log Out</span>
+                                </button>
+                            </div>
                         </div>
-                    }>
-                        <WebhookViewComponent
-                            profileId={profileId}
-                            sessionToken={sessionToken}
-                            isAdmin={isAdmin}
-                            isSuperAdmin={isSuperAdmin}
-                            quickReplies={quickReplies}
-                            quickRepliesLoading={quickRepliesLoading}
-                            quickRepliesSaving={quickRepliesSaving}
-                            quickRepliesError={quickRepliesError}
-                            onRefreshQuickReplies={onRefreshQuickReplies}
-                            onSaveQuickReplies={onSaveQuickReplies}
-                            onRefreshUiControls={onRefreshUiControls}
-                            showCallSettings={showCallSettings}
-                            notificationPermission={notificationPermission}
-                            notificationSoundEnabled={notificationSoundEnabled}
-                            onToggleNotificationSound={onToggleNotificationSound}
-                            onRequestNotifications={onRequestNotifications}
-                            onTestNotificationSound={onTestNotificationSound}
-                        />
-                    </Suspense>
+                    </div>
+
+                    <div className="grid min-h-0 flex-1 overflow-hidden qm-shell lg:grid-cols-[288px_minmax(0,1fr)]">
+                    <aside className="min-h-0 border-b border-[var(--qm-border)] bg-white p-4 lg:overflow-y-auto lg:border-b-0 lg:border-r lg:p-5">
+                        <div className="mb-2 flex items-center justify-between lg:mb-4">
+                            <p className="qm-eyebrow">Sections</p>
+                            <span className="qm-badge qm-badge-info">{mobileNavItems.length} Items</span>
+                        </div>
+
+                        <div className="flex gap-2 overflow-x-auto pb-1 lg:hidden">
+                            {mobileNavItems.map((item) => {
+                                const isActive = activeItemId === item.id;
+                                return (
+                                    <button
+                                        key={`mobile-settings-nav-${item.id}`}
+                                        type="button"
+                                        onClick={() => handleScrollToSection(item.id)}
+                                        className={`shrink-0 rounded-full border px-3 py-1.5 text-[11px] font-extrabold transition-all ${isActive
+                                            ? 'border-[var(--qm-border-strong)] bg-[#edf5ff] text-[var(--qm-brand)]'
+                                            : 'border-[var(--qm-border)] bg-white text-[var(--qm-text-muted)]'
+                                            }`}
+                                    >
+                                        {item.label}
+                                    </button>
+                                );
+                            })}
+                        </div>
+
+                        <div className="hidden space-y-5 lg:block">
+                            {settingsNav.map((section) => (
+                                <div key={section.group}>
+                                    <p className="mb-2 text-[11px] font-extrabold uppercase tracking-[0.16em] text-[var(--qm-text-soft)]">{section.group}</p>
+                                    <div className="grid gap-1.5">
+                                        {section.items.map((item) => {
+                                            const isActive = activeItemId === item.id;
+                                            return (
+                                                <button
+                                                    key={item.id}
+                                                    type="button"
+                                                    onClick={() => handleScrollToSection(item.id)}
+                                                    className={`group flex w-full items-center justify-between rounded-[12px] border px-3 py-2.5 text-left text-sm font-bold transition-all ${isActive
+                                                        ? 'border-[var(--qm-border-strong)] bg-[#edf5ff] text-[var(--qm-text)] shadow-[var(--qm-shadow-sm)]'
+                                                        : 'border-transparent bg-transparent text-[var(--qm-text-muted)] hover:border-[var(--qm-border)] hover:bg-[#f4f8ff] hover:text-[var(--qm-text)]'
+                                                        }`}
+                                                >
+                                                    <span className="truncate">{item.label}</span>
+                                                    <ChevronRight className={`h-4 w-4 shrink-0 transition-transform ${isActive ? 'text-[var(--qm-brand)]' : 'text-[var(--qm-text-soft)] group-hover:translate-x-0.5'}`} />
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </aside>
+
+                    <div className="min-h-0 overflow-y-auto bg-[var(--qm-surface-soft)]/60">
+                        <Suspense
+                            fallback={
+                                <div className="space-y-4 p-5 sm:p-7">
+                                    <div className="qm-loading-block h-4 w-44" />
+                                    <div className="qm-loading-block h-24 w-full rounded-[18px]" />
+                                    <div className="qm-loading-block h-24 w-full rounded-[18px]" />
+                                    <div className="qm-loading-block h-24 w-full rounded-[18px]" />
+                                </div>
+                            }
+                        >
+                            <div className="p-4 sm:p-6 lg:p-7">
+                                <WebhookViewComponent
+                                    profileId={profileId}
+                                    sessionToken={sessionToken}
+                                    isAdmin={isAdmin}
+                                    isSuperAdmin={isSuperAdmin}
+                                    quickReplies={quickReplies}
+                                    quickRepliesLoading={quickRepliesLoading}
+                                    quickRepliesSaving={quickRepliesSaving}
+                                    quickRepliesError={quickRepliesError}
+                                    onRefreshQuickReplies={onRefreshQuickReplies}
+                                    onSaveQuickReplies={onSaveQuickReplies}
+                                    onRefreshUiControls={onRefreshUiControls}
+                                    showCallSettings={showCallSettings}
+                                    notificationPermission={notificationPermission}
+                                    notificationSoundEnabled={notificationSoundEnabled}
+                                    onToggleNotificationSound={onToggleNotificationSound}
+                                    onRequestNotifications={onRequestNotifications}
+                                    onTestNotificationSound={onTestNotificationSound}
+                                />
+                            </div>
+                        </Suspense>
+                    </div>
+                </div>
                 </div>
             </div>
         </div>

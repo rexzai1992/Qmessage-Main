@@ -15,7 +15,7 @@ import { supabase, supabaseAuth } from './src/supabase'
 import { WabaRegistry } from './src/waba/registry'
 import { parseWabaWebhook, verifyWabaSignature } from './src/waba/webhook'
 import type { WabaInboundMessage, WabaStatus, WabaConfig, WabaCallUpdate } from './src/waba/types'
-import { ADS_SHOOT_SIMULATED_TAG, resolveCompanyId, findOrCreateUser, getMessagesForUsers, getMessagesForUsersSince, getUsersForCompany, insertMessage, getUserByPhone, deleteMessagesForUser, deleteUserById, normalizePhoneNumber, isGroupIdentifier, updateMessageStatusByMessageId, updateUserName, setUserTags, getUsersWithExpiringWindow, updateUserWindowReminder, activateUserCtaFreeWindow, getUserById, assignUserToAgentIfUnassigned, setUserAssignee, hasHumanTakeover, setUserHumanTakeover, setUserTemplateAttributes } from './src/services/wa-store'
+import { ADS_SHOOT_SIMULATED_TAG, LEGACY_ADS_SHOOT_SIMULATED_TAG, resolveCompanyId, findOrCreateUser, getMessagesForUsers, getMessagesForUsersSince, getUsersForCompany, insertMessage, getUserByPhone, deleteMessagesForUser, deleteUserById, normalizePhoneNumber, isGroupIdentifier, updateMessageStatusByMessageId, updateUserName, setUserTags, getUsersWithExpiringWindow, updateUserWindowReminder, activateUserCtaFreeWindow, getUserById, assignUserToAgentIfUnassigned, setUserAssignee, hasHumanTakeover, setUserHumanTakeover, setUserTemplateAttributes } from './src/services/wa-store'
 import type { MessageRecord, User as WaStoreUser } from './src/services/wa-store'
 import { sendWhatsAppMessage } from './src/services/whatsapp'
 import { createDownloadUrl, isR2Configured } from './src/services/r2-storage'
@@ -1007,9 +1007,14 @@ function chunkArray<T>(items: T[], size: number): T[][] {
     return chunks
 }
 
+const ADS_SHOOT_SIMULATED_TAG_VALUES = new Set([
+    ADS_SHOOT_SIMULATED_TAG,
+    LEGACY_ADS_SHOOT_SIMULATED_TAG
+].map((tag) => String(tag || '').trim().toLowerCase()))
+
 function hasAdsShootSimulatedTag(tags: unknown): boolean {
     if (!Array.isArray(tags)) return false
-    return tags.some((tag) => String(tag || '').trim().toLowerCase() === ADS_SHOOT_SIMULATED_TAG)
+    return tags.some((tag) => ADS_SHOOT_SIMULATED_TAG_VALUES.has(String(tag || '').trim().toLowerCase()))
 }
 
 async function collectSimulatedUserIdsByMessageMarker(candidateUserIds: string[], profileId: string): Promise<Set<string>> {
@@ -1112,7 +1117,7 @@ async function clearAdsShootSimulatedConversations(
             for (const userId of userChunk) {
                 const user = userById.get(userId)
                 if (!user || !Array.isArray(user.tags)) continue
-                const nextTags = user.tags.filter((tag) => String(tag || '').trim().toLowerCase() !== ADS_SHOOT_SIMULATED_TAG)
+                const nextTags = user.tags.filter((tag) => !ADS_SHOOT_SIMULATED_TAG_VALUES.has(String(tag || '').trim().toLowerCase()))
                 await setUserTags(user.id, nextTags)
             }
             continue

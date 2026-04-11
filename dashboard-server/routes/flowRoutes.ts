@@ -212,11 +212,15 @@ export function registerFlowRoutes(app: Express, ctx: any) {
                     name: string
                     color: string | null
                     sent: number
+                    total_messages: number
                     workflow_runs: number
                     expired_messages: number
                     contacts: Set<string>
                     inbound_contacts: Set<string>
                     replied_contacts: Set<string>
+                    response_time_total_ms: number
+                    response_time_count: number
+                    last_active_ts: number
                 }
             >()
 
@@ -251,11 +255,15 @@ export function registerFlowRoutes(app: Express, ctx: any) {
                     name: agent.name || agent.user_id,
                     color: agent.color,
                     sent: 0,
+                    total_messages: 0,
                     workflow_runs: 0,
                     expired_messages: 0,
                     contacts: new Set<string>(),
                     inbound_contacts: new Set<string>(),
-                    replied_contacts: new Set<string>()
+                    replied_contacts: new Set<string>(),
+                    response_time_total_ms: 0,
+                    response_time_count: 0,
+                    last_active_ts: 0
                 }
                 staffMap.set(agent.user_id, created)
                 return created
@@ -278,7 +286,11 @@ export function registerFlowRoutes(app: Express, ctx: any) {
                     if (agent) {
                         const staff = ensureStaffRow(agent)
                         staff.sent += 1
+                        staff.total_messages += 1
                         if (msg.user_id) staff.contacts.add(String(msg.user_id))
+                        if (!Number.isNaN(createdAt.getTime())) {
+                            staff.last_active_ts = Math.max(staff.last_active_ts, createdAt.getTime())
+                        }
                     }
                     const wfId = msg.workflow_state?.workflow_id || msg.workflow_state?.workflowId
                     const stepIndex = Number(msg.workflow_state?.step_index)
@@ -324,6 +336,11 @@ export function registerFlowRoutes(app: Express, ctx: any) {
                 }
                 if (hasWindowReplyCandidate && msg.user_id) {
                     staff.replied_contacts.add(String(msg.user_id))
+                    const responseMs = outTs - inboundTimes[idx]
+                    if (responseMs >= 0) {
+                        staff.response_time_total_ms += responseMs
+                        staff.response_time_count += 1
+                    }
                 } else {
                     staff.expired_messages += 1
                 }
@@ -343,17 +360,25 @@ export function registerFlowRoutes(app: Express, ctx: any) {
                     const inboundContacts = row.inbound_contacts.size
                     const repliedContacts = row.replied_contacts.size
                     const replyRate = inboundContacts > 0 ? (repliedContacts / inboundContacts) * 100 : 0
+                    const avgResponseSeconds = row.response_time_count > 0
+                        ? Math.round((row.response_time_total_ms / row.response_time_count) / 1000)
+                        : 0
+                    const onlineWindowMs = 10 * 60 * 1000
+                    const isOnline = row.last_active_ts > 0 && (Date.now() - row.last_active_ts) <= onlineWindowMs
                     return {
                         user_id: row.user_id,
                         name: row.name || row.user_id,
                         color: row.color,
                         sent: row.sent,
+                        total_messages: row.total_messages,
                         workflow_runs: row.workflow_runs,
                         expired_messages: row.expired_messages,
                         contacts_messaged: row.contacts.size,
                         inbound_contacts: inboundContacts,
                         replied_contacts: repliedContacts,
-                        reply_rate: Number(replyRate.toFixed(1))
+                        reply_rate: Number(replyRate.toFixed(1)),
+                        avg_response_seconds: avgResponseSeconds,
+                        is_online: isOnline
                     }
                 })
                 .sort((a, b) => {

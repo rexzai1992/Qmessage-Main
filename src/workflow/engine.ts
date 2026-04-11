@@ -1,5 +1,5 @@
 import type { WabaClient } from '../waba/client'
-import { ADS_SHOOT_SIMULATED_TAG, extractCtaReferralSource, findOrCreateUser, getCompanyFallbackSettings, getLastMessage, getLatestWorkflowMemory, getWorkflowById, getWorkflows, insertMessage, setUserAssignee, updateMessageWorkflowState, updateUserCtaReferral, updateUserLastInbound, updateUserTags } from '../services/wa-store'
+import { ADS_SHOOT_SIMULATED_TAG, LEGACY_ADS_SHOOT_SIMULATED_TAG, extractCtaReferralSource, findOrCreateUser, getCompanyFallbackSettings, getLastMessage, getLatestWorkflowMemory, getWorkflowById, getWorkflows, insertMessage, setUserAssignee, setUserTags, updateMessageWorkflowState, updateUserCtaReferral, updateUserLastInbound, updateUserTags } from '../services/wa-store'
 import type { User } from '../services/wa-store'
 import { sendWhatsAppMessage } from '../services/whatsapp'
 import type { WorkflowState } from './types'
@@ -602,7 +602,28 @@ export class WorkflowEngine {
         if (!user) return { handled: false, replied: false }
         const isSimulatedInbound = Boolean(ctx.raw?.simulated)
         if (isSimulatedInbound) {
-            await updateUserTags(user.id, ADS_SHOOT_SIMULATED_TAG)
+            const existingTags = Array.isArray(user.tags) ? user.tags : []
+            const hasLegacyTag = existingTags.some(
+                (tag) => String(tag || '').trim().toLowerCase() === LEGACY_ADS_SHOOT_SIMULATED_TAG
+            )
+            if (hasLegacyTag) {
+                const nextTags = Array.from(
+                    new Set(
+                        [
+                            ...existingTags.filter(
+                                (tag) => String(tag || '').trim().toLowerCase() !== LEGACY_ADS_SHOOT_SIMULATED_TAG
+                            ),
+                            ADS_SHOOT_SIMULATED_TAG
+                        ]
+                            .map((tag) => String(tag || '').trim())
+                            .filter(Boolean)
+                    )
+                )
+                await setUserTags(user.id, nextTags)
+                user.tags = nextTags
+            } else {
+                await updateUserTags(user.id, ADS_SHOOT_SIMULATED_TAG)
+            }
         }
 
         const inboundTimestamp = ctx.raw?.timestamp ? Number(ctx.raw.timestamp) * 1000 : null
