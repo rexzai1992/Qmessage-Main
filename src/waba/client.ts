@@ -1,6 +1,22 @@
 import type { WabaConfig } from './types'
 
 const DEFAULT_TIMEOUT_MS = 15000
+const MAX_LIST_BODY_LEN = 1024
+const MAX_LIST_HEADER_LEN = 60
+const MAX_LIST_FOOTER_LEN = 60
+const MAX_LIST_BUTTON_LEN = 20
+const MAX_LIST_SECTION_TITLE_LEN = 24
+const MAX_LIST_ROW_TITLE_LEN = 24
+const MAX_LIST_ROW_DESC_LEN = 72
+const MAX_LIST_ROW_ID_LEN = 200
+const MAX_LIST_TOTAL_ROWS = 10
+
+function trimToMax(value: unknown, max: number): string {
+    if (typeof value !== 'string') return ''
+    const trimmed = value.trim()
+    if (!trimmed) return ''
+    return trimmed.length > max ? trimmed.slice(0, max) : trimmed
+}
 
 export class WabaClient {
     private baseUrl: string
@@ -69,6 +85,88 @@ export class WabaClient {
         return {
             to: this.normalizeRecipient(withoutDomain),
             recipientType: 'individual'
+        }
+    }
+
+    private sanitizeInteractiveListPayload(
+        bodyText: string,
+        buttonText: string,
+        sections: Array<{ title?: string; rows: Array<{ id: string; title: string; description?: string }> }>
+    ) {
+        const body = trimToMax(bodyText, MAX_LIST_BODY_LEN) || 'Please choose an option:'
+        const button = trimToMax(buttonText, MAX_LIST_BUTTON_LEN) || 'View options'
+        const inputSections = Array.isArray(sections) ? sections : []
+        const usedIds = new Set<string>()
+        let globalRowCount = 0
+
+        const normalizeRowId = (rawId: unknown, fallbackIndex: number) => {
+            const trimmed = trimToMax(rawId, MAX_LIST_ROW_ID_LEN)
+            const normalized =
+                trimmed
+                    .replace(/[^a-zA-Z0-9_.-]+/g, '_')
+                    .replace(/^_+|_+$/g, '')
+                    .slice(0, MAX_LIST_ROW_ID_LEN) || `row_${fallbackIndex + 1}`
+            let next = normalized
+            let suffix = 2
+            while (usedIds.has(next)) {
+                const base = normalized.slice(0, Math.max(1, MAX_LIST_ROW_ID_LEN - (`_${suffix}`.length)))
+                next = `${base}_${suffix}`
+                suffix += 1
+            }
+            usedIds.add(next)
+            return next
+        }
+
+        const normalizedSections = inputSections
+            .map((section: any) => {
+                const rows = Array.isArray(section?.rows) ? section.rows : []
+                const normalizedRows: Array<{ id: string; title: string; description?: string }> = []
+
+                for (const row of rows) {
+                    if (globalRowCount >= MAX_LIST_TOTAL_ROWS) break
+                    const title =
+                        trimToMax(row?.title, MAX_LIST_ROW_TITLE_LEN) ||
+                        trimToMax(row?.id, MAX_LIST_ROW_TITLE_LEN) ||
+                        `Option ${globalRowCount + 1}`
+                    const id = normalizeRowId(row?.id, globalRowCount)
+                    const description = trimToMax(row?.description, MAX_LIST_ROW_DESC_LEN)
+                    normalizedRows.push({
+                        id,
+                        title,
+                        ...(description ? { description } : {})
+                    })
+                    globalRowCount += 1
+                }
+
+                if (normalizedRows.length === 0) return null
+
+                const sectionTitle = trimToMax(section?.title, MAX_LIST_SECTION_TITLE_LEN)
+                return {
+                    ...(sectionTitle ? { title: sectionTitle } : {}),
+                    rows: normalizedRows
+                }
+            })
+            .filter((section): section is { title?: string; rows: Array<{ id: string; title: string; description?: string }> } => Boolean(section))
+
+        if (normalizedSections.length === 0) {
+            throw new Error('sendInteractiveList requires at least one valid row')
+        }
+
+        if (normalizedSections.length > 1) {
+            return {
+                body,
+                button,
+                sections: normalizedSections.map((section, index) => ({
+                    ...section,
+                    title: section.title || `Section ${index + 1}`
+                }))
+            }
+        }
+
+        return {
+            body,
+            button,
+            sections: normalizedSections
         }
     }
 
@@ -224,30 +322,25 @@ export class WabaClient {
         }>,
         options: { header?: { type: 'text'; text: string }; footer?: string } = {}
     ) {
-        const normalizedSections = (sections || []).map(section => ({
-            ...(section?.title ? { title: section.title } : {}),
-            rows: (section?.rows || []).map(row => ({
-                id: row.id,
-                title: row.title,
-                ...(row.description ? { description: row.description } : {})
-            }))
-        }))
+        const normalizedPayload = this.sanitizeInteractiveListPayload(bodyText, buttonText, sections)
+        const headerText = trimToMax(options.header?.text, MAX_LIST_HEADER_LEN)
+        const footerText = trimToMax(options.footer, MAX_LIST_FOOTER_LEN)
 
         const interactive: any = {
             type: 'list',
-            body: { text: bodyText },
+            body: { text: normalizedPayload.body },
             action: {
-                button: buttonText,
-                sections: normalizedSections
+                button: normalizedPayload.button,
+                sections: normalizedPayload.sections
             }
         }
 
-        if (options.header) {
-            interactive.header = { type: 'text', text: options.header.text }
+        if (headerText) {
+            interactive.header = { type: 'text', text: headerText }
         }
 
-        if (options.footer) {
-            interactive.footer = { text: options.footer }
+        if (footerText) {
+            interactive.footer = { text: footerText }
         }
 
         const recipient = this.parseMessageRecipient(to)

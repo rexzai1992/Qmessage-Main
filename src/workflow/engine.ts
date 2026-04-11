@@ -1,5 +1,5 @@
 import type { WabaClient } from '../waba/client'
-import { extractCtaReferralSource, findOrCreateUser, getCompanyFallbackSettings, getLastMessage, getLatestWorkflowMemory, getWorkflowById, getWorkflows, insertMessage, setUserAssignee, updateMessageWorkflowState, updateUserCtaReferral, updateUserLastInbound, updateUserTags } from '../services/wa-store'
+import { ADS_SHOOT_SIMULATED_TAG, extractCtaReferralSource, findOrCreateUser, getCompanyFallbackSettings, getLastMessage, getLatestWorkflowMemory, getWorkflowById, getWorkflows, insertMessage, setUserAssignee, updateMessageWorkflowState, updateUserCtaReferral, updateUserLastInbound, updateUserTags } from '../services/wa-store'
 import type { User } from '../services/wa-store'
 import { sendWhatsAppMessage } from '../services/whatsapp'
 import type { WorkflowState } from './types'
@@ -22,6 +22,13 @@ export type InboundContext = {
         file_size?: number
     }
     raw?: any
+}
+
+export type WorkflowProcessResult = {
+    error?: string
+    handled: boolean
+    replied: boolean
+    completedWorkflowId?: string
 }
 
 function extractInboundReferral(raw: any): any | null {
@@ -498,6 +505,8 @@ function resolveDynamicContext(state: WorkflowState, user: User, ctx: InboundCon
     const phone = user.phone_number || ctx.phoneNumber || ''
     const context: Record<string, string> = {
         ...vars,
+        company_id: ctx.companyId || '',
+        profile_id: ctx.profileId || '',
         contact_name: contactName,
         name: contactName,
         phone_number: phone,
@@ -588,9 +597,13 @@ function evaluateCondition(action: any, state: WorkflowState, user: User, ctx: I
 }
 
 export class WorkflowEngine {
-    public async processInbound(ctx: InboundContext): Promise<{ error?: string; handled: boolean; replied: boolean }> {
+    public async processInbound(ctx: InboundContext): Promise<WorkflowProcessResult> {
         const user = await findOrCreateUser(ctx.companyId, ctx.phoneNumber)
         if (!user) return { handled: false, replied: false }
+        const isSimulatedInbound = Boolean(ctx.raw?.simulated)
+        if (isSimulatedInbound) {
+            await updateUserTags(user.id, ADS_SHOOT_SIMULATED_TAG)
+        }
 
         const inboundTimestamp = ctx.raw?.timestamp ? Number(ctx.raw.timestamp) * 1000 : null
         const inboundIso = inboundTimestamp && !Number.isNaN(inboundTimestamp)
@@ -631,23 +644,39 @@ export class WorkflowEngine {
             ctx = { ...ctx, buttonId: matchedIncomingButtonId }
         }
 
+        const simulatedSourceRaw = typeof ctx.raw?.source === 'string' ? ctx.raw.source.trim().toLowerCase() : ''
+        const inboundContent: any = {
+            type: ctx.messageType,
+            text: ctx.text,
+            button_id: ctx.buttonId,
+            button_title: ctx.buttonTitle,
+            media_id: ctx.media?.id,
+            mimetype: ctx.media?.mime_type,
+            caption: ctx.media?.caption,
+            filename: ctx.media?.filename,
+            file_size: ctx.media?.file_size,
+            referral: referral || null,
+            ...(isSimulatedInbound
+                ? {
+                    simulated: true,
+                    simulated_source: simulatedSourceRaw || 'simulated',
+                    simulated_profile_id: ctx.profileId
+                }
+                : {}),
+            ...(STORE_INBOUND_RAW_PAYLOAD ? { raw: ctx.raw } : {})
+        }
+
         const inboundRecord = await insertMessage({
             userId: user.id,
             direction: 'in',
-            content: {
-                type: ctx.messageType,
-                text: ctx.text,
-                button_id: ctx.buttonId,
-                button_title: ctx.buttonTitle,
-                media_id: ctx.media?.id,
-                mimetype: ctx.media?.mime_type,
-                caption: ctx.media?.caption,
-                filename: ctx.media?.filename,
-                file_size: ctx.media?.file_size,
-                referral: referral || null,
-                ...(STORE_INBOUND_RAW_PAYLOAD ? { raw: ctx.raw } : {})
-            },
-            workflowState: currentState
+            content: inboundContent,
+            workflowState: currentState,
+            createdAt:
+                isSimulatedInbound
+                && inboundTimestamp
+                && !Number.isNaN(inboundTimestamp)
+                    ? inboundIso
+                    : undefined
         })
 
         const inboundAnswer = getInboundAnswer(ctx)
@@ -752,9 +781,23 @@ export class WorkflowEngine {
 
                     if (workflow) {
                         const continued = await this.runWorkflowActions(ctx, user, workflow, state)
-                        return continued.error
-                            ? { error: continued.error, handled: true, replied: sentReceipt || continued.replied }
-                            : { handled: true, replied: sentReceipt || continued.replied }
+                        if (continued.error) {
+                            return {
+                                error: continued.error,
+                                handled: true,
+                                replied: sentReceipt || continued.replied,
+                                ...(continued.completedWorkflowId
+                                    ? { completedWorkflowId: continued.completedWorkflowId }
+                                    : {})
+                            }
+                        }
+                        return {
+                            handled: true,
+                            replied: sentReceipt || continued.replied,
+                            ...(continued.completedWorkflowId
+                                ? { completedWorkflowId: continued.completedWorkflowId }
+                                : {})
+                        }
                     }
 
                     return { handled: true, replied: sentReceipt }
@@ -1189,7 +1232,7 @@ export class WorkflowEngine {
         return this.runWorkflowActions(ctx, user, workflow, state)
     }
 
-    public async startWorkflow(ctx: InboundContext, workflowId: string): Promise<{ error?: string; handled: boolean; replied: boolean }> {
+    public async startWorkflow(ctx: InboundContext, workflowId: string): Promise<WorkflowProcessResult> {
         const user = await findOrCreateUser(ctx.companyId, ctx.phoneNumber)
         if (!user) return { handled: false, replied: false }
 
@@ -1219,7 +1262,7 @@ export class WorkflowEngine {
         user: User,
         workflow: any,
         state: WorkflowState
-    ): Promise<{ error?: string; handled: boolean; replied: boolean }> {
+    ): Promise<WorkflowProcessResult> {
         state.vars = sanitizeVars(state.vars)
         state.qa_history = sanitizeQaHistory(state.qa_history)
         state.awaiting_confirmation = sanitizeAwaitingConfirmation(state.awaiting_confirmation)
@@ -1255,6 +1298,7 @@ export class WorkflowEngine {
         const actions = parseActions(workflow.actions)
         let index = state.step_index || 0
         let lastError: string | null = null
+        let completedWorkflowId: string | undefined
         let safety = 0
         const maxSteps = Math.max(actions.length * 3, 50)
 
@@ -1766,6 +1810,10 @@ export class WorkflowEngine {
             }
 
             if (action.type === 'end_flow') {
+                if (typeof workflow?.id === 'string' && workflow.id.trim()) {
+                    completedWorkflowId = workflow.id.trim()
+                }
+                state.step_index = index + 1
                 break
             }
 
@@ -1773,6 +1821,12 @@ export class WorkflowEngine {
             state.step_index = index
         }
 
-        return lastError ? { error: lastError, handled: true, replied } : { handled: true, replied }
+        const result: WorkflowProcessResult = lastError
+            ? { error: lastError, handled: true, replied }
+            : { handled: true, replied }
+        if (completedWorkflowId) {
+            result.completedWorkflowId = completedWorkflowId
+        }
+        return result
     }
 }

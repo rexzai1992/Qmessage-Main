@@ -15,7 +15,7 @@ import { supabase, supabaseAuth } from './src/supabase'
 import { WabaRegistry } from './src/waba/registry'
 import { parseWabaWebhook, verifyWabaSignature } from './src/waba/webhook'
 import type { WabaInboundMessage, WabaStatus, WabaConfig, WabaCallUpdate } from './src/waba/types'
-import { resolveCompanyId, findOrCreateUser, getMessagesForUsers, getMessagesForUsersSince, getUsersForCompany, insertMessage, getUserByPhone, deleteMessagesForUser, normalizePhoneNumber, isGroupIdentifier, updateMessageStatusByMessageId, updateUserName, setUserTags, getUsersWithExpiringWindow, updateUserWindowReminder, activateUserCtaFreeWindow, getUserById, assignUserToAgentIfUnassigned, setUserAssignee, hasHumanTakeover, setUserHumanTakeover, setUserTemplateAttributes } from './src/services/wa-store'
+import { ADS_SHOOT_SIMULATED_TAG, resolveCompanyId, findOrCreateUser, getMessagesForUsers, getMessagesForUsersSince, getUsersForCompany, insertMessage, getUserByPhone, deleteMessagesForUser, normalizePhoneNumber, isGroupIdentifier, updateMessageStatusByMessageId, updateUserName, setUserTags, getUsersWithExpiringWindow, updateUserWindowReminder, activateUserCtaFreeWindow, getUserById, assignUserToAgentIfUnassigned, setUserAssignee, hasHumanTakeover, setUserHumanTakeover, setUserTemplateAttributes } from './src/services/wa-store'
 import type { MessageRecord, User as WaStoreUser } from './src/services/wa-store'
 import { sendWhatsAppMessage } from './src/services/whatsapp'
 import { createDownloadUrl, isR2Configured } from './src/services/r2-storage'
@@ -477,6 +477,655 @@ const DEFAULT_REMINDER_TEXT = 'Heads up! Our 24h reply window closes soon. Reply
 const reminderRunningProfiles = new Set<string>()
 const reminderCache = new Map<string, number>()
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123'
+const ADS_SHOOT_MODE_FILE = resolvePath('ads_shoot_mode.json')
+const ADS_SHOOT_MODE_BATCH_SIZE = 15
+const ADS_SHOOT_MODE_NIGHT_START_HOUR = 20
+const ADS_SHOOT_MODE_NIGHT_END_HOUR = 23
+const GYM_SHOWCASE_WORKFLOW_ID = 'wf-gym-auto-reply'
+const GYM_SHOWCASE_SOURCE = 'gym_showcase_boost'
+const GYM_SHOWCASE_BOOST_COUNT = 5
+const GYM_SHOWCASE_COOLDOWN_MS = 90 * 1000
+const GYM_SHOWCASE_MIN_GAP_MS = 18 * 1000
+
+type AdsShootLeadTemplate = {
+    name: string
+    text: string
+}
+
+type AdsShootLead = AdsShootLeadTemplate & {
+    phone: string
+}
+
+type GymShowcaseLead = {
+    name: string
+    phone: string
+    followupButtonId: 'location' | 'hours'
+    followupButtonTitle: 'Gym Location' | 'Operating Hours'
+}
+
+type AdsShootModeProfileConfig = {
+    companyId: string
+    profileId: string
+    enabled: boolean
+    lastRunLocalDate: string | null
+    updatedAt: string
+}
+
+type AdsShootModeStoreData = {
+    profiles: Record<string, AdsShootModeProfileConfig>
+}
+
+const ADS_SHOOT_LEAD_TEMPLATES: AdsShootLeadTemplate[] = [
+    { name: 'Aiman Rahman', text: 'Hi, how much is the monthly membership?' },
+    { name: 'Nurul Aisyah', text: 'Do you have free trial for new member?' },
+    { name: 'Daniel Lee', text: 'Can I join tonight if I sign up now?' },
+    { name: 'Siti Hajar', text: 'Is there personal trainer package available?' },
+    { name: 'Jonathan Tan', text: 'Hi, what is your gym operating hour today?' },
+    { name: 'Farah Nabila', text: 'Do you have ladies class or ladies area?' },
+    { name: 'Marcus Lim', text: 'Can I pay by card or ewallet for membership?' },
+    { name: 'Syafiq Azman', text: 'Any promo for student membership this month?' },
+    { name: 'Emily Wong', text: 'I want to lose weight. Which plan is best for beginner?' },
+    { name: 'Hafiz Roslan', text: 'If I register now, when can I start using the gym?' },
+    { name: 'Sarah Collins', text: 'Do you offer group class like HIIT or yoga?' },
+    { name: 'Amirul Hakim', text: 'How much for personal trainer per session?' },
+    { name: 'Chloe Adams', text: 'Can I freeze my membership if I travel next month?' },
+    { name: 'Izzati Sofea', text: 'Do you have shower, locker and parking at your gym?' },
+    { name: 'Brandon Clarke', text: 'Hi there, is there any annual package discount?' },
+    { name: 'Hakim Iskandar', text: 'Can my friend and I join together with better price?' },
+    { name: 'Nadia Yasmin', text: 'Is there onboarding session for first timer?' },
+    { name: 'Ethan Miller', text: 'Do you have 24-hour access membership?' },
+    { name: 'Alicia Teoh', text: 'Can I book a gym tour before I decide to join?' },
+    { name: 'Faris Danish', text: 'What documents do I need to register membership?' }
+]
+
+const adsShootModeRunningProfiles = new Set<string>()
+const adsShootModeStore: AdsShootModeStoreData = loadAdsShootModeStore()
+const gymShowcaseRunningProfiles = new Set<string>()
+const gymShowcaseLastTriggeredByProfile = new Map<string, number>()
+
+function normalizeAdsShootModeEnabled(value: unknown): boolean {
+    if (value === true) return true
+    if (value === false) return false
+    if (value === 1) return true
+    if (value === 0) return false
+    if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase()
+        return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on'
+    }
+    return false
+}
+
+function isAdsShootStorePayload(value: unknown): value is AdsShootModeStoreData {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+    const profiles = (value as any).profiles
+    return !!profiles && typeof profiles === 'object' && !Array.isArray(profiles)
+}
+
+function buildAdsShootConfigKey(companyId: string, profileId: string) {
+    return `${companyId}::${profileId}`
+}
+
+function buildDefaultAdsShootModeProfileConfig(companyId: string, profileId: string): AdsShootModeProfileConfig {
+    return {
+        companyId,
+        profileId,
+        enabled: false,
+        lastRunLocalDate: null,
+        updatedAt: new Date().toISOString()
+    }
+}
+
+function loadAdsShootModeStore(): AdsShootModeStoreData {
+    try {
+        if (!fs.existsSync(ADS_SHOOT_MODE_FILE)) return { profiles: {} }
+        const raw = fs.readFileSync(ADS_SHOOT_MODE_FILE, 'utf-8')
+        const parsed = raw ? JSON.parse(raw) : null
+        if (!isAdsShootStorePayload(parsed)) return { profiles: {} }
+
+        const profiles: Record<string, AdsShootModeProfileConfig> = {}
+        for (const [key, value] of Object.entries(parsed.profiles || {})) {
+            if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+            const companyId = typeof (value as any).companyId === 'string' ? (value as any).companyId.trim() : ''
+            const profileId = typeof (value as any).profileId === 'string' ? (value as any).profileId.trim() : ''
+            if (!companyId || !profileId) continue
+            const normalizedKey = buildAdsShootConfigKey(companyId, profileId)
+            profiles[normalizedKey || key] = {
+                companyId,
+                profileId,
+                enabled: normalizeAdsShootModeEnabled((value as any).enabled),
+                lastRunLocalDate: typeof (value as any).lastRunLocalDate === 'string' ? (value as any).lastRunLocalDate : null,
+                updatedAt: typeof (value as any).updatedAt === 'string' ? (value as any).updatedAt : new Date().toISOString()
+            }
+        }
+        return { profiles }
+    } catch (error: any) {
+        console.warn('[AdsShootMode] Failed to load mode store:', error?.message || error)
+        return { profiles: {} }
+    }
+}
+
+function saveAdsShootModeStore() {
+    try {
+        fs.writeFileSync(ADS_SHOOT_MODE_FILE, JSON.stringify(adsShootModeStore, null, 2), 'utf-8')
+    } catch (error: any) {
+        console.warn('[AdsShootMode] Failed to save mode store:', error?.message || error)
+    }
+}
+
+function getAdsShootModeProfileConfig(companyId: string, profileId: string): AdsShootModeProfileConfig {
+    const key = buildAdsShootConfigKey(companyId, profileId)
+    const existing = adsShootModeStore.profiles[key]
+    if (existing) {
+        return {
+            ...existing,
+            companyId,
+            profileId
+        }
+    }
+    return buildDefaultAdsShootModeProfileConfig(companyId, profileId)
+}
+
+function upsertAdsShootModeProfileConfig(config: AdsShootModeProfileConfig) {
+    const key = buildAdsShootConfigKey(config.companyId, config.profileId)
+    adsShootModeStore.profiles[key] = {
+        ...config,
+        updatedAt: new Date().toISOString()
+    }
+    saveAdsShootModeStore()
+}
+
+function getLocalDateKey(date: Date): string {
+    const year = date.getFullYear()
+    const month = String(date.getMonth() + 1).padStart(2, '0')
+    const day = String(date.getDate()).padStart(2, '0')
+    return `${year}-${month}-${day}`
+}
+
+function buildAdsShootLeadPhone(profileId: string, localDateKey: string, index: number): string {
+    const seed = createHash('sha256')
+        .update(`${profileId}:${localDateKey}:${index}`)
+        .digest('hex')
+    const randomPart = 10_000_000 + (Number.parseInt(seed.slice(0, 8), 16) % 90_000_000)
+    return `6011${String(randomPart)}`
+}
+
+function buildAdsShootLeads(profileId: string, localDateKey: string, count: number): AdsShootLead[] {
+    const seed = createHash('sha256')
+        .update(`ads-shoot:${profileId}:${localDateKey}`)
+        .digest('hex')
+    const offset = Number.parseInt(seed.slice(0, 6), 16) % ADS_SHOOT_LEAD_TEMPLATES.length
+    const leads: AdsShootLead[] = []
+    for (let index = 0; index < count; index += 1) {
+        const template = ADS_SHOOT_LEAD_TEMPLATES[(offset + index) % ADS_SHOOT_LEAD_TEMPLATES.length]
+        leads.push({
+            name: template.name,
+            text: template.text,
+            phone: buildAdsShootLeadPhone(profileId, localDateKey, index)
+        })
+    }
+    return leads
+}
+
+function createDeterministicRng(seedText: string): () => number {
+    const digest = createHash('sha256').update(seedText).digest()
+    let state = digest.readUInt32LE(0) || 1
+    return () => {
+        state = (state + 0x6D2B79F5) >>> 0
+        let t = Math.imul(state ^ (state >>> 15), 1 | state)
+        t ^= t + Math.imul(t ^ (t >>> 7), 61 | t)
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+    }
+}
+
+function buildAdsShootRandomizedTimestamps(config: AdsShootModeProfileConfig, source: 'manual' | 'nightly', count: number): number[] {
+    const nowMs = Date.now()
+    const now = new Date(nowMs)
+
+    let windowStartMs = nowMs - (3 * 60 * 60 * 1000)
+    let windowEndMs = nowMs
+    if (source === 'nightly') {
+        const start = new Date(now)
+        start.setHours(ADS_SHOOT_MODE_NIGHT_START_HOUR, 0, 0, 0)
+        windowStartMs = Math.min(start.getTime(), nowMs)
+        windowEndMs = nowMs
+    }
+
+    if (!Number.isFinite(windowStartMs) || !Number.isFinite(windowEndMs) || windowEndMs <= windowStartMs) {
+        const fallback = Math.floor(nowMs / 1000)
+        return Array.from({ length: count }, (_, index) => fallback + index)
+    }
+
+    const rng = createDeterministicRng(`ads-shoot-time:${config.profileId}:${source}:${getLocalDateKey(now)}`)
+    const minGapMs = 25 * 1000
+    const randomMs = Array.from({ length: count }, () => {
+        const value = windowStartMs + Math.floor((windowEndMs - windowStartMs) * rng())
+        return value
+    }).sort((a, b) => a - b)
+
+    for (let index = 1; index < randomMs.length; index += 1) {
+        if (randomMs[index] <= randomMs[index - 1]) {
+            randomMs[index] = randomMs[index - 1] + minGapMs
+        }
+    }
+
+    const capMs = windowEndMs + (count * minGapMs)
+    for (let index = 0; index < randomMs.length; index += 1) {
+        if (randomMs[index] > capMs) randomMs[index] = capMs + (index * 1000)
+    }
+
+    return randomMs.map((value) => Math.max(1, Math.floor(value / 1000)))
+}
+
+function buildRandomizedTimelineUnixSeconds(
+    seedText: string,
+    count: number,
+    windowStartMs: number,
+    windowEndMs: number,
+    minGapMs: number
+): number[] {
+    if (count <= 0) return []
+    const nowMs = Date.now()
+    if (!Number.isFinite(windowStartMs) || !Number.isFinite(windowEndMs) || windowEndMs <= windowStartMs) {
+        const fallback = Math.floor(nowMs / 1000)
+        return Array.from({ length: count }, (_, index) => fallback + index)
+    }
+
+    const rng = createDeterministicRng(seedText)
+    const randomMs = Array.from({ length: count }, () => {
+        const value = windowStartMs + Math.floor((windowEndMs - windowStartMs) * rng())
+        return value
+    }).sort((a, b) => a - b)
+
+    const gap = Math.max(1000, minGapMs)
+    for (let index = 1; index < randomMs.length; index += 1) {
+        if (randomMs[index] <= randomMs[index - 1]) {
+            randomMs[index] = randomMs[index - 1] + gap
+        }
+    }
+
+    const capMs = windowEndMs + (count * gap)
+    for (let index = 0; index < randomMs.length; index += 1) {
+        if (randomMs[index] > capMs) randomMs[index] = capMs + (index * 1000)
+    }
+
+    return randomMs.map((value) => Math.max(1, Math.floor(value / 1000)))
+}
+
+function buildGymShowcaseLeads(profileId: string, triggerPhone: string, count: number): GymShowcaseLead[] {
+    const now = new Date()
+    const seed = createHash('sha256')
+        .update(`gym-showcase:${profileId}:${triggerPhone}:${now.toISOString()}:${randomBytes(4).toString('hex')}`)
+        .digest('hex')
+    const offset = Number.parseInt(seed.slice(0, 6), 16) % ADS_SHOOT_LEAD_TEMPLATES.length
+    const phoneSeedKey = `${getLocalDateKey(now)}-gym-${seed.slice(0, 12)}`
+    const leads: GymShowcaseLead[] = []
+    for (let index = 0; index < count; index += 1) {
+        const template = ADS_SHOOT_LEAD_TEMPLATES[(offset + index) % ADS_SHOOT_LEAD_TEMPLATES.length]
+        let phone = buildAdsShootLeadPhone(profileId, phoneSeedKey, index)
+        if (phone === triggerPhone) {
+            phone = buildAdsShootLeadPhone(profileId, `${phoneSeedKey}-alt`, index)
+        }
+        const rngNibble = Number.parseInt(seed.slice((index * 2) % 60, ((index * 2) % 60) + 2), 16)
+        const chooseLocation = (Number.isFinite(rngNibble) ? rngNibble : index) % 2 === 0
+        leads.push({
+            name: template.name,
+            phone,
+            followupButtonId: chooseLocation ? 'location' : 'hours',
+            followupButtonTitle: chooseLocation ? 'Gym Location' : 'Operating Hours'
+        })
+    }
+    return leads
+}
+
+function buildGymShowcaseTimestamps(profileId: string, triggerPhone: string, count: number): number[] {
+    const nowMs = Date.now()
+    const dynamicWindowMs = Math.max(12 * 60 * 1000, count * GYM_SHOWCASE_MIN_GAP_MS * 2)
+    const windowStartMs = nowMs - dynamicWindowMs - (3 * 60 * 1000)
+    const windowEndMs = nowMs - 20 * 1000
+    return buildRandomizedTimelineUnixSeconds(
+        `gym-showcase-time:${profileId}:${triggerPhone}:${nowMs}:${count}`,
+        count,
+        windowStartMs,
+        windowEndMs,
+        GYM_SHOWCASE_MIN_GAP_MS
+    )
+}
+
+function buildGymShowcaseInbound(
+    config: WabaConfig,
+    lead: GymShowcaseLead,
+    timestamp: number,
+    leadIndex: number,
+    stepIndex: number,
+    payload: {
+        type: string
+        text?: string
+        buttonId?: string
+        buttonTitle?: string
+        buttonDescription?: string
+    },
+    triggerPhone: string
+): WabaInboundMessage {
+    const textBody = typeof payload.text === 'string'
+        ? payload.text
+        : (payload.buttonTitle || payload.buttonId || '')
+    return {
+        phoneNumberId: config.phoneNumberId,
+        from: lead.phone,
+        id: `gym-showcase-${Date.now()}-${leadIndex + 1}-${stepIndex + 1}-${randomBytes(3).toString('hex')}`,
+        timestamp,
+        type: payload.type,
+        text: textBody ? { body: textBody } : undefined,
+        buttonReplyId: payload.buttonId,
+        buttonReplyTitle: payload.buttonTitle,
+        buttonReplyDescription: payload.buttonDescription,
+        contactName: lead.name,
+        raw: {
+            source: GYM_SHOWCASE_SOURCE,
+            simulated: true,
+            profile_id: config.profileId,
+            company_id: config.companyId || null,
+            trigger_phone: triggerPhone,
+            lead_index: leadIndex + 1,
+            step_index: stepIndex + 1
+        }
+    }
+}
+
+async function runGymShowcaseBoost(
+    config: WabaConfig,
+    companyId: string,
+    triggerPhone: string
+): Promise<{ sent: number; failed: number; error?: string }> {
+    const key = buildAdsShootConfigKey(companyId, config.profileId)
+    if (gymShowcaseRunningProfiles.has(key)) {
+        return { sent: 0, failed: 0, error: 'Gym showcase boost is already running for this profile' }
+    }
+
+    const modeConfig = getAdsShootModeProfileConfig(companyId, config.profileId)
+    if (!modeConfig.enabled) {
+        return { sent: 0, failed: 0, error: 'Ads Shoot Mode is disabled for this profile' }
+    }
+
+    const companyForProfile = await getCompanyIdForProfile(config.profileId)
+    if (!companyForProfile) {
+        return { sent: 0, failed: 0, error: 'Company not found for profile' }
+    }
+    if (companyForProfile !== companyId) {
+        return { sent: 0, failed: 0, error: 'Profile does not belong to this company' }
+    }
+
+    const nowMs = Date.now()
+    const lastTriggerMs = gymShowcaseLastTriggeredByProfile.get(key) || 0
+    if (lastTriggerMs && (nowMs - lastTriggerMs) < GYM_SHOWCASE_COOLDOWN_MS) {
+        return { sent: 0, failed: 0, error: 'Gym showcase boost is cooling down' }
+    }
+
+    const leads = buildGymShowcaseLeads(config.profileId, triggerPhone, GYM_SHOWCASE_BOOST_COUNT)
+    const stepsPerLead = 6
+    const timestamps = buildGymShowcaseTimestamps(config.profileId, triggerPhone, leads.length * stepsPerLead)
+    let timelineIndex = 0
+    let sent = 0
+    let failed = 0
+
+    gymShowcaseRunningProfiles.add(key)
+    try {
+        for (let leadIndex = 0; leadIndex < leads.length; leadIndex += 1) {
+            const lead = leads[leadIndex]
+            const steps: Array<{ type: string; text?: string; buttonId?: string; buttonTitle?: string }> = [
+                { type: 'text', text: 'Hi, I want to check gym membership.' },
+                { type: 'button', text: 'Membership', buttonId: 'membership', buttonTitle: 'Membership' },
+                { type: 'button', text: 'Monthly Membership', buttonId: 'monthly_membership', buttonTitle: 'Monthly Membership' },
+                { type: 'button', text: 'Payment Success', buttonId: 'payment_success', buttonTitle: 'Payment Success' },
+                { type: 'button', text: lead.followupButtonTitle, buttonId: lead.followupButtonId, buttonTitle: lead.followupButtonTitle },
+                { type: 'button', text: 'Done', buttonId: 'done', buttonTitle: 'Done' }
+            ]
+
+            for (let stepIndex = 0; stepIndex < steps.length; stepIndex += 1) {
+                const step = steps[stepIndex]
+                const timestamp = timestamps[timelineIndex] || Math.floor(Date.now() / 1000)
+                timelineIndex += 1
+                const inbound = buildGymShowcaseInbound(
+                    config,
+                    lead,
+                    timestamp,
+                    leadIndex,
+                    stepIndex,
+                    step,
+                    triggerPhone
+                )
+                try {
+                    await handleInboundMessage(config, inbound)
+                    sent += 1
+                } catch (error: any) {
+                    failed += 1
+                    console.warn('[GymShowcase] Failed to inject simulated workflow message:', error?.message || error)
+                }
+            }
+        }
+        gymShowcaseLastTriggeredByProfile.set(key, Date.now())
+    } finally {
+        gymShowcaseRunningProfiles.delete(key)
+    }
+
+    return { sent, failed }
+}
+
+async function runAdsShootModeBatch(
+    config: AdsShootModeProfileConfig,
+    source: 'manual' | 'nightly'
+): Promise<{ sent: number; failed: number; leads: AdsShootLead[]; error?: string }> {
+    const companyId = await getCompanyIdForProfile(config.profileId)
+    if (!companyId) {
+        return { sent: 0, failed: 0, leads: [], error: 'Company not found for profile' }
+    }
+    if (companyId !== config.companyId) {
+        return { sent: 0, failed: 0, leads: [], error: 'Profile does not belong to this company' }
+    }
+
+    const wabaConfig = await wabaRegistry.getConfigByProfile(config.profileId)
+    if (!wabaConfig) {
+        return { sent: 0, failed: 0, leads: [], error: 'WABA config is not available for this profile' }
+    }
+
+    const localDateKey = getLocalDateKey(new Date())
+    const leads = buildAdsShootLeads(config.profileId, localDateKey, ADS_SHOOT_MODE_BATCH_SIZE)
+    const timestamps = buildAdsShootRandomizedTimestamps(config, source, leads.length)
+    let sent = 0
+    let failed = 0
+
+    for (let index = 0; index < leads.length; index += 1) {
+        const lead = leads[index]
+        const nowUnix = timestamps[index] || Math.floor(Date.now() / 1000)
+        const inbound: WabaInboundMessage = {
+            phoneNumberId: wabaConfig.phoneNumberId,
+            from: lead.phone,
+            id: `ads-shoot-${source}-${Date.now()}-${index + 1}-${randomBytes(3).toString('hex')}`,
+            timestamp: nowUnix,
+            type: 'text',
+            text: { body: lead.text },
+            contactName: lead.name,
+            raw: {
+                source: 'ads_shoot_mode',
+                mode: source,
+                profile_id: config.profileId,
+                company_id: config.companyId,
+                simulated: true,
+                lead_index: index + 1
+            }
+        }
+        try {
+            await handleInboundMessage(wabaConfig, inbound)
+            sent += 1
+        } catch (error: any) {
+            failed += 1
+            console.warn('[AdsShootMode] Failed to inject simulated lead:', error?.message || error)
+        }
+    }
+
+    return { sent, failed, leads }
+}
+
+async function runAdsShootModeTick() {
+    const now = new Date()
+    const localHour = now.getHours()
+    if (localHour < ADS_SHOOT_MODE_NIGHT_START_HOUR || localHour > ADS_SHOOT_MODE_NIGHT_END_HOUR) return
+
+    const localDateKey = getLocalDateKey(now)
+    const entries = Object.values(adsShootModeStore.profiles)
+    for (const config of entries) {
+        if (!config.enabled) continue
+        if (config.lastRunLocalDate === localDateKey) continue
+
+        const key = buildAdsShootConfigKey(config.companyId, config.profileId)
+        if (adsShootModeRunningProfiles.has(key)) continue
+        adsShootModeRunningProfiles.add(key)
+        try {
+            const result = await runAdsShootModeBatch(config, 'nightly')
+            if (result.error) {
+                console.warn(`[AdsShootMode] ${config.profileId}: ${result.error}`)
+                continue
+            }
+            const nextConfig: AdsShootModeProfileConfig = {
+                ...config,
+                lastRunLocalDate: localDateKey
+            }
+            upsertAdsShootModeProfileConfig(nextConfig)
+            console.log(`[AdsShootMode] ${config.profileId}: injected ${result.sent}/${ADS_SHOOT_MODE_BATCH_SIZE} nightly leads.`)
+        } finally {
+            adsShootModeRunningProfiles.delete(key)
+        }
+    }
+}
+
+function chunkArray<T>(items: T[], size: number): T[][] {
+    const nextSize = Math.max(1, Math.floor(size))
+    const chunks: T[][] = []
+    for (let index = 0; index < items.length; index += nextSize) {
+        chunks.push(items.slice(index, index + nextSize))
+    }
+    return chunks
+}
+
+function hasAdsShootSimulatedTag(tags: unknown): boolean {
+    if (!Array.isArray(tags)) return false
+    return tags.some((tag) => String(tag || '').trim().toLowerCase() === ADS_SHOOT_SIMULATED_TAG)
+}
+
+async function collectSimulatedUserIdsByMessageMarker(candidateUserIds: string[], profileId: string): Promise<Set<string>> {
+    const result = new Set<string>()
+    if (candidateUserIds.length === 0) return result
+
+    const contentMarkers: any[] = [
+        { simulated: true, simulated_profile_id: profileId },
+        { raw: { source: 'ads_shoot_mode', profile_id: profileId } },
+        { raw: { source: GYM_SHOWCASE_SOURCE, profile_id: profileId } }
+    ]
+    const userChunks = chunkArray(candidateUserIds, 120)
+    for (const userChunk of userChunks) {
+        for (const marker of contentMarkers) {
+            let offset = 0
+            const pageSize = 500
+            while (true) {
+                const { data, error } = await supabase
+                    .from('messages')
+                    .select('user_id')
+                    .in('user_id', userChunk)
+                    .contains('content', marker)
+                    .range(offset, offset + pageSize - 1)
+
+                if (error) {
+                    console.warn('[AdsShootMode] Failed to collect simulated message markers:', error.message)
+                    break
+                }
+
+                const rows = Array.isArray(data) ? data : []
+                rows.forEach((row: any) => {
+                    if (row?.user_id) result.add(String(row.user_id))
+                })
+
+                if (rows.length < pageSize) break
+                offset += pageSize
+            }
+        }
+    }
+
+    return result
+}
+
+async function clearAdsShootSimulatedConversations(
+    companyId: string,
+    profileId: string
+): Promise<{ candidate_users: number; deleted_messages: number; deleted_users: number }> {
+    const users = await getUsersForCompany(companyId)
+    if (users.length === 0) {
+        return { candidate_users: 0, deleted_messages: 0, deleted_users: 0 }
+    }
+
+    const userIds = users.map((user) => user.id).filter(Boolean)
+    const userById = new Map(users.map((user) => [user.id, user]))
+    const candidateUserIds = new Set<string>()
+    const simulatedByMarker = await collectSimulatedUserIdsByMessageMarker(userIds, profileId)
+    simulatedByMarker.forEach((userId) => candidateUserIds.add(userId))
+
+    if (candidateUserIds.size === 0) {
+        // Fallback for older payloads without simulated_profile_id markers.
+        users.forEach((user) => {
+            if (hasAdsShootSimulatedTag(user.tags)) {
+                candidateUserIds.add(user.id)
+            }
+        })
+    }
+
+    if (candidateUserIds.size === 0) {
+        return { candidate_users: 0, deleted_messages: 0, deleted_users: 0 }
+    }
+
+    let deletedMessages = 0
+    let deletedUsers = 0
+    const candidateList = Array.from(candidateUserIds)
+
+    const messageChunks = chunkArray(candidateList, 80)
+    for (const userChunk of messageChunks) {
+        const { count, error } = await supabase
+            .from('messages')
+            .delete({ count: 'exact' })
+            .in('user_id', userChunk)
+
+        if (error) {
+            console.warn(`[AdsShootMode] Failed to delete simulated messages for profile ${profileId}:`, error.message)
+            continue
+        }
+        deletedMessages += Number(count || 0)
+    }
+
+    const userChunks = chunkArray(candidateList, 80)
+    for (const userChunk of userChunks) {
+        const { count, error } = await supabase
+            .from('users')
+            .delete({ count: 'exact' })
+            .eq('company_id', companyId)
+            .in('id', userChunk)
+
+        if (error) {
+            console.warn(`[AdsShootMode] Failed to delete simulated users for profile ${profileId}:`, error.message)
+            for (const userId of userChunk) {
+                const user = userById.get(userId)
+                if (!user || !Array.isArray(user.tags)) continue
+                const nextTags = user.tags.filter((tag) => String(tag || '').trim().toLowerCase() !== ADS_SHOOT_SIMULATED_TAG)
+                await setUserTags(user.id, nextTags)
+            }
+            continue
+        }
+        deletedUsers += Number(count || 0)
+    }
+
+    return {
+        candidate_users: candidateList.length,
+        deleted_messages: deletedMessages,
+        deleted_users: deletedUsers
+    }
+}
 
 async function runWindowReminders() {
     const configs = await wabaRegistry.getProfileIds()
@@ -530,6 +1179,14 @@ async function runWindowReminders() {
 setInterval(() => {
     runWindowReminders().catch(err => console.error('[Reminder] tick failed:', err))
 }, 60_000)
+
+setInterval(() => {
+    runAdsShootModeTick().catch(err => console.error('[AdsShootMode] tick failed:', err))
+}, 60_000)
+
+setTimeout(() => {
+    runAdsShootModeTick().catch(err => console.error('[AdsShootMode] initial tick failed:', err))
+}, 8_000)
 
 const workflowEngine = new WorkflowEngine()
 
@@ -3347,10 +4004,18 @@ function enqueueWebhookEvents(events: QueuedWebhookEvent[]) {
 
 function toMinimalInboundRaw(inbound: WabaInboundMessage): any | null {
     if (INCLUDE_RAW_WEBHOOK_EVENT_PAYLOAD) return inbound.raw
-    return {
+    const raw = inbound.raw && typeof inbound.raw === 'object' ? inbound.raw : null
+    const source = readTrimmed(raw?.source)
+    const minimal: any = {
         timestamp: inbound.timestamp,
         referral: inbound.referral || null
     }
+    if (source) minimal.source = source
+    if (raw && typeof raw.simulated === 'boolean') minimal.simulated = raw.simulated
+    if (raw && typeof raw.mode === 'string') minimal.mode = raw.mode
+    if (raw && typeof raw.lead_index === 'number') minimal.lead_index = raw.lead_index
+    if (raw && typeof raw.trigger_phone === 'string') minimal.trigger_phone = raw.trigger_phone
+    return minimal
 }
 
 function toMinimalStatusRaw(status: WabaStatus): any | null {
@@ -3683,6 +4348,113 @@ registerAiRoutes(app, {
     encryptToken,
     decryptToken,
     getTokenEncryptionKey
+})
+
+app.get('/api/company/ads-shoot-mode', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const mode = getAdsShootModeProfileConfig(access.companyId, access.profileId)
+        return res.json({
+            success: true,
+            data: {
+                company_id: mode.companyId,
+                profile_id: mode.profileId,
+                enabled: mode.enabled,
+                batch_size: ADS_SHOOT_MODE_BATCH_SIZE,
+                night_start_hour: ADS_SHOOT_MODE_NIGHT_START_HOUR,
+                night_end_hour: ADS_SHOOT_MODE_NIGHT_END_HOUR,
+                last_run_local_date: mode.lastRunLocalDate,
+                updated_at: mode.updatedAt
+            }
+        })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error?.message || 'Failed to load Ads Shoot Mode settings' })
+    }
+})
+
+app.post('/api/company/ads-shoot-mode', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const admin = await isAdminUser(access.user.id, access.companyId)
+        if (!admin) {
+            return res.status(403).json({ success: false, error: 'Admin access required to update Ads Shoot Mode' })
+        }
+
+        const existing = getAdsShootModeProfileConfig(access.companyId, access.profileId)
+        const nextConfig: AdsShootModeProfileConfig = {
+            ...existing,
+            enabled: normalizeAdsShootModeEnabled(req.body?.enabled)
+        }
+        upsertAdsShootModeProfileConfig(nextConfig)
+        const shouldClearSimulated = nextConfig.enabled === false
+        const cleanup = shouldClearSimulated
+            ? await clearAdsShootSimulatedConversations(access.companyId, access.profileId)
+            : null
+
+        return res.json({
+            success: true,
+            data: {
+                company_id: nextConfig.companyId,
+                profile_id: nextConfig.profileId,
+                enabled: nextConfig.enabled,
+                batch_size: ADS_SHOOT_MODE_BATCH_SIZE,
+                night_start_hour: ADS_SHOOT_MODE_NIGHT_START_HOUR,
+                night_end_hour: ADS_SHOOT_MODE_NIGHT_END_HOUR,
+                last_run_local_date: nextConfig.lastRunLocalDate,
+                updated_at: nextConfig.updatedAt,
+                cleanup
+            }
+        })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error?.message || 'Failed to update Ads Shoot Mode settings' })
+    }
+})
+
+app.post('/api/company/ads-shoot-mode/run', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const admin = await isAdminUser(access.user.id, access.companyId)
+        if (!admin) {
+            return res.status(403).json({ success: false, error: 'Admin access required to run Ads Shoot Mode' })
+        }
+
+        const config = getAdsShootModeProfileConfig(access.companyId, access.profileId)
+        const key = buildAdsShootConfigKey(config.companyId, config.profileId)
+        if (adsShootModeRunningProfiles.has(key)) {
+            return res.status(409).json({ success: false, error: 'Ads Shoot Mode is already running for this profile' })
+        }
+
+        adsShootModeRunningProfiles.add(key)
+        try {
+            const result = await runAdsShootModeBatch(config, 'manual')
+            if (result.error) {
+                return res.status(503).json({ success: false, error: result.error })
+            }
+            return res.json({
+                success: true,
+                data: {
+                    sent: result.sent,
+                    failed: result.failed,
+                    batch_size: ADS_SHOOT_MODE_BATCH_SIZE,
+                    sample_leads: result.leads.map((lead) => ({
+                        name: lead.name,
+                        phone: lead.phone,
+                        message: lead.text
+                    }))
+                }
+            })
+        } finally {
+            adsShootModeRunningProfiles.delete(key)
+        }
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error?.message || 'Failed to run Ads Shoot Mode' })
+    }
 })
 
 // WABA WEBHOOK (Meta Cloud API)
@@ -5377,6 +6149,464 @@ app.use(
     )
 )
 
+function normalizeSimulatedPaymentStatus(value: unknown): 'payment_success' | 'payment_not_success' | null {
+    const raw = typeof value === 'string' ? value.trim().toLowerCase() : ''
+    if (!raw) return null
+    if (raw === 'payment_success' || raw === 'success' || raw === 'paid' || raw === 'done' || raw === 'ok') {
+        return 'payment_success'
+    }
+    if (raw === 'payment_not_success' || raw === 'not_success' || raw === 'failed' || raw === 'fail' || raw === 'not_paid' || raw === 'pending') {
+        return 'payment_not_success'
+    }
+    return null
+}
+
+function normalizeSimulatedPaymentReturnUrl(value: unknown): string {
+    const raw = typeof value === 'string' ? value.trim() : ''
+    if (!raw) return ''
+    try {
+        const parsed = new URL(raw)
+        const protocol = parsed.protocol.toLowerCase()
+        if (protocol === 'https:' || protocol === 'http:' || protocol === 'whatsapp:') {
+            return raw
+        }
+        return ''
+    } catch {
+        return ''
+    }
+}
+
+app.get('/simulated-payment', async (req: any, res: any) => {
+    const profileId = typeof req.query?.profileId === 'string' ? req.query.profileId.trim() : ''
+    const phoneRaw = typeof req.query?.phone === 'string' ? req.query.phone : ''
+    const phone = normalizePhoneNumber(phoneRaw)
+    const merchant = (typeof req.query?.merchant === 'string' ? req.query.merchant.trim() : '') || '2Fast Merchant Simulation'
+    const amount = (typeof req.query?.amount === 'string' ? req.query.amount.trim() : '') || '59.90'
+    const currency = (typeof req.query?.currency === 'string' ? req.query.currency.trim().toUpperCase() : '') || 'MYR'
+    const invoice = (typeof req.query?.invoice === 'string' ? req.query.invoice.trim() : '') || `SIM-${Date.now().toString().slice(-8)}`
+    const reference = (typeof req.query?.reference === 'string' ? req.query.reference.trim() : '') || invoice
+    const returnUrl = normalizeSimulatedPaymentReturnUrl(req.query?.returnUrl)
+    const returnFallback = normalizeSimulatedPaymentReturnUrl(req.query?.returnFallback)
+    const returnSuccessUrl = normalizeSimulatedPaymentReturnUrl(req.query?.returnSuccessUrl)
+    const returnFailUrl = normalizeSimulatedPaymentReturnUrl(req.query?.returnFailUrl)
+    const returnSuccessFallback = normalizeSimulatedPaymentReturnUrl(req.query?.returnSuccessFallback)
+    const returnFailFallback = normalizeSimulatedPaymentReturnUrl(req.query?.returnFailFallback)
+
+    const missingRequired = !profileId || !phone
+    const defaultWhatsappDeepLink = phone ? `whatsapp://send?phone=${phone}` : 'whatsapp://'
+    const defaultWhatsappWebLink = phone ? `https://wa.me/${phone}` : 'https://wa.me/'
+    const qrPayload = JSON.stringify({
+        merchant,
+        amount,
+        currency,
+        invoice,
+        reference,
+        profileId,
+        phone
+    })
+    const qrImageUrl = `https://quickchart.io/qr?size=280&margin=1&text=${encodeURIComponent(qrPayload)}`
+
+    const cfgJson = JSON.stringify({
+        profileId,
+        phone,
+        reference,
+        merchant,
+        amount,
+        currency,
+        invoice,
+        returnUrl: returnUrl || defaultWhatsappDeepLink,
+        returnFallback: returnFallback || defaultWhatsappWebLink,
+        returnSuccessUrl: returnSuccessUrl || '',
+        returnFailUrl: returnFailUrl || '',
+        returnSuccessFallback: returnSuccessFallback || '',
+        returnFailFallback: returnFailFallback || '',
+        redirectFallbackDelayMs: 850
+    }).replace(/</g, '\\u003c')
+
+    const missingMessage = missingRequired
+        ? 'Missing profileId or phone in URL. Add ?profileId=...&phone=... to allow workflow updates.'
+        : ''
+
+    const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Simulated Merchant Payment</title>
+  <style>
+    :root {
+      --bg: #f5f7f9;
+      --panel: #ffffff;
+      --line: #d8e2e8;
+      --text: #0f1720;
+      --muted: #536471;
+      --brand: #0f766e;
+      --accent: #134e4a;
+      --good: #0f8f49;
+      --bad: #b42318;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Space Grotesk", "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(1200px 480px at 15% -10%, #d1fae5 0%, transparent 55%),
+        radial-gradient(1000px 420px at 95% 110%, #dbeafe 0%, transparent 55%),
+        var(--bg);
+    }
+    .page { max-width: 1080px; margin: 0 auto; padding: 24px 18px 28px; }
+    .hero {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: 0 12px 30px rgba(15, 23, 32, 0.08);
+    }
+    h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: -0.03em; }
+    .sub { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.5; }
+    .meta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 16px; }
+    .meta div { background: #f8fbfc; border: 1px solid #e7eef2; border-radius: 12px; padding: 10px 12px; }
+    .meta b { display: block; font-size: 11px; color: #647481; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 3px; }
+    .meta span { font-size: 14px; font-weight: 700; }
+    .amount { font-size: 34px; font-weight: 800; line-height: 1; margin-top: 14px; color: var(--accent); }
+
+    .qr-wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; }
+    .qr {
+      width: 280px;
+      height: 280px;
+      border-radius: 16px;
+      border: 1px solid #dce7ee;
+      background: #fff;
+      object-fit: cover;
+    }
+    .caption { font-size: 12px; color: var(--muted); text-align: center; }
+
+    .methods { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 16px; }
+    .method {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: #fff;
+      cursor: pointer;
+      text-align: left;
+      transition: transform .12s ease, border-color .12s ease, background .12s ease;
+    }
+    .method:hover { transform: translateY(-1px); border-color: #9fc8c5; }
+    .method.active { border-color: #0f766e; background: #effcf8; }
+    .method b { display: block; font-size: 12px; margin-bottom: 4px; letter-spacing: 0.03em; }
+    .method span { display: block; font-size: 11px; color: var(--muted); line-height: 1.4; }
+
+    .detail {
+      margin-top: 12px;
+      border: 1px dashed #c6d6df;
+      border-radius: 12px;
+      padding: 12px;
+      background: #fbfdff;
+      font-size: 13px;
+      color: #384956;
+      min-height: 72px;
+      line-height: 1.5;
+    }
+
+    .controls {
+      margin-top: 18px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .btn {
+      border: 0;
+      border-radius: 14px;
+      padding: 14px 16px;
+      font-weight: 800;
+      font-size: 13px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: transform .12s ease, opacity .12s ease;
+    }
+    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    .btn:hover:not(:disabled) { transform: translateY(-1px); }
+    .btn.success { background: #0f8f49; color: #fff; }
+    .btn.fail { background: #b42318; color: #fff; }
+
+    .status {
+      margin-top: 12px;
+      font-size: 13px;
+      border-radius: 12px;
+      padding: 10px 12px;
+      border: 1px solid #d7e3ea;
+      background: #fff;
+      color: #334155;
+      min-height: 40px;
+    }
+    .status.good { border-color: #9dd9b8; background: #f1fcf5; color: #166534; }
+    .status.bad { border-color: #f3b3af; background: #fff4f3; color: #991b1b; }
+
+    .warn {
+      margin-top: 12px;
+      border: 1px solid #f6c3b8;
+      background: #fff3f0;
+      color: #9f1f10;
+      border-radius: 12px;
+      padding: 10px 12px;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    @media (max-width: 980px) {
+      .hero { grid-template-columns: 1fr; }
+      .methods { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .qr { width: 240px; height: 240px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="hero">
+      <section class="panel">
+        <h1>Simulated Payment Merchant</h1>
+        <p class="sub">Use this page for testing only. Choose a payment method preview, then press success or not success.</p>
+        <div class="amount">${escapeHtml(currency)} ${escapeHtml(amount)}</div>
+        <div class="meta">
+          <div><b>Merchant</b><span>${escapeHtml(merchant)}</span></div>
+          <div><b>Invoice</b><span>${escapeHtml(invoice)}</span></div>
+          <div><b>Reference</b><span>${escapeHtml(reference)}</span></div>
+          <div><b>Phone</b><span>${escapeHtml(phone || '-')}</span></div>
+        </div>
+
+        <div class="methods" id="methodGrid">
+          <button class="method active" data-method="qr"><b>QR</b><span>Scan for instant payment simulation</span></button>
+          <button class="method" data-method="card"><b>Card</b><span>Visa / Mastercard simulation</span></button>
+          <button class="method" data-method="ewallet"><b>E-Wallet</b><span>TNG / GrabPay / ShopeePay style flow</span></button>
+          <button class="method" data-method="bank"><b>Bank Transfer</b><span>Virtual account and FPX simulation</span></button>
+        </div>
+        <div class="detail" id="methodDetail"></div>
+
+        ${missingMessage ? `<div class="warn">${escapeHtml(missingMessage)}</div>` : ''}
+
+        <div class="controls">
+          <button id="btnSuccess" class="btn success">Payment Success</button>
+          <button id="btnFail" class="btn fail">Payment Not Success</button>
+        </div>
+        <div id="statusLine" class="status">Waiting for your action.</div>
+      </section>
+
+      <section class="panel qr-wrap">
+        <img class="qr" src="${qrImageUrl}" alt="Simulated payment QR code" />
+        <div class="caption">QR payload is simulated for testing. No real transaction is processed.</div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const cfg = ${cfgJson};
+    const statusLine = document.getElementById('statusLine');
+    const btnSuccess = document.getElementById('btnSuccess');
+    const btnFail = document.getElementById('btnFail');
+    const methodGrid = document.getElementById('methodGrid');
+    const methodDetail = document.getElementById('methodDetail');
+
+    const methodCopy = {
+      qr: 'QR simulation mode: customer scans QR and confirms inside banking app.',
+      card: 'Card simulation mode: enter card, expiry, CVV and complete 3DS challenge.',
+      ewallet: 'E-wallet simulation mode: redirect to wallet app, approve, and return.',
+      bank: 'Bank transfer simulation mode: customer pays via FPX/VA and callback updates status.'
+    };
+
+    function setStatus(text, type) {
+      statusLine.textContent = text;
+      statusLine.classList.remove('good', 'bad');
+      if (type === 'good') statusLine.classList.add('good');
+      if (type === 'bad') statusLine.classList.add('bad');
+    }
+
+    function setBusy(busy) {
+      btnSuccess.disabled = busy;
+      btnFail.disabled = busy;
+      btnSuccess.textContent = busy ? 'Processing...' : 'Payment Success';
+      btnFail.textContent = busy ? 'Processing...' : 'Payment Not Success';
+    }
+
+    function updateMethod(method) {
+      const nodes = Array.from(methodGrid.querySelectorAll('.method'));
+      nodes.forEach((node) => node.classList.toggle('active', node.dataset.method === method));
+      methodDetail.textContent = methodCopy[method] || methodCopy.qr;
+    }
+
+    function getRedirectTargets(status) {
+      if (status === 'payment_success') {
+        return {
+          primary: cfg.returnSuccessUrl || cfg.returnUrl || '',
+          fallback: cfg.returnSuccessFallback || cfg.returnFallback || ''
+        };
+      }
+      return {
+        primary: cfg.returnFailUrl || cfg.returnUrl || '',
+        fallback: cfg.returnFailFallback || cfg.returnFallback || ''
+      };
+    }
+
+    function navigateTo(url) {
+      if (!url) return false;
+      try {
+        window.location.assign(url);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    function redirectAfterUpdate(status) {
+      const targets = getRedirectTargets(status);
+      const primary = typeof targets.primary === 'string' ? targets.primary : '';
+      const fallback = typeof targets.fallback === 'string' ? targets.fallback : '';
+      const delay = Number(cfg.redirectFallbackDelayMs);
+      const fallbackDelayMs = Number.isFinite(delay) ? Math.max(300, delay) : 850;
+      if (!primary && !fallback) return;
+
+      setStatus('Update sent. Redirecting back to WhatsApp...', 'good');
+      if (fallback) {
+        setTimeout(() => {
+          if (document.visibilityState === 'visible') {
+            navigateTo(fallback);
+          }
+        }, fallbackDelayMs);
+      }
+
+      if (!navigateTo(primary) && fallback) {
+        navigateTo(fallback);
+      }
+    }
+
+    methodGrid.addEventListener('click', (event) => {
+      const btn = event.target && event.target.closest ? event.target.closest('.method') : null;
+      if (!btn) return;
+      updateMethod(btn.dataset.method || 'qr');
+    });
+
+    updateMethod('qr');
+
+    async function submit(status) {
+      if (!cfg.profileId || !cfg.phone) {
+        setStatus('Missing profileId or phone. Cannot notify workflow.', 'bad');
+        return;
+      }
+      setBusy(true);
+      setStatus('Sending update to automation component...', '');
+      try {
+        const response = await fetch('/api/simulated-payment/update', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            profileId: cfg.profileId,
+            phone: cfg.phone,
+            status,
+            reference: cfg.reference,
+            invoice: cfg.invoice,
+            merchant: cfg.merchant,
+            amount: cfg.amount,
+            currency: cfg.currency
+          })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data?.success === false) {
+          throw new Error(data?.error || 'Failed to update simulated payment status');
+        }
+        redirectAfterUpdate(status);
+      } catch (error) {
+        const message = error && error.message ? error.message : String(error || 'Unknown error');
+        setStatus(message, 'bad');
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    btnSuccess.addEventListener('click', () => submit('payment_success'));
+    btnFail.addEventListener('click', () => submit('payment_not_success'));
+  </script>
+</body>
+</html>`
+
+    res.setHeader('content-type', 'text/html; charset=utf-8')
+    return res.send(html)
+})
+
+app.post('/api/simulated-payment/update', async (req: any, res: any) => {
+    try {
+        const profileId = typeof req.body?.profileId === 'string' ? req.body.profileId.trim() : ''
+        const phoneRaw = typeof req.body?.phone === 'string' ? req.body.phone : ''
+        const phoneNumber = normalizePhoneNumber(phoneRaw)
+        const status = normalizeSimulatedPaymentStatus(req.body?.status)
+
+        if (!profileId) {
+            return res.status(400).json({ success: false, error: 'profileId is required' })
+        }
+        if (!phoneNumber) {
+            return res.status(400).json({ success: false, error: 'phone is required' })
+        }
+        if (!status) {
+            return res.status(400).json({ success: false, error: 'status must be payment_success or payment_not_success' })
+        }
+
+        const companyId = await getCompanyIdForProfile(profileId)
+        if (!companyId) {
+            return res.status(404).json({ success: false, error: 'Company not found for profile' })
+        }
+
+        const client = await wabaRegistry.getClientByProfile(profileId)
+        if (!client) {
+            return res.status(503).json({ success: false, error: 'WABA client not available for profile' })
+        }
+
+        const result = await workflowEngine.processInbound({
+            companyId,
+            profileId,
+            client,
+            phoneNumber,
+            messageType: 'button',
+            text: status,
+            buttonId: status,
+            buttonTitle: status === 'payment_success' ? 'Payment Success' : 'Payment Not Success',
+            raw: {
+                source: 'simulated-payment-web',
+                simulated_payment: true,
+                status,
+                invoice: req.body?.invoice || null,
+                reference: req.body?.reference || null,
+                merchant: req.body?.merchant || null,
+                amount: req.body?.amount || null,
+                currency: req.body?.currency || null
+            }
+        })
+
+        if (result?.error) {
+            return res.status(500).json({
+                success: false,
+                error: result.error,
+                handled: result.handled,
+                replied: result.replied
+            })
+        }
+
+        return res.json({
+            success: true,
+            handled: Boolean(result?.handled),
+            replied: Boolean(result?.replied),
+            status
+        })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error?.message || 'Failed to update simulated payment status' })
+    }
+})
+
 function buildChatJid(target: string | null | undefined, preferGroup = false) {
     const normalized = normalizePhoneNumber(target)
     if (!normalized) return ''
@@ -5677,6 +6907,9 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
     const companyId = profileCompanyId || await resolveCompanyId(config.companyId || profileId)
     const phoneNumber = normalizePhoneNumber(remoteJid)
     const isGroupMessage = Boolean(inbound.groupId || remoteJid.endsWith('@g.us'))
+    const inboundSource = readTrimmed((inbound.raw as any)?.source).toLowerCase()
+    const isGymShowcaseSource = inboundSource === GYM_SHOWCASE_SOURCE
+    const isSimulatedInbound = Boolean((inbound.raw as any)?.simulated) || inboundSource === 'simulated-payment-web'
 
     const client = await wabaRegistry.getClientByProfile(profileId)
     if (!client || !companyId) {
@@ -5745,7 +6978,29 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
         io.to(getCompanyRoom(companyId)).emit('profile.error', { message: `Workflow error: ${workflowResult.error}` })
     }
 
-    if (user) {
+    if (
+        !workflowResult?.error &&
+        workflowResult?.completedWorkflowId === GYM_SHOWCASE_WORKFLOW_ID &&
+        !isGroupMessage &&
+        !isGymShowcaseSource
+    ) {
+        const modeConfig = getAdsShootModeProfileConfig(companyId, profileId)
+        if (modeConfig.enabled) {
+            void runGymShowcaseBoost(config, companyId, phoneNumber)
+                .then((result) => {
+                    if (result.error) {
+                        console.log(`[GymShowcase] ${profileId}: skipped (${result.error}).`)
+                        return
+                    }
+                    console.log(`[GymShowcase] ${profileId}: injected ${result.sent} simulated workflow messages.`)
+                })
+                .catch((error: any) => {
+                    console.warn('[GymShowcase] Failed to run boost:', error?.message || error)
+                })
+        }
+    }
+
+    if (user && !isSimulatedInbound) {
         try {
             const aiResult = await maybeSendAutoAiReply({
                 companyId,

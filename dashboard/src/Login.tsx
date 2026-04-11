@@ -2,7 +2,6 @@
 import React, { useState, useEffect } from 'react'
 import type { Session } from '@supabase/supabase-js'
 import { supabase } from './supabase'
-import DebugButton from './DebugButton'
 import { getSocketUrl, resolveCompanyIdFromLocation } from './runtimeConfig'
 import qmessageLogo from './assets/qmessage-logo.jpg'
 import {
@@ -363,32 +362,6 @@ export default function Login({
                     </div>
                 </div>
             </div>
-
-            {import.meta.env.DEV && (
-                <div className="fixed bottom-6 right-6 z-[200] flex flex-col items-end gap-3">
-                    <DebugButton
-                        payload={{
-                            ts: new Date().toISOString(),
-                            env: {
-                                mode: import.meta.env.MODE,
-                                socketUrl: SOCKET_URL
-                            },
-                            supabase: {
-                                url: (supabase as any)?.supabaseUrl || import.meta.env.VITE_SUPABASE_URL || 'unknown'
-                            },
-                            auth: {
-                                mode,
-                                loading,
-                                email,
-                                companyId,
-                                hasPassword: Boolean(password)
-                            },
-                            lastMessage: msg || null,
-                            location: typeof window !== 'undefined' ? window.location.href : null
-                        }}
-                    />
-                </div>
-            )}
 
             <style dangerouslySetInnerHTML={{
                 __html: `

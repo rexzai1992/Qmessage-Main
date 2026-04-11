@@ -1120,7 +1120,7 @@ export default function FlowCanvas({
                         : type === 'CTA_URL'
                             ? 'Open'
                             : (type === 'LIST' ? 'View options' : ''),
-                url: type === 'SIMULATE_PAYMENT' ? 'https://pay.example/checkout/INV-1001' : (type === 'CTA_URL' ? 'https://example.com' : ''),
+                url: type === 'SIMULATE_PAYMENT' ? 'https://2fast.xyz/simulated-payment?profileId={{profile_id}}&phone={{phone}}' : (type === 'CTA_URL' ? 'https://example.com' : ''),
                 amount: type === 'SIMULATE_PAYMENT' ? '59.90' : '',
                 currency: type === 'SIMULATE_PAYMENT' ? 'USD' : '',
                 successKeywords: type === 'SIMULATE_PAYMENT' ? 'payment_success, paid, done' : '',

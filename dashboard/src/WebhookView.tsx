@@ -44,6 +44,14 @@ type CallSettingsFormState = {
     restrictToUserCountries: string;
 };
 
+type AdsShootModeState = {
+    enabled: boolean;
+    batchSize: number;
+    nightStartHour: number;
+    nightEndHour: number;
+    lastRunLocalDate: string | null;
+};
+
 type BusinessProfileFormState = {
     about: string;
     address: string;
@@ -76,6 +84,13 @@ const COMMAND_DESCRIPTION_MAX_LENGTH = 256;
 const COMMAND_NAME_REGEX = /^[a-z0-9_-]+$/;
 const EMOJI_REGEX = /\p{Extended_Pictographic}/u;
 const DEFAULT_APP_LOGO_MAX_BYTES = 2 * 1024 * 1024;
+const DEFAULT_ADS_SHOOT_MODE_STATE: AdsShootModeState = {
+    enabled: false,
+    batchSize: 15,
+    nightStartHour: 20,
+    nightEndHour: 23,
+    lastRunLocalDate: null
+};
 
 const normalizeCommandName = (value: unknown): string =>
     (typeof value === 'string' ? value.trim() : '').replace(/^\/+/, '').toLowerCase();
@@ -346,6 +361,12 @@ export default function WebhookView({
     const [appLogoFilename, setAppLogoFilename] = useState('');
     const [appLogoSizeBytes, setAppLogoSizeBytes] = useState<number | null>(null);
     const [appLogoMaxBytes, setAppLogoMaxBytes] = useState(DEFAULT_APP_LOGO_MAX_BYTES);
+    const [adsShootModeLoading, setAdsShootModeLoading] = useState(Boolean(sessionToken));
+    const [adsShootModeSaving, setAdsShootModeSaving] = useState(false);
+    const [adsShootModeRunning, setAdsShootModeRunning] = useState(false);
+    const [adsShootModeError, setAdsShootModeError] = useState<string | null>(null);
+    const [adsShootModeNotice, setAdsShootModeNotice] = useState<string | null>(null);
+    const [adsShootMode, setAdsShootMode] = useState<AdsShootModeState>({ ...DEFAULT_ADS_SHOOT_MODE_STATE });
     const showLegacyAutomationSettings = false;
 
     useEffect(() => {
@@ -364,6 +385,7 @@ export default function WebhookView({
                 fetchCallSettings();
             }
             fetchBusinessProfile();
+            fetchAdsShootMode();
         }
         onRefreshQuickReplies();
     }, [profileId, onRefreshQuickReplies, isSuperAdmin, sessionToken, showCallSettings]);
@@ -571,6 +593,116 @@ export default function WebhookView({
     useEffect(() => {
         fetchAppLogoSettings();
     }, [sessionToken]);
+
+    const applyAdsShootModePayload = (payload: any) => {
+        setAdsShootMode({
+            enabled: payload?.enabled === true,
+            batchSize: Number.isFinite(Number(payload?.batch_size)) ? Math.max(1, Math.floor(Number(payload.batch_size))) : 15,
+            nightStartHour: Number.isFinite(Number(payload?.night_start_hour)) ? Math.max(0, Math.min(23, Math.floor(Number(payload.night_start_hour)))) : 20,
+            nightEndHour: Number.isFinite(Number(payload?.night_end_hour)) ? Math.max(0, Math.min(23, Math.floor(Number(payload.night_end_hour)))) : 23,
+            lastRunLocalDate: typeof payload?.last_run_local_date === 'string' ? payload.last_run_local_date : null
+        });
+    };
+
+    const fetchAdsShootMode = async () => {
+        if (!sessionToken || !profileId) {
+            setAdsShootMode({ ...DEFAULT_ADS_SHOOT_MODE_STATE });
+            setAdsShootModeError(null);
+            setAdsShootModeNotice(null);
+            setAdsShootModeLoading(false);
+            return;
+        }
+        setAdsShootModeLoading(true);
+        setAdsShootModeError(null);
+        try {
+            const params = new URLSearchParams();
+            params.set('profileId', profileId);
+            const res = await fetch(`${SOCKET_URL}/api/company/ads-shoot-mode?${params.toString()}`, {
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`
+                }
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to load Ads Shoot Mode settings.');
+            }
+            applyAdsShootModePayload(data?.data || {});
+        } catch (error: any) {
+            setAdsShootModeError(error?.message || 'Failed to load Ads Shoot Mode settings.');
+        } finally {
+            setAdsShootModeLoading(false);
+        }
+    };
+
+    const handleSaveAdsShootMode = async () => {
+        if (!sessionToken || !profileId) return;
+        setAdsShootModeSaving(true);
+        setAdsShootModeError(null);
+        setAdsShootModeNotice(null);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/company/ads-shoot-mode`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    profileId,
+                    enabled: adsShootMode.enabled
+                })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to save Ads Shoot Mode settings.');
+            }
+            applyAdsShootModePayload(data?.data || {});
+            const cleanup = data?.data?.cleanup;
+            const cleanupUsers = Number.isFinite(Number(cleanup?.deleted_users)) ? Number(cleanup.deleted_users) : 0;
+            const cleanupMessages = Number.isFinite(Number(cleanup?.deleted_messages)) ? Number(cleanup.deleted_messages) : 0;
+            if (adsShootMode.enabled) {
+                setAdsShootModeNotice('Ads Shoot Mode enabled.');
+            } else if (cleanup && (cleanupUsers > 0 || cleanupMessages > 0)) {
+                setAdsShootModeNotice(`Ads Shoot Mode disabled. Cleared ${cleanupUsers} simulated contact(s) and ${cleanupMessages} message(s).`);
+            } else {
+                setAdsShootModeNotice('Ads Shoot Mode disabled.');
+            }
+        } catch (error: any) {
+            setAdsShootModeError(error?.message || 'Failed to save Ads Shoot Mode settings.');
+        } finally {
+            setAdsShootModeSaving(false);
+        }
+    };
+
+    const handleRunAdsShootModeNow = async () => {
+        if (!sessionToken || !profileId) return;
+        setAdsShootModeRunning(true);
+        setAdsShootModeError(null);
+        setAdsShootModeNotice(null);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/company/ads-shoot-mode/run`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    profileId
+                })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to run Ads Shoot Mode.');
+            }
+            const sent = Number.isFinite(Number(data?.data?.sent)) ? Number(data.data.sent) : 0;
+            const failed = Number.isFinite(Number(data?.data?.failed)) ? Number(data.data.failed) : 0;
+            setAdsShootModeNotice(`Injected ${sent} fake lead message(s)${failed > 0 ? `, ${failed} failed` : ''}.`);
+            await fetchAdsShootMode();
+        } catch (error: any) {
+            setAdsShootModeError(error?.message || 'Failed to run Ads Shoot Mode.');
+        } finally {
+            setAdsShootModeRunning(false);
+        }
+    };
 
     const handleConnectWhatsapp = async () => {
         if (!sessionToken) {
@@ -1820,6 +1952,35 @@ export default function WebhookView({
             </h2>
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-10">
+                <div id="settings-onboard-wpa" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                    <div className="flex items-center justify-between gap-3 mb-4">
+                        <div className="flex items-center gap-3">
+                            <Shield className="w-6 h-6 text-[#00a884]" />
+                            <h3 className="text-xl text-[#111b21] font-bold">Onboard WPA</h3>
+                        </div>
+                        <span className="text-[10px] px-3 py-1 rounded-full bg-[#f0f2f5] text-[#54656f] font-black tracking-widest uppercase border border-[#eceff1]">
+                            Embedded Signup
+                        </span>
+                    </div>
+                    <p className="text-sm text-[#54656f] mb-6 font-medium">
+                        Start WhatsApp onboarding for this profile. This opens Meta Embedded Signup and links the account to your workspace.
+                    </p>
+                    <button
+                        onClick={handleConnectWhatsapp}
+                        disabled={connectLoading || !sessionToken}
+                        className="w-full lg:w-auto bg-[#00a884] hover:bg-[#019273] text-white font-black px-6 py-3.5 rounded-2xl transition-all flex items-center justify-center gap-3 shadow-[0_8px_20px_rgba(0,168,132,0.24)] disabled:opacity-50 active:scale-95"
+                    >
+                        {connectLoading ? <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" /> : <Globe className="w-5 h-5" />}
+                        Start WPA Onboarding
+                    </button>
+                    {connectError && (
+                        <p className="text-sm text-rose-600 mt-4 font-semibold">{connectError}</p>
+                    )}
+                    {!sessionToken && (
+                        <p className="text-xs text-[#aebac1] mt-3">Login required to start onboarding.</p>
+                    )}
+                </div>
+
                 {/* Embedded Signup Section */}
                 <div id="settings-connect" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
                     <div className="flex items-center gap-3 mb-4">
@@ -2043,6 +2204,69 @@ export default function WebhookView({
                     </div>
                 </div>
 
+                <div id="settings-ads-shoot" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                    <div className="flex items-center justify-between gap-4 mb-5">
+                        <div className="flex items-center gap-3">
+                            <Globe className="w-6 h-6 text-[#00a884]" />
+                            <div>
+                                <h3 className="text-xl text-[#111b21] font-bold">Ads Shoot Mode</h3>
+                                <p className="text-sm text-[#54656f] font-medium mt-1">
+                                    Inject 15 fake lead messages at night ({adsShootMode.nightStartHour}:00-{adsShootMode.nightEndHour}:59), once per night.
+                                </p>
+                            </div>
+                        </div>
+                        <input
+                            type="checkbox"
+                            checked={adsShootMode.enabled}
+                            onChange={(e) => setAdsShootMode(prev => ({ ...prev, enabled: e.target.checked }))}
+                            disabled={!sessionToken || adsShootModeSaving || adsShootModeLoading || !isAdmin}
+                            className="w-4 h-4 accent-[#00a884]"
+                        />
+                    </div>
+
+                    <div className="bg-[#fcfdfd] border border-[#eceff1] rounded-2xl p-5">
+                        <p className="text-sm font-bold text-[#111b21]">Lead simulation examples</p>
+                        <p className="text-xs text-[#54656f] font-medium mt-1">
+                            "Hi, how much is monthly membership?", "Do you have free trial?", "Can I join tonight?", "Is there personal trainer?"
+                        </p>
+                        <p className="text-xs text-[#54656f] font-semibold mt-3">
+                            Last nightly run: {adsShootMode.lastRunLocalDate || 'not yet'}
+                        </p>
+                    </div>
+
+                    <div className="mt-5 flex flex-wrap items-center gap-3">
+                        <button
+                            type="button"
+                            onClick={handleSaveAdsShootMode}
+                            disabled={!sessionToken || adsShootModeSaving || adsShootModeLoading || !isAdmin}
+                            className="bg-[#00a884] hover:bg-[#008f6f] text-white px-4 py-2.5 rounded-xl text-xs font-bold uppercase tracking-widest transition-all disabled:opacity-50"
+                        >
+                            {adsShootModeSaving ? 'Saving...' : 'Save Ads Shoot Mode'}
+                        </button>
+                        <button
+                            type="button"
+                            onClick={handleRunAdsShootModeNow}
+                            disabled={!sessionToken || adsShootModeRunning || adsShootModeLoading || !isAdmin}
+                            className="bg-[#111b21] hover:bg-[#202c33] text-white px-4 py-2.5 rounded-xl text-xs font-bold uppercase tracking-widest transition-all disabled:opacity-50"
+                        >
+                            {adsShootModeRunning ? 'Running...' : 'Run 15 Leads Now'}
+                        </button>
+                        {adsShootModeLoading && (
+                            <span className="text-xs text-[#8696a0] font-semibold uppercase tracking-widest">Loading...</span>
+                        )}
+                        {!isAdmin && (
+                            <span className="text-xs text-[#8696a0] font-semibold">Admin access required to update this mode.</span>
+                        )}
+                    </div>
+
+                    {adsShootModeError && (
+                        <p className="text-sm text-rose-600 mt-4 font-semibold">{adsShootModeError}</p>
+                    )}
+                    {adsShootModeNotice && (
+                        <p className="text-sm text-emerald-600 mt-4 font-semibold">{adsShootModeNotice}</p>
+                    )}
+                </div>
+
                 <div id="settings-notifications" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
                     <div className="flex items-center justify-between gap-4 mb-5">
                         <div className="flex items-center gap-3">
@@ -2077,13 +2301,6 @@ export default function WebhookView({
                     </div>
 
                     <div className="mt-5 flex flex-wrap items-center gap-3">
-                        <button
-                            type="button"
-                            onClick={onTestNotificationSound}
-                            className="bg-[#111b21] hover:bg-[#202c33] text-white px-4 py-2.5 rounded-xl text-xs font-bold uppercase tracking-widest transition-all"
-                        >
-                            Test iPhone Glass Sound
-                        </button>
                         {notificationPermission !== 'granted' && notificationPermission !== 'unsupported' && (
                             <button
                                 type="button"

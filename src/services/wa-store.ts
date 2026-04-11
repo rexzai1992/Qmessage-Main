@@ -56,6 +56,7 @@ export type MessageRecord = {
 }
 
 export const HUMAN_TAKEOVER_TAG = 'human_takeover'
+export const ADS_SHOOT_SIMULATED_TAG = 'ads_shoot_simulated'
 
 const CTA_REPLY_WINDOW_MS = 24 * 60 * 60 * 1000
 const CTA_FREE_WINDOW_MS = 72 * 60 * 60 * 1000
@@ -699,15 +700,21 @@ export async function insertMessage(record: {
     direction: 'in' | 'out'
     content: any
     workflowState?: any | null
+    createdAt?: string | null
 }): Promise<MessageRecord | null> {
+    const payload: any = {
+        user_id: record.userId,
+        direction: record.direction,
+        content: record.content,
+        workflow_state: record.workflowState ?? null
+    }
+    if (record.createdAt) {
+        payload.created_at = record.createdAt
+    }
+
     const { data, error } = await supabase
         .from('messages')
-        .insert({
-            user_id: record.userId,
-            direction: record.direction,
-            content: record.content,
-            workflow_state: record.workflowState ?? null
-        })
+        .insert(payload)
         .select('*')
         .single()
 

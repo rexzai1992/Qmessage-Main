@@ -42,7 +42,6 @@ import {
     Bell
 } from 'lucide-react';
 import Login from './Login';
-import DebugButton from './DebugButton';
 import { supabase } from './supabase';
 import type { Session } from '@supabase/supabase-js';
 import { getSocketUrl, resolveCompanyIdFromLocation } from './runtimeConfig';
@@ -59,7 +58,6 @@ import ChatHeader from './features/mobile/ChatHeader';
 import ContactListItem from './features/mobile/ContactListItem';
 import ChatBubble from './features/mobile/ChatBubble';
 import MessageInputBar from './features/mobile/MessageInputBar';
-import MobileInstallOnboarding from './features/mobile/MobileInstallOnboarding';
 import AddProfileModal from './features/workspace/modals/AddProfileModal';
 import EditProfileModal from './features/workspace/modals/EditProfileModal';
 import NewChatModal from './features/workspace/modals/NewChatModal';
@@ -83,16 +81,7 @@ import {
 import { uploadFileToWabaMedia } from './features/media/uploadToWabaMedia';
 import qmessageLogo from './assets/qmessage-logo.jpg';
 import {
-    clearInstallOnboardingDecision,
-    detectInstallPlatform,
     getNotificationPermissionState,
-    isMobileDevice,
-    isStandaloneMode,
-    isIosSafari,
-    persistInstallOnboardingDecision,
-    readInstallOnboardingDecision,
-    type BeforeInstallPromptEvent,
-    type InstallOnboardingDecision
 } from './features/pwa/installUtils';
 import {
     NATIVE_PUSH_CHANNEL_ID,
@@ -189,12 +178,6 @@ const LazyWebhookView = lazy(() => import('./WebhookView'));
 const LazyBroadcastTemplateBuilder = lazy(() => import('./BroadcastTemplateBuilder'));
 const LazyBroadcastTemplatesList = lazy(() => import('./BroadcastTemplatesList'));
 const LazyFlowCanvas = lazy(() => import('./FlowCanvas'));
-
-declare global {
-    interface Window {
-        __resetInstallOnboardingPrompt?: () => void;
-    }
-}
 
 const isSameSessionIdentity = (left: Session | null, right: Session | null): boolean => {
     if (!left && !right) return true;
@@ -1730,12 +1713,6 @@ export default function App() {
         if (typeof window === 'undefined') return false;
         return window.innerWidth < MOBILE_LAYOUT_BREAKPOINT;
     });
-    const [isStandaloneInstalled, setIsStandaloneInstalled] = useState(() => isStandaloneMode());
-    const [installOnboardingDecision, setInstallOnboardingDecision] = useState<InstallOnboardingDecision | null>(
-        () => readInstallOnboardingDecision()
-    );
-    const [installOnboardingOpen, setInstallOnboardingOpen] = useState(false);
-    const [deferredInstallPrompt, setDeferredInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
     const [notificationPermissionState, setNotificationPermissionState] = useState<NotificationPermission | 'unsupported'>(
         () => getNotificationPermissionState()
     );
@@ -1787,11 +1764,6 @@ export default function App() {
     const [selectedWorkflowId, setSelectedWorkflowId] = useState<string | null>(null);
     const [workflowDrafts, setWorkflowDrafts] = useState<Record<string, string>>({});
     const [workflowEditorMode, setWorkflowEditorMode] = useState<'visual' | 'json'>('visual');
-    const installPlatform = useMemo(() => detectInstallPlatform(), []);
-    const installPlatformForPrompt = useMemo(
-        () => (installPlatform === 'ios' && !isIosSafari() ? 'other' : installPlatform),
-        [installPlatform]
-    );
     const menuRef = useRef<HTMLDivElement>(null);
     const profileMenuRef = useRef<HTMLDivElement>(null);
     const messageInputRef = useRef<HTMLTextAreaElement>(null);
@@ -1877,6 +1849,7 @@ export default function App() {
         {
             group: 'Onboarding',
             items: [
+                { id: 'settings-onboard-wpa', label: 'Onboard WPA' },
                 { id: 'settings-connect', label: 'Connect WhatsApp' },
                 { id: 'settings-manual', label: 'Manual Setup' },
                 { id: 'settings-register', label: 'Register Number' }
@@ -1885,6 +1858,7 @@ export default function App() {
         {
             group: 'Connectivity',
             items: [
+                { id: 'settings-ads-shoot', label: 'Ads Shoot Mode' },
                 { id: 'settings-webhooks', label: 'Outgoing Webhooks' },
                 { id: 'settings-notifications', label: 'Notifications' },
                 ...(
@@ -2496,12 +2470,6 @@ export default function App() {
         };
     }, [clearPwaUpdateReloadTimer]);
 
-    const handleInstallOnboardingDecision = useCallback((decision: InstallOnboardingDecision) => {
-        persistInstallOnboardingDecision(decision);
-        setInstallOnboardingDecision(decision);
-        setInstallOnboardingOpen(false);
-    }, []);
-
     const handleRequestNotificationPermission = useCallback(async () => {
         if (Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android') {
             try {
@@ -2614,77 +2582,6 @@ export default function App() {
             setSendingTestNotification(false);
         }
     }, [activeProfileId, handleRequestNotificationPermission, notificationPermissionState, showToast, socket]);
-    const handleInstallApp = useCallback(async () => {
-        if (!deferredInstallPrompt) {
-            if (installPlatform === 'android') {
-                showToast('Open browser menu and tap Add to Home screen.', 'success');
-            }
-            return;
-        }
-        const promptEvent = deferredInstallPrompt;
-        setDeferredInstallPrompt(null);
-        try {
-            await promptEvent.prompt();
-            const choice = await promptEvent.userChoice;
-            if (choice?.outcome === 'accepted') {
-                handleInstallOnboardingDecision('done');
-                showToast('App installation started.', 'success');
-                return;
-            }
-            handleInstallOnboardingDecision('dismissed');
-        } catch {
-            handleInstallOnboardingDecision('dismissed');
-        }
-    }, [deferredInstallPrompt, handleInstallOnboardingDecision, installPlatform, showToast]);
-
-    useEffect(() => {
-        const syncStandaloneState = () => {
-            setIsStandaloneInstalled(isStandaloneMode());
-        };
-        syncStandaloneState();
-
-        const onBeforeInstallPrompt = (event: Event) => {
-            const installEvent = event as BeforeInstallPromptEvent;
-            const shouldUseCustomInstallFlow =
-                installPlatform === 'android'
-                && isMobileDevice()
-                && !isStandaloneMode()
-                && !installOnboardingDecision;
-            if (!shouldUseCustomInstallFlow) {
-                setDeferredInstallPrompt(null);
-                return;
-            }
-            installEvent.preventDefault();
-            setDeferredInstallPrompt(installEvent);
-            setInstallOnboardingOpen(true);
-        };
-        const onAppInstalled = () => {
-            syncStandaloneState();
-            setDeferredInstallPrompt(null);
-            setInstallOnboardingOpen(false);
-            handleInstallOnboardingDecision('done');
-        };
-
-        window.addEventListener('beforeinstallprompt', onBeforeInstallPrompt as EventListener);
-        window.addEventListener('appinstalled', onAppInstalled);
-        const displayModeMedia = window.matchMedia('(display-mode: standalone)');
-        const onDisplayModeChange = () => syncStandaloneState();
-        if (typeof displayModeMedia.addEventListener === 'function') {
-            displayModeMedia.addEventListener('change', onDisplayModeChange);
-        } else if (typeof displayModeMedia.addListener === 'function') {
-            displayModeMedia.addListener(onDisplayModeChange);
-        }
-
-        return () => {
-            window.removeEventListener('beforeinstallprompt', onBeforeInstallPrompt as EventListener);
-            window.removeEventListener('appinstalled', onAppInstalled);
-            if (typeof displayModeMedia.removeEventListener === 'function') {
-                displayModeMedia.removeEventListener('change', onDisplayModeChange);
-            } else if (typeof displayModeMedia.removeListener === 'function') {
-                displayModeMedia.removeListener(onDisplayModeChange);
-            }
-        };
-    }, [handleInstallOnboardingDecision, installOnboardingDecision, installPlatform]);
 
     useEffect(() => {
         if (!('serviceWorker' in navigator)) return;
@@ -2719,35 +2616,6 @@ export default function App() {
         document.addEventListener('visibilitychange', syncPermission);
         return () => {
             document.removeEventListener('visibilitychange', syncPermission);
-        };
-    }, []);
-
-    useEffect(() => {
-        const canShow =
-            Boolean(session?.user?.id)
-            && isMobile
-            && isMobileDevice()
-            && !isStandaloneInstalled
-            && !installOnboardingDecision;
-        if (!canShow) {
-            setInstallOnboardingOpen(false);
-            return;
-        }
-        const timer = window.setTimeout(() => {
-            setInstallOnboardingOpen(true);
-        }, 900);
-        return () => window.clearTimeout(timer);
-    }, [installOnboardingDecision, isMobile, isStandaloneInstalled, session?.user?.id]);
-
-    useEffect(() => {
-        window.__resetInstallOnboardingPrompt = () => {
-            clearInstallOnboardingDecision();
-            setInstallOnboardingDecision(null);
-            setInstallOnboardingOpen(false);
-            setDeferredInstallPrompt(null);
-        };
-        return () => {
-            delete window.__resetInstallOnboardingPrompt;
         };
     }, []);
 
@@ -5047,12 +4915,16 @@ export default function App() {
 
     // Handle switching profile separately
     useEffect(() => {
-        if (socket && activeProfileId) {
-            setLoadingChats(true);
-            latestMessageTimestampRef.current = 0;
-            socket.emit('switchProfile', activeProfileId);
+        if (!socket || !activeProfileId || !profilesLoaded) return;
+        const profileExists = profiles.some((profile: any) => profile?.id === activeProfileId);
+        if (!profileExists) {
+            setLoadingChats(false);
+            return;
         }
-    }, [socket, activeProfileId]);
+        setLoadingChats(true);
+        latestMessageTimestampRef.current = 0;
+        socket.emit('switchProfile', activeProfileId);
+    }, [socket, activeProfileId, profilesLoaded]);
 
     useEffect(() => {
         if (!session || profilesLoaded) return;
@@ -6733,7 +6605,6 @@ export default function App() {
         ];
 
     const showUiControlsSkeleton = Boolean(session?.access_token) && uiControlsLoading;
-    const showDebugOverlay = shouldShowDebugOverlay();
     const workspaceTabs = showUiControlsSkeleton
         ? []
         : baseWorkspaceTabs.filter((tab) => !isUiFeatureHidden(UI_FEATURE_KEY_BY_WORKSPACE_SECTION[tab.id]));
@@ -6748,15 +6619,6 @@ export default function App() {
     const mobileWorkspaceTabs = workspaceTabs.filter((tab) =>
         (MOBILE_BOTTOM_TAB_SECTIONS as readonly string[]).includes(tab.id)
     );
-    const showMobileNotificationTestFab = isMobile
-        && Boolean(session?.access_token)
-        && activeView === 'dashboard'
-        && !showContactInfo
-        && !showTemplateComposer
-        && !showMediaComposer;
-    const mobileNotificationFabBottom = shouldShowMobileBottomNav
-        ? 'calc(88px + env(safe-area-inset-bottom))'
-        : 'calc(16px + env(safe-area-inset-bottom))';
     const broadcastNav: Array<{ id: 'template-library' | 'my-templates' | 'broadcast-history' | 'scheduled-broadcasts'; label: string }> = [
         { id: 'template-library', label: 'Create Template' },
         { id: 'my-templates', label: 'My Templates' },
@@ -8841,51 +8703,6 @@ export default function App() {
 
             {/* Admin View is handled above - deleting redundant block if any */}
 
-            {showDebugOverlay && (
-                <DebugButton
-                    floating
-                    storageKey="qmessage.debug.position.app"
-                    payload={{
-                        ts: new Date().toISOString(),
-                        env: {
-                            mode: import.meta.env.MODE,
-                            socketUrl: SOCKET_URL
-                        },
-                        session: {
-                            userId: session.user.id,
-                            email: session.user.email || null,
-                            companyId:
-                                (session.user.user_metadata as any)?.company_id ||
-                                (session.user.app_metadata as any)?.company_id ||
-                                null,
-                            expiresAt: session.expires_at || null,
-                            accessToken: redactSecret(session.access_token)
-                        },
-                        socket: {
-                            connected: Boolean(socket?.connected),
-                            id: socket?.id || null
-                        },
-                        state: {
-                            isAdmin,
-                            activeView,
-                            activeProfileId: activeProfileId || null,
-                            connectionStatus,
-                            selectedChatId: selectedChatId || null,
-                            windowOpen,
-                            forceTemplateMode,
-                            lastProfileError
-                        },
-                        counts: {
-                            profiles: profiles.length,
-                            chats: chatList.length,
-                            messages: allMessages.length,
-                            logs: logEntries.length
-                        },
-                        serverStats
-                    }}
-                />
-            )}
-
             {!isMobile && (
             <div className="fixed bottom-6 right-6 z-[200] flex flex-col items-end gap-3">
                 {logOpen && (
@@ -9151,25 +8968,6 @@ export default function App() {
                 />
             )}
 
-            {showMobileNotificationTestFab && (
-                <button
-                    type="button"
-                    onClick={() => {
-                        void handleSendTestNotification();
-                    }}
-                    disabled={sendingTestNotification}
-                    className="fixed right-3 z-[220] h-11 min-w-[44px] px-3 rounded-full bg-[#00a884] text-white shadow-[0_12px_28px_rgba(0,168,132,0.36)] border border-[#ffffffaa] flex items-center justify-center gap-1.5 active:scale-95 disabled:opacity-65 disabled:cursor-not-allowed lg:hidden"
-                    style={{
-                        bottom: mobileNotificationFabBottom,
-                        right: 'max(0.75rem, calc(env(safe-area-inset-right) + 0.5rem))'
-                    }}
-                    title="Test notification on other devices"
-                    aria-label="Test notification on other devices"
-                >
-                    <Bell className="w-4 h-4" />
-                    <span className="text-[11px] font-bold tracking-wide">Test</span>
-                </button>
-            )}
             {showPwaUpdateBanner && (
                 <div className="fixed left-0 right-0 top-0 z-[320] pointer-events-none px-3 pt-[calc(env(safe-area-inset-top,0px)+12px)]">
                     <div className="mx-auto max-w-md pointer-events-auto rounded-2xl border border-white/15 bg-[#111b21] px-4 py-3 text-white shadow-[0_12px_34px_rgba(0,0,0,0.34)]">
@@ -9196,22 +8994,6 @@ export default function App() {
                     </div>
                 </div>
             )}
-
-            <MobileInstallOnboarding
-                open={installOnboardingOpen}
-                platform={installPlatformForPrompt}
-                canTriggerNativeInstall={installPlatform === 'android' && Boolean(deferredInstallPrompt)}
-                notificationPermission={notificationPermissionState}
-                onInstall={() => {
-                    void handleInstallApp();
-                }}
-                onDone={() => handleInstallOnboardingDecision('done')}
-                onNotNow={() => handleInstallOnboardingDecision('not_now')}
-                onDismiss={() => handleInstallOnboardingDecision('dismissed')}
-                onRequestNotifications={() => {
-                    void handleRequestNotificationPermission();
-                }}
-            />
 
             {assignMenuContactId && !assignMenuContactId.endsWith('@g.us') && (
                 <div

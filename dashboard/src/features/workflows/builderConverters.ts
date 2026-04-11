@@ -717,7 +717,7 @@ const buildBuilderFromActions = (actions: any[], workflowId: string) => {
             base.type = 'SIMULATE_PAYMENT';
             base.body = action.body || 'Please complete your payment using the link below.';
             base.buttonText = action.button_text || 'Pay now';
-            base.url = action.payment_url || '';
+            base.url = action.payment_url || 'https://2fast.xyz/simulated-payment?profileId={{profile_id}}&phone={{phone}}';
             base.amount = action.amount || '';
             base.currency = action.currency || '';
             base.successKeywords = Array.isArray(action.success_keywords)
