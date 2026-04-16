@@ -1,0 +1,605 @@
+{
+  "id": "wf-gym-auto-reply",
+  "name": "Gym Auto Reply",
+  "trigger_keyword": "gym",
+  "run_on_new_chat": false,
+  "enabled": true,
+  "actions": [
+    {
+      "type": "send_buttons",
+      "text": "Welcome to Titan Gym. Stronger every day. How can we help you today?",
+      "media": {
+        "type": "image",
+        "link": "https://images.unsplash.com/photo-1517836357463-d25dfeac3438?auto=format&fit=crop&w=1200&q=80"
+      },
+      "buttons": [
+        {
+          "id": "membership",
+          "title": "Membership"
+        },
+        {
+          "id": "class_schedule",
+          "title": "Class Schedule"
+        },
+        {
+          "id": "talk_to_staff",
+          "title": "Talk to Staff"
+        }
+      ],
+      "fallback_text": "Please tap one of the buttons so I can help you faster.",
+      "routes": {
+        "membership": 1,
+        "class_schedule": 2,
+        "talk_to_staff": 15
+      }
+    },
+    {
+      "type": "send_list",
+      "text": "Choose the membership plan that fits your goal best.",
+      "button_text": "View packages",
+      "sections": [
+        {
+          "title": "Membership Plans",
+          "rows": [
+            {
+              "id": "day_pass",
+              "title": "Day Pass",
+              "description": "1-day gym access"
+            },
+            {
+              "id": "monthly_membership",
+              "title": "Monthly Membership",
+              "description": "Unlimited gym access for 30 days"
+            },
+            {
+              "id": "personal_training",
+              "title": "Personal Training",
+              "description": "1-to-1 coaching packages"
+            }
+          ]
+        }
+      ],
+      "footer": "Need help choosing? Our team can recommend the best option for you.",
+      "fallback_text": "Please choose a package from the list.",
+      "routes": {
+        "day_pass": 3,
+        "monthly_membership": 5,
+        "personal_training": 13
+      }
+    },
+    {
+      "type": "send_list",
+      "text": "Pick a class to see what suits your schedule and fitness level.",
+      "button_text": "View classes",
+      "sections": [
+        {
+          "title": "Available Classes",
+          "rows": [
+            {
+              "id": "zumba",
+              "title": "Zumba",
+              "description": "Fun cardio dance session"
+            },
+            {
+              "id": "yoga",
+              "title": "Yoga",
+              "description": "Flexibility and recovery"
+            },
+            {
+              "id": "hiit",
+              "title": "HIIT",
+              "description": "High intensity fat burn"
+            }
+          ]
+        }
+      ],
+      "footer": "Beginner friendly options are available.",
+      "fallback_text": "Please choose a class from the list.",
+      "routes": {
+        "zumba": 14,
+        "yoga": 14,
+        "hiit": 14
+      }
+    },
+    {
+      "type": "simulate_payment",
+      "body": "Day Pass is RM15 for full-day access. To book instantly, complete the payment using the link below.",
+      "payment_url": "https://2fast.xyz/simulated-payment?profileId={{profile_id}}&phone={{phone}}&plan=day-pass",
+      "button_text": "Pay Day Pass",
+      "amount": "15.00",
+      "currency": "MYR",
+      "success_keywords": [
+        "payment_success",
+        "paid",
+        "day pass paid",
+        "done"
+      ],
+      "pending_text": "No worries, your Day Pass booking is still pending. Complete the payment, then tap Payment Success once done.",
+      "receipt_text": "Day Pass payment received. Receipt ID: {{receipt_id}}. Please come to Titan Gym today during operating hours, show this receipt at the counter, and our team will check you in.",
+      "expired_text": "Your Day Pass payment link has expired. Reply PAYMENT to get a fresh link, or type STAFF if you want help.",
+      "expires_in_minutes": 30,
+      "next_step": 4
+    },
+    {
+      "type": "end_flow"
+    },
+    {
+      "type": "simulate_payment",
+      "body": "Monthly Membership is RM120 with unlimited gym access for 30 days. Complete payment below to activate your membership.",
+      "payment_url": "https://2fast.xyz/simulated-payment?profileId={{profile_id}}&phone={{phone}}&plan=monthly-membership",
+      "button_text": "Pay Monthly",
+      "amount": "120.00",
+      "currency": "MYR",
+      "success_keywords": [
+        "payment_success",
+        "paid",
+        "membership paid",
+        "payment done",
+        "done"
+      ],
+      "pending_text": "Your membership payment is still pending. Complete payment first, then tap Payment Success when finished.",
+      "receipt_text": "Monthly Membership payment received. Receipt ID: {{receipt_id}}. Please come to Titan Gym, show this receipt at the counter, and our team will activate your 30-day membership immediately.",
+      "expired_text": "This membership payment link has expired. Reply PAYMENT to request a fresh payment link, or type STAFF if you want assistance.",
+      "expires_in_minutes": 60,
+      "next_step": 6
+    },
+    {
+      "type": "send_buttons",
+      "text": "You are all set ??\n\nPlease come to Titan Gym and show your receipt at the counter.\n\nWhat would you like next?",
+      "buttons": [
+        {
+          "id": "location",
+          "title": "Gym Location"
+        },
+        {
+          "id": "hours",
+          "title": "Operating Hours"
+        },
+        {
+          "id": "staff",
+          "title": "Talk to Staff"
+        }
+      ],
+      "fallback_text": "Please tap one of the options below.",
+      "routes": {
+        "location": 7,
+        "hours": 8,
+        "staff": 15
+      }
+    },
+    {
+      "type": "send_text",
+      "text": "Titan Gym, Ground Floor, Kota Bharu Trade Centre. Bring your workout attire, towel, water bottle, and show your payment receipt at the counter.",
+      "next_step": 9
+    },
+    {
+      "type": "send_text",
+      "text": "We are open daily from 7:00 AM to 11:00 PM. You can come anytime during operating hours and show your payment receipt at the counter.",
+      "next_step": 9
+    },
+    {
+      "type": "send_buttons",
+      "text": "If you need anything else, choose one of these options.",
+      "buttons": [
+        {
+          "id": "back_membership",
+          "title": "Back to Membership"
+        },
+        {
+          "id": "talk_staff",
+          "title": "Talk to Staff"
+        },
+        {
+          "id": "done",
+          "title": "Done"
+        }
+      ],
+      "fallback_text": "Please choose one option.",
+      "routes": {
+        "back_membership": 1,
+        "talk_staff": 15,
+        "done": 10
+      }
+    },
+    {
+      "type": "end_flow"
+    },
+    {
+      "type": "send_buttons",
+      "text": "If payment was not completed, I can still help. Choose an option below.",
+      "buttons": [
+        {
+          "id": "retry_payment",
+          "title": "Retry Payment"
+        },
+        {
+          "id": "talk_to_staff",
+          "title": "Talk to Staff"
+        },
+        {
+          "id": "back_menu",
+          "title": "Back to Menu"
+        }
+      ],
+      "fallback_text": "Please tap one of the options below.",
+      "routes": {
+        "retry_payment": 5,
+        "talk_to_staff": 15,
+        "back_menu": 0
+      }
+    },
+    {
+      "type": "send_buttons",
+      "text": "If your Day Pass payment was not completed, choose what you want to do next.",
+      "buttons": [
+        {
+          "id": "retry_day_pass",
+          "title": "Retry Payment"
+        },
+        {
+          "id": "staff_day_pass",
+          "title": "Talk to Staff"
+        },
+        {
+          "id": "back_day_menu",
+          "title": "Back to Menu"
+        }
+      ],
+      "fallback_text": "Please tap one of the options below.",
+      "routes": {
+        "retry_day_pass": 3,
+        "staff_day_pass": 15,
+        "back_day_menu": 0
+      }
+    },
+    {
+      "type": "send_text",
+      "text": "Personal Training is available for fat loss, muscle gain, and beginner fitness. Reply with your goal and our trainer will recommend the best package for you.",
+      "next_step": 15
+    },
+    {
+      "type": "send_text",
+      "text": "Great choice. We have Zumba, Yoga, and HIIT sessions available weekly. Reply with your preferred class and time, and our staff will share the latest schedule and reserve your slot.",
+      "next_step": 15
+    },
+    {
+      "type": "send_text",
+      "text": "Sure, we will pass you to our staff. Please wait a moment while someone gets back to you.",
+      "next_step": 16
+    },
+    {
+      "type": "end_flow"
+    }
+  ],
+  "builder": {
+    "id": "wf-gym-auto-reply",
+    "meta": {
+      "name": "Gym Auto Reply",
+      "enabled": true
+    },
+    "nodes": [
+      {
+        "id": "node-start-wf-gym-auto-reply",
+        "type": "START",
+        "position": {
+          "x": 120,
+          "y": 80
+        },
+        "nextId": "node-wf-gym-auto-reply-0"
+      },
+      {
+        "id": "node-wf-gym-auto-reply-0",
+        "type": "QUESTION",
+        "position": {
+          "x": 120,
+          "y": 220
+        },
+        "content": "Welcome to Titan Gym. Stronger every day. How can we help you today?",
+        "options": [
+          "Membership",
+          "Class Schedule",
+          "Talk to Staff"
+        ],
+        "fallbackText": "Please tap one of the buttons so I can help you faster.",
+        "mediaType": "image",
+        "mediaUrl": "https://images.unsplash.com/photo-1517836357463-d25dfeac3438?auto=format&fit=crop&w=1200&q=80",
+        "mediaFilename": "",
+        "connections": {
+          "opt-0": "node-wf-gym-auto-reply-1",
+          "opt-1": "node-wf-gym-auto-reply-2",
+          "opt-2": "node-wf-gym-auto-reply-15"
+        }
+      },
+      {
+        "id": "node-wf-gym-auto-reply-1",
+        "type": "LIST",
+        "position": {
+          "x": -260,
+          "y": 430
+        },
+        "body": "Choose the membership plan that fits your goal best.",
+        "buttonText": "View packages",
+        "headerText": "",
+        "footerText": "Need help choosing? Our team can recommend the best option for you.",
+        "fallbackText": "Please choose a package from the list.",
+        "sections": [
+          {
+            "title": "Membership Plans",
+            "rows": [
+              {
+                "id": "day_pass",
+                "title": "Day Pass",
+                "description": "1-day gym access"
+              },
+              {
+                "id": "monthly_membership",
+                "title": "Monthly Membership",
+                "description": "Unlimited gym access for 30 days"
+              },
+              {
+                "id": "personal_training",
+                "title": "Personal Training",
+                "description": "1-to-1 coaching packages"
+              }
+            ]
+          }
+        ],
+        "connections": {
+          "row-0-0": "node-wf-gym-auto-reply-3",
+          "row-0-1": "node-wf-gym-auto-reply-5",
+          "row-0-2": "node-wf-gym-auto-reply-13"
+        }
+      },
+      {
+        "id": "node-wf-gym-auto-reply-2",
+        "type": "LIST",
+        "position": {
+          "x": 260,
+          "y": 430
+        },
+        "body": "Pick a class to see what suits your schedule and fitness level.",
+        "buttonText": "View classes",
+        "headerText": "",
+        "footerText": "Beginner friendly options are available.",
+        "fallbackText": "Please choose a class from the list.",
+        "sections": [
+          {
+            "title": "Available Classes",
+            "rows": [
+              {
+                "id": "zumba",
+                "title": "Zumba",
+                "description": "Fun cardio dance session"
+              },
+              {
+                "id": "yoga",
+                "title": "Yoga",
+                "description": "Flexibility and recovery"
+              },
+              {
+                "id": "hiit",
+                "title": "HIIT",
+                "description": "High intensity fat burn"
+              }
+            ]
+          }
+        ],
+        "connections": {
+          "row-0-0": "node-wf-gym-auto-reply-14",
+          "row-0-1": "node-wf-gym-auto-reply-14",
+          "row-0-2": "node-wf-gym-auto-reply-14"
+        }
+      },
+      {
+        "id": "node-wf-gym-auto-reply-3",
+        "type": "SIMULATE_PAYMENT",
+        "position": {
+          "x": -620,
+          "y": 690
+        },
+        "body": "Day Pass is RM15 for full-day access. To book instantly, complete the payment using the link below.",
+        "buttonText": "Pay Day Pass",
+        "url": "https://2fast.xyz/simulated-payment?profileId={{profile_id}}&phone={{phone}}&plan=day-pass",
+        "amount": "15.00",
+        "currency": "MYR",
+        "successKeywords": "payment_success, paid, day pass paid, done",
+        "pendingText": "No worries, your Day Pass booking is still pending. Complete the payment, then tap Payment Success once done.",
+        "receiptText": "Day Pass payment received. Receipt ID: {{receipt_id}}. Please come to Titan Gym today during operating hours, show this receipt at the counter, and our team will check you in.",
+        "expiredText": "Your Day Pass payment link has expired. Reply PAYMENT to get a fresh link, or type STAFF if you want help.",
+        "expiresInMinutes": 30,
+        "nextId": "node-wf-gym-auto-reply-4"
+      },
+      {
+        "id": "node-wf-gym-auto-reply-4",
+        "type": "END",
+        "position": {
+          "x": -620,
+          "y": 930
+        },
+        "content": ""
+      },
+      {
+        "id": "node-wf-gym-auto-reply-5",
+        "type": "SIMULATE_PAYMENT",
+        "position": {
+          "x": -180,
+          "y": 690
+        },
+        "body": "Monthly Membership is RM120 with unlimited gym access for 30 days. Complete payment below to activate your membership.",
+        "buttonText": "Pay Monthly",
+        "url": "https://2fast.xyz/simulated-payment?profileId={{profile_id}}&phone={{phone}}&plan=monthly-membership",
+        "amount": "120.00",
+        "currency": "MYR",
+        "successKeywords": "payment_success, paid, membership paid, payment done, done",
+        "pendingText": "Your membership payment is still pending. Complete payment first, then tap Payment Success when finished.",
+        "receiptText": "Monthly Membership payment received. Receipt ID: {{receipt_id}}. Please come to Titan Gym, show this receipt at the counter, and our team will activate your 30-day membership immediately.",
+        "expiredText": "This membership payment link has expired. Reply PAYMENT to request a fresh payment link, or type STAFF if you want assistance.",
+        "expiresInMinutes": 60,
+        "nextId": "node-wf-gym-auto-reply-6"
+      },
+      {
+        "id": "node-wf-gym-auto-reply-6",
+        "type": "QUESTION",
+        "position": {
+          "x": -180,
+          "y": 930
+        },
+        "content": "You are all set ??\n\nPlease come to Titan Gym and show your receipt at the counter.\n\nWhat would you like next?",
+        "options": [
+          "Gym Location",
+          "Operating Hours",
+          "Talk to Staff"
+        ],
+        "fallbackText": "Please tap one of the options below.",
+        "connections": {
+          "opt-0": "node-wf-gym-auto-reply-7",
+          "opt-1": "node-wf-gym-auto-reply-8",
+          "opt-2": "node-wf-gym-auto-reply-15"
+        }
+      },
+      {
+        "id": "node-wf-gym-auto-reply-7",
+        "type": "MESSAGE",
+        "position": {
+          "x": -520,
+          "y": 1180
+        },
+        "content": "Titan Gym, Ground Floor, Kota Bharu Trade Centre. Bring your workout attire, towel, water bottle, and show your payment receipt at the counter.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-gym-auto-reply-9"
+      },
+      {
+        "id": "node-wf-gym-auto-reply-8",
+        "type": "MESSAGE",
+        "position": {
+          "x": 120,
+          "y": 1180
+        },
+        "content": "We are open daily from 7:00 AM to 11:00 PM. You can come anytime during operating hours and show your payment receipt at the counter.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-gym-auto-reply-9"
+      },
+      {
+        "id": "node-wf-gym-auto-reply-9",
+        "type": "QUESTION",
+        "position": {
+          "x": -180,
+          "y": 1420
+        },
+        "content": "If you need anything else, choose one of these options.",
+        "options": [
+          "Back to Membership",
+          "Talk to Staff",
+          "Done"
+        ],
+        "fallbackText": "Please choose one option.",
+        "connections": {
+          "opt-0": "node-wf-gym-auto-reply-1",
+          "opt-1": "node-wf-gym-auto-reply-15",
+          "opt-2": "node-wf-gym-auto-reply-10"
+        }
+      },
+      {
+        "id": "node-wf-gym-auto-reply-10",
+        "type": "END",
+        "position": {
+          "x": -180,
+          "y": 1660
+        },
+        "content": ""
+      },
+      {
+        "id": "node-wf-gym-auto-reply-11",
+        "type": "QUESTION",
+        "position": {
+          "x": 260,
+          "y": 930
+        },
+        "content": "If payment was not completed, I can still help. Choose an option below.",
+        "options": [
+          "Retry Payment",
+          "Talk to Staff",
+          "Back to Menu"
+        ],
+        "fallbackText": "Please tap one of the options below.",
+        "connections": {
+          "opt-0": "node-wf-gym-auto-reply-5",
+          "opt-1": "node-wf-gym-auto-reply-15",
+          "opt-2": "node-wf-gym-auto-reply-0"
+        }
+      },
+      {
+        "id": "node-wf-gym-auto-reply-12",
+        "type": "QUESTION",
+        "position": {
+          "x": -820,
+          "y": 930
+        },
+        "content": "If your Day Pass payment was not completed, choose what you want to do next.",
+        "options": [
+          "Retry Payment",
+          "Talk to Staff",
+          "Back to Menu"
+        ],
+        "fallbackText": "Please tap one of the options below.",
+        "connections": {
+          "opt-0": "node-wf-gym-auto-reply-3",
+          "opt-1": "node-wf-gym-auto-reply-15",
+          "opt-2": "node-wf-gym-auto-reply-0"
+        }
+      },
+      {
+        "id": "node-wf-gym-auto-reply-13",
+        "type": "MESSAGE",
+        "position": {
+          "x": 140,
+          "y": 690
+        },
+        "content": "Personal Training is available for fat loss, muscle gain, and beginner fitness. Reply with your goal and our trainer will recommend the best package for you.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-gym-auto-reply-15"
+      },
+      {
+        "id": "node-wf-gym-auto-reply-14",
+        "type": "MESSAGE",
+        "position": {
+          "x": 620,
+          "y": 690
+        },
+        "content": "Great choice. We have Zumba, Yoga, and HIIT sessions available weekly. Reply with your preferred class and time, and our staff will share the latest schedule and reserve your slot.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-gym-auto-reply-15"
+      },
+      {
+        "id": "node-wf-gym-auto-reply-15",
+        "type": "MESSAGE",
+        "position": {
+          "x": 620,
+          "y": 980
+        },
+        "content": "Sure, we will pass you to our staff. Please wait a moment while someone gets back to you.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-gym-auto-reply-16"
+      },
+      {
+        "id": "node-wf-gym-auto-reply-16",
+        "type": "END",
+        "position": {
+          "x": 620,
+          "y": 1210
+        },
+        "content": ""
+      }
+    ]
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "terminal.integrated.windowsUseConptyDll": true,
+  "terminal.integrated.defaultProfile.windows": "PowerShell"
+}

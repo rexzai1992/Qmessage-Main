@@ -2,9 +2,12 @@
 import React, { Suspense, lazy, useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { List, useDynamicRowHeight, useListRef } from 'react-window';
 import { io, Socket } from 'socket.io-client';
+import { Capacitor } from '@capacitor/core';
+import { PushNotifications } from '@capacitor/push-notifications';
 import {
     Search,
     MoreVertical,
+    Menu,
     MessageSquare,
     FileText,
     File as FileIcon,
@@ -19,7 +22,6 @@ import {
     BarChart3,
     Filter,
     User,
-    ArrowLeft,
     Settings,
     Phone,
     Video,
@@ -36,10 +38,11 @@ import {
     Workflow,
     ShieldCheck,
     Bug,
-    Bot
+    Bot,
+    Bell,
+    LifeBuoy
 } from 'lucide-react';
 import Login from './Login';
-import DebugButton from './DebugButton';
 import { supabase } from './supabase';
 import type { Session } from '@supabase/supabase-js';
 import { getSocketUrl, resolveCompanyIdFromLocation } from './runtimeConfig';
@@ -51,6 +54,11 @@ import ContactsView from './features/workspace/ContactsView';
 import ChatbotsView from './features/workspace/ChatbotsView';
 import SettingsView from './features/workspace/SettingsView';
 import ChatflowView from './features/workspace/ChatflowView';
+import BottomNavBar from './features/mobile/BottomNavBar';
+import ChatHeader from './features/mobile/ChatHeader';
+import ContactListItem from './features/mobile/ContactListItem';
+import ChatBubble from './features/mobile/ChatBubble';
+import MessageInputBar from './features/mobile/MessageInputBar';
 import AddProfileModal from './features/workspace/modals/AddProfileModal';
 import EditProfileModal from './features/workspace/modals/EditProfileModal';
 import NewChatModal from './features/workspace/modals/NewChatModal';
@@ -71,17 +79,117 @@ import {
     textColor,
     withHexAlpha
 } from './features/chat/utils';
-import { uploadFileToCompanyStorage } from './features/media/uploadToCompanyStorage';
+import { uploadFileToWabaMedia } from './features/media/uploadToWabaMedia';
+import qmessageLogo from './assets/qmessage-logo.jpg';
+import {
+    getNotificationPermissionState,
+} from './features/pwa/installUtils';
+import {
+    NATIVE_PUSH_CHANNEL_ID,
+    NATIVE_PUSH_ACTION_EVENT,
+    NATIVE_PUSH_CHANNEL_STATUS_EVENT,
+    NATIVE_PUSH_RECEIVED_EVENT,
+    NATIVE_PUSH_TOKEN_EVENT,
+    initializeNativePushBridge,
+    refreshNativePushChannelStatus,
+    type NativePushActionEventDetail,
+    type NativePushChannelStatusEventDetail,
+    type NativePushReceivedEventDetail,
+    type NativePushTokenEventDetail
+} from './features/native/nativePushBridge';
+import {
+    openAndroidAppNotificationSettings,
+    openAndroidChannelNotificationSettings
+} from './features/native/nativeNotificationSettingsBridge';
 
 
 const SOCKET_URL = getSocketUrl();
 const SINGLE_PROFILE_MODE = true;
 const OAUTH_PENDING_COMPANY_KEY = 'pendingOAuthCompanyId';
+const MOBILE_LAYOUT_BREAKPOINT = 1024;
+const MOBILE_BOTTOM_TAB_SECTIONS = ['team-inbox', 'automations', 'contacts', 'more'] as const;
+const PWA_UPDATE_AVAILABLE_EVENT = 'qmessage:pwa-update-available';
+const API_REQUEST_TIMEOUT_MS = 18_000;
+const AUTH_CHECK_TIMEOUT_MS = 4_000;
+const PROFILE_SYNC_TIMEOUT_MS = 20_000;
+const CHAT_SYNC_TIMEOUT_MS = 24_000;
+const SOCKET_STALE_REFRESH_INTERVAL_MS = 90_000;
+const QUICK_REPLIES_PREFETCH_DELAY_MS = 220;
+const NOTIFICATION_SOUND_PREF_KEY = 'qmessage.notification.sound.enabled.v1';
+const ANDROID_HEADS_UP_PROMPT_KEY = 'qmessage.native.android.headsup.prompted.v1';
+
+const readNotificationSoundPreference = (): boolean => {
+    if (typeof window === 'undefined') return true;
+    try {
+        const raw = window.localStorage.getItem(NOTIFICATION_SOUND_PREF_KEY);
+        if (!raw) return true;
+        const normalized = raw.trim().toLowerCase();
+        return !(normalized === '0' || normalized === 'false' || normalized === 'off');
+    } catch {
+        return true;
+    }
+};
+
+const shouldPromptAndroidHeadsUpEnable = (): boolean => {
+    if (typeof window === 'undefined') return false;
+    try {
+        const raw = window.sessionStorage.getItem(ANDROID_HEADS_UP_PROMPT_KEY);
+        return raw !== '1';
+    } catch {
+        return true;
+    }
+};
+
+const markAndroidHeadsUpPrompted = () => {
+    if (typeof window === 'undefined') return;
+    try {
+        window.sessionStorage.setItem(ANDROID_HEADS_UP_PROMPT_KEY, '1');
+    } catch {
+        // ignore persistence failures
+    }
+};
+
+const shouldShowDebugOverlay = (): boolean => {
+    if (import.meta.env.DEV) return true;
+    if (Capacitor.isNativePlatform()) return true;
+    if (typeof window === 'undefined') return false;
+    const protocol = (window.location.protocol || '').toLowerCase();
+    if (protocol === 'capacitor:' || protocol === 'ionic:') return true;
+    try {
+        return new URLSearchParams(window.location.search).get('debug') === '1';
+    } catch {
+        return false;
+    }
+};
+
+const urlBase64ToUint8Array = (value: string): ArrayBuffer => {
+    const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+    const padding = '='.repeat((4 - (normalized.length % 4)) % 4);
+    const base64 = normalized + padding;
+    const raw = window.atob(base64);
+    const output = new Uint8Array(raw.length);
+    for (let index = 0; index < raw.length; index += 1) {
+        output[index] = raw.charCodeAt(index);
+    }
+    return output.buffer;
+};
+
 
 const LazyWebhookView = lazy(() => import('./WebhookView'));
 const LazyBroadcastTemplateBuilder = lazy(() => import('./BroadcastTemplateBuilder'));
 const LazyBroadcastTemplatesList = lazy(() => import('./BroadcastTemplatesList'));
 const LazyFlowCanvas = lazy(() => import('./FlowCanvas'));
+
+const isSameSessionIdentity = (left: Session | null, right: Session | null): boolean => {
+    if (!left && !right) return true;
+    if (!left || !right) return false;
+    return (
+        left.access_token === right.access_token
+        && left.refresh_token === right.refresh_token
+        && left.expires_at === right.expires_at
+        && left.user?.id === right.user?.id
+    );
+};
 
 interface Message {
     key: {
@@ -142,6 +250,75 @@ interface Chat {
     unreadCount: number;
 }
 
+type ChatListFilterOption = 'all' | 'tagged' | 'untagged' | 'assigned' | 'unassigned';
+
+type ChatListComputationResult = {
+    chatsMap: Map<string, Chat>;
+    chatList: Chat[];
+    latestChatId: string | null;
+};
+
+type ContactListRow = {
+    id: string;
+    name: string;
+    phone: string;
+    tags: string[];
+    assigneeUserId: string | null;
+    assigneeName: string | null;
+    assigneeColor: string | null;
+    lastInboundAt: string | null;
+    lastActivityTs: number;
+    totalMessages: number;
+};
+
+type UnreadDeltaByChat = Record<string, number>;
+
+type UnreadCandidate = {
+    jid: string;
+    dedupeKey: string;
+};
+
+type DebugSocketEventRecord = {
+    name: string;
+    at: number;
+    detail?: string;
+};
+
+type ChatListFlickerStats = {
+    changes: number;
+    rapidChanges: number;
+    lastSignature: string;
+    lastChangedAt: number;
+};
+
+type SendMediaKind = 'image' | 'video' | 'document';
+
+type SendMediaPayload = {
+    type: SendMediaKind;
+    id?: string;
+    url?: string;
+    assetKey?: string;
+    filename?: string;
+};
+
+type OutgoingMessagePayload = {
+    text: string;
+    media?: SendMediaPayload;
+};
+
+type TemplateBodyAttributePayload = {
+    scope: 'body';
+    index: number;
+    key: string;
+    value: string;
+};
+
+type TemplateBuildResult = {
+    components?: any[];
+    bodyAttributes: TemplateBodyAttributePayload[];
+    error: string | null;
+};
+
 interface MediaData {
     data: string;
     mimetype: string;
@@ -154,6 +331,16 @@ interface MediaDownloadProgressState {
     status: MediaDownloadStatus;
 }
 
+type QuickReplyMediaItem = {
+    type?: 'image' | 'video' | 'document';
+    media_storage?: 'external' | 'r2';
+    media_asset_key?: string;
+    media_mime_type?: string;
+    media_size_bytes?: number | null;
+    media_url?: string;
+    media_filename?: string;
+};
+
 interface QuickReply {
     id?: string;
     shortcut: string;
@@ -165,6 +352,7 @@ interface QuickReply {
     media_size_bytes?: number | null;
     media_url?: string;
     media_filename?: string;
+    media_items?: QuickReplyMediaItem[];
 }
 
 type TeamUserLite = {
@@ -225,6 +413,9 @@ type AppToast = {
     id: number;
     message: string;
     tone: 'success' | 'error';
+    variant?: 'default' | 'chat';
+    title?: string;
+    avatarLabel?: string;
 };
 
 type OnboardingStepId = 'welcome' | 'waba_id' | 'phone_number_id' | 'access_token' | 'verify_token' | 'connect';
@@ -249,6 +440,8 @@ type OnboardingStepConfig = {
 
 type ContactMeta = {
     name?: string;
+    alias?: string | null;
+    whatsappName?: string | null;
     lastInboundAt?: string | null;
     tags?: string[];
     humanTakeover?: boolean;
@@ -280,12 +473,15 @@ type AnalyticsStaffRow = {
     name: string;
     color: string | null;
     sent: number;
+    total_messages: number;
     workflow_runs: number;
     expired_messages: number;
     contacts_messaged: number;
     inbound_contacts: number;
     replied_contacts: number;
     reply_rate: number;
+    avg_response_seconds: number;
+    is_online: boolean;
 };
 
 type AnalyticsPayload = {
@@ -301,6 +497,7 @@ type MessageVirtualRow =
 
 const CHAT_ROW_HEIGHT = 102;
 const MESSAGE_DRAFT_STORAGE_PREFIX = 'draftMessage:';
+const CHAT_READ_CURSOR_STORAGE_PREFIX = 'chatReadCursor:';
 const ONBOARDING_TOUR_STORAGE_PREFIX = 'onboardingTourSeen:';
 const ONBOARDING_TOUR_VERSION = 'v1';
 const ENABLE_FIRST_TIME_SETUP = false;
@@ -358,7 +555,16 @@ const splitContactTags = (value: unknown): { labelTags: string[]; systemTags: st
 const buildContactJidVariants = (jid: string | null | undefined): string[] => {
     const value = typeof jid === 'string' ? jid.trim() : '';
     if (!value) return [];
+    if (value.endsWith('@g.us')) {
+        const cleanGroupId = getCleanId(value);
+        const variants = [value, cleanGroupId ? `${cleanGroupId}@g.us` : '', cleanGroupId].filter(Boolean);
+        return Array.from(new Set(variants));
+    }
     const clean = getCleanId(value);
+    if (clean.includes(':') || clean.toLowerCase().startsWith('y2fwav9ncm91cd')) {
+        const variants = [value, `${clean}@g.us`, clean].filter(Boolean);
+        return Array.from(new Set(variants));
+    }
     const digits = clean.replace(/\D/g, '');
     const normalized = (digits.length >= 6 ? digits : clean.toLowerCase()).trim();
     const variants = [
@@ -378,10 +584,45 @@ const canonicalContactJid = (jid: string | null | undefined): string => {
     if (!value) return '';
     if (value.endsWith('@g.us')) return value;
     const clean = getCleanId(value);
+    if (clean.includes(':') || clean.toLowerCase().startsWith('y2fwav9ncm91cd')) {
+        return `${clean}@g.us`;
+    }
     const digits = clean.replace(/\D/g, '');
     if (digits.length >= 6) return `${digits}@s.whatsapp.net`;
     const normalized = clean.toLowerCase().trim();
     return normalized ? `${normalized}@s.whatsapp.net` : value.toLowerCase();
+};
+
+const normalizeChatReadCursorMap = (value: unknown): Record<string, number> => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    const next: Record<string, number> = {};
+    Object.entries(value as Record<string, unknown>).forEach(([jid, ts]) => {
+        const canonical = canonicalContactJid(jid);
+        const numericTs = Number(ts);
+        if (!canonical || !Number.isFinite(numericTs) || numericTs <= 0) return;
+        next[canonical] = Math.floor(numericTs);
+    });
+    return next;
+};
+
+const readChatReadCursorFromStorage = (profileId: string | null | undefined): Record<string, number> => {
+    if (typeof window === 'undefined' || !profileId) return {};
+    try {
+        const raw = window.localStorage.getItem(`${CHAT_READ_CURSOR_STORAGE_PREFIX}${profileId}`);
+        if (!raw) return {};
+        const parsed = JSON.parse(raw);
+        return normalizeChatReadCursorMap(parsed);
+    } catch {
+        return {};
+    }
+};
+
+const resolveRealtimeReadCursor = (
+    profileId: string | null | undefined,
+    inMemoryCursor: Record<string, number>
+): Record<string, number> => {
+    if (Object.keys(inMemoryCursor).length > 0) return inMemoryCursor;
+    return readChatReadCursorFromStorage(profileId);
 };
 
 const pickContactMetaByJid = (
@@ -393,6 +634,116 @@ const pickContactMetaByJid = (
         if (contactMap[key]) return contactMap[key];
     }
     return null;
+};
+
+type DesktopChatListRowProps = {
+    chats: Chat[];
+    contacts: Record<string, ContactMeta>;
+    selectedChatId: string | null;
+    onOpenChat: (chatId: string) => void;
+    onToggleAssigneeMenu: (chatId: string) => void;
+};
+
+const DesktopChatListRow = ({
+    ariaAttributes,
+    index,
+    style,
+    chats,
+    contacts,
+    selectedChatId,
+    onOpenChat,
+    onToggleAssigneeMenu
+}: {
+    ariaAttributes: {
+        'aria-posinset': number;
+        'aria-setsize': number;
+        role: 'listitem';
+    };
+    index: number;
+    style: React.CSSProperties;
+} & DesktopChatListRowProps) => {
+    const chat = chats[index];
+    if (!chat) return null;
+    const contactMeta = pickContactMetaByJid(contacts, chat.id) || {};
+    const assigneeName = contactMeta.assigneeName || null;
+    const assigneeColor = contactMeta.assigneeColor || '#6b7280';
+    const contactTags = splitContactTags(contactMeta.tags).labelTags;
+    const primaryTag = contactTags[0] || null;
+    const extraTagCount = Math.max(0, contactTags.length - (primaryTag ? 1 : 0));
+    const assigneeNode = assigneeName ? (
+        <button
+            type="button"
+            onClick={(event) => {
+                event.stopPropagation();
+                onToggleAssigneeMenu(chat.id);
+            }}
+            className="px-1.5 py-0.5 text-[9px] rounded uppercase font-bold border tracking-tight hover:opacity-85 transition-all"
+            style={{
+                backgroundColor: withHexAlpha(assigneeColor, '20', '#f3f4f6'),
+                borderColor: withHexAlpha(assigneeColor, '66', '#d1d5db'),
+                color: textColor(assigneeColor, '#374151')
+            }}
+            title={`Staff ${assigneeName}`}
+        >
+            <span className="inline-flex max-w-[110px] items-center truncate">Staff {assigneeName}</span>
+        </button>
+    ) : chat.id.endsWith('@g.us') ? (
+        <span className="px-1.5 py-0.5 bg-[#f0f2f5] text-[#54656f] text-[9px] rounded uppercase font-bold border border-[#eceff1] tracking-tight">Staff Group</span>
+    ) : (
+        <button
+            type="button"
+            onClick={(event) => {
+                event.stopPropagation();
+                onToggleAssigneeMenu(chat.id);
+            }}
+            className="px-1.5 py-0.5 bg-[#f8f9fa] text-[#9ca3af] text-[9px] rounded uppercase font-bold border border-[#eceff1] tracking-tight hover:bg-[#f0f2f5] transition-all"
+        >
+            <span className="inline-flex max-w-[110px] items-center truncate">Staff Unassigned</span>
+        </button>
+    );
+
+    return (
+        <div style={style} {...ariaAttributes}>
+            <ContactListItem
+                id={chat.id}
+                name={chat.name}
+                preview={chat.lastMessage || ''}
+                timestampLabel={chat.timestamp ? new Date(chat.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
+                isSelected={selectedChatId === chat.id}
+                isGroup={chat.id.endsWith('@g.us')}
+                phoneLabel={
+                    (chat.id.endsWith('@s.whatsapp.net') || chat.id.endsWith('@lid'))
+                        && getCleanId(chat.name) !== getCleanId(chat.id)
+                        ? formatPhoneNumber(getCleanId(chat.id))
+                        : undefined
+                }
+                badgeCount={chat.unreadCount}
+                primaryTag={primaryTag}
+                extraTagCount={extraTagCount}
+                assignee={assigneeNode}
+                onClick={() => onOpenChat(chat.id)}
+            />
+        </div>
+    );
+};
+
+const normalizeContactNameValue = (value: unknown): string => (
+    typeof value === 'string' ? value.trim() : ''
+);
+
+const resolveContactDisplayName = (
+    aliasValue: unknown,
+    whatsappNameValue: unknown,
+    fallbackNameValue: unknown,
+    jid: string | null | undefined
+): string => {
+    const alias = normalizeContactNameValue(aliasValue);
+    if (alias) return alias;
+    const whatsappName = normalizeContactNameValue(whatsappNameValue);
+    if (whatsappName) return whatsappName;
+    const fallback = normalizeContactNameValue(fallbackNameValue);
+    if (fallback) return fallback;
+    return getCleanId(jid || '');
 };
 
 
@@ -518,12 +869,15 @@ const normalizeAnalyticsPayload = (payload: any): AnalyticsPayload => {
                 name: typeof row?.name === 'string' ? row.name : '',
                 color: typeof row?.color === 'string' ? row.color : null,
                 sent: toSafeAnalyticsCount(row?.sent),
+                total_messages: toSafeAnalyticsCount(row?.total_messages ?? row?.sent),
                 workflow_runs: toSafeAnalyticsCount(row?.workflow_runs),
                 expired_messages: toSafeAnalyticsCount(row?.expired_messages),
                 contacts_messaged: toSafeAnalyticsCount(row?.contacts_messaged),
                 inbound_contacts: toSafeAnalyticsCount(row?.inbound_contacts),
                 replied_contacts: toSafeAnalyticsCount(row?.replied_contacts),
-                reply_rate: toSafeAnalyticsRate(row?.reply_rate)
+                reply_rate: toSafeAnalyticsRate(row?.reply_rate),
+                avg_response_seconds: toSafeAnalyticsCount(row?.avg_response_seconds),
+                is_online: Boolean(row?.is_online)
             }))
             .filter((row: AnalyticsStaffRow) => Boolean(row.user_id))
         : [];
@@ -552,6 +906,896 @@ const formatAnalyticsDateShort = (value: string): string => {
     return parsed.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 };
 
+const formatAnalyticsDuration = (seconds: number): string => {
+    const safeSeconds = Math.max(0, Math.floor(seconds));
+    if (safeSeconds < 60) return `${safeSeconds}s`;
+    const minutes = Math.floor(safeSeconds / 60);
+    const remainder = safeSeconds % 60;
+    if (minutes < 60) return `${minutes}m ${remainder}s`;
+    const hours = Math.floor(minutes / 60);
+    const remMinutes = minutes % 60;
+    return `${hours}h ${remMinutes}m`;
+};
+
+const getUnreadCountForChat = (unreadMessagesByChat: Record<string, number>, jidValue: string): number => {
+    const key = canonicalContactJid(jidValue) || jidValue;
+    return Math.max(0, Number(unreadMessagesByChat[key] || 0));
+};
+
+const getChatListPreviewText = (msg: Message): string => (
+    msg.message?.conversation
+    || msg.message?.extendedTextMessage?.text
+    || msg.message?.buttonsMessage?.contentText
+    || msg.message?.listMessage?.description
+    || (msg.message?.buttonsMessage ? 'Buttons' : msg.message?.listMessage ? 'List' : 'Media message')
+);
+
+const getIncomingNotificationPreview = (msg: Message): string => {
+    const preview = getMessagePreviewText(msg).trim();
+    if (preview) return preview;
+    if (msg.message?.imageMessage) return 'Photo';
+    if (msg.message?.videoMessage) return 'Video';
+    if (msg.message?.documentMessage) return 'Document';
+    if (msg.message?.audioMessage) return 'Voice message';
+    return 'New message';
+};
+
+const MAX_NOTIFICATION_BODY_LENGTH = 120;
+
+const truncateNotificationBody = (value: string, maxLength = MAX_NOTIFICATION_BODY_LENGTH): string => {
+    const normalized = value.replace(/\s+/g, ' ').trim();
+    if (!normalized) return 'New message';
+    if (maxLength <= 3) return normalized.slice(0, Math.max(0, maxLength));
+    if (normalized.length <= maxLength) return normalized;
+    return `${normalized.slice(0, maxLength - 3)}...`;
+};
+
+const normalizeChatDisplayName = (rawName: string, jid: string): string => {
+    const cleanId = getCleanId(jid);
+    const normalized = rawName.trim() || cleanId;
+    if (normalized.includes('@')) return getCleanId(normalized);
+    return normalized;
+};
+
+const doesChatMatchQueryAndFilter = (
+    chat: Chat,
+    contacts: Record<string, ContactMeta>,
+    query: string,
+    filter: ChatListFilterOption
+): boolean => {
+    const meta: ContactMeta = pickContactMetaByJid(contacts, chat.id) || {};
+    const tags = splitContactTags(meta.tags).labelTags;
+    const hasTags = tags.length > 0;
+    const hasAssignee = Boolean((meta.assigneeUserId || '').trim() || (meta.assigneeName || '').trim());
+    const cleanId = getCleanId(chat.id).toLowerCase();
+    const matchesQuery =
+        !query
+        || chat.name.toLowerCase().includes(query)
+        || cleanId.includes(query)
+        || tags.some((tag) => tag.toLowerCase().includes(query));
+    if (!matchesQuery) return false;
+    if (filter === 'tagged') return hasTags;
+    if (filter === 'untagged') return !hasTags;
+    if (filter === 'assigned') return hasAssignee;
+    if (filter === 'unassigned') return !hasAssignee;
+    return true;
+};
+
+const dedupeChatsByCanonicalJid = (list: Chat[]): Chat[] => {
+    const seenCustomers = new Set<string>();
+    return list.filter((chat) => {
+        const key = canonicalContactJid(chat.id) || chat.id;
+        if (seenCustomers.has(key)) return false;
+        seenCustomers.add(key);
+        return true;
+    });
+};
+
+const applyUnreadCountsToChats = (
+    list: Chat[],
+    unreadMessagesByChat: Record<string, number>
+): Chat[] => list.map((chat) => ({
+    ...chat,
+    unreadCount: getUnreadCountForChat(unreadMessagesByChat, chat.id)
+}));
+
+const buildChatListComputation = (
+    allMessages: Message[],
+    contacts: Record<string, ContactMeta>,
+    searchQuery: string,
+    chatListFilter: ChatListFilterOption,
+    unreadMessagesByChat: Record<string, number>
+): ChatListComputationResult => {
+    const nextMap = new Map<string, Chat>();
+
+    allMessages.forEach((msg) => {
+        const rawJid = msg.key.remoteJid;
+        if (!rawJid) return;
+        const jid = canonicalContactJid(rawJid);
+        if (!jid) return;
+
+        const existing = nextMap.get(jid);
+        if (!existing || (msg.messageTimestamp && msg.messageTimestamp > (existing.timestamp || 0))) {
+            const cleanId = getCleanId(jid);
+            const rawName = pickContactMetaByJid(contacts, rawJid)?.name || msg.pushName || cleanId;
+            nextMap.set(jid, {
+                id: jid,
+                name: normalizeChatDisplayName(rawName, jid),
+                lastMessage: getChatListPreviewText(msg),
+                timestamp: msg.messageTimestamp,
+                unreadCount: getUnreadCountForChat(unreadMessagesByChat, jid)
+            });
+        }
+    });
+
+    Object.entries(contacts).forEach(([rawJid, contact]) => {
+        const jid = canonicalContactJid(rawJid);
+        if (!jid || nextMap.has(jid)) return;
+        const mergedContact = pickContactMetaByJid(contacts, jid) || contact;
+        const cleanId = getCleanId(jid);
+        const lastInboundMs = mergedContact?.lastInboundAt ? new Date(mergedContact.lastInboundAt).getTime() : 0;
+        const timestamp = Number.isFinite(lastInboundMs) && lastInboundMs > 0
+            ? Math.floor(lastInboundMs / 1000)
+            : 0;
+        nextMap.set(jid, {
+            id: jid,
+            name: normalizeChatDisplayName(mergedContact?.name || cleanId, jid),
+            lastMessage: '',
+            timestamp,
+            unreadCount: getUnreadCountForChat(unreadMessagesByChat, jid)
+        });
+    });
+
+    const query = searchQuery.trim().toLowerCase();
+    const filteredAndSorted = Array.from(nextMap.values())
+        .filter((chat) => doesChatMatchQueryAndFilter(chat, contacts, query, chatListFilter))
+        .sort((a, b) => {
+            const tsDiff = (b.timestamp || 0) - (a.timestamp || 0);
+            if (tsDiff !== 0) return tsDiff;
+            return a.id.localeCompare(b.id);
+        });
+    const dedupedList = dedupeChatsByCanonicalJid(filteredAndSorted);
+    const nextListWithUnread = applyUnreadCountsToChats(dedupedList, unreadMessagesByChat);
+
+    return {
+        chatsMap: nextMap,
+        chatList: nextListWithUnread,
+        latestChatId: nextListWithUnread[0]?.id || null
+    };
+};
+
+const ensureContactRow = (
+    rows: Map<string, ContactListRow>,
+    contacts: Record<string, ContactMeta>,
+    jid: string
+): ContactListRow | null => {
+    const key = canonicalContactJid(jid);
+    if (!key || key.endsWith('@g.us')) return null;
+    const existing = rows.get(key);
+    if (existing) return existing;
+
+    const meta = pickContactMetaByJid(contacts, key) || {};
+    const phone = formatPhoneNumber(getCleanId(key));
+    const fallbackName = phone;
+    const row: ContactListRow = {
+        id: key,
+        name: meta.name || fallbackName,
+        phone,
+        tags: splitContactTags(meta.tags).labelTags,
+        assigneeUserId: meta.assigneeUserId || null,
+        assigneeName: meta.assigneeName || null,
+        assigneeColor: meta.assigneeColor || null,
+        lastInboundAt: meta.lastInboundAt || null,
+        lastActivityTs: meta.lastInboundAt ? new Date(meta.lastInboundAt).getTime() || 0 : 0,
+        totalMessages: 0
+    };
+    rows.set(key, row);
+    return row;
+};
+
+const applyMessageToContactRow = (row: ContactListRow, msg: Message): void => {
+    row.totalMessages += 1;
+    const timestampMs = (msg.messageTimestamp || 0) * 1000;
+    if (timestampMs > row.lastActivityTs) row.lastActivityTs = timestampMs;
+    if (!msg.key.fromMe && timestampMs > 0) {
+        const inboundIso = new Date(timestampMs).toISOString();
+        if (!row.lastInboundAt || timestampMs > new Date(row.lastInboundAt).getTime()) {
+            row.lastInboundAt = inboundIso;
+        }
+    }
+    if (!row.name) {
+        row.name = msg.pushName || row.phone;
+    }
+};
+
+const doesContactMatchQuery = (row: ContactListRow, query: string): boolean => {
+    if (!query) return true;
+    if (row.name.toLowerCase().includes(query)) return true;
+    if (row.phone.toLowerCase().includes(query)) return true;
+    if (row.tags.some((tag) => tag.toLowerCase().includes(query))) return true;
+    return false;
+};
+
+const getContactSortTimestamp = (row: ContactListRow): number => (
+    row.lastActivityTs || (row.lastInboundAt ? new Date(row.lastInboundAt).getTime() : 0)
+);
+
+const buildContactsListComputation = (
+    contacts: Record<string, ContactMeta>,
+    allMessages: Message[],
+    contactsSearchQuery: string
+): ContactListRow[] => {
+    const rows = new Map<string, ContactListRow>();
+    Object.keys(contacts).forEach((jid) => {
+        ensureContactRow(rows, contacts, jid);
+    });
+
+    allMessages.forEach((msg) => {
+        const row = ensureContactRow(rows, contacts, msg.key?.remoteJid || '');
+        if (!row) return;
+        applyMessageToContactRow(row, msg);
+    });
+
+    const query = contactsSearchQuery.trim().toLowerCase();
+    const filtered = Array.from(rows.values()).filter((row) => doesContactMatchQuery(row, query));
+    filtered.sort((a, b) => getContactSortTimestamp(b) - getContactSortTimestamp(a));
+    return filtered;
+};
+
+const buildUnreadDedupeKey = (
+    jid: string,
+    rawMessageId: string,
+    timestamp: number,
+    index: number
+): string => `${jid}:${rawMessageId || `ts-${timestamp}-idx-${index}`}`;
+
+const toUnreadCandidate = (
+    message: any,
+    index: number,
+    chatReadCursorByChat: Record<string, number>
+): UnreadCandidate | null => {
+    if (message?.key?.fromMe) return null;
+    const jid = canonicalContactJid(message?.key?.remoteJid || '');
+    if (!jid) return null;
+    const rawMessageId = typeof message?.key?.id === 'string' ? message.key.id.trim() : '';
+    const timestamp = Number(message?.messageTimestamp || 0);
+    const readCursor = Number(chatReadCursorByChat[jid] || 0);
+    if (readCursor > 0 && (!timestamp || timestamp <= readCursor)) return null;
+    return {
+        jid,
+        dedupeKey: buildUnreadDedupeKey(jid, rawMessageId, timestamp, index)
+    };
+};
+
+const incrementUnreadDelta = (target: UnreadDeltaByChat, jid: string): void => {
+    target[jid] = (target[jid] || 0) + 1;
+};
+
+const mergeUnreadDelta = (
+    currentUnreadByChat: Record<string, number>,
+    unreadDeltaByChat: UnreadDeltaByChat
+): Record<string, number> => {
+    if (Object.keys(unreadDeltaByChat).length === 0) return currentUnreadByChat;
+    const next = { ...currentUnreadByChat };
+    Object.entries(unreadDeltaByChat).forEach(([jid, count]) => {
+        next[jid] = (next[jid] || 0) + count;
+    });
+    return next;
+};
+
+const collectUnreadDeltaFromIncomingUpsert = (
+    incomingMessages: any[],
+    activeChatKey: string,
+    seenIncomingMessageKeys: Set<string>,
+    chatReadCursorByChat: Record<string, number>
+): UnreadDeltaByChat => {
+    const unreadDeltaByChat: UnreadDeltaByChat = {};
+    incomingMessages.forEach((msg, index) => {
+        const candidate = toUnreadCandidate(msg, index, chatReadCursorByChat);
+        if (!candidate) return;
+        if (seenIncomingMessageKeys.has(candidate.dedupeKey)) return;
+        seenIncomingMessageKeys.add(candidate.dedupeKey);
+        if (activeChatKey && candidate.jid === activeChatKey) return;
+        incrementUnreadDelta(unreadDeltaByChat, candidate.jid);
+    });
+    return unreadDeltaByChat;
+};
+
+const collectUnreadDeltaFromHistory = (
+    historyMessages: any[],
+    activeChatKey: string,
+    previousSeen: Set<string>,
+    chatReadCursorByChat: Record<string, number>
+): { nextSeen: Set<string>; unreadDeltaByChat: UnreadDeltaByChat } => {
+    const nextSeen = new Set<string>();
+    const unreadDeltaByChat: UnreadDeltaByChat = {};
+    historyMessages.forEach((msg, index) => {
+        const candidate = toUnreadCandidate(msg, index, chatReadCursorByChat);
+        if (!candidate) return;
+        nextSeen.add(candidate.dedupeKey);
+        if (previousSeen.has(candidate.dedupeKey)) return;
+        if (activeChatKey && candidate.jid === activeChatKey) return;
+        incrementUnreadDelta(unreadDeltaByChat, candidate.jid);
+    });
+    return { nextSeen, unreadDeltaByChat };
+};
+
+const buildMessageIdentityKey = (msg: Message, index = 0): string => {
+    const jid = canonicalContactJid(msg?.key?.remoteJid || '') || msg?.key?.remoteJid || '';
+    const id = typeof msg?.key?.id === 'string' ? msg.key.id.trim() : '';
+    const ts = Number(msg?.messageTimestamp || 0);
+    return `${jid}:${id || `ts-${ts}-i-${index}`}`;
+};
+
+const mergeMessagesByIdentity = (current: Message[], incoming: Message[]): Message[] => {
+    if (!Array.isArray(incoming) || incoming.length === 0) return current;
+    const seen = new Set<string>();
+    const merged: Message[] = [];
+
+    incoming.forEach((msg, index) => {
+        const key = buildMessageIdentityKey(msg, index);
+        if (seen.has(key)) return;
+        seen.add(key);
+        merged.push(msg);
+    });
+
+    current.forEach((msg, index) => {
+        const key = buildMessageIdentityKey(msg, index + incoming.length);
+        if (seen.has(key)) return;
+        seen.add(key);
+        merged.push(msg);
+    });
+
+    return merged;
+};
+
+const getLatestTimestampFromMessages = (messages: Message[]): number => {
+    let latest = 0;
+    messages.forEach((msg) => {
+        const ts = Number(msg?.messageTimestamp || 0);
+        if (Number.isFinite(ts) && ts > latest) latest = ts;
+    });
+    return latest;
+};
+
+const trimString = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
+
+const createClientTempMessageId = (): string => `tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+const createSendMediaPayload = (
+    type: SendMediaKind,
+    mediaId: string,
+    mediaUrl: string,
+    mediaAssetKey: string,
+    mediaFilename = ''
+): SendMediaPayload | null => {
+    if (!mediaId && !mediaUrl && !mediaAssetKey) return null;
+    return {
+        type,
+        ...(mediaId ? { id: mediaId } : {}),
+        ...(mediaUrl ? { url: mediaUrl } : {}),
+        ...(mediaAssetKey ? { assetKey: mediaAssetKey } : {}),
+        ...(type === 'document' && mediaFilename ? { filename: mediaFilename } : {})
+    };
+};
+
+const buildSendMediaFromComposerState = (
+    mediaType: 'none' | 'image' | 'video' | 'document',
+    mediaId: string,
+    mediaUrl: string,
+    mediaAssetKey: string,
+    mediaFilename: string
+): SendMediaPayload | null => {
+    if (mediaType !== 'image' && mediaType !== 'video' && mediaType !== 'document') return null;
+    return createSendMediaPayload(mediaType, mediaId, mediaUrl, mediaAssetKey, mediaFilename);
+};
+
+const normalizeQuickReplyMediaItemType = (
+    value: unknown,
+    fallback: 'image' | 'video' | 'document'
+): 'image' | 'video' | 'document' => {
+    const normalized = trimString(value).toLowerCase();
+    if (normalized === 'image' || normalized === 'video' || normalized === 'document') return normalized;
+    return fallback;
+};
+
+const buildSendMediaPayloadFromQuickReplyMediaItem = (
+    mediaItem: QuickReplyMediaItem,
+    fallbackType: 'image' | 'video' | 'document'
+): SendMediaPayload | null => {
+    const mediaType = normalizeQuickReplyMediaItemType(mediaItem?.type, fallbackType);
+    const mediaUrl = trimString(mediaItem?.media_url);
+    const mediaAssetKey = trimString(mediaItem?.media_asset_key);
+    const mediaFilename = trimString(mediaItem?.media_filename);
+    return createSendMediaPayload(mediaType, '', mediaUrl, mediaAssetKey, mediaFilename);
+};
+
+const extractMessageMediaFields = (mediaMessage: any): { mediaId: string; mediaUrl: string; mediaAssetKey: string } => ({
+    mediaId: trimString(mediaMessage?.mediaId),
+    mediaUrl: trimString(mediaMessage?.url),
+    mediaAssetKey: trimString(mediaMessage?.assetKey)
+});
+
+const buildOutgoingMediaFromMessage = (msg: Message): SendMediaPayload | null => {
+    const imageFields = extractMessageMediaFields(msg?.message?.imageMessage);
+    const imagePayload = createSendMediaPayload('image', imageFields.mediaId, imageFields.mediaUrl, imageFields.mediaAssetKey);
+    if (imagePayload) return imagePayload;
+
+    const videoFields = extractMessageMediaFields(msg?.message?.videoMessage);
+    const videoPayload = createSendMediaPayload('video', videoFields.mediaId, videoFields.mediaUrl, videoFields.mediaAssetKey);
+    if (videoPayload) return videoPayload;
+
+    const documentFields = extractMessageMediaFields(msg?.message?.documentMessage);
+    const documentPayload = createSendMediaPayload(
+        'document',
+        documentFields.mediaId,
+        documentFields.mediaUrl,
+        documentFields.mediaAssetKey,
+        trimString(msg?.message?.documentMessage?.fileName)
+    );
+    if (documentPayload) return documentPayload;
+
+    return null;
+};
+
+const buildOptimisticMessageContent = (
+    outgoingText: string,
+    sendMedia: SendMediaPayload | null
+): NonNullable<Message['message']> => {
+    if (!sendMedia) return { conversation: outgoingText };
+    if (sendMedia.type === 'image') {
+        return {
+            ...(outgoingText ? { conversation: outgoingText } : {}),
+            imageMessage: {
+                mediaId: sendMedia.id,
+                caption: outgoingText,
+                assetKey: sendMedia.assetKey,
+                url: sendMedia.url
+            }
+        };
+    }
+    if (sendMedia.type === 'video') {
+        return {
+            ...(outgoingText ? { conversation: outgoingText } : {}),
+            videoMessage: {
+                mediaId: sendMedia.id,
+                caption: outgoingText,
+                assetKey: sendMedia.assetKey,
+                url: sendMedia.url
+            }
+        };
+    }
+    return {
+        ...(outgoingText ? { conversation: outgoingText } : {}),
+        documentMessage: {
+            mediaId: sendMedia.id,
+            caption: outgoingText,
+            assetKey: sendMedia.assetKey,
+            fileName: sendMedia.filename || 'document',
+            url: sendMedia.url
+        }
+    };
+};
+
+const buildOptimisticPendingMessage = (args: {
+    tempMessageId: string;
+    remoteJid: string;
+    outgoingText: string;
+    sendMedia: SendMediaPayload | null;
+    agentUserId?: string;
+    agentName: string;
+}): Message => ({
+    key: { id: args.tempMessageId, remoteJid: args.remoteJid, fromMe: true },
+    message: buildOptimisticMessageContent(args.outgoingText, args.sendMedia),
+    messageTimestamp: Math.floor(Date.now() / 1000),
+    status: 'pending',
+    agent: {
+        user_id: args.agentUserId,
+        name: args.agentName,
+        color: '#6b7280'
+    }
+});
+
+const markMessageStatusById = (
+    messages: Message[],
+    messageId: string,
+    status: NonNullable<Message['status']>
+): Message[] => messages.map((msg) => (
+    msg.key?.id === messageId
+        ? { ...msg, status }
+        : msg
+));
+
+const replaceTempMessageIdAndStatus = (
+    messages: Message[],
+    tempMessageId: string,
+    realMessageId: string,
+    status: NonNullable<Message['status']>
+): Message[] => messages.map((msg) => (
+    msg.key?.id === tempMessageId
+        ? { ...msg, key: { ...msg.key, id: realMessageId }, status }
+        : msg
+));
+
+const buildWorkflowBuilderWithNameMeta = (workflow: any, workflowName: string): any => {
+    const builderMeta =
+        workflow?.builder && typeof workflow.builder === 'object' && !Array.isArray(workflow.builder)
+            ? (workflow.builder as any)
+            : null;
+    if (!builderMeta) return workflow?.builder || null;
+    return {
+        ...builderMeta,
+        meta: {
+            ...(builderMeta.meta && typeof builderMeta.meta === 'object' ? builderMeta.meta : {}),
+            name: workflowName,
+            enabled: workflow?.enabled !== false
+        }
+    };
+};
+
+const normalizeWorkflowForSave = (workflow: any, drafts: Record<string, string>): any => {
+    const workflowName = trimString(workflow?.name);
+    const builder = buildWorkflowBuilderWithNameMeta(workflow, workflowName);
+    const draft = drafts[workflow.id];
+    if (typeof draft !== 'string') {
+        return { ...workflow, name: workflowName, builder };
+    }
+    try {
+        return { ...workflow, name: workflowName, builder, actions: JSON.parse(draft) };
+    } catch {
+        throw new Error(`Invalid JSON in actions for workflow: ${workflow.id}`);
+    }
+};
+
+const normalizeWorkflowsForSave = (workflows: any[], drafts: Record<string, string>): any[] => (
+    workflows.map((workflow) => normalizeWorkflowForSave(workflow, drafts))
+);
+
+const ensureWorkflowDraftEntries = (
+    workflows: any[],
+    existingDrafts: Record<string, string>
+): Record<string, string> => {
+    const nextDrafts = { ...existingDrafts };
+    workflows.forEach((workflow) => {
+        if (typeof nextDrafts[workflow.id] === 'string') return;
+        nextDrafts[workflow.id] = JSON.stringify(Array.isArray(workflow.actions) ? workflow.actions : [], null, 2);
+    });
+    return nextDrafts;
+};
+
+const createUniqueWorkflowId = (existingIds: Set<string>): string => {
+    let nextId = `wf-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    while (existingIds.has(nextId)) {
+        nextId = `wf-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    }
+    return nextId;
+};
+
+const createCopiedWorkflowName = (existingNames: Set<string>, sourceName: string): string => {
+    let copiedName = sourceName ? `${sourceName}-copy` : 'workflow-copy';
+    let copyNameIndex = 2;
+    while (existingNames.has(copiedName.toLowerCase())) {
+        copiedName = sourceName ? `${sourceName}-copy-${copyNameIndex}` : `workflow-copy-${copyNameIndex}`;
+        copyNameIndex += 1;
+    }
+    return copiedName;
+};
+
+const deepCloneJsonValue = <T,>(value: T): T => JSON.parse(JSON.stringify(value));
+
+const buildCopiedWorkflowRecord = (
+    sourceWorkflow: any,
+    copiedId: string,
+    copiedName: string,
+    buildBuilderFromActionsFn: typeof buildBuilderFromActions
+): { copiedWorkflow: any; copiedActions: any[] } => {
+    const sourceActions = Array.isArray(sourceWorkflow.actions) ? sourceWorkflow.actions : [];
+    const copiedActions = deepCloneJsonValue(sourceActions);
+    const copiedBuilder = sourceWorkflow?.builder && Array.isArray(sourceWorkflow.builder.nodes)
+        ? deepCloneJsonValue(sourceWorkflow.builder)
+        : buildBuilderFromActionsFn(copiedActions, copiedId);
+    if (copiedBuilder && typeof copiedBuilder === 'object') {
+        copiedBuilder.id = copiedId;
+    }
+    const sourceTrigger = trimString(sourceWorkflow?.trigger_keyword);
+    return {
+        copiedWorkflow: {
+            ...sourceWorkflow,
+            id: copiedId,
+            name: copiedName,
+            trigger_keyword: sourceTrigger,
+            run_on_new_chat: false,
+            enabled: false,
+            actions: copiedActions,
+            builder: copiedBuilder
+        },
+        copiedActions
+    };
+};
+
+const extractCallPermissionSummary = (payload: any): { permissionStatus: string; canStartCall: boolean } => {
+    const permissionStatus = String(payload?.data?.permission?.status || '').toLowerCase();
+    const actions = Array.isArray(payload?.data?.actions) ? payload.data.actions : [];
+    const startAction = actions.find((entry: any) => String(entry?.action_name || '').toLowerCase() === 'start_call');
+    const canStartCall = startAction?.can_perform_action === true;
+    return { permissionStatus, canStartCall };
+};
+
+const getCallPermissionFeedback = (
+    kind: 'voice' | 'video',
+    permissionStatus: string,
+    canStartCall: boolean,
+    userWaId: string
+): { message: string; tone: 'success' | 'error'; logMessage?: string } => {
+    const callTypeLabel = kind === 'video' ? 'Video call' : 'Voice call';
+    if (permissionStatus === 'granted' && canStartCall) {
+        return {
+            message: `${callTypeLabel} is permitted. Dialer UI not enabled yet.`,
+            tone: 'success',
+            logMessage: `[Calls] ${callTypeLabel} permitted for ${userWaId}.`
+        };
+    }
+    if (permissionStatus === 'pending') {
+        return { message: 'Call permission is pending approval from this user.', tone: 'error' };
+    }
+    if (permissionStatus === 'denied') {
+        return { message: 'Call permission was denied by this user.', tone: 'error' };
+    }
+    if (permissionStatus === 'expired') {
+        return { message: 'Call permission has expired. Request permission again.', tone: 'error' };
+    }
+    return { message: 'Call permission is not available for this contact.', tone: 'error' };
+};
+
+const isCallingApiNotEnabledError = (errorMessage: string): boolean => (
+    errorMessage.includes('calling api not enabled') || errorMessage.includes('code=138000')
+);
+
+const emitSocketWithTimeout = async (
+    socket: Socket,
+    eventName: string,
+    payload: Record<string, unknown>,
+    timeoutMs: number,
+    timeoutError: string
+): Promise<any> => new Promise((resolve) => {
+    const timeout = window.setTimeout(() => {
+        resolve({ success: false, error: timeoutError });
+    }, timeoutMs);
+    socket.emit(eventName, payload, (ack: any) => {
+        window.clearTimeout(timeout);
+        resolve(ack);
+    });
+});
+
+const applyAssignedContactUpdate = (
+    previousContacts: Record<string, ContactMeta>,
+    targetJid: string,
+    contact: any
+): Record<string, ContactMeta> => {
+    const next = { ...previousContacts };
+    const aliasKeys = Array.from(new Set([
+        ...buildContactJidVariants(targetJid),
+        ...buildContactJidVariants(contact?.id)
+    ]));
+    const canonicalKey = canonicalContactJid(contact?.id || targetJid) || contact?.id || targetJid;
+    const prevMeta = pickContactMetaByJid(next, canonicalKey) || {};
+    const incomingAlias = normalizeContactNameValue(contact?.alias);
+    const nextAlias = contact?.alias === undefined
+        ? ((prevMeta as any).alias ?? null)
+        : (incomingAlias || null);
+    const incomingWhatsappName = normalizeContactNameValue(contact?.whatsappName);
+    const nextWhatsappName = contact?.whatsappName === undefined
+        ? ((prevMeta as any).whatsappName ?? null)
+        : (incomingWhatsappName || null);
+    const legacyIncomingName = normalizeContactNameValue(contact?.name);
+    const nextDisplayName = resolveContactDisplayName(
+        nextAlias,
+        nextWhatsappName,
+        legacyIncomingName || (prevMeta as any).name,
+        canonicalKey
+    );
+    aliasKeys.forEach((key) => {
+        if (key !== canonicalKey) delete next[key];
+    });
+    next[canonicalKey] = {
+        ...prevMeta,
+        name: nextDisplayName,
+        alias: nextAlias,
+        whatsappName: nextWhatsappName,
+        lastInboundAt: contact?.lastInboundAt ?? prevMeta.lastInboundAt ?? null,
+        tags: Array.isArray(contact?.tags) ? contact.tags : (prevMeta.tags || []),
+        assigneeUserId: contact?.assigneeUserId ?? null,
+        assigneeName: contact?.assigneeName ?? null,
+        assigneeColor: contact?.assigneeColor ?? null,
+        ctaReferralAt: contact?.ctaReferralAt ?? prevMeta.ctaReferralAt ?? null,
+        ctaFreeWindowStartedAt: contact?.ctaFreeWindowStartedAt ?? prevMeta.ctaFreeWindowStartedAt ?? null,
+        ctaFreeWindowExpiresAt: contact?.ctaFreeWindowExpiresAt ?? prevMeta.ctaFreeWindowExpiresAt ?? null
+    };
+    return next;
+};
+
+const parseTemplateComponentsInput = (templateComponents: string): { components?: any[]; error: string | null } => {
+    const raw = templateComponents.trim();
+    if (!raw) return { components: undefined, error: null };
+    try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) {
+            return { components: undefined, error: 'Template components must be a JSON array.' };
+        }
+        return { components: parsed, error: null };
+    } catch {
+        return { components: undefined, error: 'Invalid JSON in template components.' };
+    }
+};
+
+const buildTemplateHeaderComponent = (args: {
+    selectedTemplateHeaderFormat: string;
+    requiredTemplateHeaderAttributeCount: number;
+    templateHeaderAttributes: string[];
+    templateHeaderMediaUrl: string;
+    templateHeaderDocumentFilename: string;
+}): { component?: any; error: string | null } => {
+    const {
+        selectedTemplateHeaderFormat,
+        requiredTemplateHeaderAttributeCount,
+        templateHeaderAttributes,
+        templateHeaderMediaUrl,
+        templateHeaderDocumentFilename
+    } = args;
+    const headerType = selectedTemplateHeaderFormat;
+    const mediaLink = templateHeaderMediaUrl.trim();
+    if (requiredTemplateHeaderAttributeCount > 0) {
+        const missingHeaderParamIndex = templateHeaderAttributes.findIndex((value) => !value.trim());
+        if (missingHeaderParamIndex >= 0) {
+            return { error: `Header attribute {{${missingHeaderParamIndex + 1}}} is required.` };
+        }
+        return {
+            component: {
+                type: 'header',
+                parameters: templateHeaderAttributes.map((value) => ({
+                    type: 'text',
+                    text: value.trim()
+                }))
+            },
+            error: null
+        };
+    }
+    if (headerType !== 'IMAGE' && headerType !== 'VIDEO' && headerType !== 'DOCUMENT') {
+        return { component: undefined, error: null };
+    }
+    if (!mediaLink) {
+        return { error: `Template header requires ${headerType.toLowerCase()} link.` };
+    }
+    if (headerType === 'DOCUMENT') {
+        return {
+            component: {
+                type: 'header',
+                parameters: [
+                    {
+                        type: 'document',
+                        document: {
+                            link: mediaLink,
+                            ...(templateHeaderDocumentFilename.trim()
+                                ? { filename: templateHeaderDocumentFilename.trim() }
+                                : {})
+                        }
+                    }
+                ]
+            },
+            error: null
+        };
+    }
+    if (headerType === 'IMAGE') {
+        return {
+            component: {
+                type: 'header',
+                parameters: [{ type: 'image', image: { link: mediaLink } }]
+            },
+            error: null
+        };
+    }
+    return {
+        component: {
+            type: 'header',
+            parameters: [{ type: 'video', video: { link: mediaLink } }]
+        },
+        error: null
+    };
+};
+
+const buildTemplateBodyComponent = (args: {
+    requiredTemplateBodyAttributeCount: number;
+    templateBodyAttributes: string[];
+    templateBodyAttributeNames: string[];
+    selectedTemplateBodyText: unknown;
+}): { component?: any; bodyAttributes: TemplateBodyAttributePayload[]; error: string | null } => {
+    const {
+        requiredTemplateBodyAttributeCount,
+        templateBodyAttributes,
+        templateBodyAttributeNames,
+        selectedTemplateBodyText
+    } = args;
+    if (requiredTemplateBodyAttributeCount <= 0) {
+        return { component: undefined, bodyAttributes: [], error: null };
+    }
+    const missingBodyParamIndex = templateBodyAttributes.findIndex((value) => !value.trim());
+    if (missingBodyParamIndex >= 0) {
+        return { component: undefined, bodyAttributes: [], error: `Body attribute {{${missingBodyParamIndex + 1}}} is required.` };
+    }
+    const missingBodyAttributeNameIndex = templateBodyAttributeNames.findIndex((value) => !value.trim());
+    if (missingBodyAttributeNameIndex >= 0) {
+        return {
+            component: undefined,
+            bodyAttributes: [],
+            error: `Body attribute label for {{${missingBodyAttributeNameIndex + 1}}} is required.`
+        };
+    }
+    return {
+        component: {
+            type: 'body',
+            parameters: templateBodyAttributes.map((value) => ({
+                type: 'text',
+                text: value.trim()
+            }))
+        },
+        bodyAttributes: templateBodyAttributes.map((value, index) => ({
+            scope: 'body' as const,
+            index: index + 1,
+            key: (
+                templateBodyAttributeNames[index]
+                || inferTemplateVariableLabel(selectedTemplateBodyText, index + 1, 'body')
+            ).trim(),
+            value: value.trim()
+        })),
+        error: null
+    };
+};
+
+const buildTemplateFromSelection = (args: {
+    selectedTemplateHeaderFormat: string;
+    requiredTemplateHeaderAttributeCount: number;
+    templateHeaderAttributes: string[];
+    templateHeaderMediaUrl: string;
+    templateHeaderDocumentFilename: string;
+    requiredTemplateBodyAttributeCount: number;
+    templateBodyAttributes: string[];
+    templateBodyAttributeNames: string[];
+    selectedTemplateBodyText: unknown;
+}): TemplateBuildResult => {
+    const built: any[] = [];
+    const headerResult = buildTemplateHeaderComponent({
+        selectedTemplateHeaderFormat: args.selectedTemplateHeaderFormat,
+        requiredTemplateHeaderAttributeCount: args.requiredTemplateHeaderAttributeCount,
+        templateHeaderAttributes: args.templateHeaderAttributes,
+        templateHeaderMediaUrl: args.templateHeaderMediaUrl,
+        templateHeaderDocumentFilename: args.templateHeaderDocumentFilename
+    });
+    if (headerResult.error) {
+        return { components: undefined, bodyAttributes: [], error: headerResult.error };
+    }
+    if (headerResult.component) {
+        built.push(headerResult.component);
+    }
+
+    const bodyResult = buildTemplateBodyComponent({
+        requiredTemplateBodyAttributeCount: args.requiredTemplateBodyAttributeCount,
+        templateBodyAttributes: args.templateBodyAttributes,
+        templateBodyAttributeNames: args.templateBodyAttributeNames,
+        selectedTemplateBodyText: args.selectedTemplateBodyText
+    });
+    if (bodyResult.error) {
+        return { components: undefined, bodyAttributes: [], error: bodyResult.error };
+    }
+    if (bodyResult.component) {
+        built.push(bodyResult.component);
+    }
+    return {
+        components: built.length > 0 ? built : undefined,
+        bodyAttributes: bodyResult.bodyAttributes,
+        error: null
+    };
+};
+
 
 export default function App() {
     // Auth State
@@ -565,6 +1809,7 @@ export default function App() {
     const [contacts, setContacts] = useState<Record<string, ContactMeta>>({});
     const [selectedChatId, setSelectedChatId] = useState<string | null>(() => {
         if (typeof window === 'undefined') return null;
+        if (window.innerWidth < MOBILE_LAYOUT_BREAKPOINT) return null;
         try {
             return window.localStorage.getItem('lastChatId');
         } catch {
@@ -575,13 +1820,17 @@ export default function App() {
     const [messageText, setMessageText] = useState('');
     const [composerMediaType, setComposerMediaType] = useState<'none' | 'image' | 'video' | 'document'>('none');
     const [composerMediaUrl, setComposerMediaUrl] = useState('');
+    const [composerMediaId, setComposerMediaId] = useState('');
     const [composerMediaAssetKey, setComposerMediaAssetKey] = useState('');
     const [composerMediaMimeType, setComposerMediaMimeType] = useState('');
     const [composerMediaSizeBytes, setComposerMediaSizeBytes] = useState<number | null>(null);
     const [composerMediaFilename, setComposerMediaFilename] = useState('');
+    const [composerQueuedMedia, setComposerQueuedMedia] = useState<SendMediaPayload[]>([]);
     const [composerMediaUploading, setComposerMediaUploading] = useState(false);
+    const [composerDragActive, setComposerDragActive] = useState(false);
     const [composerMediaError, setComposerMediaError] = useState<string | null>(null);
     const [showMediaComposer, setShowMediaComposer] = useState(false);
+    const [showMobileComposerMenu, setShowMobileComposerMenu] = useState(false);
     const [templateName, setTemplateName] = useState('');
     const [templateLanguage, setTemplateLanguage] = useState('en_US');
     const [templateComponents, setTemplateComponents] = useState('');
@@ -626,6 +1875,8 @@ export default function App() {
 
     const [searchQuery, setSearchQuery] = useState('');
     const [chatListFilter, setChatListFilter] = useState<'all' | 'tagged' | 'untagged' | 'assigned' | 'unassigned'>('all');
+    const [mobileChatQuickFilter, setMobileChatQuickFilter] = useState<'all' | 'unread'>('all');
+    const [mobileTagFilter, setMobileTagFilter] = useState('');
     const [contactsSearchQuery, setContactsSearchQuery] = useState('');
     const [teamUsers, setTeamUsers] = useState<TeamUserLite[]>([]);
     const [teamUsersLoading, setTeamUsersLoading] = useState(false);
@@ -633,9 +1884,11 @@ export default function App() {
     const [assignMenuContactId, setAssignMenuContactId] = useState<string | null>(null);
     const [assigningContactId, setAssigningContactId] = useState<string | null>(null);
     const [humanTakeoverSaving, setHumanTakeoverSaving] = useState(false);
+    const [callActionLoading, setCallActionLoading] = useState<'voice' | 'video' | null>(null);
     const [mediaCache, setMediaCache] = useState<Record<string, MediaData>>({});
     const [mediaDownloadProgress, setMediaDownloadProgress] = useState<Record<string, MediaDownloadProgressState>>({});
     const [unreadMessagesByChat, setUnreadMessagesByChat] = useState<Record<string, number>>({});
+    const [chatReadCursorByChat, setChatReadCursorByChat] = useState<Record<string, number>>({});
     const [showContactInfo, setShowContactInfo] = useState(false);
     const [showNewChatModal, setShowNewChatModal] = useState(false);
     const [newPhoneNumber, setNewPhoneNumber] = useState('');
@@ -651,6 +1904,28 @@ export default function App() {
     const [isOffline, setIsOffline] = useState(() => {
         if (typeof window === 'undefined') return false;
         return !window.navigator.onLine;
+    });
+    const [isMobile, setIsMobile] = useState(() => {
+        if (typeof window === 'undefined') return false;
+        return window.innerWidth < MOBILE_LAYOUT_BREAKPOINT;
+    });
+    const [debugPanelOpen, setDebugPanelOpen] = useState(false);
+    const [debugPanelVersion, setDebugPanelVersion] = useState(0);
+    const [notificationPermissionState, setNotificationPermissionState] = useState<NotificationPermission | 'unsupported'>(
+        () => getNotificationPermissionState()
+    );
+    const [notificationSoundEnabled, setNotificationSoundEnabled] = useState<boolean>(
+        () => readNotificationSoundPreference()
+    );
+    const [sendingTestNotification, setSendingTestNotification] = useState(false);
+    const [pwaUpdateRegistration, setPwaUpdateRegistration] = useState<ServiceWorkerRegistration | null>(null);
+    const [showPwaUpdateBanner, setShowPwaUpdateBanner] = useState(false);
+    const [nativePushTokenState, setNativePushTokenState] = useState<{
+        token: string;
+        platform: 'android' | 'ios' | '';
+    }>({
+        token: '',
+        platform: ''
     });
 
     const [activeView, setActiveView] = useState<'dashboard' | 'chatflow' | 'settings' | 'admin'>('dashboard');
@@ -670,7 +1945,11 @@ export default function App() {
     const [activeProfileId, setActiveProfileId] = useState<string | null>(() => {
         if (typeof window === 'undefined') return null;
         try {
-            return window.localStorage.getItem('lastActiveProfileId');
+            const stored = window.localStorage.getItem('lastActiveProfileId');
+            const normalized = trimString(stored);
+            if (!normalized) return null;
+            if (normalized === 'null' || normalized === 'undefined') return null;
+            return normalized;
         } catch {
             return null;
         }
@@ -692,14 +1971,52 @@ export default function App() {
     const messageInputRef = useRef<HTMLTextAreaElement>(null);
     const composerFileInputRef = useRef<HTMLInputElement>(null);
     const activeProfileIdRef = useRef<string | null>(null);
+    const profilesRef = useRef<any[]>([]);
     const selectedChatIdRef = useRef<string | null>(null);
+    const chatReadCursorByChatRef = useRef<Record<string, number>>({});
+    const mobileSwipeStartRef = useRef<{ x: number; y: number; at: number } | null>(null);
+    const contactsRef = useRef<Record<string, ContactMeta>>({});
     const lastRecoverAtRef = useRef(0);
     const lastInboundRef = useRef<number | null>(null);
+    const lastRealtimeEventAtRef = useRef(Date.now());
+    const lastRefreshRequestEmitAtRef = useRef(0);
+    const latestMessageTimestampRef = useRef(0);
     const requestedMediaRef = useRef<Set<string>>(new Set());
     const seenIncomingMessageKeysRef = useRef<Set<string>>(new Set());
+    const notifiedIncomingMessageKeysRef = useRef<Set<string>>(new Set());
     const mediaDownloadProgressRef = useRef<Record<string, MediaDownloadProgressState>>({});
     const mediaProgressTimerRef = useRef<Record<string, number>>({});
     const mediaProgressTimeoutRef = useRef<Record<string, number>>({});
+    const socketInstanceRef = useRef<Socket | null>(null);
+    const socketAccessTokenRef = useRef('');
+    const refreshSessionPromiseRef = useRef<Promise<string | null> | null>(null);
+    const refreshAccessTokenRef = useRef<(() => Promise<string | null>) | null>(null);
+    const lastTestNotificationTriggerAtRef = useRef(0);
+    const notificationAudioContextRef = useRef<AudioContext | null>(null);
+    const notificationSoundEnabledRef = useRef(notificationSoundEnabled);
+    const pushSubscriptionEndpointRef = useRef('');
+    const pushSubscriptionUserIdRef = useRef<string | null>(null);
+    const pushSubscriptionSyncingRef = useRef(false);
+    const nativePushSyncedTokenRef = useRef('');
+    const nativePushSyncedPlatformRef = useRef<'android' | 'ios' | ''>('');
+    const nativePushSyncedUserIdRef = useRef<string | null>(null);
+    const nativePushTokenSyncingRef = useRef(false);
+    const hiddenSocketDisconnectTimerRef = useRef<number | null>(null);
+    const pwaUpdateReloadTimerRef = useRef<number | null>(null);
+    const pwaUpdateReloadingRef = useRef(false);
+    const lastUiControlsRefreshAtRef = useRef(0);
+    const debugSocketEventCountersRef = useRef<Record<string, number>>({});
+    const debugLastSocketEventRef = useRef<DebugSocketEventRecord | null>(null);
+    const lastSwitchProfileEmitRef = useRef<{ socket: Socket | null; profileId: string | null }>({
+        socket: null,
+        profileId: null
+    });
+    const chatListFlickerStatsRef = useRef<ChatListFlickerStats>({
+        changes: 0,
+        rapidChanges: 0,
+        lastSignature: '',
+        lastChangedAt: 0
+    });
     const { ref: chatListViewportRef, size: chatListViewport } = useElementSize<HTMLDivElement>();
     const { ref: messageViewportRef, size: messageViewport } = useElementSize<HTMLDivElement>();
     const messageListRef = useListRef(null);
@@ -707,10 +2024,56 @@ export default function App() {
         defaultRowHeight: 120,
         key: selectedChatId || 'all'
     });
+    const debugOverlayEnabled = useMemo(() => shouldShowDebugOverlay(), []);
+
+    const bumpDebugSocketEvent = useCallback((name: string, detail = '') => {
+        if (!debugOverlayEnabled) return;
+        const nextCount = (debugSocketEventCountersRef.current[name] || 0) + 1;
+        debugSocketEventCountersRef.current[name] = nextCount;
+        debugLastSocketEventRef.current = {
+            name,
+            at: Date.now(),
+            detail: detail ? detail.slice(0, 180) : ''
+        };
+        if (debugPanelOpen) {
+            setDebugPanelVersion((prev) => prev + 1);
+        }
+    }, [debugOverlayEnabled, debugPanelOpen]);
 
     useEffect(() => {
         mediaDownloadProgressRef.current = mediaDownloadProgress;
     }, [mediaDownloadProgress]);
+
+    const isSuperAdmin = useMemo(() => {
+        const userMeta: any = (session?.user?.user_metadata as any) || {};
+        const appMeta: any = (session?.user?.app_metadata as any) || {};
+        const roleCandidates = [
+            userMeta.role,
+            appMeta.role
+        ];
+        const flagCandidates = [
+            userMeta.super_admin,
+            userMeta.is_super_admin,
+            appMeta.super_admin,
+            appMeta.is_super_admin
+        ];
+        const hasSuperRole = roleCandidates.some((value) => {
+            if (typeof value === 'string') {
+                const normalized = value.trim().toLowerCase();
+                return normalized === 'super_admin' || normalized === 'superadmin' || normalized === 'super-admin';
+            }
+            return false;
+        });
+        if (hasSuperRole) return true;
+        return flagCandidates.some((value) => {
+            if (value === true) return true;
+            if (typeof value === 'string') {
+                const normalized = value.trim().toLowerCase();
+                return normalized === 'true' || normalized === '1' || normalized === 'yes';
+            }
+            return false;
+        });
+    }, [session?.user?.app_metadata, session?.user?.user_metadata]);
 
     const settingsNav = [
         {
@@ -724,7 +2087,15 @@ export default function App() {
         {
             group: 'Connectivity',
             items: [
+                { id: 'settings-ads-shoot', label: 'Ads Shoot Mode' },
                 { id: 'settings-webhooks', label: 'Outgoing Webhooks' },
+                { id: 'settings-notifications', label: 'Notifications' },
+                ...(
+                    hiddenUiFeatures.some((feature) => String(feature).trim().toLowerCase() === 'calls')
+                        ? []
+                        : [{ id: 'settings-calls', label: 'Call Settings' }]
+                ),
+                { id: 'settings-business-profile', label: 'Business Profile' },
                 { id: 'settings-branding', label: 'App Logo' }
             ]
         },
@@ -734,9 +2105,10 @@ export default function App() {
                 { id: 'settings-team-users', label: 'Team Users' }
             ]
         },
-        ...(isAdmin ? [{
+        ...(isSuperAdmin ? [{
             group: 'Admin',
             items: [
+                { id: 'settings-system-runtime', label: 'System Runtime' },
                 { id: 'settings-connected-clients', label: 'Connected Clients' },
                 { id: 'settings-connected-businesses', label: 'Connected Businesses' }
             ]
@@ -757,27 +2129,6 @@ export default function App() {
         if (!normalized) return false;
         return hiddenUiFeatureSet.has(normalized);
     }, [hiddenUiFeatureSet]);
-
-    const isWabaProviderAdmin = useMemo(() => {
-        const userMeta: any = (session?.user?.user_metadata as any) || {};
-        const appMeta: any = (session?.user?.app_metadata as any) || {};
-        const candidates = [
-            userMeta.waba_admin,
-            userMeta.is_waba_admin,
-            appMeta.waba_admin,
-            appMeta.is_waba_admin,
-            userMeta.role,
-            appMeta.role
-        ];
-        return candidates.some((value) => {
-            if (typeof value === 'boolean') return value;
-            if (typeof value === 'string') {
-                const normalized = value.trim().toLowerCase();
-                return normalized === 'true' || normalized === 'waba_admin' || normalized === 'super_admin';
-            }
-            return false;
-        });
-    }, [session?.user?.app_metadata, session?.user?.user_metadata]);
 
     const onboardingSteps = useMemo<OnboardingStepConfig[]>(() => ([
         {
@@ -1085,17 +2436,418 @@ export default function App() {
         setAppToast({
             id: Date.now(),
             message,
-            tone
+            tone,
+            variant: 'default'
         });
     }, []);
 
+    const showChatToast = useCallback((title: string, message: string) => {
+        const safeTitle = title.trim() || 'New message';
+        const safeMessage = message.trim() || 'New message';
+        setAppToast({
+            id: Date.now(),
+            title: safeTitle,
+            message: safeMessage,
+            tone: 'success',
+            variant: 'chat',
+            avatarLabel: getInitials(safeTitle)
+        });
+    }, []);
+
+    const playNotificationGlassSound = useCallback(async (force = false): Promise<boolean> => {
+        if (!force && !notificationSoundEnabledRef.current) return false;
+        if (typeof window === 'undefined') return false;
+
+        const AudioContextCtor = window.AudioContext || (window as any).webkitAudioContext;
+        if (!AudioContextCtor) return false;
+
+        const ctx: AudioContext = notificationAudioContextRef.current || new AudioContextCtor();
+        notificationAudioContextRef.current = ctx;
+
+        if (ctx.state === 'suspended') {
+            try {
+                await ctx.resume();
+            } catch {
+                return false;
+            }
+        }
+
+        if (ctx.state !== 'running') return false;
+
+        const startAt = ctx.currentTime + 0.01;
+        const master = ctx.createGain();
+        master.gain.setValueAtTime(0.0001, startAt);
+        master.connect(ctx.destination);
+
+        const tones = [
+            { frequency: 1318.51, at: 0.0, gain: 0.18, decay: 0.28 },
+            { frequency: 1760.0, at: 0.045, gain: 0.14, decay: 0.26 },
+            { frequency: 2349.32, at: 0.09, gain: 0.11, decay: 0.22 }
+        ];
+
+        tones.forEach((tone) => {
+            const baseOsc = ctx.createOscillator();
+            baseOsc.type = 'triangle';
+            baseOsc.frequency.setValueAtTime(tone.frequency, startAt + tone.at);
+
+            const sparkleOsc = ctx.createOscillator();
+            sparkleOsc.type = 'sine';
+            sparkleOsc.frequency.setValueAtTime(tone.frequency * 2, startAt + tone.at);
+
+            const highpass = ctx.createBiquadFilter();
+            highpass.type = 'highpass';
+            highpass.frequency.setValueAtTime(780, startAt);
+
+            const baseGain = ctx.createGain();
+            baseGain.gain.setValueAtTime(0.0001, startAt + tone.at);
+            baseGain.gain.exponentialRampToValueAtTime(tone.gain, startAt + tone.at + 0.016);
+            baseGain.gain.exponentialRampToValueAtTime(0.0001, startAt + tone.at + tone.decay);
+
+            const sparkleGain = ctx.createGain();
+            sparkleGain.gain.setValueAtTime(0.0001, startAt + tone.at);
+            sparkleGain.gain.exponentialRampToValueAtTime(tone.gain * 0.35, startAt + tone.at + 0.012);
+            sparkleGain.gain.exponentialRampToValueAtTime(0.0001, startAt + tone.at + tone.decay);
+
+            baseOsc.connect(baseGain);
+            sparkleOsc.connect(sparkleGain);
+            baseGain.connect(highpass);
+            sparkleGain.connect(highpass);
+            highpass.connect(master);
+
+            baseOsc.start(startAt + tone.at);
+            sparkleOsc.start(startAt + tone.at);
+            baseOsc.stop(startAt + tone.at + tone.decay + 0.05);
+            sparkleOsc.stop(startAt + tone.at + tone.decay + 0.05);
+        });
+
+        master.gain.exponentialRampToValueAtTime(0.65, startAt + 0.03);
+        master.gain.exponentialRampToValueAtTime(0.0001, startAt + 0.72);
+
+        return true;
+    }, []);
+
+    useEffect(() => {
+        if (!session?.access_token) return;
+        void initializeNativePushBridge();
+    }, [session?.access_token]);
+
+    useEffect(() => {
+        const handleNativePushToken = (event: Event) => {
+            const detail = (event as CustomEvent<NativePushTokenEventDetail>).detail;
+            const token = typeof detail?.value === 'string' ? detail.value.trim() : '';
+            const platform = detail?.platform === 'android' || detail?.platform === 'ios'
+                ? detail.platform
+                : '';
+            if (!token) return;
+            setNativePushTokenState((prev) => (
+                prev.token === token && prev.platform === platform
+                    ? prev
+                    : { token, platform }
+            ));
+            pushLog(
+                `[Native Push] Device token ready (${token.slice(0, 10)}...)${platform ? ` [${platform}]` : ''}.`,
+                'info'
+            );
+        };
+
+        window.addEventListener(NATIVE_PUSH_TOKEN_EVENT, handleNativePushToken as EventListener);
+        return () => {
+            window.removeEventListener(NATIVE_PUSH_TOKEN_EVENT, handleNativePushToken as EventListener);
+        };
+    }, [pushLog]);
+    useEffect(() => {
+        const handleNativePushChannelStatus = (event: Event) => {
+            if (!Capacitor.isNativePlatform() || Capacitor.getPlatform() !== 'android') return;
+
+            const detail = (event as CustomEvent<NativePushChannelStatusEventDetail>).detail;
+            pushLog(
+                `[Native Push] Channel ${detail?.id || 'unknown'} status: headsUp=${detail?.headsUpEnabled ? 'on' : 'off'} importance=${typeof detail?.importance === 'number' ? detail.importance : 'n/a'}.`,
+                detail?.headsUpEnabled ? 'info' : 'error'
+            );
+            if (detail?.headsUpEnabled) return;
+            if (!shouldPromptAndroidHeadsUpEnable()) return;
+
+            markAndroidHeadsUpPrompted();
+            showToast('Heads-up notifications are OFF. Enable Pop on screen for Chat Messages.', 'error');
+
+            const importanceLabel = typeof detail?.importance === 'number'
+                ? ' (importance ' + String(detail.importance) + ')'
+                : '';
+
+            window.setTimeout(() => {
+                const wantsHelp = window.confirm(
+                    'Heads-up alerts are disabled' + importanceLabel + '. Open notification settings and enable Pop on screen for Chat Messages?'
+                );
+                if (!wantsHelp) return;
+
+                void (async () => {
+                    const targetChannelId = (detail?.id || NATIVE_PUSH_CHANNEL_ID || '').trim();
+                    const openedChannelSettings = targetChannelId
+                        ? await openAndroidChannelNotificationSettings(targetChannelId)
+                        : false;
+                    if (openedChannelSettings) return;
+
+                    const openedAppSettings = await openAndroidAppNotificationSettings();
+                    if (openedAppSettings) return;
+
+                    window.alert(
+                        'Android steps:\\n1) Long-press QMessage app icon\\n2) App info\\n3) Notifications\\n4) Chat Messages\\n5) Enable Pop on screen, sound, and vibration'
+                    );
+                })();
+            }, 420);
+        };
+
+        window.addEventListener(NATIVE_PUSH_CHANNEL_STATUS_EVENT, handleNativePushChannelStatus as EventListener);
+        void refreshNativePushChannelStatus();
+        return () => {
+            window.removeEventListener(NATIVE_PUSH_CHANNEL_STATUS_EVENT, handleNativePushChannelStatus as EventListener);
+        };
+    }, [pushLog, showToast]);
+
+    useEffect(() => {
+        const handleNativePushForeground = (event: Event) => {
+            if (socketInstanceRef.current?.connected) return;
+            const detail = (event as CustomEvent<NativePushReceivedEventDetail>).detail;
+            pushLog(
+                `[Native Push] Received app=${detail?.appVisibility || 'unknown'} payload=${detail?.payloadKind || 'unknown'} channel=${NATIVE_PUSH_CHANNEL_ID}.`,
+                'info'
+            );
+            if (document.visibilityState !== 'visible') return;
+            const title = typeof detail?.title === 'string' ? detail.title.trim() : '';
+            const body = typeof detail?.body === 'string' ? detail.body.trim() : '';
+            showChatToast(
+                title || 'QMessage',
+                truncateNotificationBody(body || 'New message')
+            );
+            void playNotificationGlassSound();
+        };
+
+        window.addEventListener(NATIVE_PUSH_RECEIVED_EVENT, handleNativePushForeground as EventListener);
+        return () => {
+            window.removeEventListener(NATIVE_PUSH_RECEIVED_EVENT, handleNativePushForeground as EventListener);
+        };
+    }, [playNotificationGlassSound, pushLog, showChatToast]);
+
+    const handleToggleNotificationSound = useCallback((enabled: boolean) => {
+        setNotificationSoundEnabled(enabled);
+        if (enabled) {
+            void playNotificationGlassSound(true);
+        }
+    }, [playNotificationGlassSound]);
+
+    const handleTestNotificationSound = useCallback(async () => {
+        const played = await playNotificationGlassSound(true);
+        if (played) {
+            showToast('Playing iPhone Glass notification sound.', 'success');
+            return;
+        }
+        showToast('Unable to play notification sound on this device right now.', 'error');
+    }, [playNotificationGlassSound, showToast]);
+
+    useEffect(() => {
+        notificationSoundEnabledRef.current = notificationSoundEnabled;
+        try {
+            window.localStorage.setItem(NOTIFICATION_SOUND_PREF_KEY, notificationSoundEnabled ? '1' : '0');
+        } catch {
+            // ignore persistence failures
+        }
+    }, [notificationSoundEnabled]);
+
+    useEffect(() => {
+        return () => {
+            const ctx = notificationAudioContextRef.current;
+            notificationAudioContextRef.current = null;
+            if (ctx) {
+                void ctx.close().catch(() => undefined);
+            }
+        };
+    }, []);
+
+    const clearPwaUpdateReloadTimer = useCallback(() => {
+        if (pwaUpdateReloadTimerRef.current !== null) {
+            window.clearTimeout(pwaUpdateReloadTimerRef.current);
+            pwaUpdateReloadTimerRef.current = null;
+        }
+    }, []);
+
+    const handleApplyPwaUpdate = useCallback(() => {
+        const waitingWorker = pwaUpdateRegistration?.waiting;
+        if (!waitingWorker) {
+            setShowPwaUpdateBanner(false);
+            return;
+        }
+        pwaUpdateReloadingRef.current = true;
+        setShowPwaUpdateBanner(false);
+        waitingWorker.postMessage({ type: 'SKIP_WAITING' });
+        clearPwaUpdateReloadTimer();
+        pwaUpdateReloadTimerRef.current = window.setTimeout(() => {
+            window.location.reload();
+        }, 3200);
+    }, [clearPwaUpdateReloadTimer, pwaUpdateRegistration]);
+
     useEffect(() => {
         if (!appToast) return;
+        const dismissAfterMs = appToast.variant === 'chat' ? 3200 : 2400;
         const timer = window.setTimeout(() => {
             setAppToast((current) => (current?.id === appToast.id ? null : current));
-        }, 2400);
+        }, dismissAfterMs);
         return () => window.clearTimeout(timer);
     }, [appToast]);
+
+    useEffect(() => {
+        return () => {
+            clearPwaUpdateReloadTimer();
+        };
+    }, [clearPwaUpdateReloadTimer]);
+
+    const handleRequestNotificationPermission = useCallback(async () => {
+        if (Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android') {
+            try {
+                const current = await PushNotifications.checkPermissions();
+                let receiveStatus = current.receive;
+                pushLog(`[Native Push] POST_NOTIFICATIONS(check)=${receiveStatus}.`, 'info');
+
+                if (receiveStatus !== 'granted') {
+                    const requested = await PushNotifications.requestPermissions();
+                    receiveStatus = requested.receive;
+                    pushLog(`[Native Push] POST_NOTIFICATIONS(request)=${receiveStatus}.`, requested.receive === 'granted' ? 'info' : 'error');
+                }
+
+                if (receiveStatus === 'granted') {
+                    setNotificationPermissionState('granted');
+                    showToast('Notifications enabled for incoming chat alerts.', 'success');
+                    return;
+                }
+
+                setNotificationPermissionState('denied');
+                showToast('Android notifications are blocked. Open settings to enable them.', 'error');
+                const wantsSettings = window.confirm(
+                    'Android notification permission is blocked. Open app notification settings now?'
+                );
+                if (wantsSettings) {
+                    const opened = await openAndroidAppNotificationSettings();
+                    if (!opened) {
+                        window.alert(
+                            'Android steps:\\n1) Long-press QMessage app icon\\n2) App info\\n3) Notifications\\n4) Enable notifications for this app'
+                        );
+                    }
+                }
+                return;
+            } catch (error: any) {
+                showToast(error?.message || 'Failed to request Android notification permission.', 'error');
+                return;
+            }
+        }
+
+        if (!('Notification' in window)) {
+            setNotificationPermissionState('unsupported');
+            showToast('This device does not support browser notifications.', 'error');
+            return;
+        }
+        try {
+            const permission = await Notification.requestPermission();
+            setNotificationPermissionState(permission);
+            if (permission === 'granted') {
+                showToast('Notifications enabled for incoming chat alerts.', 'success');
+                window.setTimeout(() => {
+                    void syncWebPushSubscription(true);
+                }, 0);
+                return;
+            }
+            if (permission === 'denied') {
+                showToast('Notifications blocked. You can enable them in browser settings.', 'error');
+            }
+        } catch (error: any) {
+            showToast(error?.message || 'Failed to request notification permission.', 'error');
+        }
+    }, [pushLog, showToast]);
+
+    const handleSendTestNotification = useCallback(async () => {
+        if (!socket) {
+            showToast('Realtime connection is not ready yet. Please try again.', 'error');
+            return;
+        }
+
+        const nowMs = Date.now();
+        if (nowMs - lastTestNotificationTriggerAtRef.current < 1500) {
+            return;
+        }
+        lastTestNotificationTriggerAtRef.current = nowMs;
+
+        if (notificationPermissionState === 'default') {
+            await handleRequestNotificationPermission();
+        }
+
+        setSendingTestNotification(true);
+        try {
+            const deviceLabel = (() => {
+                const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+                if (/iphone/i.test(ua)) return 'iPhone';
+                if (/ipad/i.test(ua)) return 'iPad';
+                if (/android/i.test(ua)) return 'Android';
+                return 'Device';
+            })();
+
+            const ack = await emitSocketWithTimeout(
+                socket,
+                'notification.test',
+                {
+                    profileId: activeProfileIdRef.current || activeProfileId || '',
+                    title: 'QMessage Test Notification',
+                    body: `Test sent from ${deviceLabel}.`,
+                    source: 'mobile-fab'
+                },
+                5000,
+                'Notification test timed out.'
+            );
+
+            if (!ack?.success) {
+                throw new Error(ack?.error || 'Failed to send test notification.');
+            }
+
+            showToast('Test sent. Check your other logged-in devices.', 'success');
+        } catch (error: any) {
+            showToast(error?.message || 'Failed to send test notification.', 'error');
+        } finally {
+            setSendingTestNotification(false);
+        }
+    }, [activeProfileId, handleRequestNotificationPermission, notificationPermissionState, showToast, socket]);
+
+    useEffect(() => {
+        if (!('serviceWorker' in navigator)) return;
+
+        const onPwaUpdateAvailable = (event: Event) => {
+            const customEvent = event as CustomEvent<ServiceWorkerRegistration>;
+            const registration = customEvent.detail;
+            if (!registration?.waiting) return;
+            setPwaUpdateRegistration(registration);
+            setShowPwaUpdateBanner(true);
+        };
+
+        const onControllerChange = () => {
+            if (!pwaUpdateReloadingRef.current) return;
+            pwaUpdateReloadingRef.current = false;
+            clearPwaUpdateReloadTimer();
+            window.location.reload();
+        };
+
+        window.addEventListener(PWA_UPDATE_AVAILABLE_EVENT, onPwaUpdateAvailable as EventListener);
+        navigator.serviceWorker.addEventListener('controllerchange', onControllerChange);
+
+        return () => {
+            window.removeEventListener(PWA_UPDATE_AVAILABLE_EVENT, onPwaUpdateAvailable as EventListener);
+            navigator.serviceWorker.removeEventListener('controllerchange', onControllerChange);
+        };
+    }, [clearPwaUpdateReloadTimer]);
+
+    useEffect(() => {
+        const syncPermission = () => setNotificationPermissionState(getNotificationPermissionState());
+        syncPermission();
+        document.addEventListener('visibilitychange', syncPermission);
+        return () => {
+            document.removeEventListener('visibilitychange', syncPermission);
+        };
+    }, []);
 
     const getDraftStorageKey = useCallback((profileId?: string | null, chatId?: string | null) => {
         if (!profileId || !chatId) return null;
@@ -1143,15 +2895,355 @@ export default function App() {
         [persistDraft, selectedChatId]
     );
 
+    const updateSessionState = useCallback((nextSession: Session | null) => {
+        setSession((previousSession) => {
+            if (isSameSessionIdentity(previousSession, nextSession)) {
+                return previousSession;
+            }
+            return nextSession;
+        });
+    }, []);
+
+    const refreshAccessToken = useCallback(async (): Promise<string | null> => {
+        if (refreshSessionPromiseRef.current) {
+            return refreshSessionPromiseRef.current;
+        }
+
+        const pendingRefresh = supabase.auth
+            .refreshSession()
+            .then(({ data, error }) => {
+                const refreshedToken = data?.session?.access_token?.trim() || '';
+                if (error || !refreshedToken) return null;
+                updateSessionState(data.session);
+                return refreshedToken;
+            })
+            .catch(() => null)
+            .finally(() => {
+                refreshSessionPromiseRef.current = null;
+            });
+
+        refreshSessionPromiseRef.current = pendingRefresh;
+        return pendingRefresh;
+    }, [updateSessionState]);
+
+
+    useEffect(() => {
+        refreshAccessTokenRef.current = refreshAccessToken;
+    }, [refreshAccessToken]);
+    const fetchWithSessionAuth = useCallback(
+        async (
+            input: RequestInfo | URL,
+            init: RequestInit = {},
+            retryOnUnauthorized = true,
+            requestTimeoutMs = API_REQUEST_TIMEOUT_MS
+        ) => {
+            const method = typeof init.method === 'string' ? init.method.trim().toUpperCase() : 'GET';
+            const isRetryableTimeoutMethod = method === 'GET' || method === 'HEAD';
+            const buildHeaders = (token: string) => {
+                const headers = new Headers(init.headers || undefined);
+                headers.set('Authorization', `Bearer ${token}`);
+                return headers;
+            };
+
+            const runWithToken = async (token: string) => {
+                const timeoutController = new AbortController();
+                const externalSignal = init.signal;
+                const onExternalAbort = () => timeoutController.abort();
+                if (externalSignal) {
+                    if (externalSignal.aborted) {
+                        timeoutController.abort();
+                    } else {
+                        externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+                    }
+                }
+
+                const shouldTimeout = Number.isFinite(requestTimeoutMs) && requestTimeoutMs > 0;
+                const timeoutId = shouldTimeout
+                    ? window.setTimeout(() => {
+                        timeoutController.abort();
+                    }, requestTimeoutMs)
+                    : null;
+
+                try {
+                    return await fetch(input, {
+                        ...init,
+                        headers: buildHeaders(token),
+                        signal: timeoutController.signal
+                    });
+                } catch (error: any) {
+                    if (timeoutController.signal.aborted && !externalSignal?.aborted) {
+                        throw new Error('Request timed out. Please retry.');
+                    }
+                    throw error;
+                } finally {
+                    if (typeof timeoutId === 'number') {
+                        window.clearTimeout(timeoutId);
+                    }
+                    if (externalSignal) {
+                        externalSignal.removeEventListener('abort', onExternalAbort);
+                    }
+                }
+            };
+
+            const runWithTimeoutRetry = async (token: string) => {
+                try {
+                    return await runWithToken(token);
+                } catch (error: any) {
+                    const message = typeof error?.message === 'string' ? error.message : '';
+                    if (!isRetryableTimeoutMethod || !message.includes('Request timed out')) {
+                        throw error;
+                    }
+                    await new Promise<void>((resolve) => {
+                        window.setTimeout(() => resolve(), 350);
+                    });
+                    return runWithToken(token);
+                }
+            };
+
+            const currentToken = session?.access_token?.trim();
+            if (!currentToken) {
+                throw new Error('Invalid or expired session');
+            }
+
+            let response = await runWithTimeoutRetry(currentToken);
+            if (response.status !== 401 || !retryOnUnauthorized) {
+                return response;
+            }
+
+            const refreshedToken = await refreshAccessToken();
+            if (!refreshedToken) {
+                return response;
+            }
+            response = await runWithTimeoutRetry(refreshedToken);
+            return response;
+        },
+        [refreshAccessToken, session?.access_token]
+    );
+
+    const syncWebPushSubscription = useCallback(async (force = false): Promise<boolean> => {
+        const currentUserId = typeof session?.user?.id === 'string' ? session.user.id.trim() : '';
+        if (!currentUserId || !session?.access_token) return false;
+        if (typeof window === 'undefined') return false;
+        if (!window.isSecureContext) return false;
+        if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) return false;
+        if (Notification.permission !== 'granted') return false;
+
+        if (pushSubscriptionUserIdRef.current !== currentUserId) {
+            pushSubscriptionUserIdRef.current = currentUserId;
+            pushSubscriptionEndpointRef.current = '';
+        }
+
+        if (pushSubscriptionSyncingRef.current) return false;
+        pushSubscriptionSyncingRef.current = true;
+
+        try {
+            let registration: ServiceWorkerRegistration | null = null;
+            try {
+                registration = (await navigator.serviceWorker.getRegistration()) || null;
+            } catch {
+                registration = null;
+            }
+
+            if (!registration) {
+                try {
+                    registration = await navigator.serviceWorker.register('/sw.js');
+                } catch {
+                    registration = null;
+                }
+            }
+
+            if (!registration) {
+                const readyRegistration = await Promise.race<ServiceWorkerRegistration | null>([
+                    navigator.serviceWorker.ready,
+                    new Promise<null>((resolve) => {
+                        window.setTimeout(() => resolve(null), 2400);
+                    })
+                ]);
+                registration = readyRegistration;
+            }
+
+            if (!registration?.pushManager) return false;
+
+            const keyRes = await fetchWithSessionAuth(SOCKET_URL + '/api/push/public-key');
+            const keyData = await keyRes.json().catch(() => null);
+            const publicKey = typeof keyData?.publicKey === 'string' ? keyData.publicKey.trim() : '';
+            if (!keyRes.ok || !keyData?.success || !keyData?.enabled || !publicKey) {
+                return false;
+            }
+
+            let subscription = await registration.pushManager.getSubscription();
+            if (!subscription) {
+                subscription = await registration.pushManager.subscribe({
+                    userVisibleOnly: true,
+                    applicationServerKey: urlBase64ToUint8Array(publicKey)
+                });
+            }
+            if (!subscription) return false;
+
+            const payload = subscription.toJSON();
+            const endpoint = typeof payload?.endpoint === 'string' ? payload.endpoint.trim() : '';
+            if (!endpoint) return false;
+
+            if (!force && endpoint === pushSubscriptionEndpointRef.current) {
+                return true;
+            }
+
+            const subscribeRes = await fetchWithSessionAuth(SOCKET_URL + '/api/push/subscribe', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ subscription: payload })
+            });
+            const subscribeData = await subscribeRes.json().catch(() => null);
+            if (!subscribeRes.ok || !subscribeData?.success) {
+                throw new Error(subscribeData?.error || 'Failed to register push subscription.');
+            }
+
+            pushSubscriptionEndpointRef.current = endpoint;
+            pushSubscriptionUserIdRef.current = currentUserId;
+            return true;
+        } catch (error) {
+            console.warn('[push] Failed to sync browser push subscription:', error);
+            return false;
+        } finally {
+            pushSubscriptionSyncingRef.current = false;
+        }
+    }, [fetchWithSessionAuth, session?.access_token, session?.user?.id]);
+
+    useEffect(() => {
+        if (!session?.access_token || !session?.user?.id) {
+            pushSubscriptionEndpointRef.current = '';
+            pushSubscriptionUserIdRef.current = null;
+            return;
+        }
+        if (notificationPermissionState !== 'granted') return;
+        if (typeof window === 'undefined') return;
+        if (!window.isSecureContext) return;
+        if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+
+        let cancelled = false;
+        let retryTimer: number | null = null;
+        let attempts = 0;
+        const maxAttempts = 8;
+
+        const attemptSync = async (force = false) => {
+            attempts += 1;
+            const synced = await syncWebPushSubscription(force);
+            if (cancelled || synced || attempts >= maxAttempts) return;
+            retryTimer = window.setTimeout(() => {
+                void attemptSync();
+            }, 1200);
+        };
+
+        void attemptSync();
+
+        return () => {
+            cancelled = true;
+            if (retryTimer !== null) {
+                window.clearTimeout(retryTimer);
+            }
+        };
+    }, [notificationPermissionState, session?.access_token, session?.user?.id, syncWebPushSubscription]);
+
+    const syncNativePushToken = useCallback(async (force = false): Promise<boolean> => {
+        const currentUserId = typeof session?.user?.id === 'string' ? session.user.id.trim() : '';
+        const accessToken = typeof session?.access_token === 'string' ? session.access_token.trim() : '';
+        if (!currentUserId || !accessToken) return false;
+        if (!Capacitor.isNativePlatform()) return false;
+
+        const token = typeof nativePushTokenState.token === 'string' ? nativePushTokenState.token.trim() : '';
+        const platformFromState = nativePushTokenState.platform;
+        const platformRaw = platformFromState || Capacitor.getPlatform();
+        const platform = platformRaw === 'android' || platformRaw === 'ios' ? platformRaw : '';
+
+        if (!token || !platform) return false;
+
+        if (nativePushSyncedUserIdRef.current !== currentUserId) {
+            nativePushSyncedTokenRef.current = '';
+            nativePushSyncedPlatformRef.current = '';
+            nativePushSyncedUserIdRef.current = currentUserId;
+        }
+
+        if (
+            !force
+            && nativePushSyncedTokenRef.current === token
+            && nativePushSyncedPlatformRef.current === platform
+            && nativePushSyncedUserIdRef.current === currentUserId
+        ) {
+            return true;
+        }
+
+        if (nativePushTokenSyncingRef.current) return false;
+        nativePushTokenSyncingRef.current = true;
+
+        try {
+            const registerRes = await fetchWithSessionAuth(`${SOCKET_URL}/api/push/native/register`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    token,
+                    platform,
+                    appId: 'com.qmessage.app'
+                })
+            });
+            const registerData = await registerRes.json().catch(() => null);
+            if (!registerRes.ok || !registerData?.success) {
+                throw new Error(registerData?.error || 'Failed to register native push token.');
+            }
+
+            nativePushSyncedTokenRef.current = token;
+            nativePushSyncedPlatformRef.current = platform;
+            nativePushSyncedUserIdRef.current = currentUserId;
+            return true;
+        } catch (error) {
+            console.warn('[native-push] Failed to sync native push token:', error);
+            return false;
+        } finally {
+            nativePushTokenSyncingRef.current = false;
+        }
+    }, [fetchWithSessionAuth, nativePushTokenState.platform, nativePushTokenState.token, session?.access_token, session?.user?.id]);
+
+    useEffect(() => {
+        if (!session?.access_token || !session?.user?.id) {
+            nativePushSyncedTokenRef.current = '';
+            nativePushSyncedPlatformRef.current = '';
+            nativePushSyncedUserIdRef.current = null;
+            return;
+        }
+        if (!Capacitor.isNativePlatform()) return;
+
+        let cancelled = false;
+        let retryTimer: number | null = null;
+        let attempts = 0;
+        const maxAttempts = 5;
+
+        const attemptSync = async (force = false) => {
+            attempts += 1;
+            const synced = await syncNativePushToken(force);
+            if (cancelled || synced || attempts >= maxAttempts) return;
+            retryTimer = window.setTimeout(() => {
+                void attemptSync();
+            }, 1400);
+        };
+
+        void attemptSync();
+
+        return () => {
+            cancelled = true;
+            if (retryTimer !== null) {
+                window.clearTimeout(retryTimer);
+            }
+        };
+    }, [session?.access_token, session?.user?.id, syncNativePushToken]);
+
     const fetchTeamUsers = useCallback(async () => {
         if (!session?.access_token) return;
         setTeamUsersLoading(true);
         try {
-            const res = await fetch(`${SOCKET_URL}/api/company/team-users`, {
-                headers: {
-                    Authorization: `Bearer ${session.access_token}`
-                }
-            });
+            const res = await fetchWithSessionAuth(`${SOCKET_URL}/api/company/team-users`);
             const data = await res.json().catch(() => null);
             if (!res.ok || !data?.success) {
                 throw new Error(data?.error || 'Failed to load team users');
@@ -1171,7 +3263,7 @@ export default function App() {
         } finally {
             setTeamUsersLoading(false);
         }
-    }, [session?.access_token]);
+    }, [fetchWithSessionAuth, session?.access_token]);
 
     const fetchWorkflowTemplateOptions = useCallback(async () => {
         if (!activeProfileId || !session?.access_token) {
@@ -1266,23 +3358,17 @@ export default function App() {
             if (!socket || !activeProfileId || !jid || jid.endsWith('@g.us')) return;
             setAssigningContactId(jid);
             try {
-                const response: any = await new Promise((resolve) => {
-                    const timeout = window.setTimeout(() => {
-                        resolve({ success: false, error: 'Assignment timed out. Please try again.' });
-                    }, 8000);
-                    socket.emit(
-                        'contact.assign',
-                        {
-                            profileId: activeProfileId,
-                            jid,
-                            assigneeUserId
-                        },
-                        (ack: any) => {
-                            window.clearTimeout(timeout);
-                            resolve(ack);
-                        }
-                    );
-                });
+                const response: any = await emitSocketWithTimeout(
+                    socket,
+                    'contact.assign',
+                    {
+                        profileId: activeProfileId,
+                        jid,
+                        assigneeUserId
+                    },
+                    8000,
+                    'Assignment timed out. Please try again.'
+                );
 
                 if (!response?.success) {
                     throw new Error(response?.error || 'Failed to assign contact');
@@ -1290,31 +3376,7 @@ export default function App() {
 
                 const contact = response?.data?.contact;
                 if (contact?.id) {
-                    setContacts((prev) => {
-                        const next = { ...prev };
-                        const aliasKeys = Array.from(new Set([
-                            ...buildContactJidVariants(jid),
-                            ...buildContactJidVariants(contact.id)
-                        ]));
-                        const canonicalKey = canonicalContactJid(contact.id || jid) || contact.id || jid;
-                        const prevMeta = pickContactMetaByJid(next, canonicalKey) || {};
-                        aliasKeys.forEach((key) => {
-                            if (key !== canonicalKey) delete next[key];
-                        });
-                        next[canonicalKey] = {
-                            ...prevMeta,
-                            name: contact.name || prevMeta.name || getCleanId(canonicalKey),
-                            lastInboundAt: contact.lastInboundAt ?? prevMeta.lastInboundAt ?? null,
-                            tags: Array.isArray(contact.tags) ? contact.tags : (prevMeta.tags || []),
-                            assigneeUserId: contact.assigneeUserId ?? null,
-                            assigneeName: contact.assigneeName ?? null,
-                            assigneeColor: contact.assigneeColor ?? null,
-                            ctaReferralAt: contact.ctaReferralAt ?? prevMeta.ctaReferralAt ?? null,
-                            ctaFreeWindowStartedAt: contact.ctaFreeWindowStartedAt ?? prevMeta.ctaFreeWindowStartedAt ?? null,
-                            ctaFreeWindowExpiresAt: contact.ctaFreeWindowExpiresAt ?? prevMeta.ctaFreeWindowExpiresAt ?? null
-                        };
-                        return next;
-                    });
+                    setContacts((prev) => applyAssignedContactUpdate(prev, jid, contact));
                 }
             } catch (err: any) {
                 alert(err?.message || 'Failed to assign contact');
@@ -1328,6 +3390,7 @@ export default function App() {
 
     const recoverSocketConnection = useCallback(
         (reason: string) => {
+            if (document.visibilityState !== 'visible') return;
             const nowMs = Date.now();
             if (nowMs - lastRecoverAtRef.current < 30_000) return;
             lastRecoverAtRef.current = nowMs;
@@ -1345,7 +3408,7 @@ export default function App() {
     );
 
     const fetchAnalytics = useCallback(() => {
-        if (!activeProfileId) return;
+        if (!activeProfileId || !session?.access_token) return;
         setAnalyticsLoading(true);
         setAnalyticsError(null);
         const params = new URLSearchParams({
@@ -1354,7 +3417,11 @@ export default function App() {
             end: analyticsEnd
         });
         if (analyticsTag.trim()) params.set('tag', analyticsTag.trim());
-        fetch(`${SOCKET_URL}/api/analytics?${params.toString()}`)
+        fetch(`${SOCKET_URL}/api/analytics?${params.toString()}`, {
+            headers: {
+                Authorization: `Bearer ${session.access_token}`
+            }
+        })
             .then(async res => {
                 const text = await res.text();
                 try {
@@ -1375,7 +3442,7 @@ export default function App() {
                 setAnalyticsError(err?.message || 'Failed to load analytics');
             })
             .finally(() => setAnalyticsLoading(false));
-    }, [activeProfileId, analyticsStart, analyticsEnd, analyticsTag]);
+    }, [activeProfileId, analyticsStart, analyticsEnd, analyticsTag, session?.access_token]);
 
     const analyticsRows = useMemo<AnalyticsPerDayRow[]>(() => analyticsData?.per_day || [], [analyticsData]);
     const analyticsStaffRows = useMemo<AnalyticsStaffRow[]>(() => analyticsData?.per_staff || [], [analyticsData]);
@@ -1417,6 +3484,31 @@ export default function App() {
             inboundShare
         };
     }, [analyticsData, analyticsRows]);
+
+    const analyticsStaffInsights = useMemo(() => {
+        const onlineCount = analyticsStaffRows.filter((row) => row.is_online).length;
+        const totalMessages = analyticsStaffRows.reduce((sum, row) => sum + toSafeAnalyticsCount(row.total_messages), 0);
+        const responseRows = analyticsStaffRows.filter((row) => row.avg_response_seconds > 0);
+        const weighted = responseRows.reduce(
+            (acc, row) => {
+                const weight = Math.max(1, toSafeAnalyticsCount(row.replied_contacts));
+                return {
+                    total: acc.total + (row.avg_response_seconds * weight),
+                    weight: acc.weight + weight
+                };
+            },
+            { total: 0, weight: 0 }
+        );
+        const averageResponseSeconds = weighted.weight > 0
+            ? Math.round(weighted.total / weighted.weight)
+            : 0;
+
+        return {
+            onlineCount,
+            totalMessages,
+            averageResponseSeconds
+        };
+    }, [analyticsStaffRows]);
 
     const normalizeQuickReplyShortcut = useCallback((value: string) => {
         if (!value) return '';
@@ -1461,10 +3553,102 @@ export default function App() {
         return typeof value === 'string' ? value.trim() : '';
     }, []);
 
+    const normalizeQuickReplyMediaItems = useCallback((
+        value: unknown,
+        fallbackType: 'image' | 'video' | 'document'
+    ): QuickReplyMediaItem[] => {
+        if (!Array.isArray(value)) return [];
+        const normalized: QuickReplyMediaItem[] = [];
+        value.forEach((entry: any) => {
+            const mediaType = normalizeQuickReplyMediaItemType(entry?.type, fallbackType);
+            const mediaAssetKey = normalizeQuickReplyMediaAssetKey(entry?.media_asset_key);
+            const mediaStorage: 'external' | 'r2' = mediaAssetKey ? 'r2' : normalizeQuickReplyMediaStorage(entry?.media_storage);
+            const mediaUrl = normalizeQuickReplyMediaUrl(entry?.media_url);
+            if (mediaStorage === 'r2') {
+                if (!mediaAssetKey) return;
+            } else if (!mediaUrl) {
+                return;
+            }
+            const mediaFilename = mediaType === 'document'
+                ? normalizeQuickReplyMediaFilename(entry?.media_filename)
+                : '';
+            normalized.push({
+                type: mediaType,
+                media_storage: mediaStorage,
+                media_asset_key: mediaAssetKey,
+                media_mime_type: normalizeQuickReplyMediaMimeType(entry?.media_mime_type),
+                media_size_bytes: normalizeQuickReplyMediaSizeBytes(entry?.media_size_bytes),
+                media_url: mediaStorage === 'r2' ? '' : mediaUrl,
+                media_filename: mediaFilename
+            });
+        });
+        return normalized;
+    }, [
+        normalizeQuickReplyMediaAssetKey,
+        normalizeQuickReplyMediaFilename,
+        normalizeQuickReplyMediaMimeType,
+        normalizeQuickReplyMediaSizeBytes,
+        normalizeQuickReplyMediaStorage,
+        normalizeQuickReplyMediaUrl
+    ]);
+
+    const buildLegacyQuickReplyMediaItems = useCallback((
+        item: any,
+        messageType: 'image' | 'video' | 'document'
+    ): QuickReplyMediaItem[] => {
+        const mediaAssetKey = normalizeQuickReplyMediaAssetKey(item?.media_asset_key);
+        const mediaStorage: 'external' | 'r2' = mediaAssetKey ? 'r2' : normalizeQuickReplyMediaStorage(item?.media_storage);
+        const mediaUrl = normalizeQuickReplyMediaUrl(item?.media_url);
+        if (mediaStorage === 'r2') {
+            if (!mediaAssetKey) return [];
+        } else if (!mediaUrl) {
+            return [];
+        }
+        return [{
+            type: messageType,
+            media_storage: mediaStorage,
+            media_asset_key: mediaAssetKey,
+            media_mime_type: normalizeQuickReplyMediaMimeType(item?.media_mime_type),
+            media_size_bytes: normalizeQuickReplyMediaSizeBytes(item?.media_size_bytes),
+            media_url: mediaStorage === 'r2' ? '' : mediaUrl,
+            media_filename: messageType === 'document' ? normalizeQuickReplyMediaFilename(item?.media_filename) : ''
+        }];
+    }, [
+        normalizeQuickReplyMediaAssetKey,
+        normalizeQuickReplyMediaFilename,
+        normalizeQuickReplyMediaMimeType,
+        normalizeQuickReplyMediaSizeBytes,
+        normalizeQuickReplyMediaStorage,
+        normalizeQuickReplyMediaUrl
+    ]);
+
     const normalizeQuickReplyRecord = useCallback((item: any): QuickReply => {
         const message_type = normalizeQuickReplyMessageType(item?.message_type);
-        const media_asset_key = normalizeQuickReplyMediaAssetKey(item?.media_asset_key);
-        const media_storage = media_asset_key ? 'r2' : normalizeQuickReplyMediaStorage(item?.media_storage);
+        let media_items = message_type === 'text'
+            ? []
+            : normalizeQuickReplyMediaItems(item?.media_items, message_type);
+        if (message_type !== 'text' && media_items.length === 0) {
+            media_items = buildLegacyQuickReplyMediaItems(item, message_type);
+        }
+        const primaryMedia = media_items[0] || null;
+        const media_asset_key = primaryMedia
+            ? normalizeQuickReplyMediaAssetKey(primaryMedia.media_asset_key)
+            : normalizeQuickReplyMediaAssetKey(item?.media_asset_key);
+        const media_storage = primaryMedia
+            ? (media_asset_key ? 'r2' : normalizeQuickReplyMediaStorage(primaryMedia.media_storage))
+            : (media_asset_key ? 'r2' : normalizeQuickReplyMediaStorage(item?.media_storage));
+        const media_mime_type = primaryMedia
+            ? normalizeQuickReplyMediaMimeType(primaryMedia.media_mime_type)
+            : normalizeQuickReplyMediaMimeType(item?.media_mime_type);
+        const media_size_bytes = primaryMedia
+            ? normalizeQuickReplyMediaSizeBytes(primaryMedia.media_size_bytes)
+            : normalizeQuickReplyMediaSizeBytes(item?.media_size_bytes);
+        const media_url = primaryMedia
+            ? normalizeQuickReplyMediaUrl(primaryMedia.media_url)
+            : normalizeQuickReplyMediaUrl(item?.media_url);
+        const media_filename = primaryMedia
+            ? normalizeQuickReplyMediaFilename(primaryMedia.media_filename)
+            : normalizeQuickReplyMediaFilename(item?.media_filename);
         return {
             id: typeof item?.id === 'string' ? item.id : undefined,
             shortcut: typeof item?.shortcut === 'string' ? item.shortcut : '',
@@ -1472,14 +3656,17 @@ export default function App() {
             message_type,
             media_storage,
             media_asset_key,
-            media_mime_type: normalizeQuickReplyMediaMimeType(item?.media_mime_type),
-            media_size_bytes: normalizeQuickReplyMediaSizeBytes(item?.media_size_bytes),
-            media_url: normalizeQuickReplyMediaUrl(item?.media_url),
-            media_filename: message_type === 'document' ? normalizeQuickReplyMediaFilename(item?.media_filename) : ''
+            media_mime_type,
+            media_size_bytes,
+            media_url,
+            media_filename: message_type === 'document' ? media_filename : '',
+            media_items
         };
     }, [
+        buildLegacyQuickReplyMediaItems,
         normalizeQuickReplyMediaAssetKey,
         normalizeQuickReplyMediaFilename,
+        normalizeQuickReplyMediaItems,
         normalizeQuickReplyMediaMimeType,
         normalizeQuickReplyMediaSizeBytes,
         normalizeQuickReplyMediaStorage,
@@ -1488,17 +3675,17 @@ export default function App() {
     ]);
 
     const fetchQuickReplies = useCallback(() => {
-        if (!activeProfileId || !session?.access_token) {
+        if (!profilesLoaded) {
+            return;
+        }
+        const profileExists = profiles.some((profile: any) => profile?.id === activeProfileId);
+        if (!activeProfileId || !session?.access_token || !profileExists) {
             setQuickReplies([]);
             return;
         }
         setQuickRepliesLoading(true);
         setQuickRepliesError(null);
-        fetch(`${SOCKET_URL}/api/company/quick-replies?profileId=${encodeURIComponent(activeProfileId)}`, {
-            headers: {
-                Authorization: `Bearer ${session.access_token}`
-            }
-        })
+        fetchWithSessionAuth(`${SOCKET_URL}/api/company/quick-replies?profileId=${encodeURIComponent(activeProfileId)}`)
             .then(async res => {
                 const text = await res.text();
                 try {
@@ -1519,7 +3706,7 @@ export default function App() {
                 setQuickRepliesError(err?.message || 'Failed to load quick replies');
             })
             .finally(() => setQuickRepliesLoading(false));
-    }, [activeProfileId, normalizeQuickReplyRecord, session?.access_token]);
+    }, [activeProfileId, fetchWithSessionAuth, normalizeQuickReplyRecord, profiles, profilesLoaded, session?.access_token]);
 
     const saveQuickReplies = useCallback(async (items: QuickReply[]) => {
         if (!activeProfileId || !session?.access_token) return;
@@ -1537,6 +3724,7 @@ export default function App() {
             media_size_bytes: number | null;
             media_url: string | null;
             media_filename: string | null;
+            media_items: QuickReplyMediaItem[];
         }> = [];
 
         for (const item of items) {
@@ -1550,6 +3738,31 @@ export default function App() {
             const mediaSizeBytes = normalizeQuickReplyMediaSizeBytes(item.media_size_bytes);
             const mediaUrl = normalizeQuickReplyMediaUrl(item.media_url);
             const mediaFilename = normalizeQuickReplyMediaFilename(item.media_filename);
+            let mediaItems = messageType === 'text'
+                ? []
+                : normalizeQuickReplyMediaItems(item.media_items, messageType);
+            if (messageType !== 'text' && mediaItems.length === 0) {
+                mediaItems = buildLegacyQuickReplyMediaItems(item, messageType);
+            }
+            const primaryMedia = mediaItems[0] || null;
+            const primaryMediaStorage = primaryMedia
+                ? (normalizeQuickReplyMediaAssetKey(primaryMedia.media_asset_key) ? 'r2' : normalizeQuickReplyMediaStorage(primaryMedia.media_storage))
+                : resolvedMediaStorage;
+            const primaryMediaAssetKey = primaryMedia
+                ? normalizeQuickReplyMediaAssetKey(primaryMedia.media_asset_key)
+                : mediaAssetKey;
+            const primaryMediaMimeType = primaryMedia
+                ? normalizeQuickReplyMediaMimeType(primaryMedia.media_mime_type)
+                : mediaMimeType;
+            const primaryMediaSizeBytes = primaryMedia
+                ? normalizeQuickReplyMediaSizeBytes(primaryMedia.media_size_bytes)
+                : mediaSizeBytes;
+            const primaryMediaUrl = primaryMedia
+                ? normalizeQuickReplyMediaUrl(primaryMedia.media_url)
+                : mediaUrl;
+            const primaryMediaFilename = primaryMedia
+                ? normalizeQuickReplyMediaFilename(primaryMedia.media_filename)
+                : mediaFilename;
             if (!shortcut) continue;
             if (seen.has(shortcut)) {
                 setQuickRepliesError(`Duplicate shortcut: /${shortcut}`);
@@ -1558,9 +3771,7 @@ export default function App() {
             }
             if (messageType === 'text') {
                 if (!text) continue;
-            } else if (resolvedMediaStorage === 'r2') {
-                if (!mediaAssetKey) continue;
-            } else if (!mediaUrl) {
+            } else if (mediaItems.length === 0) {
                 continue;
             }
             seen.add(shortcut);
@@ -1568,12 +3779,29 @@ export default function App() {
                 shortcut,
                 text,
                 message_type: messageType,
-                media_storage: messageType === 'text' ? 'external' : resolvedMediaStorage,
-                media_asset_key: messageType === 'text' || resolvedMediaStorage !== 'r2' ? null : mediaAssetKey,
-                media_mime_type: messageType === 'text' || resolvedMediaStorage !== 'r2' ? null : (mediaMimeType || null),
-                media_size_bytes: messageType === 'text' || resolvedMediaStorage !== 'r2' ? null : mediaSizeBytes,
-                media_url: messageType === 'text' || resolvedMediaStorage === 'r2' ? null : mediaUrl,
-                media_filename: messageType === 'document' && mediaFilename ? mediaFilename : null
+                media_storage: messageType === 'text' ? 'external' : primaryMediaStorage,
+                media_asset_key: messageType === 'text' || primaryMediaStorage !== 'r2' ? null : primaryMediaAssetKey,
+                media_mime_type: messageType === 'text' || primaryMediaStorage !== 'r2' ? null : (primaryMediaMimeType || null),
+                media_size_bytes: messageType === 'text' || primaryMediaStorage !== 'r2' ? null : primaryMediaSizeBytes,
+                media_url: messageType === 'text' || primaryMediaStorage === 'r2' ? null : primaryMediaUrl,
+                media_filename: messageType === 'document' && primaryMediaFilename ? primaryMediaFilename : null,
+                media_items: messageType === 'text'
+                    ? []
+                    : mediaItems.map((entry) => {
+                        const entryAssetKey = normalizeQuickReplyMediaAssetKey(entry.media_asset_key);
+                        const entryStorage: 'external' | 'r2' = entryAssetKey ? 'r2' : normalizeQuickReplyMediaStorage(entry.media_storage);
+                        return {
+                            type: normalizeQuickReplyMediaItemType(entry.type, messageType),
+                            media_storage: entryStorage,
+                            media_asset_key: entryStorage === 'r2' ? entryAssetKey : '',
+                            media_mime_type: entryStorage === 'r2' ? normalizeQuickReplyMediaMimeType(entry.media_mime_type) : '',
+                            media_size_bytes: entryStorage === 'r2' ? normalizeQuickReplyMediaSizeBytes(entry.media_size_bytes) : null,
+                            media_url: entryStorage === 'r2' ? '' : normalizeQuickReplyMediaUrl(entry.media_url),
+                            media_filename: normalizeQuickReplyMediaItemType(entry.type, messageType) === 'document'
+                                ? normalizeQuickReplyMediaFilename(entry.media_filename)
+                                : ''
+                        };
+                    })
             });
         }
 
@@ -1605,6 +3833,8 @@ export default function App() {
         }
     }, [
         activeProfileId,
+        buildLegacyQuickReplyMediaItems,
+        normalizeQuickReplyMediaItems,
         normalizeQuickReplyMediaFilename,
         normalizeQuickReplyMediaAssetKey,
         normalizeQuickReplyMediaMimeType,
@@ -1624,13 +3854,30 @@ export default function App() {
             'broadcast',
             'chatbots',
             'contacts',
+            'calls',
             'analytics',
             'settings'
         ]);
+        const aliases: Record<string, string> = {
+            'team_inbox': 'team-inbox',
+            'teaminbox': 'team-inbox',
+            'inbox': 'team-inbox',
+            'automation': 'automations',
+            'broadcasts': 'broadcast',
+            'chatbot': 'chatbots',
+            'contact': 'contacts',
+            'call': 'calls',
+            'analytic': 'analytics',
+            'setting': 'settings',
+            'more': 'analytics',
+            'other': 'analytics'
+        };
         const unique = new Set<string>();
         const push = (entry: unknown) => {
             if (typeof entry !== 'string') return;
-            const normalized = entry.trim().toLowerCase();
+            const raw = entry.trim().toLowerCase();
+            const normalizedBase = raw.replace(/\s+/g, '-');
+            const normalized = aliases[normalizedBase] || aliases[normalizedBase.replace(/-/g, '')] || normalizedBase;
             if (!normalized || !allowed.has(normalized)) return;
             unique.add(normalized);
         };
@@ -1669,11 +3916,7 @@ export default function App() {
         }
         setUiControlsLoading(true);
         try {
-            const res = await fetch(`${SOCKET_URL}/api/company/ui-controls`, {
-                headers: {
-                    Authorization: `Bearer ${session.access_token}`
-                }
-            });
+            const res = await fetchWithSessionAuth(`${SOCKET_URL}/api/company/ui-controls`, {}, true, 18_000);
             const text = await res.text();
             let data: any = null;
             try {
@@ -1695,20 +3938,123 @@ export default function App() {
             setAppLogoUrl(typeof data?.data?.app_logo_url === 'string' ? data.data.app_logo_url.trim() : '');
         } catch (error: any) {
             console.warn('Failed to load company UI controls:', error?.message || error);
-            setHiddenUiFeatures([]);
-            setAppLogoUrl('');
+            // Preserve previously loaded UI controls on transient/network failures
+            // so hidden features do not suddenly reappear.
         } finally {
             setUiControlsLoading(false);
         }
-    }, [normalizeHiddenFeatureList, session?.access_token]);
+    }, [fetchWithSessionAuth, normalizeHiddenFeatureList, session?.access_token]);
+
+    const markChatAsRead = useCallback((chatId: string | null | undefined) => {
+        const chatKey = canonicalContactJid(chatId || '');
+        if (!chatKey) return;
+        setUnreadMessagesByChat((prev) => {
+            if (!(chatKey in prev)) return prev;
+            const next = { ...prev };
+            delete next[chatKey];
+            return next;
+        });
+        const latestTs = allMessages.reduce((maxTs, msg) => {
+            const jid = canonicalContactJid(msg.key?.remoteJid || '');
+            if (jid !== chatKey) return maxTs;
+            return Math.max(maxTs, Number(msg?.messageTimestamp || 0));
+        }, 0);
+        const readUntilTs = Math.max(latestTs, Math.floor(Date.now() / 1000));
+        setChatReadCursorByChat((prev) => {
+            if ((prev[chatKey] || 0) >= readUntilTs) return prev;
+            return {
+                ...prev,
+                [chatKey]: readUntilTs
+            };
+        });
+    }, [allMessages]);
 
     useEffect(() => {
         activeProfileIdRef.current = activeProfileId;
-    }, [activeProfileId]);
+        bumpDebugSocketEvent('state.activeProfileId', trimString(activeProfileId) || '(none)');
+    }, [activeProfileId, bumpDebugSocketEvent]);
+
+    useEffect(() => {
+        profilesRef.current = Array.isArray(profiles) ? profiles : [];
+        if (!debugOverlayEnabled) return;
+        const summary = profilesRef.current
+            .slice(0, 6)
+            .map((profile: any) => `${trimString(profile?.id)}:${trimString(profile?.status) || '-'}`)
+            .join(',');
+        bumpDebugSocketEvent('state.profiles', `count=${profilesRef.current.length} ${summary}`);
+    }, [profiles, debugOverlayEnabled, bumpDebugSocketEvent]);
 
     useEffect(() => {
         selectedChatIdRef.current = selectedChatId;
     }, [selectedChatId]);
+
+    useEffect(() => {
+        chatReadCursorByChatRef.current = chatReadCursorByChat;
+    }, [chatReadCursorByChat]);
+
+    useEffect(() => {
+        if (Object.keys(chatReadCursorByChat).length === 0) return;
+        if (Object.keys(unreadMessagesByChat).length === 0) return;
+
+        const latestInboundByChat: Record<string, number> = {};
+        allMessages.forEach((msg) => {
+            if (msg?.key?.fromMe) return;
+            const jid = canonicalContactJid(msg?.key?.remoteJid || '');
+            if (!jid) return;
+            const ts = Number(msg?.messageTimestamp || 0);
+            if (!Number.isFinite(ts) || ts <= 0) return;
+            latestInboundByChat[jid] = Math.max(latestInboundByChat[jid] || 0, ts);
+        });
+
+        setUnreadMessagesByChat((prev) => {
+            let changed = false;
+            const next: Record<string, number> = {};
+            Object.entries(prev).forEach(([jid, count]) => {
+                const normalizedCount = Math.max(0, Number(count) || 0);
+                if (normalizedCount <= 0) {
+                    changed = true;
+                    return;
+                }
+                const readCursor = Number(chatReadCursorByChat[jid] || 0);
+                const latestInboundTs = Number(latestInboundByChat[jid] || 0);
+                if (readCursor > 0 && latestInboundTs > 0 && latestInboundTs <= readCursor) {
+                    changed = true;
+                    return;
+                }
+                next[jid] = normalizedCount;
+            });
+            return changed ? next : prev;
+        });
+    }, [allMessages, chatReadCursorByChat, unreadMessagesByChat]);
+
+    useEffect(() => {
+        contactsRef.current = contacts;
+    }, [contacts]);
+
+    useEffect(() => {
+        if (!activeProfileId) {
+            setChatReadCursorByChat({});
+            chatReadCursorByChatRef.current = {};
+            return;
+        }
+        const next = readChatReadCursorFromStorage(activeProfileId);
+        chatReadCursorByChatRef.current = next;
+        setChatReadCursorByChat(next);
+    }, [activeProfileId]);
+
+    useEffect(() => {
+        if (!activeProfileId) return;
+        try {
+            const storageKey = `${CHAT_READ_CURSOR_STORAGE_PREFIX}${activeProfileId}`;
+            if (Object.keys(chatReadCursorByChat).length === 0) {
+                window.localStorage.removeItem(storageKey);
+                return;
+            }
+            window.localStorage.setItem(storageKey, JSON.stringify(chatReadCursorByChat));
+        } catch {
+            // ignore storage errors
+        }
+    }, [activeProfileId, chatReadCursorByChat]);
 
     useEffect(() => {
         try {
@@ -1727,8 +4073,16 @@ export default function App() {
             setQuickReplies([]);
             return;
         }
-        fetchQuickReplies();
-    }, [activeProfileId, fetchQuickReplies]);
+        if (workspaceSection !== 'team-inbox' || !selectedChatId) {
+            return;
+        }
+        const timer = window.setTimeout(() => {
+            fetchQuickReplies();
+        }, QUICK_REPLIES_PREFETCH_DELAY_MS);
+        return () => {
+            window.clearTimeout(timer);
+        };
+    }, [activeProfileId, fetchQuickReplies, selectedChatId, workspaceSection]);
 
     useEffect(() => {
         if (!session?.access_token) {
@@ -1737,19 +4091,42 @@ export default function App() {
             setUiControlsLoading(false);
             return;
         }
-        fetchUiControls();
+        const timer = window.setTimeout(() => {
+            fetchUiControls();
+        }, 180);
+        return () => {
+            window.clearTimeout(timer);
+        };
     }, [fetchUiControls, session?.access_token]);
 
     useEffect(() => {
         if (!session?.access_token) return;
-        const refreshTimer = window.setInterval(() => {
+        const refreshUiControlsIfNeeded = (force = false) => {
+            const nowMs = Date.now();
+            if (!force && nowMs - lastUiControlsRefreshAtRef.current < 5 * 60 * 1000) {
+                return;
+            }
+            lastUiControlsRefreshAtRef.current = nowMs;
             fetchUiControls();
-        }, 4 * 60 * 1000);
-        return () => window.clearInterval(refreshTimer);
+        };
+
+        const onVisibilityChange = () => {
+            if (document.visibilityState !== 'visible') return;
+            refreshUiControlsIfNeeded();
+        };
+        const onOnline = () => refreshUiControlsIfNeeded(true);
+
+        document.addEventListener('visibilitychange', onVisibilityChange);
+        window.addEventListener('online', onOnline);
+        return () => {
+            document.removeEventListener('visibilitychange', onVisibilityChange);
+            window.removeEventListener('online', onOnline);
+        };
     }, [fetchUiControls, session?.access_token]);
 
 
     useEffect(() => {
+        if (isMobile) return;
         if (!activeProfileId) return;
         try {
             const stored = window.localStorage.getItem(`lastChatId:${activeProfileId}`);
@@ -1759,7 +4136,13 @@ export default function App() {
         } catch {
             // ignore storage errors
         }
-    }, [activeProfileId, selectedChatId]);
+    }, [activeProfileId, isMobile, selectedChatId]);
+
+    useEffect(() => {
+        if (!isMobile) return;
+        if (!selectedChatId) return;
+        setSelectedChatId(null);
+    }, [isMobile]);
 
     useEffect(() => {
         if (!activeProfileId || !selectedChatId) {
@@ -1769,12 +4152,14 @@ export default function App() {
                 if (prev.startsWith('blob:')) URL.revokeObjectURL(prev);
                 return '';
             });
+            setComposerMediaId('');
             setComposerMediaAssetKey('');
             setComposerMediaMimeType('');
             setComposerMediaSizeBytes(null);
             setComposerMediaFilename('');
             setComposerMediaError(null);
             setComposerMediaUploading(false);
+            setComposerDragActive(false);
             setShowMediaComposer(false);
             return;
         }
@@ -1787,12 +4172,14 @@ export default function App() {
                     if (prev.startsWith('blob:')) URL.revokeObjectURL(prev);
                     return '';
                 });
+                setComposerMediaId('');
                 setComposerMediaAssetKey('');
                 setComposerMediaMimeType('');
                 setComposerMediaSizeBytes(null);
                 setComposerMediaFilename('');
                 setComposerMediaError(null);
                 setComposerMediaUploading(false);
+                setComposerDragActive(false);
                 setShowMediaComposer(false);
                 return;
             }
@@ -1824,22 +4211,26 @@ export default function App() {
     useEffect(() => {
         const chatKey = canonicalContactJid(selectedChatId || '');
         if (!chatKey) return;
-        setUnreadMessagesByChat((prev) => {
-            if (!(chatKey in prev)) return prev;
-            const next = { ...prev };
-            delete next[chatKey];
-            return next;
-        });
-    }, [selectedChatId]);
+        markChatAsRead(chatKey);
+    }, [selectedChatId, markChatAsRead]);
+
+    useEffect(() => {
+        if (!selectedChatId) return;
+        markChatAsRead(selectedChatId);
+    }, [selectedChatId, allMessages.length, markChatAsRead]);
 
     useEffect(() => {
         setShowWorkflowStarter(false);
     }, [selectedChatId, activeProfileId]);
 
     useEffect(() => {
+        setShowMobileComposerMenu(false);
+    }, [selectedChatId, workspaceSection, isMobile, showMediaComposer, showTemplateComposer]);
+
+    useEffect(() => {
         if (!selectedChatId) return;
         const contact = pickContactMetaByJid(contacts, selectedChatId);
-        setContactDraftName(contact?.name || getCleanId(selectedChatId));
+        setContactDraftName(contact?.alias || '');
         setContactTagsDraft(splitContactTags(contact?.tags).labelTags);
         setContactTagInput('');
         setContactDirty(false);
@@ -1849,7 +4240,7 @@ export default function App() {
         if (!selectedChatId || contactDirty) return;
         const contact = pickContactMetaByJid(contacts, selectedChatId);
         if (!contact) return;
-        setContactDraftName(contact.name || getCleanId(selectedChatId));
+        setContactDraftName(contact.alias || '');
         setContactTagsDraft(splitContactTags(contact.tags).labelTags);
     }, [contacts, selectedChatId, contactDirty]);
 
@@ -1881,6 +4272,14 @@ export default function App() {
             window.removeEventListener('online', syncOnlineState);
             window.removeEventListener('offline', syncOnlineState);
         };
+    }, []);
+
+    useEffect(() => {
+        if (typeof window === 'undefined') return;
+        const syncMobileLayout = () => setIsMobile(window.innerWidth < MOBILE_LAYOUT_BREAKPOINT);
+        syncMobileLayout();
+        window.addEventListener('resize', syncMobileLayout);
+        return () => window.removeEventListener('resize', syncMobileLayout);
     }, []);
 
     useEffect(() => {
@@ -1941,11 +4340,89 @@ export default function App() {
         setShowAnalytics(false);
     }, [isUiFeatureHidden, showAnalytics, uiControlsLoading]);
 
+    useEffect(() => {
+        if (!isMobile) return;
+        if ((MOBILE_BOTTOM_TAB_SECTIONS as readonly string[]).includes(workspaceSection)) return;
+        setWorkspaceSection('team-inbox');
+        setSelectedChatId(null);
+    }, [isMobile, workspaceSection]);
+
+    useEffect(() => {
+        if (!isMobile) return;
+        if (chatListFilter === 'all') return;
+        setChatListFilter('all');
+    }, [isMobile, chatListFilter]);
+
+    const mobileSwipeSectionOrder = useMemo<Array<'team-inbox' | 'automations' | 'contacts' | 'more'>>(() => {
+        if (uiControlsLoading) return ['team-inbox', 'automations', 'contacts', 'more'];
+        const ordered: Array<'team-inbox' | 'automations' | 'contacts' | 'more'> = ['team-inbox', 'automations', 'contacts', 'more'];
+        return ordered.filter((section) => !isUiFeatureHidden(UI_FEATURE_KEY_BY_WORKSPACE_SECTION[section]));
+    }, [isUiFeatureHidden, uiControlsLoading]);
+
+    const switchMobileWorkspaceBySwipe = useCallback((nextSection: 'team-inbox' | 'automations' | 'contacts' | 'more') => {
+        setShowContactInfo(false);
+        if (nextSection === 'more') {
+            setShowAnalytics(true);
+            return;
+        }
+        setShowAnalytics(false);
+        if (nextSection === 'team-inbox') {
+            setSelectedChatId(null);
+        }
+        setWorkspaceSection(nextSection);
+    }, []);
+
+    const handleMobileWorkspaceTouchStart = useCallback((event: React.TouchEvent) => {
+        if (!isMobile || activeView !== 'dashboard') return;
+        if (event.touches.length !== 1) return;
+        if (workspaceSection === 'team-inbox' && Boolean(selectedChatId)) return;
+        const target = event.target as HTMLElement | null;
+        if (target?.closest('input, textarea, select, button, [contenteditable=\"true\"]')) return;
+        if (target?.closest('.mobile-horizontal-scroll')) return;
+        const touch = event.touches[0];
+        mobileSwipeStartRef.current = {
+            x: touch.clientX,
+            y: touch.clientY,
+            at: Date.now()
+        };
+    }, [activeView, isMobile, selectedChatId, workspaceSection]);
+
+    const handleMobileWorkspaceTouchEnd = useCallback((event: React.TouchEvent) => {
+        if (!isMobile || activeView !== 'dashboard') return;
+        if (workspaceSection === 'team-inbox' && Boolean(selectedChatId)) return;
+        const start = mobileSwipeStartRef.current;
+        mobileSwipeStartRef.current = null;
+        if (!start || event.changedTouches.length === 0) return;
+
+        const touch = event.changedTouches[0];
+        const deltaX = touch.clientX - start.x;
+        const deltaY = touch.clientY - start.y;
+        const elapsedMs = Date.now() - start.at;
+        const absX = Math.abs(deltaX);
+        const absY = Math.abs(deltaY);
+
+        if (elapsedMs > 700) return;
+        if (absX < 72) return;
+        if (absY > 64) return;
+        if (absX <= absY) return;
+
+        const activeSection = showAnalytics ? 'more' : workspaceSection;
+        const currentIndex = mobileSwipeSectionOrder.findIndex((section) => section === activeSection);
+        if (currentIndex < 0) return;
+
+        const step = deltaX < 0 ? 1 : -1;
+        const nextIndex = currentIndex + step;
+        if (nextIndex < 0 || nextIndex >= mobileSwipeSectionOrder.length) return;
+
+        switchMobileWorkspaceBySwipe(mobileSwipeSectionOrder[nextIndex]);
+    }, [activeView, isMobile, mobileSwipeSectionOrder, selectedChatId, showAnalytics, switchMobileWorkspaceBySwipe, workspaceSection]);
+
 
     const handleSignOut = async () => {
         clearAllDrafts();
         setMessageText('');
         setUnreadMessagesByChat({});
+        setChatReadCursorByChat({});
         seenIncomingMessageKeysRef.current.clear();
         setHostAuthError(null);
         setShowOnboardingTutorial(false);
@@ -1956,23 +4433,40 @@ export default function App() {
             // ignore
         }
         await supabase.auth.signOut();
-        setSession(null);
+        updateSessionState(null);
     };
 
     // Check Auth
     useEffect(() => {
-        supabase.auth.getSession().then(({ data: { session } }) => {
-            setSession(session);
+        let cancelled = false;
+        const authTimeout = window.setTimeout(() => {
+            if (cancelled) return;
             setAuthChecking(false);
-        });
+        }, AUTH_CHECK_TIMEOUT_MS);
+
+        supabase.auth.getSession()
+            .then(({ data: { session } }) => {
+                if (cancelled) return;
+                updateSessionState(session);
+                setAuthChecking(false);
+            })
+            .catch(() => {
+                if (cancelled) return;
+                setAuthChecking(false);
+            });
 
         const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-            setSession(session);
+            if (cancelled) return;
+            updateSessionState(session);
             setAuthChecking(false);
         });
 
-        return () => subscription.unsubscribe();
-    }, []);
+        return () => {
+            cancelled = true;
+            window.clearTimeout(authTimeout);
+            subscription.unsubscribe();
+        };
+    }, [updateSessionState]);
 
     useEffect(() => {
         if (!session) {
@@ -2019,9 +4513,9 @@ export default function App() {
             // ignore
         }
         supabase.auth.signOut().finally(() => {
-            setSession(null);
+            updateSessionState(null);
         });
-    }, [session]);
+    }, [session, updateSessionState]);
 
     useEffect(() => {
         if (!ENABLE_FIRST_TIME_SETUP) {
@@ -2030,7 +4524,7 @@ export default function App() {
             return;
         }
         if (authChecking || hostAuthError) return;
-        if (!session?.user?.id || !onboardingStorageKey || !isAdmin || isWabaProviderAdmin) {
+        if (!session?.user?.id || !onboardingStorageKey || !isAdmin || isSuperAdmin) {
             setShowOnboardingTutorial(false);
             resetOnboardingWizard();
             return;
@@ -2050,62 +4544,179 @@ export default function App() {
 
         resetOnboardingWizard();
         setShowOnboardingTutorial(true);
-    }, [authChecking, hostAuthError, isAdmin, isWabaProviderAdmin, onboardingStorageKey, resetOnboardingWizard, session?.user?.id]);
+    }, [authChecking, hostAuthError, isAdmin, isSuperAdmin, onboardingStorageKey, resetOnboardingWizard, session?.user?.id]);
 
     useEffect(() => {
-        if (!session) {
+        if (!session?.access_token) {
             setIsAdmin(false);
             return;
         }
 
-        supabase
-            .from('user_roles')
-            .select('role')
-            .eq('user_id', session.user.id)
-            .maybeSingle()
-            .then(({ data, error }) => {
-                if (error) {
-                    console.warn('user_roles lookup failed', error);
-                    setIsAdmin(false);
-                    return;
+        const metadataRoleCandidates = [
+            (session.user.user_metadata as any)?.role,
+            (session.user.app_metadata as any)?.role
+        ]
+            .map((value) => (typeof value === 'string' ? value.trim().toLowerCase() : ''))
+            .filter(Boolean);
+        const metadataRole = metadataRoleCandidates[0] || '';
+        if (metadataRole === 'admin' || metadataRole === 'owner') {
+            setIsAdmin(true);
+            return;
+        }
+        if (metadataRole === 'agent') {
+            setIsAdmin(false);
+            return;
+        }
+
+        let cancelled = false;
+        const resolveRole = async () => {
+            try {
+                const res = await fetchWithSessionAuth(`${SOCKET_URL}/api/company/me`);
+                const data = await res.json().catch(() => null);
+                if (!res.ok || !data?.success) {
+                    throw new Error(data?.error || 'Failed to resolve current user role');
                 }
-                const role = typeof data?.role === 'string' ? data.role.toLowerCase() : '';
-                setIsAdmin(role === 'admin' || role === 'owner');
-            });
-    }, [session]);
+                const role = typeof data?.data?.role === 'string'
+                    ? data.data.role.toLowerCase()
+                    : '';
+                if (!cancelled) {
+                    setIsAdmin(role === 'admin' || role === 'owner');
+                }
+            } catch (error) {
+                console.warn('company role lookup failed', error);
+                if (!cancelled) {
+                    setIsAdmin(false);
+                }
+            }
+        };
+
+        void resolveRole();
+        return () => {
+            cancelled = true;
+        };
+    }, [fetchWithSessionAuth, session?.access_token]);
 
     useEffect(() => {
         const statusEmoji = connectionStatus === 'open' ? '🟢' : connectionStatus === 'connecting' ? '🟡' : '🔴';
         document.title = `${statusEmoji} WhatsApp Business API`;
     }, [connectionStatus]);
 
+    const socketAccessToken = session?.access_token || '';
+
     useEffect(() => {
-        if (!session) {
+        if (!socketAccessToken) {
+            refreshSessionPromiseRef.current = null;
+            const existingSocket = socketInstanceRef.current;
+            if (existingSocket) {
+                existingSocket.removeAllListeners();
+                if (existingSocket.connected) {
+                    existingSocket.disconnect();
+                }
+            }
+            socketInstanceRef.current = null;
+            socketAccessTokenRef.current = '';
             setSocket(null);
             setProfiles([]);
             setProfilesLoaded(false);
             setActiveProfileId(null);
             setAllMessages([]);
+            latestMessageTimestampRef.current = 0;
             setContacts({});
             return;
         }
 
-        console.log('Connecting socket with token', session.access_token.substring(0, 10));
+        if (
+            socketInstanceRef.current
+            && socketAccessTokenRef.current === socketAccessToken
+        ) {
+            setSocket(socketInstanceRef.current);
+            return;
+        }
+
+        const previousSocket = socketInstanceRef.current;
+        if (previousSocket) {
+            previousSocket.removeAllListeners();
+            if (previousSocket.connected) {
+                previousSocket.disconnect();
+            }
+        }
+
         setProfilesLoaded(false);
+        const isNativeSocketClient = Capacitor.isNativePlatform();
         const newSocket = io(SOCKET_URL, {
-            auth: { token: session.access_token },
-            transports: ['websocket', 'polling']
+            auth: { token: socketAccessToken },
+            transports: isNativeSocketClient ? ['websocket'] : ['websocket', 'polling'],
+            rememberUpgrade: true,
+            autoConnect: false,
+            reconnection: true,
+            reconnectionAttempts: Infinity,
+            reconnectionDelay: 750,
+            reconnectionDelayMax: 4000,
+            timeout: 12000
         });
+        socketInstanceRef.current = newSocket;
+        socketAccessTokenRef.current = socketAccessToken;
         setSocket(newSocket);
+        let disposed = false;
+        const connectTimer = window.setTimeout(() => {
+            if (!disposed && !newSocket.connected) {
+                newSocket.connect();
+            }
+        }, 50);
+
+        const emitRefreshMessages = (options: { forceFullHistory?: boolean; includeContacts?: boolean } = {}) => {
+            const profileId = activeProfileIdRef.current;
+            if (!profileId || !newSocket.connected) return;
+
+            const nowMs = Date.now();
+            const latestTs = Math.max(0, Math.floor(latestMessageTimestampRef.current || 0));
+            const forceFullHistory = options.forceFullHistory === true || latestTs <= 0;
+            const minGapMs = forceFullHistory ? 0 : 1200;
+            if (nowMs - lastRefreshRequestEmitAtRef.current < minGapMs) return;
+
+            const sinceTimestamp = forceFullHistory ? 0 : Math.max(0, latestTs - 2);
+            newSocket.emit('refreshMessages', {
+                profileId,
+                sinceTimestamp,
+                includeContacts: options.includeContacts === true,
+                forceFullHistory
+            });
+            lastRefreshRequestEmitAtRef.current = nowMs;
+            lastRealtimeEventAtRef.current = nowMs;
+        };
+
+        const emitPresenceVisibility = () => {
+            if (!newSocket.connected) return;
+            const visibility = document.visibilityState === 'visible' ? 'visible' : 'hidden';
+            newSocket.emit('presence.visibility', { visibility });
+        };
 
         newSocket.on('connect', () => {
-            if (activeProfileIdRef.current) {
-                newSocket.emit('switchProfile', activeProfileIdRef.current);
+            bumpDebugSocketEvent('socket.connect', `id=${newSocket.id || '-'}`);
+            const profileId = activeProfileIdRef.current;
+            if (profileId) {
+                const shouldRequestContacts = latestMessageTimestampRef.current <= 0;
+                emitRefreshMessages({
+                    forceFullHistory: shouldRequestContacts,
+                    includeContacts: shouldRequestContacts
+                });
             }
+            lastRealtimeEventAtRef.current = Date.now();
+            emitPresenceVisibility();
         });
 
         newSocket.on('profiles.update', (data) => {
-            const list = Array.isArray(data) ? data : [];
+            const list = (Array.isArray(data) ? data : [])
+                .map((profile: any) => {
+                    const normalizedId = trimString(profile?.id) || trimString(profile?.profileId);
+                    if (!normalizedId) return null;
+                    return {
+                        ...profile,
+                        id: normalizedId
+                    };
+                })
+                .filter(Boolean) as any[];
+            bumpDebugSocketEvent('profiles.update', `count=${list.length}`);
             setProfiles(list);
             setProfilesLoaded(true);
             if (list.length === 0) {
@@ -2137,64 +4748,268 @@ export default function App() {
             if (next?.id) setActiveProfileId(next.id);
         });
 
+        newSocket.on('profile.unread', (data) => {
+            const profileId = typeof data?.profileId === 'string' ? data.profileId : '';
+            const unreadCount = Math.max(0, Number(data?.unreadCount || 0));
+            if (!profileId) return;
+            setProfiles((prev) => prev.map((item: any) => {
+                if (item?.id !== profileId) return item;
+                return {
+                    ...item,
+                    unreadCount
+                };
+            }));
+        });
+
         newSocket.on('connection.update', (update) => {
+            bumpDebugSocketEvent(
+                'connection.update',
+                `profile=${trimString(update?.profileId) || '-'} status=${trimString(update?.connection) || '-'}`
+            );
             if (update.profileId === activeProfileIdRef.current) setConnectionStatus(update.connection);
             if (update.connection === 'close') {
                 pushLog('WABA connection closed.', 'info');
             }
         });
 
+        const notifyIncomingMessages = async (incomingMessages: Message[]) => {
+            if (!Array.isArray(incomingMessages) || incomingMessages.length === 0) return;
+            const canShowSystemNotification = 'Notification' in window && Notification.permission === 'granted';
+
+            const visibleChatKey = canonicalContactJid(selectedChatIdRef.current || '');
+            const notificationCandidates: Message[] = [];
+
+            incomingMessages.forEach((msg, index) => {
+                if (msg?.key?.fromMe) return;
+                const jid = canonicalContactJid(msg?.key?.remoteJid || '');
+                if (!jid) return;
+                if (document.visibilityState === 'visible' && jid === visibleChatKey) return;
+
+                const rawId = typeof msg?.key?.id === 'string' ? msg.key.id.trim() : '';
+                const ts = Number(msg?.messageTimestamp || 0);
+                const dedupeKey = `${jid}:${rawId || `ts-${ts}-idx-${index}`}`;
+                if (notifiedIncomingMessageKeysRef.current.has(dedupeKey)) return;
+                notifiedIncomingMessageKeysRef.current.add(dedupeKey);
+                notificationCandidates.push(msg);
+            });
+
+            if (notificationCandidates.length === 0) return;
+
+            if (notifiedIncomingMessageKeysRef.current.size > 5000) {
+                const recentKeys = Array.from(notifiedIncomingMessageKeysRef.current).slice(-2500);
+                notifiedIncomingMessageKeysRef.current = new Set(recentKeys);
+            }
+
+            const latest = notificationCandidates[notificationCandidates.length - 1];
+            const jid = canonicalContactJid(latest?.key?.remoteJid || '');
+            if (!jid) return;
+
+            const contactMeta = pickContactMetaByJid(contactsRef.current, jid) || {};
+            const fallbackName = formatPhoneNumber(getCleanId(jid));
+            const senderName =
+                (typeof contactMeta.name === 'string' && contactMeta.name.trim())
+                || (typeof latest?.pushName === 'string' && latest.pushName.trim())
+                || fallbackName
+                || 'New message';
+            const notificationSuffix = notificationCandidates.length > 1
+                ? ` (+${notificationCandidates.length - 1} more)`
+                : '';
+            const body = `${truncateNotificationBody(
+                getIncomingNotificationPreview(latest),
+                Math.max(24, MAX_NOTIFICATION_BODY_LENGTH - notificationSuffix.length)
+            )}${notificationSuffix}`;
+
+            void playNotificationGlassSound();
+
+
+            if (document.visibilityState === 'visible') {
+                showChatToast(senderName, body);
+            }
+
+            if (!canShowSystemNotification) return;
+
+            const options: NotificationOptions = {
+                body,
+                icon: '/icons/icon-192.png',
+                badge: '/icons/icon-192.png',
+                tag: `chat:${jid}`,
+                data: {
+                    url: `/?chat=${encodeURIComponent(jid)}`
+                }
+            };
+
+            try {
+                const registration = await navigator.serviceWorker?.getRegistration?.();
+                if (registration) {
+                    await registration.showNotification(senderName, options);
+                    return;
+                }
+            } catch {
+                // fallback to Notification constructor below
+            }
+
+            try {
+                const notification = new Notification(senderName, options);
+                notification.onclick = () => {
+                    window.focus();
+                };
+            } catch {
+                // ignore unsupported Notification constructor environments
+            }
+        };
+
         newSocket.on('messages.upsert', (data) => {
             if (data.profileId === activeProfileIdRef.current) {
+                lastRealtimeEventAtRef.current = Date.now();
                 const incomingMessages = Array.isArray(data?.messages) ? data.messages : [];
-                setAllMessages((prev) => [...incomingMessages, ...prev]);
+                bumpDebugSocketEvent('messages.upsert', `count=${incomingMessages.length}`);
+                const latestIncomingTs = getLatestTimestampFromMessages(incomingMessages);
+                if (latestIncomingTs > latestMessageTimestampRef.current) {
+                    latestMessageTimestampRef.current = latestIncomingTs;
+                }
+                setAllMessages((prev) => mergeMessagesByIdentity(prev, incomingMessages));
                 setLoadingChats(false);
                 if (incomingMessages.length === 0) return;
+                void notifyIncomingMessages(incomingMessages);
                 const activeChatKey = canonicalContactJid(selectedChatIdRef.current || '');
+                const effectiveReadCursor = resolveRealtimeReadCursor(
+                    activeProfileIdRef.current,
+                    chatReadCursorByChatRef.current
+                );
+                if (
+                    Object.keys(chatReadCursorByChatRef.current).length === 0
+                    && Object.keys(effectiveReadCursor).length > 0
+                ) {
+                    chatReadCursorByChatRef.current = effectiveReadCursor;
+                    setChatReadCursorByChat((prev) => (
+                        Object.keys(prev).length === 0 ? effectiveReadCursor : prev
+                    ));
+                }
                 setUnreadMessagesByChat((prev) => {
-                    let next = prev;
-                    let changed = false;
-                    incomingMessages.forEach((msg: any, index: number) => {
-                        if (msg?.key?.fromMe) return;
-                        const jid = canonicalContactJid(msg?.key?.remoteJid || '');
-                        if (!jid) return;
-                        const rawId = typeof msg?.key?.id === 'string' ? msg.key.id.trim() : '';
-                        const ts = Number(msg?.messageTimestamp || 0);
-                        const dedupeKey = `${jid}:${rawId || `ts-${ts}-idx-${index}`}`;
-                        if (seenIncomingMessageKeysRef.current.has(dedupeKey)) return;
-                        seenIncomingMessageKeysRef.current.add(dedupeKey);
-                        if (activeChatKey && jid === activeChatKey) return;
-                        if (!changed) {
-                            next = { ...prev };
-                            changed = true;
-                        }
-                        next[jid] = (next[jid] || 0) + 1;
-                    });
-                    return changed ? next : prev;
+                    const unreadDeltaByChat = collectUnreadDeltaFromIncomingUpsert(
+                        incomingMessages,
+                        activeChatKey,
+                        seenIncomingMessageKeysRef.current,
+                        effectiveReadCursor
+                    );
+                    return mergeUnreadDelta(prev, unreadDeltaByChat);
                 });
             }
         });
 
         newSocket.on('messages.history', (data) => {
             if (data.profileId === activeProfileIdRef.current) {
+                lastRealtimeEventAtRef.current = Date.now();
                 const historyMessages = Array.isArray(data?.messages) ? data.messages : [];
+                bumpDebugSocketEvent('messages.history', `count=${historyMessages.length}`);
                 setAllMessages(historyMessages);
+                const latestHistoryTs = Number(data?.latestTimestamp || 0) || getLatestTimestampFromMessages(historyMessages);
+                latestMessageTimestampRef.current = Math.max(latestMessageTimestampRef.current, latestHistoryTs);
                 setLoadingChats(false);
-                const nextSeen = new Set<string>();
-                historyMessages.forEach((msg: any, index: number) => {
-                    if (msg?.key?.fromMe) return;
-                    const jid = canonicalContactJid(msg?.key?.remoteJid || '');
-                    if (!jid) return;
-                    const rawId = typeof msg?.key?.id === 'string' ? msg.key.id.trim() : '';
-                    const ts = Number(msg?.messageTimestamp || 0);
-                    nextSeen.add(`${jid}:${rawId || `ts-${ts}-idx-${index}`}`);
-                });
+                const previousSeen = seenIncomingMessageKeysRef.current;
+                const activeChatKey = canonicalContactJid(selectedChatIdRef.current || '');
+                const effectiveReadCursor = resolveRealtimeReadCursor(
+                    activeProfileIdRef.current,
+                    chatReadCursorByChatRef.current
+                );
+                if (
+                    Object.keys(chatReadCursorByChatRef.current).length === 0
+                    && Object.keys(effectiveReadCursor).length > 0
+                ) {
+                    chatReadCursorByChatRef.current = effectiveReadCursor;
+                    setChatReadCursorByChat((prev) => (
+                        Object.keys(prev).length === 0 ? effectiveReadCursor : prev
+                    ));
+                }
+                const { nextSeen, unreadDeltaByChat } = collectUnreadDeltaFromHistory(
+                    historyMessages,
+                    activeChatKey,
+                    previousSeen,
+                    effectiveReadCursor
+                );
                 seenIncomingMessageKeysRef.current = nextSeen;
-                setUnreadMessagesByChat({});
+                if (Object.keys(unreadDeltaByChat).length > 0) {
+                    setUnreadMessagesByChat((prev) => mergeUnreadDelta(prev, unreadDeltaByChat));
+                }
             }
         });
 
+        newSocket.on('messages.delta', (data) => {
+            if (data.profileId !== activeProfileIdRef.current) return;
+            lastRealtimeEventAtRef.current = Date.now();
+            const deltaMessages = Array.isArray(data?.messages) ? data.messages : [];
+            bumpDebugSocketEvent('messages.delta', `count=${deltaMessages.length}`);
+            const latestDeltaTs = Number(data?.latestTimestamp || 0) || getLatestTimestampFromMessages(deltaMessages);
+            if (latestDeltaTs > latestMessageTimestampRef.current) {
+                latestMessageTimestampRef.current = latestDeltaTs;
+            }
+            if (deltaMessages.length === 0) return;
+
+            setAllMessages((prev) => mergeMessagesByIdentity(prev, deltaMessages));
+            void notifyIncomingMessages(deltaMessages);
+            const activeChatKey = canonicalContactJid(selectedChatIdRef.current || '');
+            const effectiveReadCursor = resolveRealtimeReadCursor(
+                activeProfileIdRef.current,
+                chatReadCursorByChatRef.current
+            );
+            setUnreadMessagesByChat((prev) => {
+                const unreadDeltaByChat = collectUnreadDeltaFromIncomingUpsert(
+                    deltaMessages,
+                    activeChatKey,
+                    seenIncomingMessageKeysRef.current,
+                    effectiveReadCursor
+                );
+                return mergeUnreadDelta(prev, unreadDeltaByChat);
+            });
+        });
+
+        newSocket.on('notification.test', (payload) => {
+            const title = typeof payload?.title === 'string' && payload.title.trim()
+                ? payload.title.trim()
+                : 'QMessage Test Notification';
+            const body = typeof payload?.body === 'string' && payload.body.trim()
+                ? payload.body.trim()
+                : 'Cross-device notification test';
+
+            showChatToast(title, body);
+            void playNotificationGlassSound();
+
+            const canShowSystemNotification = 'Notification' in window && Notification.permission === 'granted';
+            if (!canShowSystemNotification) return;
+
+            const options: NotificationOptions = {
+                body,
+                icon: '/icons/icon-192.png',
+                badge: '/icons/icon-192.png',
+                tag: `test-notification:${payload?.id || Date.now()}`,
+                data: {
+                    url: '/'
+                }
+            };
+
+            void (async () => {
+                try {
+                    const registration = await navigator.serviceWorker?.getRegistration?.();
+                    if (registration) {
+                        await registration.showNotification(title, options);
+                        return;
+                    }
+                } catch {
+                    // fallback below
+                }
+
+                try {
+                    const notification = new Notification(title, options);
+                    notification.onclick = () => {
+                        window.focus();
+                    };
+                } catch {
+                    // ignore unsupported Notification constructor environments
+                }
+            })();
+        });
         newSocket.on('server.stats', (stats) => {
+            lastRealtimeEventAtRef.current = Date.now();
             setServerStats(stats);
         });
 
@@ -2209,6 +5024,29 @@ export default function App() {
                         : msg
                 )
             );
+        });
+
+        newSocket.on('calls.update', (data) => {
+            if (data?.profileId !== activeProfileIdRef.current) return;
+            const eventName = typeof data?.event === 'string' ? data.event.trim().toLowerCase() : '';
+            const callId = typeof data?.callId === 'string' ? data.callId.trim() : '';
+            const from = typeof data?.from === 'string' ? data.from.trim() : '';
+            const to = typeof data?.to === 'string' ? data.to.trim() : '';
+
+            if (eventName === 'connect') {
+                pushLog(`[Calls] Incoming call ${callId || '-'} from ${from || 'unknown'} to ${to || '-'}.`, 'info');
+                showToast('Incoming WhatsApp call received.', 'success');
+                return;
+            }
+
+            if (eventName === 'terminate') {
+                pushLog(`[Calls] Call ${callId || '-'} ended.`, 'info');
+                return;
+            }
+
+            if (eventName) {
+                pushLog(`[Calls] ${eventName.toUpperCase()} ${callId || '-'}.`, 'info');
+            }
         });
 
         newSocket.on('messages.cleared', (data) => {
@@ -2239,15 +5077,38 @@ export default function App() {
 
         newSocket.on('contacts.update', (data) => {
             if (data.profileId === activeProfileIdRef.current) {
+                lastRealtimeEventAtRef.current = Date.now();
+                const contactCount = Array.isArray(data?.contacts) ? data.contacts.length : 0;
+                bumpDebugSocketEvent('contacts.update', `count=${contactCount}`);
                 setContacts(prev => {
                     const next = { ...prev };
                     data.contacts.forEach((c: any) => {
                         if (!c.id) return;
                         const aliasKeys = buildContactJidVariants(c.id);
                         const canonicalKey = canonicalContactJid(c.id) || c.id;
+                        if (c.deleted === true) {
+                            aliasKeys.forEach((key) => {
+                                if (key in next) delete next[key];
+                            });
+                            if (canonicalKey in next) delete next[canonicalKey];
+                            return;
+                        }
                         const prevMeta = pickContactMetaByJid(next, canonicalKey) || {};
-                        const incomingName = typeof c.name === 'string' ? c.name : (typeof c.notify === 'string' ? c.notify : '');
-                        const resolvedName = pickContactName(incomingName, (prevMeta as any).name, c.id);
+                        const incomingName = normalizeContactNameValue(
+                            typeof c.name === 'string' ? c.name : (typeof c.notify === 'string' ? c.notify : '')
+                        );
+                        const nextAlias = c.alias === undefined
+                            ? ((prevMeta as any).alias ?? null)
+                            : (normalizeContactNameValue(c.alias) || null);
+                        const nextWhatsappName = c.whatsappName === undefined
+                            ? ((prevMeta as any).whatsappName ?? null)
+                            : (normalizeContactNameValue(c.whatsappName) || null);
+                        const resolvedName = resolveContactDisplayName(
+                            nextAlias,
+                            nextWhatsappName,
+                            pickContactName(incomingName, (prevMeta as any).name, c.id),
+                            canonicalKey
+                        );
                         const nextLastInboundAt = c.lastInboundAt === undefined ? (prevMeta as any).lastInboundAt || null : c.lastInboundAt;
                         const nextAssigneeUserId = c.assigneeUserId === undefined ? (prevMeta as any).assigneeUserId || null : c.assigneeUserId;
                         const nextAssigneeName = c.assigneeName === undefined ? (prevMeta as any).assigneeName || null : c.assigneeName;
@@ -2264,6 +5125,8 @@ export default function App() {
                         });
                         next[canonicalKey] = {
                             name: resolvedName || (prevMeta as any).name,
+                            alias: nextAlias,
+                            whatsappName: nextWhatsappName,
                             lastInboundAt: nextLastInboundAt,
                             tags: Array.isArray(c.tags) ? c.tags : (prevMeta as any).tags || [],
                             assigneeUserId: nextAssigneeUserId,
@@ -2341,65 +5204,229 @@ export default function App() {
 
         newSocket.on('profile.error', (data) => {
             setStartingWorkflow(false);
-            if (typeof data?.message === 'string') {
-                setLastProfileError(data.message);
-                pushLog(data.message, 'error');
+            setIsCreatingProfile(false);
+
+            const profileErrorMessage = typeof data?.message === 'string' ? data.message : '';
+            bumpDebugSocketEvent('profile.error', profileErrorMessage || '(empty)');
+            if (profileErrorMessage) {
+                setLastProfileError(profileErrorMessage);
+                pushLog(profileErrorMessage, 'error');
             }
-            if (typeof data?.message === 'string' && data.message.includes('Outside 24h window')) {
+
+            if (profileErrorMessage.includes('Outside 24h window')) {
                 setForceTemplateMode(true);
                 return;
             }
-            alert(data.message);
-            setIsCreatingProfile(false);
+
+            if (profileErrorMessage.includes('Profile not found for this company')) {
+                const list = Array.isArray(profilesRef.current) ? profilesRef.current : [];
+                const openProfiles = list.filter((profile: any) => profile?.status === 'open');
+                const fallbackProfile = openProfiles[0] || list[0];
+                if (fallbackProfile?.id && fallbackProfile.id !== activeProfileIdRef.current) {
+                    setLastProfileError(null);
+                    setActiveProfileId(fallbackProfile.id);
+                    setConnectionStatus('connecting');
+                    setLoadingChats(true);
+                    return;
+                }
+                setConnectionStatus('close');
+            }
+
+            alert(profileErrorMessage || 'Profile operation failed.');
             setLoadingChats(false);
         });
 
         newSocket.on('workflow.started', (data) => {
             setStartingWorkflow(false);
-            const profileId = activeProfileIdRef.current;
-            if (profileId) {
-                newSocket.emit('refreshMessages', profileId);
-            }
+            emitRefreshMessages();
             if (data?.workflowId) {
                 pushLog(`Workflow started: ${data.workflowId}`, 'info');
             }
         });
 
-        newSocket.on('connect_error', (err: any) => {
+        let socketAuthRetryInFlight = false;
+
+        newSocket.on('connect_error', async (err: any) => {
             setProfilesLoaded(true);
-            pushLog(`Socket connect error: ${err?.message || err}`, 'error');
+            setLoadingChats(false);
+
+            const errorMessage = typeof err?.message === 'string' ? err.message : String(err || '');
+            bumpDebugSocketEvent('socket.connect_error', errorMessage || '(empty)');
+            const normalizedErrorMessage = errorMessage.toLowerCase();
+            const shouldTryTokenRefresh =
+                normalizedErrorMessage.includes('invalid session')
+                || normalizedErrorMessage.includes('authentication error')
+                || normalizedErrorMessage.includes('jwt')
+                || normalizedErrorMessage.includes('token');
+
+            if (shouldTryTokenRefresh && !socketAuthRetryInFlight) {
+                socketAuthRetryInFlight = true;
+                try {
+                    const refreshedToken = await refreshAccessTokenRef.current?.();
+                    if (refreshedToken) {
+                        socketAccessTokenRef.current = refreshedToken;
+                        newSocket.auth = { token: refreshedToken };
+                        if (!newSocket.connected) {
+                            newSocket.connect();
+                        }
+                        pushLog('Socket session refreshed. Reconnecting...', 'info');
+                        return;
+                    }
+                } finally {
+                    socketAuthRetryInFlight = false;
+                }
+            }
+
+            pushLog(`Socket connect error: ${errorMessage || err}`, 'error');
         });
 
         newSocket.on('disconnect', (reason: any) => {
+            bumpDebugSocketEvent('socket.disconnect', trimString(reason) || String(reason || '-'));
             pushLog(`Socket disconnected: ${reason}`, 'info');
+            if (document.visibilityState !== 'visible') return;
+            window.setTimeout(() => {
+                if (!newSocket.connected) {
+                    newSocket.connect();
+                }
+            }, 350);
         });
 
-        const refreshInterval = setInterval(() => {
-            if (newSocket.connected && activeProfileIdRef.current) {
-                newSocket.emit('refreshMessages', activeProfileIdRef.current);
+        const requestActiveProfileRefresh = () => {
+            if (document.visibilityState !== 'visible') return;
+            if (!newSocket.connected || !activeProfileIdRef.current) return;
+            emitRefreshMessages();
+        };
+        let refreshDebounceTimer: number | null = null;
+
+        const scheduleActiveProfileRefresh = (delayMs = 300) => {
+            if (typeof refreshDebounceTimer === 'number') {
+                window.clearTimeout(refreshDebounceTimer);
             }
-        }, 10000);
+            refreshDebounceTimer = window.setTimeout(() => {
+                refreshDebounceTimer = null;
+                requestActiveProfileRefresh();
+            }, delayMs);
+        };
+
+        const clearHiddenDisconnectTimer = () => {
+            if (typeof hiddenSocketDisconnectTimerRef.current !== 'number') return;
+            window.clearTimeout(hiddenSocketDisconnectTimerRef.current);
+            hiddenSocketDisconnectTimerRef.current = null;
+        };
+
+        const handleVisibilityChange = () => {
+            emitPresenceVisibility();
+            if (document.visibilityState === 'visible') {
+                clearHiddenDisconnectTimer();
+                if (!newSocket.connected) newSocket.connect();
+                scheduleActiveProfileRefresh(80);
+                return;
+            }
+            clearHiddenDisconnectTimer();
+        };
+
+        const handleWindowFocus = () => requestActiveProfileRefresh();
+        const handleWindowBlur = () => emitPresenceVisibility();
+        const handlePageHide = () => emitPresenceVisibility();
+        const handleOnline = () => {
+            if (!newSocket.connected) newSocket.connect();
+            scheduleActiveProfileRefresh(120);
+        };
+
+        const staleRefreshTimer = window.setInterval(() => {
+            if (document.visibilityState !== 'visible') return;
+            const profileId = activeProfileIdRef.current;
+            if (!profileId) return;
+            if (!newSocket.connected) {
+                newSocket.connect();
+                return;
+            }
+            const staleForMs = Date.now() - lastRealtimeEventAtRef.current;
+            if (staleForMs < SOCKET_STALE_REFRESH_INTERVAL_MS) return;
+            emitRefreshMessages();
+        }, SOCKET_STALE_REFRESH_INTERVAL_MS);
+        const visibilityHeartbeatTimer = window.setInterval(() => {
+            emitPresenceVisibility();
+        }, 30_000);
+
+        document.addEventListener('visibilitychange', handleVisibilityChange);
+        window.addEventListener('focus', handleWindowFocus);
+        window.addEventListener('blur', handleWindowBlur);
+        window.addEventListener('pagehide', handlePageHide);
+        window.addEventListener('online', handleOnline);
 
         return () => {
-            clearInterval(refreshInterval);
-            newSocket.close();
+            disposed = true;
+            window.clearInterval(staleRefreshTimer);
+            window.clearInterval(visibilityHeartbeatTimer);
+            if (typeof refreshDebounceTimer === 'number') {
+                window.clearTimeout(refreshDebounceTimer);
+            }
+            document.removeEventListener('visibilitychange', handleVisibilityChange);
+            window.removeEventListener('focus', handleWindowFocus);
+            window.removeEventListener('blur', handleWindowBlur);
+            window.removeEventListener('pagehide', handlePageHide);
+            window.removeEventListener('online', handleOnline);
+            clearHiddenDisconnectTimer();
+            window.clearTimeout(connectTimer);
+            newSocket.removeAllListeners();
+            if (newSocket.connected) {
+                newSocket.disconnect();
+            }
+            if (socketInstanceRef.current === newSocket) {
+                socketInstanceRef.current = null;
+                socketAccessTokenRef.current = '';
+            }
         };
-    }, [session]); // ONLY reconnect if session changes
+    }, [socketAccessToken]);
+
+    // Keep active profile valid as soon as profile list is available.
+    useEffect(() => {
+        if (!profilesLoaded) return;
+        const openProfiles = profiles.filter((profile: any) => profile?.status === 'open');
+        const hasOpenProfiles = openProfiles.length > 0;
+        const profileExists = activeProfileId
+            ? profiles.some((profile: any) => profile?.id === activeProfileId)
+            : false;
+
+        if (!activeProfileId || !profileExists) {
+            const fallbackProfile = hasOpenProfiles ? openProfiles[0] : profiles[0];
+            if (fallbackProfile?.id && fallbackProfile.id !== activeProfileId) {
+                setConnectionStatus('connecting');
+                setLoadingChats(true);
+                setActiveProfileId(fallbackProfile.id);
+                return;
+            }
+
+            setLoadingChats(false);
+            if (profiles.length === 0) {
+                setConnectionStatus('close');
+            }
+            return;
+        }
+    }, [activeProfileId, profiles, profilesLoaded]);
 
     // Handle switching profile separately
     useEffect(() => {
-        if (socket && activeProfileId) {
-            console.log('Switching to profile:', activeProfileId);
-            setLoadingChats(true);
-            socket.emit('switchProfile', activeProfileId);
-        }
-    }, [socket, activeProfileId]);
+        if (!socket || !profilesLoaded || !activeProfileId) return;
+        const profileExists = profilesRef.current.some((profile: any) => profile?.id === activeProfileId);
+        if (!profileExists) return;
+        const lastEmit = lastSwitchProfileEmitRef.current;
+        if (lastEmit.socket === socket && lastEmit.profileId === activeProfileId) return;
+        lastSwitchProfileEmitRef.current = { socket, profileId: activeProfileId };
+
+        setLoadingChats(true);
+        latestMessageTimestampRef.current = 0;
+        bumpDebugSocketEvent('switchProfile.emit', activeProfileId);
+        socket.emit('switchProfile', activeProfileId);
+    }, [socket, activeProfileId, profilesLoaded, bumpDebugSocketEvent]);
 
     useEffect(() => {
         if (!session || profilesLoaded) return;
         const timer = window.setTimeout(() => {
             recoverSocketConnection('Profiles load timed out. Restarting socket connection...');
-        }, 15_000);
+            setProfilesLoaded(true);
+        }, PROFILE_SYNC_TIMEOUT_MS);
         return () => window.clearTimeout(timer);
     }, [session, profilesLoaded, recoverSocketConnection]);
 
@@ -2407,7 +5434,8 @@ export default function App() {
         if (!session || !activeProfileId || !loadingChats) return;
         const timer = window.setTimeout(() => {
             recoverSocketConnection('Chat sync timed out. Restarting socket connection...');
-        }, 15_000);
+            setLoadingChats(false);
+        }, CHAT_SYNC_TIMEOUT_MS);
         return () => window.clearTimeout(timer);
     }, [session, activeProfileId, loadingChats, recoverSocketConnection]);
 
@@ -2450,22 +5478,16 @@ export default function App() {
     };
 
     useEffect(() => {
-        if (activeView !== 'chatflow' || !activeProfileId) return;
-        setWorkflowsLoading(true);
-        fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`)
-            .then(res => res.json())
-            .then(data => {
-                const list = Array.isArray(data?.workflows) ? data.workflows : [];
-                applyWorkflowsFromServer(list);
-            })
-            .catch(err => console.error('Failed to fetch workflows:', err))
-            .finally(() => setWorkflowsLoading(false));
-    }, [activeView, activeProfileId]);
+        const shouldLoadWorkflows = activeView === 'chatflow'
+            || (activeView === 'dashboard' && workspaceSection === 'automations');
+        if (!shouldLoadWorkflows || !activeProfileId || !session?.access_token) return;
 
-    useEffect(() => {
-        if (activeView !== 'dashboard' || !activeProfileId) return;
         setWorkflowsLoading(true);
-        fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`)
+        fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`, {
+            headers: {
+                Authorization: `Bearer ${session.access_token}`
+            }
+        })
             .then(res => res.json())
             .then(data => {
                 const list = Array.isArray(data?.workflows) ? data.workflows : [];
@@ -2473,7 +5495,7 @@ export default function App() {
             })
             .catch(err => console.error('Failed to fetch workflows:', err))
             .finally(() => setWorkflowsLoading(false));
-    }, [activeView, activeProfileId]);
+    }, [activeView, activeProfileId, session?.access_token, workspaceSection]);
 
     useEffect(() => {
         if (activeView !== 'chatflow' || workflowEditorMode !== 'visual' || !selectedWorkflowId) return;
@@ -2486,42 +5508,19 @@ export default function App() {
 
     const handleSaveWorkflows = async (updatedWorkflows: any[], draftOverrides?: Record<string, string>) => {
         try {
-            if (!activeProfileId) {
-                alert('No active profile selected.');
+            if (!activeProfileId || !session?.access_token) {
+                alert('Please sign in and select an active profile.');
                 return false;
             }
-            // Validate JSON drafts before saving
             const drafts = draftOverrides || workflowDrafts;
-            const normalized = updatedWorkflows.map(wf => {
-                const workflowName = typeof wf?.name === 'string' ? wf.name.trim() : '';
-                const builderMeta =
-                    wf?.builder && typeof wf.builder === 'object' && !Array.isArray(wf.builder)
-                        ? (wf.builder as any)
-                        : null;
-                const builderWithName = builderMeta
-                    ? {
-                        ...builderMeta,
-                        meta: {
-                            ...(builderMeta.meta && typeof builderMeta.meta === 'object' ? builderMeta.meta : {}),
-                            name: workflowName,
-                            enabled: wf?.enabled !== false
-                        }
-                    }
-                    : wf?.builder || null;
-                const draft = drafts[wf.id];
-                if (typeof draft === 'string') {
-                    try {
-                        return { ...wf, name: workflowName, builder: builderWithName, actions: JSON.parse(draft) };
-                    } catch {
-                        throw new Error(`Invalid JSON in actions for workflow: ${wf.id}`);
-                    }
-                }
-                return { ...wf, name: workflowName, builder: builderWithName };
-            });
+            const normalized = normalizeWorkflowsForSave(updatedWorkflows, drafts);
 
             const res = await fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${session.access_token}`
+                },
                 body: JSON.stringify({ workflows: normalized })
             });
 
@@ -2530,7 +5529,11 @@ export default function App() {
                 throw new Error(payload?.error || `Failed to save workflows (${res.status})`);
             }
 
-            const refreshed = await fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`);
+            const refreshed = await fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`, {
+                headers: {
+                    Authorization: `Bearer ${session.access_token}`
+                }
+            });
             const refreshedPayload = await refreshed.json().catch(() => ({}));
             const list = Array.isArray(refreshedPayload?.workflows) ? refreshedPayload.workflows : [];
             applyWorkflowsFromServer(list);
@@ -2543,187 +5546,79 @@ export default function App() {
         }
     };
 
-    const { chatsMap, chatList, latestChatId } = useMemo(() => {
-        const nextMap = new Map<string, Chat>();
-        allMessages.forEach(msg => {
-            const rawJid = msg.key.remoteJid;
-            if (!rawJid) return;
-            const jid = canonicalContactJid(rawJid);
-            if (!jid) return;
-
-            const existing = nextMap.get(jid);
-            const content =
-                msg.message?.conversation ||
-                msg.message?.extendedTextMessage?.text ||
-                msg.message?.buttonsMessage?.contentText ||
-                msg.message?.listMessage?.description ||
-                (msg.message?.buttonsMessage ? 'Buttons' : msg.message?.listMessage ? 'List' : 'Media message');
-
-            if (!existing || (msg.messageTimestamp && msg.messageTimestamp > (existing.timestamp || 0))) {
-                const cleanId = getCleanId(jid);
-                let rawName = pickContactMetaByJid(contacts, rawJid)?.name || msg.pushName || cleanId;
-                if (rawName.includes('@')) {
-                    rawName = getCleanId(rawName);
-                }
-
-                nextMap.set(jid, {
-                    id: jid,
-                    name: rawName,
-                    lastMessage: content,
-                    timestamp: msg.messageTimestamp,
-                    unreadCount: 0,
-                });
-            }
-        });
-
-        // Ensure contacts with no messages still appear in chat list.
-        Object.entries(contacts).forEach(([rawJid, contact]) => {
-            const jid = canonicalContactJid(rawJid);
-            if (!jid || nextMap.has(jid)) return;
-            const mergedContact = pickContactMetaByJid(contacts, jid) || contact;
-            const cleanId = getCleanId(jid);
-            let rawName = mergedContact?.name || cleanId;
-            if (rawName.includes('@')) rawName = getCleanId(rawName);
-            const lastInboundMs = mergedContact?.lastInboundAt ? new Date(mergedContact.lastInboundAt).getTime() : 0;
-            const timestamp = Number.isFinite(lastInboundMs) && lastInboundMs > 0
-                ? Math.floor(lastInboundMs / 1000)
-                : 0;
-            nextMap.set(jid, {
-                id: jid,
-                name: rawName,
-                lastMessage: '',
-                timestamp,
-                unreadCount: 0
-            });
-        });
-
-        const query = searchQuery.trim().toLowerCase();
-        const dedupedList = Array.from(nextMap.values())
-            .filter((chat) => {
-                const meta: ContactMeta = pickContactMetaByJid(contacts, chat.id) || {};
-                const tags = splitContactTags(meta.tags).labelTags;
-                const hasTags = tags.length > 0;
-                const hasAssignee = Boolean((meta.assigneeUserId || '').trim() || (meta.assigneeName || '').trim());
-                const cleanId = getCleanId(chat.id).toLowerCase();
-                const matchesQuery =
-                    !query
-                    || chat.name.toLowerCase().includes(query)
-                    || cleanId.includes(query)
-                    || tags.some((tag) => tag.toLowerCase().includes(query));
-                if (!matchesQuery) return false;
-                if (chatListFilter === 'tagged') return hasTags;
-                if (chatListFilter === 'untagged') return !hasTags;
-                if (chatListFilter === 'assigned') return hasAssignee;
-                if (chatListFilter === 'unassigned') return !hasAssignee;
-                return true;
-            })
-            .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-
-        const seenCustomers = new Set<string>();
-        const nextList = dedupedList.filter((chat) => {
-            const key = canonicalContactJid(chat.id) || chat.id;
-            if (seenCustomers.has(key)) return false;
-            seenCustomers.add(key);
-            return true;
-        });
-
-        return {
-            chatsMap: nextMap,
-            chatList: nextList,
-            latestChatId: nextList[0]?.id || null
-        };
-    }, [allMessages, contacts, searchQuery, chatListFilter]);
+    const { chatsMap, chatList, latestChatId } = useMemo(
+        () => buildChatListComputation(allMessages, contacts, searchQuery, chatListFilter, unreadMessagesByChat),
+        [allMessages, contacts, searchQuery, chatListFilter, unreadMessagesByChat]
+    );
 
     const totalUnreadMessages = useMemo(
-        () => Object.values(unreadMessagesByChat).reduce((sum, count) => sum + Math.max(0, Number(count) || 0), 0),
-        [unreadMessagesByChat]
+        () => chatList.reduce((sum, chat) => sum + Math.max(0, Number(chat.unreadCount) || 0), 0),
+        [chatList]
     );
     const totalUnreadBadgeCount = Math.max(0, Math.min(999, totalUnreadMessages));
-
-    const contactsList = useMemo(() => {
-        type ContactRow = {
-            id: string;
-            name: string;
-            phone: string;
-            tags: string[];
-            assigneeUserId: string | null;
-            assigneeName: string | null;
-            assigneeColor: string | null;
-            lastInboundAt: string | null;
-            lastActivityTs: number;
-            totalMessages: number;
-        };
-
-        const rows = new Map<string, ContactRow>();
-        const ensure = (jid: string): ContactRow | null => {
-            const key = canonicalContactJid(jid);
-            if (!key || key.endsWith('@g.us')) return null;
-            const existing = rows.get(key);
-            if (existing) return existing;
-            const meta = pickContactMetaByJid(contacts, key) || {};
-            const fallbackName = formatPhoneNumber(getCleanId(key));
-            const row: ContactRow = {
-                id: key,
-                name: meta.name || fallbackName,
-                phone: formatPhoneNumber(getCleanId(key)),
-                tags: splitContactTags(meta.tags).labelTags,
-                assigneeUserId: meta.assigneeUserId || null,
-                assigneeName: meta.assigneeName || null,
-                assigneeColor: meta.assigneeColor || null,
-                lastInboundAt: meta.lastInboundAt || null,
-                lastActivityTs: meta.lastInboundAt ? new Date(meta.lastInboundAt).getTime() || 0 : 0,
-                totalMessages: 0
-            };
-            rows.set(key, row);
-            return row;
-        };
-
-        Object.keys(contacts).forEach((jid) => {
-            ensure(jid);
+    const mobileUnreadChatCount = useMemo(
+        () => chatList.reduce((sum, chat) => sum + (chat.unreadCount > 0 ? 1 : 0), 0),
+        [chatList]
+    );
+    const mobileChatFilterTags = useMemo(() => {
+        const next = new Set<string>();
+        Object.values(contacts).forEach((meta) => {
+            splitContactTags(meta?.tags).labelTags.forEach((tag) => {
+                const normalized = tag.trim();
+                if (normalized) next.add(normalized);
+            });
         });
-
-        allMessages.forEach((msg) => {
-            const jid = msg.key?.remoteJid || '';
-            const row = ensure(jid);
-            if (!row) return;
-            row.totalMessages += 1;
-            const ts = (msg.messageTimestamp || 0) * 1000;
-            if (ts > row.lastActivityTs) row.lastActivityTs = ts;
-            if (!msg.key.fromMe && ts > 0) {
-                const inboundIso = new Date(ts).toISOString();
-                if (!row.lastInboundAt || ts > new Date(row.lastInboundAt).getTime()) {
-                    row.lastInboundAt = inboundIso;
-                }
-            }
-            if (!row.name) {
-                row.name = msg.pushName || row.phone;
-            }
-        });
-
-        const query = contactsSearchQuery.trim().toLowerCase();
-        const filtered = Array.from(rows.values()).filter((row) => {
-            if (!query) return true;
-            if (row.name.toLowerCase().includes(query)) return true;
-            if (row.phone.toLowerCase().includes(query)) return true;
-            if (row.tags.some((tag) => tag.toLowerCase().includes(query))) return true;
-            return false;
-        });
-
-        filtered.sort((a, b) => {
-            const aTs = a.lastActivityTs || (a.lastInboundAt ? new Date(a.lastInboundAt).getTime() : 0);
-            const bTs = b.lastActivityTs || (b.lastInboundAt ? new Date(b.lastInboundAt).getTime() : 0);
-            return bTs - aTs;
-        });
-
-        return filtered;
-    }, [contacts, allMessages, contactsSearchQuery]);
+        return Array.from(next).sort((a, b) => a.localeCompare(b));
+    }, [contacts]);
+    const mobileTagFilterKey = mobileTagFilter.trim().toLowerCase();
+    const chatListForView = useMemo(() => {
+        if (!isMobile) return chatList;
+        let next = chatList;
+        if (mobileChatQuickFilter === 'unread') {
+            next = next.filter((chat) => chat.unreadCount > 0);
+        }
+        if (mobileTagFilterKey) {
+            next = next.filter((chat) => {
+                const meta: ContactMeta = pickContactMetaByJid(contacts, chat.id) || {};
+                return splitContactTags(meta.tags).labelTags.some(
+                    (tag) => tag.trim().toLowerCase() === mobileTagFilterKey
+                );
+            });
+        }
+        return next;
+    }, [chatList, contacts, isMobile, mobileChatQuickFilter, mobileTagFilterKey]);
 
     useEffect(() => {
+        if (!debugOverlayEnabled) return;
+        const nowMs = Date.now();
+        const nextSignature = chatListForView.map((chat) => `${chat.id}:${chat.timestamp || 0}:${chat.unreadCount}`).join('|');
+        const stats = chatListFlickerStatsRef.current;
+        if (stats.lastSignature && stats.lastSignature !== nextSignature) {
+            stats.changes += 1;
+            if (nowMs - stats.lastChangedAt < 1200) {
+                stats.rapidChanges += 1;
+            }
+            stats.lastChangedAt = nowMs;
+        }
+        if (!stats.lastChangedAt) {
+            stats.lastChangedAt = nowMs;
+        }
+        stats.lastSignature = nextSignature;
+    }, [chatListForView, debugOverlayEnabled]);
+
+    const contactsList = useMemo(
+        () => buildContactsListComputation(contacts, allMessages, contactsSearchQuery),
+        [contacts, allMessages, contactsSearchQuery]
+    );
+
+    useEffect(() => {
+        if (isMobile) return;
         if (activeView !== 'dashboard') return;
+        if (workspaceSection !== 'team-inbox') return;
         if (!selectedChatId && latestChatId) {
             setSelectedChatId(latestChatId);
         }
-    }, [activeView, selectedChatId, latestChatId]);
+    }, [activeView, isMobile, latestChatId, selectedChatId, workspaceSection]);
 
     const tagAnalytics = useMemo(() => {
         const tagCounts = new Map<string, number>();
@@ -3137,6 +6032,12 @@ export default function App() {
     useEffect(() => {
         if (!selectedChatId) return;
         currentChatMessages.forEach((msg) => {
+            const hasDirectMediaUrl = Boolean(
+                msg.message?.imageMessage?.url ||
+                msg.message?.documentMessage?.url ||
+                msg.message?.videoMessage?.url
+            );
+            if (hasDirectMediaUrl) return;
             const imageMediaId = msg.message?.imageMessage?.mediaId;
             const docMediaId = msg.message?.documentMessage?.mediaId;
             const docName = msg.message?.documentMessage?.fileName || '';
@@ -3167,7 +6068,16 @@ export default function App() {
             unreadCount: 0
         })
         : null;
+    const isMobileChatOpen = isMobile && Boolean(selectedChatId);
     const selectedContact = selectedChatId ? pickContactMetaByJid(contacts, selectedChatId) : null;
+    const selectedContactAlias = normalizeContactNameValue(selectedContact?.alias);
+    const selectedContactWhatsappName = normalizeContactNameValue(selectedContact?.whatsappName)
+        || (
+            !selectedContactAlias
+                ? normalizeContactNameValue(selectedContact?.name)
+                : ''
+        )
+        || formatPhoneNumber(getCleanId(selectedChat?.id));
     const selectedContactTemplateAttributes = useMemo(() => {
         const list = Array.isArray(selectedContact?.templateAttributes)
             ? [...selectedContact.templateAttributes]
@@ -3197,6 +6107,14 @@ export default function App() {
     const windowExpiresMs = lastInboundMs ? lastInboundMs + 24 * 60 * 60 * 1000 : null;
     const windowRemainingMs = windowExpiresMs ? windowExpiresMs - now : null;
     const windowOpen = windowRemainingMs !== null && windowRemainingMs > 0;
+    const showMobileWindowClosedBanner = Boolean(
+        isMobile
+        && selectedChatId
+        && selectedChat
+        && !selectedChat.id.endsWith('@g.us')
+        && lastInboundMs
+        && !windowOpen
+    );
     const ctaFreeWindowExpiresMs = selectedContact?.ctaFreeWindowExpiresAt
         ? new Date(selectedContact.ctaFreeWindowExpiresAt || '').getTime()
         : null;
@@ -3207,7 +6125,12 @@ export default function App() {
     const ctaFreeWindowOpen = ctaFreeWindowRemainingMs !== null && ctaFreeWindowRemainingMs > 0;
     const canSendText = windowOpen && !forceTemplateMode;
     const hasComposerMedia = composerMediaType !== 'none'
-        && (composerMediaAssetKey.trim().length > 0 || composerMediaUrl.trim().length > 0);
+        && (
+            composerMediaId.trim().length > 0
+            || composerMediaAssetKey.trim().length > 0
+            || composerMediaUrl.trim().length > 0
+        );
+    const composerQueuedMediaCount = composerQueuedMedia.length;
     const quickReplyQuery = useMemo(() => {
         const trimmed = messageText.trim();
         if (!trimmed.startsWith('/')) return null;
@@ -3332,12 +6255,15 @@ export default function App() {
             }
             return '';
         });
+        setComposerMediaId('');
         setComposerMediaAssetKey('');
         setComposerMediaMimeType('');
         setComposerMediaSizeBytes(null);
         setComposerMediaFilename('');
+        setComposerQueuedMedia([]);
         setComposerMediaError(null);
         setComposerMediaUploading(false);
+        setComposerDragActive(false);
         setComposerMediaType(nextType);
         if (nextType === 'none') {
             setShowMediaComposer(false);
@@ -3352,61 +6278,133 @@ export default function App() {
         };
     }, [composerMediaUrl]);
 
-    const uploadComposerMediaFile = useCallback(async (file: File, requestedType: 'image' | 'video' | 'document') => {
+    const uploadComposerMediaFiles = useCallback(async (
+        files: File[],
+        forcedType?: 'image' | 'video' | 'document'
+    ) => {
+        const fileQueue = Array.isArray(files) ? files.filter(Boolean) : [];
+        if (fileQueue.length === 0) return;
         if (!activeProfileId || !session?.access_token) {
             setComposerMediaError('Select a profile and login before uploading media.');
             return;
         }
+        const queue = forcedType === 'video' ? fileQueue.slice(0, 1) : fileQueue;
+        const initialType = forcedType || inferComposerMediaType(queue[0]);
+        const uploadedPayloads: SendMediaPayload[] = [];
+        let uploadFailedCount = 0;
+        let firstUploadError = '';
+
         setShowMediaComposer(true);
-        setComposerMediaType(requestedType);
+        setComposerMediaType(initialType);
+        setComposerQueuedMedia([]);
         setComposerMediaUploading(true);
         setComposerMediaError(null);
+
         try {
-            const uploaded = await uploadFileToCompanyStorage({
-                apiBaseUrl: SOCKET_URL,
-                profileId: activeProfileId,
-                sessionToken: session.access_token,
-                purpose: 'chat_message',
-                messageType: requestedType,
-                file
-            });
-            const previewUrl = URL.createObjectURL(file);
-            setComposerMediaUrl((prev) => {
-                if (prev.startsWith('blob:')) {
-                    URL.revokeObjectURL(prev);
+            for (const file of queue) {
+                const mediaType = forcedType || inferComposerMediaType(file);
+                try {
+                    const uploaded = await uploadFileToWabaMedia({
+                        apiBaseUrl: SOCKET_URL,
+                        profileId: activeProfileId,
+                        sessionToken: session.access_token,
+                        file
+                    });
+                    const sendPayload = createSendMediaPayload(
+                        mediaType,
+                        uploaded.mediaId,
+                        '',
+                        '',
+                        mediaType === 'document' ? (uploaded.fileName || 'document') : ''
+                    );
+                    if (!sendPayload) continue;
+                    if (uploadedPayloads.length === 0) {
+                        const previewUrl = URL.createObjectURL(file);
+                        setComposerMediaUrl((prev) => {
+                            if (prev.startsWith('blob:')) {
+                                URL.revokeObjectURL(prev);
+                            }
+                            return previewUrl;
+                        });
+                        setComposerMediaType(mediaType);
+                        setComposerMediaId(uploaded.mediaId);
+                        setComposerMediaAssetKey('');
+                        setComposerMediaMimeType(uploaded.mimeType);
+                        setComposerMediaSizeBytes(uploaded.sizeBytes);
+                        setComposerMediaFilename(mediaType === 'document' ? (uploaded.fileName || 'document') : '');
+                    }
+                    uploadedPayloads.push(sendPayload);
+                } catch (error: any) {
+                    uploadFailedCount += 1;
+                    if (!firstUploadError) firstUploadError = error?.message || 'Upload failed.';
                 }
-                return previewUrl;
-            });
-            setComposerMediaAssetKey(uploaded.assetKey);
-            setComposerMediaMimeType(uploaded.mimeType);
-            setComposerMediaSizeBytes(uploaded.sizeBytes);
-            setComposerMediaFilename(requestedType === 'document' ? (uploaded.fileName || 'document') : '');
-        } catch (error: any) {
-            setComposerMediaError(error?.message || 'Upload failed.');
-            setComposerMediaAssetKey('');
-            setComposerMediaMimeType('');
-            setComposerMediaSizeBytes(null);
+            }
+
+            if (uploadedPayloads.length === 0) {
+                setComposerMediaError(firstUploadError || 'Upload failed.');
+                setComposerMediaId('');
+                setComposerMediaAssetKey('');
+                setComposerMediaMimeType('');
+                setComposerMediaSizeBytes(null);
+                return;
+            }
+
+            setComposerQueuedMedia(uploadedPayloads.slice(1));
+            if (uploadFailedCount > 0) {
+                setComposerMediaError(`${uploadFailedCount} file${uploadFailedCount > 1 ? 's' : ''} failed to upload.`);
+            } else {
+                setComposerMediaError(null);
+            }
         } finally {
             setComposerMediaUploading(false);
         }
-    }, [activeProfileId, session?.access_token]);
+    }, [activeProfileId, inferComposerMediaType, session?.access_token]);
 
     const handleComposerMediaInputChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
-        const file = event.target.files?.[0] || null;
+        const files = Array.from(event.target.files || []);
         event.target.value = '';
-        if (!file) return;
+        if (files.length === 0) return;
         const messageType =
             composerMediaType === 'image' || composerMediaType === 'video' || composerMediaType === 'document'
                 ? composerMediaType
-                : inferComposerMediaType(file);
-        void uploadComposerMediaFile(file, messageType);
-    }, [composerMediaType, inferComposerMediaType, uploadComposerMediaFile]);
+                : undefined;
+        void uploadComposerMediaFiles(files, messageType);
+    }, [composerMediaType, uploadComposerMediaFiles]);
+
+    const handleComposerDragOver = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+        if (!canSendText) return;
+        const hasFiles = Array.from(event.dataTransfer?.types || []).includes('Files');
+        if (!hasFiles) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (!composerDragActive) {
+            setComposerDragActive(true);
+        }
+    }, [canSendText, composerDragActive]);
+
+    const handleComposerDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+        setComposerDragActive(false);
+    }, []);
+
+    const handleComposerDrop = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+        if (!canSendText) return;
+        event.preventDefault();
+        event.stopPropagation();
+        setComposerDragActive(false);
+        const files = Array.from(event.dataTransfer?.files || []);
+        if (files.length === 0) return;
+        void uploadComposerMediaFiles(files);
+    }, [canSendText, uploadComposerMediaFiles]);
 
     const openComposerMediaPicker = useCallback((messageType: 'image' | 'video' | 'document') => {
         setShowMediaComposer(true);
         if (composerMediaType !== messageType) {
             resetComposerMedia(messageType);
         } else {
+            setComposerQueuedMedia([]);
             setComposerMediaError(null);
             setComposerMediaType(messageType);
         }
@@ -3418,23 +6416,44 @@ export default function App() {
     const handleQuickReplyPick = (item: QuickReply) => {
         const text = typeof item.text === 'string' ? item.text.trim() : '';
         const quickReplyType = normalizeQuickReplyMessageType(item.message_type);
-        const mediaUrl = normalizeQuickReplyMediaUrl(item.media_url);
-        const mediaStorage = normalizeQuickReplyMediaStorage(item.media_storage);
-        const mediaAssetKey = normalizeQuickReplyMediaAssetKey(item.media_asset_key);
-        const mediaMimeType = normalizeQuickReplyMediaMimeType(item.media_mime_type);
-        const mediaSizeBytes = normalizeQuickReplyMediaSizeBytes(item.media_size_bytes);
-        const mediaFilename = normalizeQuickReplyMediaFilename(item.media_filename);
+        const mediaFallbackType: 'image' | 'video' | 'document' = quickReplyType === 'text' ? 'image' : quickReplyType;
+        let normalizedMediaItems = quickReplyType === 'text'
+            ? []
+            : normalizeQuickReplyMediaItems(item.media_items, mediaFallbackType);
+        if (quickReplyType !== 'text' && normalizedMediaItems.length === 0) {
+            normalizedMediaItems = buildLegacyQuickReplyMediaItems(item, mediaFallbackType);
+        }
+        const sendMediaList = normalizedMediaItems
+            .map((mediaItem) => buildSendMediaPayloadFromQuickReplyMediaItem(mediaItem, mediaFallbackType))
+            .filter((payload): payload is SendMediaPayload => Boolean(payload));
+        const firstMediaPayload = sendMediaList[0] || null;
+        const firstMediaMeta = normalizedMediaItems[0] || null;
         if (!text && quickReplyType === 'text') return;
 
-        if (quickReplyType === 'text' || (!mediaUrl && !mediaAssetKey)) {
+        if (quickReplyType === 'text' || !firstMediaPayload) {
             resetComposerMedia('none');
+            setComposerQueuedMedia([]);
         } else {
-            setComposerMediaType(quickReplyType);
-            setComposerMediaUrl(mediaUrl);
-            setComposerMediaAssetKey(mediaStorage === 'r2' ? mediaAssetKey : '');
-            setComposerMediaMimeType(mediaMimeType);
-            setComposerMediaSizeBytes(mediaSizeBytes);
-            setComposerMediaFilename(quickReplyType === 'document' ? (mediaFilename || 'document') : '');
+            setComposerMediaType(firstMediaPayload.type);
+            setComposerMediaUrl(firstMediaPayload.url || '');
+            setComposerMediaId(firstMediaPayload.id || '');
+            setComposerMediaAssetKey(firstMediaPayload.assetKey || '');
+            setComposerMediaMimeType(
+                firstMediaMeta
+                    ? normalizeQuickReplyMediaMimeType(firstMediaMeta.media_mime_type)
+                    : ''
+            );
+            setComposerMediaSizeBytes(
+                firstMediaMeta
+                    ? normalizeQuickReplyMediaSizeBytes(firstMediaMeta.media_size_bytes)
+                    : null
+            );
+            setComposerMediaFilename(
+                firstMediaPayload.type === 'document'
+                    ? (firstMediaPayload.filename || normalizeQuickReplyMediaFilename(firstMediaMeta?.media_filename) || 'document')
+                    : ''
+            );
+            setComposerQueuedMedia(sendMediaList.slice(1));
             setComposerMediaError(null);
             setShowMediaComposer(true);
         }
@@ -3455,61 +6474,11 @@ export default function App() {
         }
     }, [lastInboundMs]);
 
-    const buildOutgoingPayloadFromMessage = useCallback((msg: Message): {
-        text: string;
-        media?: { type: 'image' | 'video' | 'document'; url?: string; assetKey?: string; filename?: string };
-    } | null => {
+    const buildOutgoingPayloadFromMessage = useCallback((msg: Message): OutgoingMessagePayload | null => {
         if (!msg?.key?.fromMe) return null;
-        const text =
-            typeof msg?.message?.conversation === 'string'
-                ? msg.message.conversation.trim()
-                : typeof msg?.message?.extendedTextMessage?.text === 'string'
-                    ? msg.message.extendedTextMessage.text.trim()
-                    : '';
-        const imageUrl = typeof msg?.message?.imageMessage?.url === 'string' ? msg.message.imageMessage.url.trim() : '';
-        const imageAssetKey = typeof msg?.message?.imageMessage?.assetKey === 'string' ? msg.message.imageMessage.assetKey.trim() : '';
-        if (imageUrl || imageAssetKey) {
-            return {
-                text,
-                media: {
-                    type: 'image',
-                    ...(imageUrl ? { url: imageUrl } : {}),
-                    ...(imageAssetKey ? { assetKey: imageAssetKey } : {})
-                }
-            };
-        }
-        const videoUrl = typeof msg?.message?.videoMessage?.url === 'string' ? msg.message.videoMessage.url.trim() : '';
-        const videoAssetKey = typeof msg?.message?.videoMessage?.assetKey === 'string' ? msg.message.videoMessage.assetKey.trim() : '';
-        if (videoUrl || videoAssetKey) {
-            return {
-                text,
-                media: {
-                    type: 'video',
-                    ...(videoUrl ? { url: videoUrl } : {}),
-                    ...(videoAssetKey ? { assetKey: videoAssetKey } : {})
-                }
-            };
-        }
-        const documentUrl = typeof msg?.message?.documentMessage?.url === 'string' ? msg.message.documentMessage.url.trim() : '';
-        const documentAssetKey =
-            typeof msg?.message?.documentMessage?.assetKey === 'string'
-                ? msg.message.documentMessage.assetKey.trim()
-                : '';
-        if (documentUrl || documentAssetKey) {
-            const filename =
-                typeof msg?.message?.documentMessage?.fileName === 'string'
-                    ? msg.message.documentMessage.fileName.trim()
-                    : '';
-            return {
-                text,
-                media: {
-                    type: 'document',
-                    ...(documentUrl ? { url: documentUrl } : {}),
-                    ...(documentAssetKey ? { assetKey: documentAssetKey } : {}),
-                    ...(filename ? { filename } : {})
-                }
-            };
-        }
+        const text = trimString(msg?.message?.conversation) || trimString(msg?.message?.extendedTextMessage?.text);
+        const media = buildOutgoingMediaFromMessage(msg);
+        if (media) return { text, media };
         if (!text) return null;
         return { text };
     }, []);
@@ -3525,7 +6494,7 @@ export default function App() {
             : (selectedChatId || '');
         if (!jid) return;
 
-        const resendTempId = `tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const resendTempId = createClientTempMessageId();
         setAllMessages((prev) =>
             prev.map((msg) =>
                 msg.key?.id === messageId
@@ -3550,24 +6519,12 @@ export default function App() {
             },
             (ack: any) => {
                 if (!ack?.success) {
-                    setAllMessages((prev) =>
-                        prev.map((msg) =>
-                            msg.key?.id === resendTempId
-                                ? { ...msg, status: 'failed' }
-                                : msg
-                        )
-                    );
+                    setAllMessages((prev) => markMessageStatusById(prev, resendTempId, 'failed'));
                     return;
                 }
-                const realMessageId = typeof ack?.data?.messageId === 'string' ? ack.data.messageId : '';
+                const realMessageId = trimString(ack?.data?.messageId);
                 if (!realMessageId) return;
-                setAllMessages((prev) =>
-                    prev.map((msg) =>
-                        msg.key?.id === resendTempId
-                            ? { ...msg, key: { ...msg.key, id: realMessageId }, status: 'sent' }
-                            : msg
-                    )
-                );
+                setAllMessages((prev) => replaceTempMessageIdAndStatus(prev, resendTempId, realMessageId, 'sent'));
             }
         );
     }, [activeProfileId, allMessages, buildOutgoingPayloadFromMessage, selectedChatId, socket]);
@@ -3576,97 +6533,63 @@ export default function App() {
         if (!socket || !activeProfileId || !selectedChatId) return;
         if (composerMediaUploading) return;
         const outgoingText = messageText.trim();
-        const mediaUrl = composerMediaUrl.trim();
-        const mediaAssetKey = composerMediaAssetKey.trim();
-        const mediaType = composerMediaType;
-        const mediaFilename = composerMediaFilename.trim();
-        const tempMessageId = `tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        const sendMedia =
-            (mediaType === 'image' || mediaType === 'video' || mediaType === 'document') && (mediaUrl || mediaAssetKey)
-                ? {
-                    type: mediaType,
-                    ...(mediaUrl ? { url: mediaUrl } : {}),
-                    ...(mediaAssetKey ? { assetKey: mediaAssetKey } : {}),
-                    ...(mediaType === 'document' && mediaFilename ? { filename: mediaFilename } : {})
-                }
-                : null;
-
-        if (!outgoingText && !sendMedia) return;
-
-        socket.emit(
-            'sendMessage',
-            {
-                profileId: activeProfileId,
-                jid: selectedChatId,
-                text: outgoingText,
-                ...(sendMedia ? { media: sendMedia } : {}),
-                clientTempId: tempMessageId
-            },
-            (ack: any) => {
-                if (!ack?.success) {
-                    setAllMessages((prev) =>
-                        prev.map((msg) =>
-                            msg.key?.id === tempMessageId
-                                ? { ...msg, status: 'failed' }
-                                : msg
-                        )
-                    );
-                    return;
-                }
-                const realMessageId = typeof ack?.data?.messageId === 'string' ? ack.data.messageId : '';
-                if (!realMessageId) return;
-                setAllMessages((prev) =>
-                    prev.map((msg) =>
-                        msg.key?.id === tempMessageId
-                            ? { ...msg, key: { ...msg.key, id: realMessageId }, status: 'sent' }
-                            : msg
-                    )
-                );
-            }
+        const primaryMedia = buildSendMediaFromComposerState(
+            composerMediaType,
+            composerMediaId.trim(),
+            composerMediaUrl.trim(),
+            composerMediaAssetKey.trim(),
+            composerMediaFilename.trim()
         );
-        const tempMsg: Message = {
-            key: { id: tempMessageId, remoteJid: selectedChatId, fromMe: true },
-            message: (() => {
-                if (!sendMedia) return { conversation: outgoingText };
-                if (sendMedia.type === 'image') {
-                    return {
-                        ...(outgoingText ? { conversation: outgoingText } : {}),
-                        imageMessage: {
-                            caption: outgoingText,
-                            assetKey: sendMedia.assetKey,
-                            url: sendMedia.url
-                        }
-                    };
-                }
-                if (sendMedia.type === 'video') {
-                    return {
-                        ...(outgoingText ? { conversation: outgoingText } : {}),
-                        videoMessage: {
-                            caption: outgoingText,
-                            assetKey: sendMedia.assetKey,
-                            url: sendMedia.url
-                        }
-                    };
-                }
-                return {
-                    ...(outgoingText ? { conversation: outgoingText } : {}),
-                    documentMessage: {
-                        caption: outgoingText,
-                        assetKey: sendMedia.assetKey,
-                        fileName: sendMedia.filename || 'document',
-                        url: sendMedia.url
+        const queuedMedia = composerQueuedMedia.filter((entry) => (
+            Boolean(entry?.id || entry?.url || entry?.assetKey)
+        ));
+        const mediaBatch = primaryMedia ? [primaryMedia, ...queuedMedia] : queuedMedia;
+
+        if (!outgoingText && mediaBatch.length === 0) return;
+
+        const pendingMessages: Message[] = [];
+        const emitSend = (text: string, media: SendMediaPayload | null) => {
+            const tempMessageId = createClientTempMessageId();
+            socket.emit(
+                'sendMessage',
+                {
+                    profileId: activeProfileId,
+                    jid: selectedChatId,
+                    text,
+                    ...(media ? { media } : {}),
+                    clientTempId: tempMessageId
+                },
+                (ack: any) => {
+                    if (!ack?.success) {
+                        setAllMessages((prev) => markMessageStatusById(prev, tempMessageId, 'failed'));
+                        return;
                     }
-                };
-            })(),
-            messageTimestamp: Math.floor(Date.now() / 1000),
-            status: 'pending',
-            agent: {
-                user_id: session?.user?.id,
-                name: currentAgentName,
-                color: '#6b7280'
-            }
+                    const realMessageId = trimString(ack?.data?.messageId);
+                    if (!realMessageId) return;
+                    setAllMessages((prev) => replaceTempMessageIdAndStatus(prev, tempMessageId, realMessageId, 'sent'));
+                }
+            );
+            pendingMessages.push(buildOptimisticPendingMessage({
+                tempMessageId,
+                remoteJid: selectedChatId,
+                outgoingText: text,
+                sendMedia: media,
+                agentUserId: session?.user?.id,
+                agentName: currentAgentName
+            }));
         };
-        setAllMessages(prev => [tempMsg, ...prev]);
+
+        if (mediaBatch.length === 0) {
+            emitSend(outgoingText, null);
+        } else {
+            mediaBatch.forEach((media, index) => {
+                emitSend(index === 0 ? outgoingText : '', media);
+            });
+        }
+
+        if (pendingMessages.length > 0) {
+            setAllMessages((prev) => [...pendingMessages.reverse(), ...prev]);
+        }
         persistDraft('', activeProfileId, selectedChatId);
         setMessageText('');
         resetComposerMedia('none');
@@ -3674,11 +6597,16 @@ export default function App() {
 
     const openSettingsFromMore = useCallback(() => {
         if (isUiFeatureHidden(SETTINGS_UI_FEATURE_KEY)) return;
+        setShowAnalytics(false);
+        setShowContactInfo(false);
         setWorkspaceSection('team-inbox');
+        if (isMobile) {
+            setSelectedChatId(null);
+        }
         requestAnimationFrame(() => {
             setActiveView('settings');
         });
-    }, [isUiFeatureHidden]);
+    }, [isMobile, isUiFeatureHidden]);
 
     const openAnalyticsFromMore = useCallback(() => {
         if (isUiFeatureHidden('analytics')) return;
@@ -3717,6 +6645,62 @@ export default function App() {
             setHumanTakeoverSaving(false);
         }
     }, [activeProfileId, selectedChatId, selectedHumanTakeover, socket]);
+
+    const handleCallAction = useCallback(async (kind: 'voice' | 'video') => {
+        if (!session?.access_token) {
+            showToast('Please login again before checking call permission.', 'error');
+            return;
+        }
+        if (!activeProfileId) {
+            showToast('No active profile selected.', 'error');
+            return;
+        }
+        if (!selectedChatId) return;
+        if (selectedChatId.endsWith('@g.us')) {
+            showToast('Calls are not supported for groups yet.', 'error');
+            return;
+        }
+
+        const userWaId = getCleanId(selectedChatId).replace(/\D/g, '');
+        if (!userWaId) {
+            showToast('This contact has no valid WhatsApp ID for calling.', 'error');
+            return;
+        }
+
+        setCallActionLoading(kind);
+        try {
+            const params = new URLSearchParams({
+                profileId: activeProfileId,
+                user_wa_id: userWaId
+            });
+            const response = await fetch(`${SOCKET_URL}/api/waba/call-permissions?${params.toString()}`, {
+                method: 'GET',
+                headers: {
+                    Authorization: `Bearer ${session.access_token}`
+                }
+            });
+            const payload = await response.json().catch(() => null);
+            if (!response.ok || payload?.success === false) {
+                throw new Error(payload?.error || `Failed with status ${response.status}`);
+            }
+
+            const { permissionStatus, canStartCall } = extractCallPermissionSummary(payload);
+            const feedback = getCallPermissionFeedback(kind, permissionStatus, canStartCall, userWaId);
+            showToast(feedback.message, feedback.tone);
+            if (feedback.logMessage) {
+                pushLog(feedback.logMessage, 'info');
+            }
+        } catch (error: any) {
+            const rawMessage = String(error?.message || '').toLowerCase();
+            if (isCallingApiNotEnabledError(rawMessage)) {
+                showToast('Meta Calling API is not enabled for this phone number yet. Enable WhatsApp Cloud Calling for this number first.', 'error');
+            } else {
+                showToast(error?.message || 'Failed to check call permission.', 'error');
+            }
+        } finally {
+            setCallActionLoading(null);
+        }
+    }, [activeProfileId, selectedChatId, session?.access_token, showToast, pushLog]);
 
     const handleStartWorkflow = () => {
         if (!socket || !selectedChatId || !activeProfileId || !startWorkflowId) return;
@@ -3811,11 +6795,7 @@ export default function App() {
                     ? { ...workflow, run_on_new_chat: false }
                 : workflow
         );
-        const nextDrafts = { ...workflowDrafts };
-        nextWorkflows.forEach((workflow: any) => {
-            if (typeof nextDrafts[workflow.id] === 'string') return;
-            nextDrafts[workflow.id] = JSON.stringify(Array.isArray(workflow.actions) ? workflow.actions : [], null, 2);
-        });
+        const nextDrafts = ensureWorkflowDraftEntries(nextWorkflows, workflowDrafts);
 
         setWorkflows(nextWorkflows);
         setWorkflowDrafts(nextDrafts);
@@ -3835,11 +6815,7 @@ export default function App() {
                 ? { ...workflow, enabled: nextEnabled }
                 : workflow
         );
-        const nextDrafts = { ...workflowDrafts };
-        nextWorkflows.forEach((workflow: any) => {
-            if (typeof nextDrafts[workflow.id] === 'string') return;
-            nextDrafts[workflow.id] = JSON.stringify(Array.isArray(workflow.actions) ? workflow.actions : [], null, 2);
-        });
+        const nextDrafts = ensureWorkflowDraftEntries(nextWorkflows, workflowDrafts);
 
         setWorkflows(nextWorkflows);
         setWorkflowDrafts(nextDrafts);
@@ -3869,10 +6845,7 @@ export default function App() {
         const existingIds = new Set(
             automationWorkflows.map((workflow: any) => String(workflow?.id ?? '').trim()).filter(Boolean)
         );
-        let copiedId = `wf-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-        while (existingIds.has(copiedId)) {
-            copiedId = `wf-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-        }
+        const copiedId = createUniqueWorkflowId(existingIds);
 
         const existingNames = new Set(
             automationWorkflows
@@ -3880,37 +6853,14 @@ export default function App() {
                 .filter(Boolean)
                 .map((name: string) => name.toLowerCase())
         );
-        const sourceName = typeof sourceWorkflow?.name === 'string' ? sourceWorkflow.name.trim() : '';
-        let copiedName = sourceName ? `${sourceName}-copy` : 'workflow-copy';
-        let copyNameIndex = 2;
-        while (existingNames.has(copiedName.toLowerCase())) {
-            copiedName = sourceName ? `${sourceName}-copy-${copyNameIndex}` : `workflow-copy-${copyNameIndex}`;
-            copyNameIndex += 1;
-        }
-
-        const sourceActions = Array.isArray(sourceWorkflow.actions) ? sourceWorkflow.actions : [];
-        const copiedActions = JSON.parse(JSON.stringify(sourceActions));
-        const copiedBuilder = sourceWorkflow?.builder && Array.isArray(sourceWorkflow.builder.nodes)
-            ? JSON.parse(JSON.stringify(sourceWorkflow.builder))
-            : buildBuilderFromActions(copiedActions, copiedId);
-        if (copiedBuilder && typeof copiedBuilder === 'object') {
-            copiedBuilder.id = copiedId;
-        }
-
-        const sourceTrigger = typeof sourceWorkflow?.trigger_keyword === 'string'
-            ? sourceWorkflow.trigger_keyword.trim()
-            : '';
-
-        const copiedWorkflow = {
-            ...sourceWorkflow,
-            id: copiedId,
-            name: copiedName,
-            trigger_keyword: sourceTrigger,
-            run_on_new_chat: false,
-            enabled: false,
-            actions: copiedActions,
-            builder: copiedBuilder
-        };
+        const sourceName = trimString(sourceWorkflow?.name);
+        const copiedName = createCopiedWorkflowName(existingNames, sourceName);
+        const { copiedWorkflow, copiedActions } = buildCopiedWorkflowRecord(
+            sourceWorkflow,
+            copiedId,
+            copiedName,
+            buildBuilderFromActions
+        );
 
         const nextWorkflows = [...automationWorkflows, copiedWorkflow];
         const nextDrafts = {
@@ -3951,17 +6901,26 @@ export default function App() {
         const mergedTags = [...systemTags, ...nextLabelTags];
         const aliasKeys = buildContactJidVariants(selectedChatId);
         const canonicalKey = canonicalContactJid(selectedChatId) || selectedChatId;
+        const nextAlias = contactDraftName.trim();
 
         // Optimistic local update so labels appear immediately before socket round-trip.
         setContacts((prev) => {
             const next = { ...prev };
             const prevMeta = pickContactMetaByJid(next, canonicalKey) || existingContact || {};
+            const currentWhatsappName = normalizeContactNameValue((prevMeta as any).whatsappName);
             aliasKeys.forEach((key) => {
                 if (key !== canonicalKey) delete next[key];
             });
             next[canonicalKey] = {
                 ...prevMeta,
-                name: contactDraftName.trim() || prevMeta.name || getCleanId(canonicalKey),
+                name: resolveContactDisplayName(
+                    nextAlias,
+                    currentWhatsappName,
+                    (prevMeta as any).name,
+                    canonicalKey
+                ),
+                alias: nextAlias || null,
+                whatsappName: currentWhatsappName || null,
                 tags: mergedTags
             };
             return next;
@@ -3970,11 +6929,11 @@ export default function App() {
         socket.emit('contact.update', {
             profileId: activeProfileId,
             jid: selectedChatId,
-            name: contactDraftName.trim(),
+            alias: nextAlias,
             tags: mergedTags
         });
         setContactDirty(false);
-        pushLog('Contact saved.', 'info');
+        pushLog('Alias saved.', 'info');
     };
 
     const handleAddTag = () => {
@@ -4011,95 +6970,32 @@ export default function App() {
         }
 
         let components: any[] | undefined;
-        let namedBodyAttributes: Array<{ scope: 'body'; index: number; key: string; value: string }> = [];
-        if (templateComponents.trim()) {
-            try {
-                const parsed = JSON.parse(templateComponents);
-                if (!Array.isArray(parsed)) {
-                    alert('Template components must be a JSON array.');
-                    return;
-                }
-                components = parsed;
-            } catch {
-                alert('Invalid JSON in template components.');
+        let namedBodyAttributes: TemplateBodyAttributePayload[] = [];
+        const parsedTemplateInput = parseTemplateComponentsInput(templateComponents);
+        if (parsedTemplateInput.error) {
+            alert(parsedTemplateInput.error);
+            return;
+        }
+        if (parsedTemplateInput.components) {
+            components = parsedTemplateInput.components;
+        } else if (selectedTemplateOption) {
+            const templateBuildResult = buildTemplateFromSelection({
+                selectedTemplateHeaderFormat,
+                requiredTemplateHeaderAttributeCount,
+                templateHeaderAttributes,
+                templateHeaderMediaUrl,
+                templateHeaderDocumentFilename,
+                requiredTemplateBodyAttributeCount,
+                templateBodyAttributes,
+                templateBodyAttributeNames,
+                selectedTemplateBodyText: selectedTemplateBody?.text
+            });
+            if (templateBuildResult.error) {
+                alert(templateBuildResult.error);
                 return;
             }
-        } else if (selectedTemplateOption) {
-            const built: any[] = [];
-            const headerType = selectedTemplateHeaderFormat;
-            const mediaLink = templateHeaderMediaUrl.trim();
-            if (requiredTemplateHeaderAttributeCount > 0) {
-                const missingHeaderParamIndex = templateHeaderAttributes.findIndex((value) => !value.trim());
-                if (missingHeaderParamIndex >= 0) {
-                    alert(`Header attribute {{${missingHeaderParamIndex + 1}}} is required.`);
-                    return;
-                }
-                built.push({
-                    type: 'header',
-                    parameters: templateHeaderAttributes.map((value) => ({
-                        type: 'text',
-                        text: value.trim()
-                    }))
-                });
-            } else if (headerType === 'IMAGE' || headerType === 'VIDEO' || headerType === 'DOCUMENT') {
-                if (!mediaLink) {
-                    alert(`Template header requires ${headerType.toLowerCase()} link.`);
-                    return;
-                }
-                if (headerType === 'DOCUMENT') {
-                    built.push({
-                        type: 'header',
-                        parameters: [
-                            {
-                                type: 'document',
-                                document: {
-                                    link: mediaLink,
-                                    ...(templateHeaderDocumentFilename.trim()
-                                        ? { filename: templateHeaderDocumentFilename.trim() }
-                                        : {})
-                                }
-                            }
-                        ]
-                    });
-                } else if (headerType === 'IMAGE') {
-                    built.push({
-                        type: 'header',
-                        parameters: [{ type: 'image', image: { link: mediaLink } }]
-                    });
-                } else if (headerType === 'VIDEO') {
-                    built.push({
-                        type: 'header',
-                        parameters: [{ type: 'video', video: { link: mediaLink } }]
-                    });
-                }
-            }
-
-            if (requiredTemplateBodyAttributeCount > 0) {
-                const missingBodyParamIndex = templateBodyAttributes.findIndex((value) => !value.trim());
-                if (missingBodyParamIndex >= 0) {
-                    alert(`Body attribute {{${missingBodyParamIndex + 1}}} is required.`);
-                    return;
-                }
-                const missingBodyAttributeNameIndex = templateBodyAttributeNames.findIndex((value) => !value.trim());
-                if (missingBodyAttributeNameIndex >= 0) {
-                    alert(`Body attribute label for {{${missingBodyAttributeNameIndex + 1}}} is required.`);
-                    return;
-                }
-                built.push({
-                    type: 'body',
-                    parameters: templateBodyAttributes.map((value) => ({
-                        type: 'text',
-                        text: value.trim()
-                    }))
-                });
-                namedBodyAttributes = templateBodyAttributes.map((value, index) => ({
-                    scope: 'body' as const,
-                    index: index + 1,
-                    key: (templateBodyAttributeNames[index] || inferTemplateVariableLabel(selectedTemplateBody?.text, index + 1, 'body')).trim(),
-                    value: value.trim()
-                }));
-            }
-            components = built.length > 0 ? built : undefined;
+            components = templateBuildResult.components;
+            namedBodyAttributes = templateBuildResult.bodyAttributes;
         }
 
         socket.emit('sendTemplate', {
@@ -4119,11 +7015,12 @@ export default function App() {
         setContacts({});
         setSelectedChatId(null);
         setUnreadMessagesByChat({});
+        setChatReadCursorByChat({});
         seenIncomingMessageKeysRef.current.clear();
         setShowTemplateComposer(false);
         setConnectionStatus('connecting'); // Anticipate status update
         setLoadingChats(true);
-        socket?.emit('switchProfile', id);
+        lastSwitchProfileEmitRef.current = { socket: null, profileId: null };
         setShowProfileMenu(false);
     };
 
@@ -4134,7 +7031,6 @@ export default function App() {
     const submitAddProfile = () => {
         if (newProfileName.trim() && !isCreatingProfile) {
             setIsCreatingProfile(true);
-            console.log('Submitting new profile:', newProfileName.trim());
             socket?.emit('addProfile', newProfileName.trim());
         }
     };
@@ -4152,32 +7048,91 @@ export default function App() {
         }
     };
 
-    const handleDeleteProfile = (profileId: string, name: string) => {
+    const handleDeleteProfile = (profileId: string, _name: string) => {
         socket?.emit('deleteProfile', profileId);
         if (activeProfileId === profileId) {
-            // If we deleted the active profile, switch to default or first available
-            const next = profiles.find(p => p.id !== profileId);
+            const remainingProfiles = profiles.filter((p) => p.id !== profileId);
+            const openProfiles = remainingProfiles.filter((p: any) => p?.status === 'open');
+            const next = openProfiles[0] || remainingProfiles[0];
             if (next) {
                 handleSwitchProfile(next.id);
             } else {
-                handleSwitchProfile('default');
+                setActiveProfileId(null);
+                setAllMessages([]);
+                setContacts({});
+                setSelectedChatId(null);
+                setUnreadMessagesByChat({});
+                setChatReadCursorByChat({});
+                setLoadingChats(false);
+                setConnectionStatus('close');
             }
         }
     };
 
     const handleOpenChat = useCallback((chatId: string) => {
         setSelectedChatId(chatId);
-        const chatKey = canonicalContactJid(chatId);
-        if (chatKey) {
-            setUnreadMessagesByChat((prev) => {
-                if (!(chatKey in prev)) return prev;
-                const next = { ...prev };
-                delete next[chatKey];
-                return next;
-            });
-        }
+        markChatAsRead(chatId);
         setChatOpenNonce((prev) => prev + 1);
-    }, []);
+    }, [markChatAsRead]);
+
+    useEffect(() => {
+        const consumeNotificationChatParam = (rawUrl: string | null | undefined) => {
+            if (!rawUrl) return;
+            let nextChatId = '';
+            try {
+                const parsed = new URL(rawUrl, window.location.origin);
+                nextChatId = parsed.searchParams.get('chat') || '';
+                if (!nextChatId) return;
+                parsed.searchParams.delete('chat');
+                window.history.replaceState({}, '', parsed.pathname + parsed.search + parsed.hash);
+            } catch {
+                return;
+            }
+
+            setShowAnalytics(false);
+            setWorkspaceSection('team-inbox');
+            handleOpenChat(nextChatId);
+        };
+
+        consumeNotificationChatParam(window.location.href);
+
+        const handleNativePushAction = (event: Event) => {
+            const detail = (event as CustomEvent<NativePushActionEventDetail>).detail;
+            pushLog(
+                `[Native Push] Action=${detail?.actionId || 'tap'} app=${detail?.appVisibility || 'unknown'} channel=${NATIVE_PUSH_CHANNEL_ID}.`,
+                'info'
+            );
+            const payloadData = detail?.payload?.notification?.data as Record<string, unknown> | undefined;
+            const urlFromData = typeof payloadData?.url === 'string' ? payloadData.url : '';
+            const chatFromData = typeof payloadData?.chat === 'string' ? payloadData.chat : '';
+
+            if (urlFromData) {
+                consumeNotificationChatParam(urlFromData);
+                return;
+            }
+            if (chatFromData) {
+                consumeNotificationChatParam(`/?chat=${encodeURIComponent(chatFromData)}`);
+            }
+        };
+
+        window.addEventListener(NATIVE_PUSH_ACTION_EVENT, handleNativePushAction as EventListener);
+
+        const handleServiceWorkerMessage = (event: MessageEvent<any>) => {
+            if (event?.data?.type !== 'notification-click') return;
+            consumeNotificationChatParam(event.data?.url);
+        };
+
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.addEventListener('message', handleServiceWorkerMessage);
+        }
+
+        return () => {
+            window.removeEventListener(NATIVE_PUSH_ACTION_EVENT, handleNativePushAction as EventListener);
+            if ('serviceWorker' in navigator) {
+                navigator.serviceWorker.removeEventListener('message', handleServiceWorkerMessage);
+            }
+        };
+    }, [handleOpenChat, pushLog]);
 
     const handleNewChat = () => {
         if (!newPhoneNumber.trim()) return;
@@ -4254,7 +7209,7 @@ export default function App() {
                 forcedMessage={hostAuthError}
                 onLogin={(nextSession) => {
                     setHostAuthError(null);
-                    setSession(nextSession);
+                    updateSessionState(nextSession);
                     setAuthChecking(false);
                 }}
             />
@@ -4272,7 +7227,7 @@ export default function App() {
             { id: 'broadcast', label: 'Broadcast', icon: Send },
             { id: 'chatbots', label: 'Chatbot', icon: Bot },
             { id: 'contacts', label: 'Contacts', icon: Users },
-            { id: 'more', label: 'Analytic', icon: BarChart3 }
+            { id: 'more', label: 'Analytics', icon: BarChart3 }
         ];
 
     const showUiControlsSkeleton = Boolean(session?.access_token) && uiControlsLoading;
@@ -4282,60 +7237,254 @@ export default function App() {
 
     const activeWorkspaceLabel = workspaceTabs.find(tab => tab.id === workspaceSection)?.label || 'Workspace';
     const defaultWorkspaceSection = workspaceTabs[0]?.id || 'team-inbox';
+    const hideGlobalHeaderOnMobileInbox = isMobile
+        && activeView === 'dashboard'
+        && workspaceSection === 'team-inbox'
+        && !showAnalytics;
+    const shouldShowMobileBottomNav = isMobile
+        && activeView === 'dashboard'
+        && (showAnalytics || !(workspaceSection === 'team-inbox' && Boolean(selectedChatId)))
+        && !showContactInfo;
+    const mobileWorkspaceTabs = workspaceTabs.filter((tab) =>
+        (MOBILE_BOTTOM_TAB_SECTIONS as readonly string[]).includes(tab.id)
+    );
     const broadcastNav: Array<{ id: 'template-library' | 'my-templates' | 'broadcast-history' | 'scheduled-broadcasts'; label: string }> = [
         { id: 'template-library', label: 'Create Template' },
         { id: 'my-templates', label: 'My Templates' },
         { id: 'broadcast-history', label: 'Broadcast History' },
         { id: 'scheduled-broadcasts', label: 'Scheduled Broadcasts' }
     ];
+    const mobileSafeInsetsStyle: React.CSSProperties | undefined = isMobile
+        ? {
+            paddingLeft: 'max(env(safe-area-inset-left), 0px)',
+            paddingRight: 'max(env(safe-area-inset-right), 0px)'
+        }
+        : undefined;
+    const mobileHeaderOffsetStyle: React.CSSProperties | undefined = isMobile
+        ? {
+            paddingLeft: 'max(env(safe-area-inset-left), 0px)',
+            paddingRight: 'max(env(safe-area-inset-right), 0px)',
+            paddingTop: 'calc(64px + env(safe-area-inset-top))'
+        }
+        : undefined;
+    const mobileBottomNavPaddingStyle: React.CSSProperties | undefined = isMobile && shouldShowMobileBottomNav
+        ? {
+            paddingBottom: 'calc(76px + env(safe-area-inset-bottom))'
+        }
+        : undefined;
+    const mobileBottomNavContentPaddingStyle: React.CSSProperties | undefined = isMobile && shouldShowMobileBottomNav
+        ? {
+            paddingBottom: 'calc(92px + env(safe-area-inset-bottom))'
+        }
+        : undefined;
+    const handleToggleChatAssigneeMenu = (chatId: string) => {
+        if (!teamUsers.length && !teamUsersLoading) fetchTeamUsers();
+        setAssignMenuContactId((prev) => (prev === chatId ? null : chatId));
+    };
+    const webChatListRowProps: DesktopChatListRowProps = {
+        chats: chatListForView,
+        contacts,
+        selectedChatId,
+        onOpenChat: handleOpenChat,
+        onToggleAssigneeMenu: handleToggleChatAssigneeMenu
+    };
+    const renderChatListItem = (chat: Chat, style?: React.CSSProperties) => {
+        const contactMeta = pickContactMetaByJid(contacts, chat.id) || {};
+        const assigneeName = contactMeta.assigneeName || null;
+        const assigneeColor = contactMeta.assigneeColor || '#6b7280';
+        const contactTags = splitContactTags(contactMeta.tags).labelTags;
+        const primaryTag = contactTags[0] || null;
+        const extraTagCount = Math.max(0, contactTags.length - (primaryTag ? 1 : 0));
+        const assigneeNode = assigneeName ? (
+            <button
+                type="button"
+                onClick={(e) => {
+                    e.stopPropagation();
+                    handleToggleChatAssigneeMenu(chat.id);
+                }}
+                className="px-1.5 py-0.5 text-[9px] rounded uppercase font-bold border tracking-tight hover:opacity-85 transition-all"
+                style={{
+                    backgroundColor: withHexAlpha(assigneeColor, '20', '#f3f4f6'),
+                    borderColor: withHexAlpha(assigneeColor, '66', '#d1d5db'),
+                    color: textColor(assigneeColor, '#374151')
+                }}
+                title={`Staff ${assigneeName}`}
+            >
+                <span className="inline-flex max-w-[110px] items-center truncate">Staff {assigneeName}</span>
+            </button>
+        ) : chat.id.endsWith('@g.us') ? (
+            <span className="px-1.5 py-0.5 bg-[#f0f2f5] text-[#54656f] text-[9px] rounded uppercase font-bold border border-[#eceff1] tracking-tight">Staff Group</span>
+        ) : (
+            <button
+                type="button"
+                onClick={(e) => {
+                    e.stopPropagation();
+                    handleToggleChatAssigneeMenu(chat.id);
+                }}
+                className="px-1.5 py-0.5 bg-[#f8f9fa] text-[#9ca3af] text-[9px] rounded uppercase font-bold border border-[#eceff1] tracking-tight hover:bg-[#f0f2f5] transition-all"
+            >
+                <span className="inline-flex max-w-[110px] items-center truncate">Staff Unassigned</span>
+            </button>
+        );
+        return (
+            <div key={`chat-row-${chat.id}`} style={style}>
+                <ContactListItem
+                    id={chat.id}
+                    name={chat.name}
+                    preview={chat.lastMessage || ''}
+                    timestampLabel={chat.timestamp ? new Date(chat.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
+                    isSelected={selectedChatId === chat.id}
+                    isGroup={chat.id.endsWith('@g.us')}
+                    phoneLabel={
+                        (chat.id.endsWith('@s.whatsapp.net') || chat.id.endsWith('@lid'))
+                            && getCleanId(chat.name) !== getCleanId(chat.id)
+                            ? formatPhoneNumber(getCleanId(chat.id))
+                            : undefined
+                    }
+                    badgeCount={chat.unreadCount}
+                    primaryTag={primaryTag}
+                    extraTagCount={extraTagCount}
+                    assignee={assigneeNode}
+                    onClick={() => handleOpenChat(chat.id)}
+                />
+            </div>
+        );
+    };
+
+    const activeProfileExists = Boolean(
+        activeProfileId
+        && profiles.some((profile: any) => trimString(profile?.id) === activeProfileId)
+    );
+    const debugProfileSummary = profiles
+        .slice(0, 8)
+        .map((profile: any) => ({
+            id: trimString(profile?.id),
+            status: trimString(profile?.status) || 'unknown',
+            companyId: trimString(profile?.company_id),
+            name: trimString(profile?.name)
+        }));
+    const debugSnapshot = {
+        ts: new Date().toISOString(),
+        env: {
+            mode: import.meta.env.MODE,
+            socketUrl: SOCKET_URL,
+            native: Capacitor.isNativePlatform()
+        },
+        session: {
+            userId: session?.user?.id || null,
+            email: session?.user?.email || null,
+            companyId: resolveCompanyIdFromLocation() || trimString((session?.user?.user_metadata as any)?.company_id) || trimString((session?.user?.app_metadata as any)?.company_id) || null,
+            expiresAt: session?.expires_at || null,
+            accessToken: session?.access_token ? `len ${session.access_token.length}` : null
+        },
+        socket: {
+            connected: Boolean(socket?.connected),
+            id: socket?.id || null,
+            transport: socket?.io?.engine?.transport?.name || null
+        },
+        state: {
+            isAdmin,
+            activeView,
+            workspaceSection,
+            activeProfileId,
+            activeProfileStatus,
+            activeProfileExists,
+            profilesLoaded,
+            connectionStatus,
+            selectedChatId,
+            windowOpen,
+            forceTemplateMode,
+            lastProfileError
+        },
+        counts: {
+            profiles: profiles.length,
+            chats: chatList.length,
+            chatsView: chatListForView.length,
+            messages: allMessages.length,
+            logs: logEntries.length
+        },
+        diagnostics: {
+            panelVersion: debugPanelVersion,
+            chatListTop: chatListForView.slice(0, 8).map((chat) => chat.id),
+            listChanges: chatListFlickerStatsRef.current.changes,
+            rapidListChanges: chatListFlickerStatsRef.current.rapidChanges,
+            lastSocketEvent: debugLastSocketEventRef.current,
+            eventCounters: debugSocketEventCountersRef.current
+        },
+        profiles: debugProfileSummary,
+        serverStats: serverStats
+            ? {
+                cpu: serverStats.cpu,
+                memPct: serverStats.memPct,
+                inBps: serverStats?.bandwidth?.inBps || 0,
+                outBps: serverStats?.bandwidth?.outBps || 0,
+                timestamp: serverStats.timestamp
+            }
+            : null
+    };
 
     return (
         <>
             {isOffline && (
                 <>
-                    <div className="fixed top-0 inset-x-0 z-[260] bg-[#111b21] text-white border-b border-[#2f3b42]">
+                    <div
+                        className="fixed top-0 inset-x-0 z-[260] bg-[#111b21] text-white border-b border-[#2f3b42]"
+                        style={{
+                            paddingTop: 'max(env(safe-area-inset-top), 0px)',
+                            paddingLeft: 'max(env(safe-area-inset-left), 0px)',
+                            paddingRight: 'max(env(safe-area-inset-right), 0px)'
+                        }}
+                    >
                         <div className="h-11 px-4 flex items-center justify-center gap-2 text-[12px] font-bold tracking-wide">
                             <span className="px-2 py-0.5 rounded-full bg-rose-500/90 text-[10px] uppercase">Offline</span>
-                            <span>No internet connection. Reconnecting…</span>
+                            <span>No internet connection. Reconnecting...</span>
                         </div>
                     </div>
-                    <div className="fixed left-1/2 -translate-x-1/2 bottom-5 z-[260] pointer-events-none">
-                        <div className="offline-dino-card">
-                            <div className="offline-dino-stage">
-                                <div className="offline-dino-runner" role="img" aria-label="Running dinosaur">🦖</div>
-                                <div className="offline-dino-ground" />
-                            </div>
-                            <div className="offline-dino-label">
-                                Waiting for internet
-                                <span className="offline-dino-dots" aria-hidden="true">
-                                    <span>.</span>
-                                    <span>.</span>
-                                    <span>.</span>
-                                </span>
+                    {!isMobile && (
+                        <div className="fixed left-1/2 -translate-x-1/2 bottom-5 z-[260] pointer-events-none">
+                            <div className="offline-dino-card">
+                                <div className="offline-dino-stage">
+                                    <div className="offline-dino-runner" role="img" aria-label="Running dinosaur">🦖</div>
+                                    <div className="offline-dino-ground" />
+                                </div>
+                                <div className="offline-dino-label">
+                                    Waiting for internet
+                                    <span className="offline-dino-dots" aria-hidden="true">
+                                        <span>.</span>
+                                        <span>.</span>
+                                        <span>.</span>
+                                    </span>
+                                </div>
                             </div>
                         </div>
-                    </div>
+                    )}
                 </>
             )}
-            <header className="fixed top-0 inset-x-0 z-[120] h-[72px] bg-white border-b border-[#eceff1]">
-                <div className="h-full px-5 flex items-center justify-between gap-4">
+            {!hideGlobalHeaderOnMobileInbox && (
+            <header
+                className="fixed top-0 inset-x-0 z-[120] h-[64px] lg:h-[72px] bg-white/92 backdrop-blur-md border-b border-[var(--qm-border)]"
+                style={isMobile ? {
+                    minHeight: 'calc(64px + env(safe-area-inset-top))',
+                    paddingTop: 'max(env(safe-area-inset-top), 0px)',
+                    paddingLeft: 'max(env(safe-area-inset-left), 0px)',
+                    paddingRight: 'max(env(safe-area-inset-right), 0px)'
+                } : undefined}
+            >
+                <div className="h-full px-3 sm:px-4 lg:px-5 flex items-center justify-between gap-3 lg:gap-4">
                     <div className="flex items-center gap-5 min-w-0 flex-1">
                         <div className="flex items-center gap-2 shrink-0">
-                            <div className="h-8 min-w-[96px] max-w-[170px] px-3 rounded-lg border border-[#eceff1] bg-[#f8f9fa] flex items-center justify-center overflow-hidden">
-                                {appLogoUrl ? (
-                                    <img
-                                        src={appLogoUrl}
-                                        alt="App logo"
-                                        className="h-6 w-auto max-w-[150px] object-contain"
-                                        loading="lazy"
-                                    />
-                                ) : (
-                                    <span className="text-[10px] font-black uppercase tracking-widest text-[#8696a0]">Logo</span>
-                                )}
-                            </div>
+                            <img
+                                src={appLogoUrl || qmessageLogo}
+                                alt="QMessage logo"
+                                className="h-8 w-auto max-w-[170px] object-contain"
+                                loading="lazy"
+                            />
                         </div>
                         <div className="hidden xl:block w-px h-8 bg-[#eceff1]" />
-                        <nav className="flex items-center gap-1 overflow-x-auto whitespace-nowrap custom-scrollbar">
+                        <div className="lg:hidden min-w-0">
+                            <div className="text-[14px] font-bold text-[#111b21] truncate">{activeWorkspaceLabel}</div>
+                        </div>
+                        <nav className="hidden lg:flex items-center gap-1 overflow-x-auto whitespace-nowrap custom-scrollbar">
                             {showUiControlsSkeleton ? (
                                 <div className="animate-pulse flex items-center gap-2">
                                     <div className="h-9 w-28 rounded-xl bg-[#eef2f5]" />
@@ -4354,9 +7503,10 @@ export default function App() {
                                                 openAnalyticsFromMore();
                                                 return;
                                             }
+                                            setShowAnalytics(false);
                                             setWorkspaceSection(tab.id);
                                         }}
-                                        className={`px-3 py-2 rounded-xl text-[16px] font-bold transition-all flex items-center gap-2 ${active ? 'text-[#00a884] bg-[#00a884]/10' : 'text-[#4a4a4a] hover:bg-[#f0f2f5]'}`}
+                                    className={`px-3 py-2 rounded-xl text-[16px] font-bold transition-all flex items-center gap-2 ${active ? 'text-[#00a884] bg-[#e8f8f2] border border-[#c7efdf]' : 'text-[#4a4a4a] hover:bg-[#f4f8ff]'}`}
                                     >
                                         <Icon className="w-4 h-4" />
                                         <span>{tab.label}</span>
@@ -4384,8 +7534,9 @@ export default function App() {
                                         setActiveView('dashboard');
                                         setShowAnalytics(false);
                                         setWorkspaceSection('team-inbox');
+                                        if (isMobile) setSelectedChatId(null);
                                     }}
-                                    className="relative w-10 h-10 rounded-full bg-[#f3f4f6] text-[#00a884] flex items-center justify-center hover:bg-[#e8f5f1] transition-all"
+                                    className="relative w-10 h-10 rounded-full bg-[#edf4fb] text-[#00a884] border border-[var(--qm-border)] flex items-center justify-center hover:bg-[#e8f5f1] transition-all"
                                     title="Unread messages"
                                 >
                                     <MessageSquare className="w-5 h-5" />
@@ -4398,9 +7549,11 @@ export default function App() {
                                 {!isUiFeatureHidden(SETTINGS_UI_FEATURE_KEY) && (
                                     <button
                                         onClick={openSettingsFromMore}
-                                        className="hidden md:flex w-10 h-10 rounded-full bg-[#f3f4f6] text-[#6b7280] items-center justify-center"
+                                        className="hidden sm:flex w-10 h-10 rounded-full bg-[#edf4fb] border border-[var(--qm-border)] text-[#6b7280] items-center justify-center"
+                                        title="Open settings"
+                                        aria-label="Open settings"
                                     >
-                                        <User className="w-5 h-5" />
+                                        <MoreVertical className="w-5 h-5" />
                                     </button>
                                 )}
                             </>
@@ -4408,39 +7561,40 @@ export default function App() {
                     </div>
                 </div>
             </header>
+            )}
 
             {workspaceSection === 'team-inbox' ? (
-                <div className="flex h-screen pt-[72px] bg-[#f8f9fa] overflow-hidden text-[#111b21] font-sans">
-            <div className="w-[400px] border-r border-[#eceff1] flex flex-col bg-white">
-                <div className="px-3 py-2 border-b border-[#f0f2f5]">
+                <div
+                    className={`qm-app-gradient flex ${isMobile ? 'h-[100dvh]' : 'h-screen'} ${hideGlobalHeaderOnMobileInbox ? 'pt-0' : 'pt-[64px] lg:pt-[72px]'} overflow-hidden text-[#111b21] font-sans`}
+                    style={{
+                        ...(hideGlobalHeaderOnMobileInbox ? mobileSafeInsetsStyle : mobileHeaderOffsetStyle),
+                        ...(mobileBottomNavPaddingStyle || {})
+                    }}
+                    onTouchStart={handleMobileWorkspaceTouchStart}
+                    onTouchEnd={handleMobileWorkspaceTouchEnd}
+                >
+            <div className={`${isMobileChatOpen ? 'hidden' : 'flex'} w-full lg:w-[400px] border-r border-[var(--qm-border)] flex-col bg-white/95`}>
+                <div className={`px-3 py-2 border-b border-[var(--qm-border)] ${hideGlobalHeaderOnMobileInbox ? 'pt-[max(env(safe-area-inset-top),0.35rem)]' : ''}`}>
                     <div className="flex items-center gap-2">
                         <div className="flex items-center gap-1.5">
-                            <button
-                                type="button"
-                                onClick={() => setShowNewChatModal(true)}
-                                className="w-8 h-8 rounded-lg bg-[#00a884]/12 border border-[#00a884]/25 text-[#00a884] flex items-center justify-center hover:bg-[#00a884]/18 transition-all"
-                                title="Start new chat"
-                            >
-                                <MessageSquare className="w-4 h-4" />
-                            </button>
-                            <button
-                                type="button"
-                                onClick={() => setShowNewChatModal(true)}
-                                className="w-8 h-8 rounded-lg bg-[#2563eb]/12 border border-[#2563eb]/25 text-[#2563eb] flex items-center justify-center hover:bg-[#2563eb]/18 transition-all"
-                                title="Start new chat"
-                            >
-                                <MessageSquare className="w-4 h-4" />
-                            </button>
-                            <button
-                                type="button"
-                                onClick={() => setShowNewChatModal(true)}
-                                className="w-8 h-8 rounded-lg bg-[#ec4899]/12 border border-[#ec4899]/25 text-[#ec4899] flex items-center justify-center hover:bg-[#ec4899]/18 transition-all"
-                                title="Start new chat"
-                            >
-                                <MessageSquare className="w-4 h-4" />
-                            </button>
+                            {isMobile ? (
+                                <img
+                                    src={appLogoUrl || qmessageLogo}
+                                    alt="QMessage logo"
+                                    className="w-9 h-9 rounded-lg object-cover"
+                                />
+                            ) : (
+                                <button
+                                    type="button"
+                                    onClick={() => setShowNewChatModal(true)}
+                                    className="w-8 h-8 rounded-lg bg-[#00a884]/12 border border-[#00a884]/25 text-[#00a884] flex items-center justify-center hover:bg-[#00a884]/18 transition-all"
+                                    title="Start new chat"
+                                >
+                                    <Plus className="w-4 h-4" />
+                                </button>
+                            )}
                         </div>
-                        <div className="flex-1 bg-[#f0f2f5] rounded-xl flex items-center px-4 py-2 focus-within:bg-white focus-within:ring-1 focus-within:ring-[#00a884]/20 transition-all">
+                        <div className="flex-1 bg-[#f4f8ff] border border-transparent rounded-xl flex items-center px-4 py-2 focus-within:bg-white focus-within:border-[var(--qm-border)] focus-within:ring-1 focus-within:ring-[#00a884]/20 transition-all">
                             <Search className="w-4 h-4 text-[#54656f] mr-4" />
                             <input
                                 type="text"
@@ -4450,21 +7604,73 @@ export default function App() {
                                 className="bg-transparent border-none text-[15px] w-full focus:outline-none placeholder:text-[#54656f]"
                             />
                         </div>
-                        <div className="w-[132px] bg-[#f0f2f5] rounded-xl flex items-center px-2.5 py-2 border border-transparent focus-within:border-[#00a884]/30 transition-all">
-                            <Filter className="w-3.5 h-3.5 text-[#54656f] mr-2" />
-                            <select
-                                value={chatListFilter}
-                                onChange={(e) => setChatListFilter(e.target.value as typeof chatListFilter)}
-                                className="bg-transparent text-[11px] font-bold text-[#334155] w-full focus:outline-none"
+                        {isMobile && !isUiFeatureHidden(SETTINGS_UI_FEATURE_KEY) && (
+                            <button
+                                type="button"
+                                onClick={openSettingsFromMore}
+                                className="w-10 h-10 rounded-xl bg-[#f4f8ff] border border-[var(--qm-border)] text-[#54656f] flex items-center justify-center hover:bg-white hover:border-[#cdd8e0] transition-all"
+                                title="Open settings"
+                                aria-label="Open settings"
                             >
-                                <option value="all">All</option>
-                                <option value="tagged">Tagged</option>
-                                <option value="untagged">Untagged</option>
-                                <option value="assigned">Assigned</option>
-                                <option value="unassigned">Unassigned</option>
-                            </select>
-                        </div>
+                                <MoreVertical className="w-4 h-4" />
+                            </button>
+                        )}
+                        {!isMobile && (
+                            <div className="flex w-[108px] sm:w-[132px] bg-[#f4f8ff] rounded-xl items-center px-2.5 py-2 border border-transparent focus-within:border-[#00a884]/30 transition-all">
+                                <Filter className="w-3.5 h-3.5 text-[#54656f] mr-2" />
+                                <select
+                                    value={chatListFilter}
+                                    onChange={(e) => setChatListFilter(e.target.value as typeof chatListFilter)}
+                                    className="bg-transparent text-[11px] font-bold text-[#334155] w-full focus:outline-none"
+                                >
+                                    <option value="all">All</option>
+                                    <option value="tagged">Tagged</option>
+                                    <option value="untagged">Untagged</option>
+                                    <option value="assigned">Assigned</option>
+                                    <option value="unassigned">Unassigned</option>
+                                </select>
+                            </div>
+                        )}
                     </div>
+                    {isMobile && (
+                        <div className="mobile-horizontal-scroll mt-2 flex items-center gap-2 pr-1">
+                            <button
+                                type="button"
+                                onClick={() => setMobileChatQuickFilter('all')}
+                                className={`snap-start h-8 px-3 rounded-full text-[11px] font-bold border whitespace-nowrap transition-all ${mobileChatQuickFilter === 'all'
+                                        ? 'bg-[#e9f7f4] border-[#b9eadd] text-[#008f6f]'
+                                        : 'bg-[#f7f9fa] border-[#e2e8ee] text-[#54656f]'
+                                    }`}
+                            >
+                                All
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setMobileChatQuickFilter('unread')}
+                                className={`snap-start h-8 px-3 rounded-full text-[11px] font-bold border whitespace-nowrap transition-all ${mobileChatQuickFilter === 'unread'
+                                        ? 'bg-[#e9f7f4] border-[#b9eadd] text-[#008f6f]'
+                                        : 'bg-[#f7f9fa] border-[#e2e8ee] text-[#54656f]'
+                                    }`}
+                            >
+                                Unread {mobileUnreadChatCount > 0 ? `(${mobileUnreadChatCount})` : ''}
+                            </button>
+                            <div className={`snap-start h-8 rounded-full border whitespace-nowrap transition-all flex items-center gap-1.5 pl-2 pr-2 ${mobileTagFilter ? 'bg-[#ecfdf3] border-[#bbf7d0] text-[#166534]' : 'bg-[#f7f9fa] border-[#e2e8ee] text-[#54656f]'}`}>
+                                <Plus className="w-3.5 h-3.5 shrink-0" />
+                                <select
+                                    value={mobileTagFilter}
+                                    onChange={(e) => setMobileTagFilter(e.target.value)}
+                                    className="bg-transparent text-[11px] font-bold focus:outline-none pr-1"
+                                >
+                                    <option value="">+ Tag</option>
+                                    {mobileChatFilterTags.map((tag) => (
+                                        <option key={`mobile-filter-tag-${tag}`} value={tag}>
+                                            {tag}
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+                        </div>
+                    )}
                 </div>
 
                 <div className="flex-1 overflow-y-auto custom-scrollbar">
@@ -4532,9 +7738,13 @@ export default function App() {
                                         </div>
                                     ))}
                                 </div>
-                            ) : chatList.length === 0 ? (
+                            ) : chatListForView.length === 0 ? (
                                 <div className="h-full flex items-center justify-center text-sm text-[#8696a0]">
                                     No chats found.
+                                </div>
+                            ) : isMobile ? (
+                                <div className="h-full overflow-y-auto custom-scrollbar">
+                                    {chatListForView.map((chat) => renderChatListItem(chat))}
                                 </div>
                             ) : chatListViewport.height > 0 ? (
                                 <List
@@ -4542,104 +7752,11 @@ export default function App() {
                                         height: chatListViewport.height,
                                         width: chatListViewport.width || '100%'
                                     }}
-                                    rowCount={chatList.length}
+                                    rowCount={chatListForView.length}
                                     rowHeight={CHAT_ROW_HEIGHT}
-                                    rowProps={{}}
+                                    rowProps={webChatListRowProps}
                                     overscanCount={8}
-                                    rowComponent={(props: any) => {
-                                        const { index, style } = props as { index: number; style: React.CSSProperties };
-                                        const chat = chatList[index];
-                                        const contactMeta = pickContactMetaByJid(contacts, chat.id) || {};
-                                        const assigneeName = contactMeta.assigneeName || null;
-                                        const assigneeColor = contactMeta.assigneeColor || '#6b7280';
-                                        const contactTags = splitContactTags(contactMeta.tags).labelTags;
-                                        const primaryTag = contactTags[0] || null;
-                                        const extraTagCount = Math.max(0, contactTags.length - (primaryTag ? 1 : 0));
-                                        return (
-                                            <div style={style}>
-                                                <div
-                                                    onClick={() => handleOpenChat(chat.id)}
-                                                    className={`flex items-center px-3 py-2 cursor-pointer hover:bg-[#f5f6f6] transition-colors border-b border-[#fcfdfd] ${selectedChatId === chat.id ? 'bg-[#f0f2f5]' : ''}`}
-                                                >
-                                                    <div className="w-12 h-12 rounded-full bg-[#f0f2f5] mr-3 flex-shrink-0 flex items-center justify-center border border-[#eceff1]">
-                                                        {chat.id.endsWith('@g.us') ? (
-                                                            <Users className="text-[#54656f] w-5 h-5" />
-                                                        ) : (
-                                                            <User className="text-[#54656f] w-5 h-5" />
-                                                        )}
-                                                    </div>
-                                                    <div className="flex-1 min-w-0 border-b border-[#f5f6f6] pb-3 pt-1">
-                                                        <div className="flex justify-between items-baseline mb-0.5">
-                                                            <h3 className="font-bold text-[16px] truncate pr-2 text-[#111b21]">
-                                                                {chat.name}
-                                                            </h3>
-                                                            <span className="text-[11px] font-medium text-[#54656f]">
-                                                                {chat.timestamp ? new Date(chat.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
-                                                            </span>
-                                                        </div>
-                                                        {(chat.id.endsWith('@s.whatsapp.net') || chat.id.endsWith('@lid')) &&
-                                                            getCleanId(chat.name) !== getCleanId(chat.id) && (
-                                                                <div className="text-[11px] text-[#00a884] font-bold leading-none mb-1">
-                                                                    {formatPhoneNumber(getCleanId(chat.id))}
-                                                                </div>
-                                                            )}
-                                                        <div className="flex items-center justify-between mt-0.5 gap-2">
-                                                            <div className="flex-1 min-w-0 flex items-center gap-1.5">
-                                                                <p className="truncate text-[13px] text-[#54656f] font-medium leading-tight flex-1 min-w-0">
-                                                                    {chat.lastMessage}
-                                                                </p>
-                                                                {primaryTag && (
-                                                                    <span
-                                                                        className="max-w-[84px] truncate px-1.5 py-0.5 rounded-full bg-[#e8f5f1] border border-[#d1eee6] text-[9px] font-bold text-[#0f766e] uppercase tracking-wide"
-                                                                        title={primaryTag}
-                                                                    >
-                                                                        {primaryTag}
-                                                                    </span>
-                                                                )}
-                                                                {extraTagCount > 0 && (
-                                                                    <span className="text-[9px] font-bold text-[#6b7280]">+{extraTagCount}</span>
-                                                                )}
-                                                            </div>
-                                                            <div className="ml-2 flex items-center gap-1.5 shrink-0">
-                                                                {assigneeName ? (
-                                                                    <button
-                                                                        type="button"
-                                                                        onClick={(e) => {
-                                                                            e.stopPropagation();
-                                                                            if (!teamUsers.length && !teamUsersLoading) fetchTeamUsers();
-                                                                            setAssignMenuContactId(prev => (prev === chat.id ? null : chat.id));
-                                                                        }}
-                                                                        className="px-1.5 py-0.5 text-[9px] rounded uppercase font-bold border tracking-tight hover:opacity-85 transition-all"
-                                                                        style={{
-                                                                            backgroundColor: withHexAlpha(assigneeColor, '20', '#f3f4f6'),
-                                                                            borderColor: withHexAlpha(assigneeColor, '66', '#d1d5db'),
-                                                                            color: textColor(assigneeColor, '#374151')
-                                                                        }}
-                                                                    >
-                                                                        {assigneeName}
-                                                                    </button>
-                                                                ) : chat.id.endsWith('@g.us') ? (
-                                                                    <span className="px-1.5 py-0.5 bg-[#f0f2f5] text-[#54656f] text-[9px] rounded uppercase font-bold border border-[#eceff1] tracking-tight">Group</span>
-                                                                ) : (
-                                                                    <button
-                                                                        type="button"
-                                                                        onClick={(e) => {
-                                                                            e.stopPropagation();
-                                                                            if (!teamUsers.length && !teamUsersLoading) fetchTeamUsers();
-                                                                            setAssignMenuContactId(prev => (prev === chat.id ? null : chat.id));
-                                                                        }}
-                                                                        className="px-1.5 py-0.5 bg-[#f8f9fa] text-[#9ca3af] text-[9px] rounded uppercase font-bold border border-[#eceff1] tracking-tight hover:bg-[#f0f2f5] transition-all"
-                                                                    >
-                                                                        Unassigned
-                                                                    </button>
-                                                                )}
-                                                            </div>
-                                                        </div>
-                                                    </div>
-                                                </div>
-                                            </div>
-                                        );
-                                    }}
+                                    rowComponent={DesktopChatListRow}
                                 />
                             ) : null}
                         </div>
@@ -4648,11 +7765,66 @@ export default function App() {
             </div>
 
             {selectedChatId ? (
-                <div className="flex-1 min-w-0 flex bg-[#f0f2f5] relative overflow-hidden">
+                <div
+                    className="flex-1 min-w-0 flex bg-[#f3f8ff] relative overflow-hidden"
+                    onDragOver={handleComposerDragOver}
+                    onDragLeave={handleComposerDragLeave}
+                    onDrop={handleComposerDrop}
+                >
+                    {canSendText && composerDragActive && (
+                        <div className="absolute inset-0 z-30 pointer-events-none bg-[#00a884]/6 backdrop-blur-[1px]">
+                            <div className="absolute inset-x-0 top-0 h-[3px] bg-[#00a884]" />
+                            <div className="h-full w-full flex items-center justify-center">
+                                <div className="rounded-2xl border-2 border-dashed border-[#00a884]/50 bg-white/90 px-5 py-3 shadow-[0_10px_28px_rgba(0,0,0,0.12)]">
+                                    <p className="text-xs font-extrabold uppercase tracking-[0.14em] text-[#007f62]">
+                                        Drop image, video, or file to attach
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                    )}
                     <div className="flex-1 min-w-0 flex flex-col min-h-0 relative overflow-hidden">
                     <div className="absolute inset-0 opacity-[0.06] pointer-events-none bg-[url('https://web.whatsapp.com/img/bg-chat-tile-light_6860a4760a595861d83d.png')] bg-repeat" />
 
-                    <header className="h-[60px] shrink-0 bg-[#f0f2f5] px-3 flex items-center justify-between z-10 border-l border-[#eceff1]">
+                    {isMobile ? (
+                        <ChatHeader
+                            title={selectedChat?.name || 'Chat'}
+                            subtitle={selectedChat?.id.endsWith('@g.us')
+                                ? 'Group chat'
+                                : (
+                                    <>
+                                        <span className="text-[#00a884] font-bold">{formatPhoneNumber(getCleanId(selectedChat?.id))}</span>
+                                        {lastInboundMs ? (
+                                            windowOpen ? (
+                                                <span className="ml-1.5 font-semibold text-[#00a884]">
+                                                    {`${formatRemaining(windowRemainingMs || 0)} left`}
+                                                </span>
+                                            ) : null
+                                        ) : (
+                                            <span className="ml-1.5 text-[#8a9aa1]">24h: no inbound</span>
+                                        )}
+                                    </>
+                                )}
+                            isGroup={selectedChat?.id.endsWith('@g.us')}
+                            showBack
+                            onBack={() => {
+                                setSelectedChatId(null);
+                                setShowContactInfo(false);
+                            }}
+                            onOpenInfo={() => setShowContactInfo(true)}
+                            rightSlot={(
+                                <button
+                                    type="button"
+                                    onClick={handleClearChat}
+                                    className="p-2 rounded-lg hover:bg-white/90 text-[#54656f] hover:text-rose-600 transition-all"
+                                    title="Clear chat"
+                                >
+                                    <Trash2 className="w-4 h-4" />
+                                </button>
+                            )}
+                        />
+                    ) : (
+                    <header className="h-[60px] shrink-0 bg-[#f4f8ff] px-3 flex items-center justify-between z-10 border-l border-[var(--qm-border)]">
                         <div className="flex items-center gap-3 cursor-pointer" onClick={() => setShowContactInfo(true)}>
                             <div className="w-10 h-10 rounded-full bg-white flex items-center justify-center overflow-hidden border border-[#eceff1] shadow-sm">
                                 {selectedChat?.id.endsWith('@g.us') ? (
@@ -4733,8 +7905,28 @@ export default function App() {
                             </div>
                         </div>
                         <div className="flex items-center gap-6 text-[#54656f]">
-                            <Video className="w-5 h-5 cursor-pointer hover:text-[#111b21]" />
-                            <Phone className="w-5 h-5 cursor-pointer hover:text-[#111b21]" />
+                            {!isUiFeatureHidden('calls') && (
+                                <>
+                                    <button
+                                        type="button"
+                                        onClick={() => void handleCallAction('video')}
+                                        disabled={callActionLoading !== null}
+                                        title="Check video call permission"
+                                        className="text-[#54656f] hover:text-[#111b21] transition-colors disabled:opacity-50"
+                                    >
+                                        <Video className="w-5 h-5" />
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => void handleCallAction('voice')}
+                                        disabled={callActionLoading !== null}
+                                        title="Check voice call permission"
+                                        className="text-[#54656f] hover:text-[#111b21] transition-colors disabled:opacity-50"
+                                    >
+                                        <Phone className="w-5 h-5" />
+                                    </button>
+                                </>
+                            )}
                             <div className="w-px h-6 bg-[#eceff1] mx-1" />
                             <Search className="w-5 h-5 cursor-pointer hover:text-[#111b21]" />
                             <User className="w-5 h-5 cursor-pointer hover:text-[#111b21]" onClick={() => setShowContactInfo(true)} />
@@ -4742,8 +7934,17 @@ export default function App() {
                             <MoreVertical className="w-5 h-5 cursor-pointer hover:text-[#111b21]" />
                         </div>
                     </header>
+                    )}
 
-                    <div className="flex-1 min-h-0 px-16 py-6 z-10 flex flex-col">
+                    {showMobileWindowClosedBanner && (
+                        <div className="absolute top-[66px] left-1/2 -translate-x-1/2 z-20 pointer-events-none">
+                            <div className="px-3 py-1.5 rounded-full bg-[#fff3e0]/95 text-[#a16207] text-[11px] font-bold border border-[#fde68a] shadow-[0_8px_24px_rgba(0,0,0,0.12)] backdrop-blur-[2px] whitespace-nowrap">
+                                24h window closed. Use template message to reply.
+                            </div>
+                        </div>
+                    )}
+
+                    <div className={`flex-1 min-h-0 z-10 flex flex-col ${isMobile ? (showMobileWindowClosedBanner ? 'px-2 pt-11 pb-3' : 'px-2 py-3') : 'px-16 py-6'}`}>
                         {lastProfileError && (
                             <div className="self-center sticky top-2 z-20 mb-2 flex items-center gap-3 bg-[#fff4e5] border border-[#ffd9b3] text-[#7a4b00] px-3 py-2 rounded-xl text-[11px] font-bold shadow-sm">
                                 <span className="flex-1">{lastProfileError}</span>
@@ -4799,21 +8000,37 @@ export default function App() {
                                         const buttons = Array.isArray(buttonsMessage?.buttons) ? buttonsMessage?.buttons : [];
                                         const listSections = Array.isArray(listMessage?.sections) ? listMessage?.sections : [];
                                         const isFailedOutgoing = msg.key.fromMe && msg.status === 'failed';
+                                        const messageTimestampLabel = msg.messageTimestamp
+                                            ? new Date(msg.messageTimestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })
+                                            : '';
 
                                         return (
                                             <div style={style} className="w-full px-1">
-                                                <div className={`w-full flex ${msg.key.fromMe ? 'justify-end' : 'justify-start'}`}>
-                                                    <div className="max-w-[85%] flex flex-col">
-                                                        <div className={`
-                                                            px-3 py-1.5 rounded-xl text-[14px] shadow-[0_1px_0.5px_rgba(0,0,0,0.1)] relative mb-1 tracking-tight
-                                                            ${msg.key.fromMe
-                                                            ? (isFailedOutgoing
-                                                                ? 'bg-[#fee2e2] border border-[#fecaca] text-[#7f1d1d] rounded-tr-none'
-                                                                : 'bg-[#d9fdd3] text-[#111b21] rounded-tr-none')
-                                                            : 'bg-white text-[#111b21] rounded-tl-none'}
-                                                        `}>
+                                                <ChatBubble
+                                                    fromMe={Boolean(msg.key.fromMe)}
+                                                    failed={isFailedOutgoing}
+                                                    senderName={messageSenderName}
+                                                    senderColor={textColor(messageSenderColor, '#6b7280')}
+                                                    timestampLabel={messageTimestampLabel}
+                                                    statusIcon={renderMessageStatus(msg)}
+                                                    footerSlot={isFailedOutgoing ? (
+                                                        <div className="mt-1 text-right">
+                                                            <button
+                                                                type="button"
+                                                                onClick={(event) => {
+                                                                    event.stopPropagation();
+                                                                    if (!msg.key?.id) return;
+                                                                    handleResendMessage(msg.key.id);
+                                                                }}
+                                                                className="text-[10px] font-bold text-[#d93025] hover:underline"
+                                                            >
+                                                                Resend
+                                                            </button>
+                                                        </div>
+                                                    ) : undefined}
+                                                >
                                                             {messageText && (
-                                                                <p className={`leading-relaxed whitespace-pre-wrap break-words ${isFailedOutgoing ? 'pr-28' : 'pr-14'}`}>
+                                                                <p className="leading-relaxed whitespace-pre-wrap break-words">
                                                                     {messageText}
                                                                 </p>
                                                             )}
@@ -4988,24 +8205,31 @@ export default function App() {
                                                                 const mediaId = msg.message?.videoMessage?.mediaId;
                                                                 const directUrl = msg.message?.videoMessage?.url;
                                                                 const cacheEntry = mediaCache[msg.key.id!] || (mediaId ? mediaCache[mediaId] : undefined);
+                                                                const videoSrc = cacheEntry
+                                                                    ? `data:${cacheEntry.mimetype};base64,${cacheEntry.data}`
+                                                                    : (directUrl || '');
                                                                 return (
-                                                                    <div className="mt-1 mb-1 max-w-sm rounded-lg overflow-hidden bg-[#fcfdfd] min-h-[100px] flex items-center justify-center relative border border-[#eceff1]">
-                                                                        {cacheEntry ? (
-                                                                            <video
-                                                                                controls
-                                                                                className="max-w-full h-auto block"
-                                                                                src={`data:${cacheEntry.mimetype};base64,${cacheEntry.data}`}
-                                                                            />
-                                                                        ) : directUrl ? (
-                                                                            <video
-                                                                                controls
-                                                                                className="max-w-full h-auto block"
-                                                                                src={directUrl}
-                                                                            />
-                                                                        ) : (
-                                                                            <div className="p-4 text-center" onClick={() => handleDownloadMedia(msg)}>
-                                                                                {renderMediaLoadingPlaceholder(msg)}
+                                                                    <div className="mt-1 mb-1 w-[280px] max-w-[78vw] rounded-xl overflow-hidden bg-[#0b141a] border border-[#eceff1]">
+                                                                        {videoSrc ? (
+                                                                            <div className="w-full aspect-[16/10] bg-black">
+                                                                                <video
+                                                                                    controls
+                                                                                    preload="metadata"
+                                                                                    playsInline
+                                                                                    className="w-full h-full object-cover block"
+                                                                                    src={videoSrc}
+                                                                                />
                                                                             </div>
+                                                                        ) : (
+                                                                            <button
+                                                                                type="button"
+                                                                                onClick={() => handleDownloadMedia(msg)}
+                                                                                className="w-full aspect-[16/10] bg-[#f8f9fa] text-[#54656f] flex flex-col items-center justify-center gap-2 px-3"
+                                                                            >
+                                                                                <Video className="w-6 h-6 text-[#00a884]" />
+                                                                                <span className="text-[11px] font-bold uppercase tracking-widest text-[#54656f]">Video Preview</span>
+                                                                                {renderMediaLoadingPlaceholder(msg, true)}
+                                                                            </button>
                                                                         )}
                                                                     </div>
                                                                 );
@@ -5031,36 +8255,7 @@ export default function App() {
                                                                 );
                                                             })()}
 
-                                                            <div className="absolute bottom-1 right-2 flex items-center gap-1">
-                                                                <span className="text-[10px] text-[#54656f]/70 font-bold">
-                                                                    {msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }) : ''}
-                                                                </span>
-                                                                {renderMessageStatus(msg)}
-                                                                {isFailedOutgoing && (
-                                                                    <button
-                                                                        type="button"
-                                                                        onClick={(event) => {
-                                                                            event.stopPropagation();
-                                                                            if (!msg.key?.id) return;
-                                                                            handleResendMessage(msg.key.id);
-                                                                        }}
-                                                                        className="text-[10px] font-bold text-[#d93025] hover:underline"
-                                                                    >
-                                                                        Resend
-                                                                    </button>
-                                                                )}
-                                                            </div>
-                                                        </div>
-                                                        {messageSenderName && (
-                                                            <div
-                                                                className="mt-0.5 px-1 text-[10px] font-medium text-right"
-                                                                style={{ color: textColor(messageSenderColor, '#6b7280') }}
-                                                            >
-                                                                {messageSenderName}
-                                                            </div>
-                                                        )}
-                                                    </div>
-                                                </div>
+                                                </ChatBubble>
                                             </div>
                                         );
                                     }}
@@ -5069,41 +8264,61 @@ export default function App() {
                         </div>
                     </div>
 
-                    <footer className="shrink-0 bg-[#f0f2f5] px-3 py-2 flex items-center gap-1.5 z-10 min-h-[54px]">
-                        <div className="flex items-center text-[#54656f]">
+                    <MessageInputBar>
+                        <div className="flex items-center gap-1.5 z-10 min-h-[54px]">
+                        <div className="relative flex items-center text-[#54656f]">
+                            {isMobile && (
+                                <button
+                                    type="button"
+                                    onClick={() => setShowMobileComposerMenu((prev) => !prev)}
+                                    className={`p-1.5 rounded-lg transition-all cursor-pointer ${showMobileComposerMenu ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
+                                    title="More actions"
+                                >
+                                    <Menu className="w-5 h-5" />
+                                </button>
+                            )}
                             <button type="button" className="p-1.5 hover:bg-white rounded-lg transition-all cursor-pointer">
                                 <Smile className="w-6 h-6" />
                             </button>
-                            <button
-                                type="button"
-                                onClick={() => openComposerMediaPicker('image')}
-                                className={`p-1.5 rounded-lg transition-all cursor-pointer ${composerMediaType === 'image' && showMediaComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
-                                title="Attach image"
-                            >
-                                <ImageIcon className="w-5 h-5" />
-                            </button>
-                            <button
-                                type="button"
-                                onClick={() => openComposerMediaPicker('document')}
-                                className={`p-1.5 rounded-lg transition-all cursor-pointer ${composerMediaType === 'document' && showMediaComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
-                                title="Attach document"
-                            >
-                                <FileIcon className="w-5 h-5" />
-                            </button>
-                            <button
-                                type="button"
-                                onClick={() => openComposerMediaPicker('video')}
-                                className={`p-1.5 rounded-lg transition-all cursor-pointer ${composerMediaType === 'video' && showMediaComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
-                                title="Attach video"
-                            >
-                                <Paperclip className="w-6 h-6 -rotate-45" />
-                            </button>
+                            {!isMobile && (
+                                <>
+                                    <button
+                                        type="button"
+                                        onClick={() => openComposerMediaPicker('image')}
+                                        className={`p-1.5 rounded-lg transition-all cursor-pointer ${composerMediaType === 'image' && showMediaComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
+                                        title="Attach image"
+                                    >
+                                        <ImageIcon className="w-5 h-5" />
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => openComposerMediaPicker('document')}
+                                        className={`p-1.5 rounded-lg transition-all cursor-pointer ${composerMediaType === 'document' && showMediaComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
+                                        title="Attach document"
+                                    >
+                                        <FileIcon className="w-5 h-5" />
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => openComposerMediaPicker('video')}
+                                        className={`p-1.5 rounded-lg transition-all cursor-pointer ${composerMediaType === 'video' && showMediaComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'hover:bg-white'}`}
+                                        title="Attach video"
+                                    >
+                                        <Paperclip className="w-6 h-6 -rotate-45" />
+                                    </button>
+                                </>
+                            )}
                         </div>
-                        {workflowStarter}
-                        <div className="flex-1 mx-1 relative">
-                            {!canSendText && (
-                                <div className="absolute -top-8 left-0 px-3 py-1.5 rounded-lg bg-[#fff3e0] text-[#a16207] text-[11px] font-bold border border-[#fde68a]">
-                                    24h window closed for free text. Template message can still be sent anytime.
+                        {!isMobile && workflowStarter}
+                        <div
+                            className="flex-1 mx-1 relative"
+                            onDragOver={handleComposerDragOver}
+                            onDragLeave={handleComposerDragLeave}
+                            onDrop={handleComposerDrop}
+                        >
+                            {!canSendText && !isMobile && (
+                                <div className="absolute -top-8 left-0 px-3 py-1.5 rounded-lg text-[11px] bg-[#fff3e0] text-[#a16207] font-bold border border-[#fde68a]">
+                                    24h window closed. Use template message to reply.
                                 </div>
                             )}
                             {canSendText && quickReplyQuery !== null && (
@@ -5124,23 +8339,45 @@ export default function App() {
                                                 onClick={() => handleQuickReplyPick(item)}
                                                 className="w-full text-left px-4 py-3 hover:bg-[#f6f8f9] transition-all border-b border-[#f1f3f4] last:border-b-0"
                                             >
+                                                {(() => {
+                                                    const itemQuickReplyType = normalizeQuickReplyMessageType(item.message_type);
+                                                    const mediaItems = itemQuickReplyType === 'text'
+                                                        ? []
+                                                        : normalizeQuickReplyMediaItems(item.media_items, itemQuickReplyType);
+                                                    const mediaCount = mediaItems.length > 0
+                                                        ? mediaItems.length
+                                                        : (
+                                                            itemQuickReplyType === 'text'
+                                                                ? 0
+                                                                : (normalizeQuickReplyMediaUrl(item.media_url) || normalizeQuickReplyMediaAssetKey(item.media_asset_key))
+                                                                    ? 1
+                                                                    : 0
+                                                        );
+                                                    const mediaBadge = mediaCount > 1
+                                                        ? `${itemQuickReplyType} x${mediaCount}`
+                                                        : itemQuickReplyType;
+                                                    return (
+                                                        <>
                                                 <div className="flex items-center justify-between gap-2">
                                                     <div className="text-xs font-bold uppercase tracking-widest text-[#00a884]">/{normalizeQuickReplyShortcut(item.shortcut)}</div>
-                                                    {normalizeQuickReplyMessageType(item.message_type) !== 'text' && (
+                                                    {itemQuickReplyType !== 'text' && (
                                                         <span className="text-[10px] font-semibold uppercase tracking-wide text-[#4b5c68] bg-[#eef2f5] px-2 py-0.5 rounded-full">
-                                                            {normalizeQuickReplyMessageType(item.message_type)}
+                                                            {mediaBadge}
                                                         </span>
                                                     )}
                                                 </div>
                                                 <div className="text-sm text-[#111b21] mt-1 max-h-10 overflow-hidden">
                                                     {(() => {
-                                                        const type = normalizeQuickReplyMessageType(item.message_type);
                                                         const text = typeof item.text === 'string' ? item.text.trim() : '';
                                                         if (text) return text;
-                                                        if (type === 'text') return '';
-                                                        return `Media quick reply (${type})`;
+                                                        if (itemQuickReplyType === 'text') return '';
+                                                        if (mediaCount > 1) return `Media quick reply (${mediaCount} files)`;
+                                                        return `Media quick reply (${itemQuickReplyType})`;
                                                     })()}
                                                 </div>
+                                                        </>
+                                                    );
+                                                })()}
                                             </button>
                                         ))
                                     )}
@@ -5162,6 +8399,7 @@ export default function App() {
                                         ref={composerFileInputRef}
                                         type="file"
                                         accept={composerMediaType === 'image' ? 'image/*' : composerMediaType === 'video' ? 'video/*' : '*/*'}
+                                        multiple={composerMediaType !== 'video'}
                                         className="hidden"
                                         onChange={handleComposerMediaInputChange}
                                     />
@@ -5205,37 +8443,49 @@ export default function App() {
                                         </div>
                                     )}
                                     <p className="text-[11px] text-[#6b7280]">
-                                        Text + media will be sent in one message.
+                                        {composerQueuedMediaCount > 0
+                                            ? `Text + first media will be sent first, then ${composerQueuedMediaCount} more attachment${composerQueuedMediaCount > 1 ? 's' : ''}.`
+                                            : 'Text + media will be sent in one message.'}
                                     </p>
                                 </div>
                             )}
-                                <textarea
-                                    ref={messageInputRef}
-                                    placeholder={canSendText ? 'Type a message (Enter = newline, Ctrl/Cmd+Enter = send)' : 'Type a message (24h closed - use template)'}
-                                    value={messageText}
-                                    disabled={!canSendText}
-                                    onChange={(e) => setMessageTextWithDraft(e.target.value)}
-                                    onKeyDown={(e) => {
-                                        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-                                            e.preventDefault();
-                                            if (!canSendText) {
-                                                setShowTemplateComposer(true);
-                                                return;
+                                {isMobile && !canSendText ? (
+                                    <button
+                                        type="button"
+                                        onClick={() => setShowTemplateComposer(true)}
+                                        className="w-full border border-[#f7dca2] bg-[#fff8e7] text-[#9a6700] rounded-xl px-3 py-2.5 text-[13px] font-bold text-left hover:bg-[#fff3d6] transition-all"
+                                    >
+                                        Tap here to send a template message
+                                    </button>
+                                ) : (
+                                    <textarea
+                                        ref={messageInputRef}
+                                        placeholder={canSendText ? 'Type a message (Enter = newline, Ctrl/Cmd+Enter = send)' : 'Type a message (24h closed - use template)'}
+                                        value={messageText}
+                                        disabled={!canSendText}
+                                        onChange={(e) => setMessageTextWithDraft(e.target.value)}
+                                        onKeyDown={(e) => {
+                                            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                                                e.preventDefault();
+                                                if (!canSendText) {
+                                                    setShowTemplateComposer(true);
+                                                    return;
+                                                }
+                                                if (quickReplyQuery !== null && quickReplySuggestions.length > 0) {
+                                                    handleQuickReplyPick(quickReplySuggestions[0]);
+                                                    return;
+                                                }
+                                                handleSendMessage();
                                             }
-                                            if (quickReplyQuery !== null && quickReplySuggestions.length > 0) {
+                                            if (canSendText && e.key === 'Tab' && quickReplyQuery !== null && quickReplySuggestions.length > 0) {
+                                                e.preventDefault();
                                                 handleQuickReplyPick(quickReplySuggestions[0]);
-                                                return;
                                             }
-                                            handleSendMessage();
-                                        }
-                                        if (canSendText && e.key === 'Tab' && quickReplyQuery !== null && quickReplySuggestions.length > 0) {
-                                            e.preventDefault();
-                                            handleQuickReplyPick(quickReplySuggestions[0]);
-                                        }
-                                    }}
-                                    rows={1}
-                                    className={`w-full border border-[#eceff1] rounded-lg px-3 py-2.5 text-[14px] leading-5 resize-y min-h-[44px] max-h-[132px] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20 placeholder:text-[#54656f]/50 ${canSendText ? 'bg-white text-[#111b21]' : 'bg-[#f8f9fa] text-[#9ca3af] cursor-not-allowed'}`}
-                                />
+                                        }}
+                                        rows={1}
+                                        className={`w-full border border-[#eceff1] rounded-lg px-3 py-2.5 text-[14px] leading-5 resize-y min-h-[44px] max-h-[132px] focus:outline-none focus:ring-1 focus:ring-[#00a884]/20 placeholder:text-[#54656f]/50 ${canSendText ? 'bg-white text-[#111b21]' : 'bg-[#f8f9fa] text-[#9ca3af] cursor-not-allowed'}`}
+                                    />
+                                )}
                             {composerMediaUploading ? (
                                 <div className="mt-1 text-[11px] font-bold text-[#54656f]">
                                     Uploading attachment…
@@ -5243,20 +8493,23 @@ export default function App() {
                             ) : hasComposerMedia && (
                                 <div className="mt-1 text-[11px] font-bold text-[#00a884]">
                                     Attachment ready: {composerMediaType}
+                                    {composerQueuedMediaCount > 0 ? ` (+${composerQueuedMediaCount} more)` : ''}. Add text or tap send.
                                 </div>
                             )}
                         </div>
                         <div className="text-[#54656f] flex items-center gap-1.5">
                             <div className="relative">
-                                <button
-                                    type="button"
-                                    onClick={() => setShowTemplateComposer(prev => !prev)}
-                                    className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-bold transition-all ${showTemplateComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'bg-white border border-[#eceff1] text-[#334155] hover:bg-[#f8fafc]'}`}
-                                    title="Send template message"
-                                >
-                                    <FileText className="w-4 h-4" />
-                                    <span>Template</span>
-                                </button>
+                                {!isMobile && (
+                                    <button
+                                        type="button"
+                                        onClick={() => setShowTemplateComposer(prev => !prev)}
+                                        className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-bold transition-all ${showTemplateComposer ? 'bg-[#00a884]/10 text-[#00a884]' : 'bg-white border border-[#eceff1] text-[#334155] hover:bg-[#f8fafc]'}`}
+                                        title="Send template message"
+                                    >
+                                        <FileText className="w-4 h-4" />
+                                        <span>Template</span>
+                                    </button>
+                                )}
                                 {showTemplateComposer && (
                                     <div className="absolute bottom-[52px] right-0 w-[460px] max-w-[90vw] bg-white border border-[#eceff1] rounded-2xl shadow-xl z-30 p-3 space-y-2">
                                         <div className="text-[11px] font-bold uppercase tracking-widest text-[#54656f]">Send Template Message</div>
@@ -5435,22 +8688,111 @@ export default function App() {
                                     </div>
                                 )}
                             </div>
-                            {canSendText ? (
-                                (messageText.trim() || hasComposerMedia) ? (
-                                    <div onClick={handleSendMessage} className="p-2.5 bg-[#00a884] shadow-sm rounded-lg cursor-pointer text-white transition-transform active:scale-95"><Send className="w-5 h-5" /></div>
-                                ) : (
-                                    <div className="p-1.5 hover:bg-white rounded-lg transition-all cursor-pointer"><Mic className="w-6 h-6" /></div>
-                                )
-                            ) : null}
+                            {canSendText && (messageText.trim() || hasComposerMedia) ? (
+                                <button
+                                    type="button"
+                                    onClick={handleSendMessage}
+                                    className="w-11 h-11 rounded-full bg-[#00a884] shadow-sm cursor-pointer text-white transition-all hover:bg-[#008f6f] active:scale-95 flex items-center justify-center"
+                                    title="Send message"
+                                >
+                                    <Send className="w-5 h-5" />
+                                </button>
+                            ) : (
+                                <button
+                                    type="button"
+                                    onClick={() => {
+                                        if (!canSendText) {
+                                            setShowTemplateComposer(true);
+                                            return;
+                                        }
+                                        // Voice recording trigger placeholder (matches existing behavior).
+                                    }}
+                                    className={`w-11 h-11 rounded-full transition-all cursor-pointer flex items-center justify-center ${canSendText ? 'bg-[#00a884] text-white hover:bg-[#008f6f]' : 'bg-[#e6ebef] text-[#7d8b95]'}`}
+                                    title={canSendText ? 'Voice record' : 'Voice message unavailable, use template'}
+                                >
+                                    <Mic className="w-5 h-5" />
+                                </button>
+                            )}
                         </div>
-                    </footer>
+                        {isMobile && (
+                            <>
+                                <div
+                                    className={`fixed inset-0 z-[205] bg-[#111b21]/45 backdrop-blur-[1px] transition-opacity duration-300 ${showMobileComposerMenu ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}
+                                    onClick={() => setShowMobileComposerMenu(false)}
+                                />
+                                <div
+                                    className={`fixed inset-0 z-[210] flex items-end transition-opacity duration-200 ${showMobileComposerMenu ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}
+                                    style={{ paddingBottom: 'max(env(safe-area-inset-bottom), 0.5rem)' }}
+                                >
+                                    <div className={`mx-2 rounded-t-[28px] rounded-b-2xl border border-[#eceff1] bg-white shadow-[0_-16px_40px_rgba(0,0,0,0.22)] transition-transform duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${showMobileComposerMenu ? 'translate-y-0' : 'translate-y-full'}`}>
+                                        <div className="pt-2 pb-1.5 flex justify-center">
+                                            <div className="h-1.5 w-12 rounded-full bg-[#d2dbe1]" />
+                                        </div>
+                                        <div className="px-4 pb-2 text-[11px] font-bold uppercase tracking-widest text-[#667781]">
+                                            Attach
+                                        </div>
+                                        <div className="px-3 pb-3 grid grid-cols-2 gap-2">
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    setShowMobileComposerMenu(false);
+                                                    openComposerMediaPicker('image');
+                                                }}
+                                                className="h-[52px] rounded-2xl border border-[#e7edf2] bg-[#f8fafb] text-[12px] font-semibold text-[#334155] hover:bg-[#eef4f6] flex items-center justify-center gap-2"
+                                            >
+                                                <ImageIcon className="w-4 h-4 text-[#54656f]" />
+                                                Image
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    setShowMobileComposerMenu(false);
+                                                    openComposerMediaPicker('document');
+                                                }}
+                                                className="h-[52px] rounded-2xl border border-[#e7edf2] bg-[#f8fafb] text-[12px] font-semibold text-[#334155] hover:bg-[#eef4f6] flex items-center justify-center gap-2"
+                                            >
+                                                <FileIcon className="w-4 h-4 text-[#54656f]" />
+                                                Document
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    setShowMobileComposerMenu(false);
+                                                    openComposerMediaPicker('video');
+                                                }}
+                                                className="h-[52px] rounded-2xl border border-[#e7edf2] bg-[#f8fafb] text-[12px] font-semibold text-[#334155] hover:bg-[#eef4f6] flex items-center justify-center gap-2"
+                                            >
+                                                <Paperclip className="w-4 h-4 -rotate-45 text-[#54656f]" />
+                                                Video
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    setShowMobileComposerMenu(false);
+                                                    setShowTemplateComposer(true);
+                                                }}
+                                                className="h-[52px] rounded-2xl border border-[#e7edf2] bg-[#f8fafb] text-[12px] font-semibold text-[#334155] hover:bg-[#eef4f6] flex items-center justify-center gap-2"
+                                            >
+                                                <FileText className="w-4 h-4 text-[#54656f]" />
+                                                Template
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </>
+                        )}
+                        </div>
+                    </MessageInputBar>
 
                     </div>
 
                     {/* Contact Info Sidebar */}
                     {showContactInfo && (
-                        <aside className="w-[360px] max-w-[42vw] min-w-[320px] h-full bg-white border-l border-[#eceff1] shadow-[-12px_0_28px_rgba(0,0,0,0.08)] flex flex-col overflow-hidden z-20">
-                                <header className="h-[54px] bg-[#f0f2f5] px-4 flex items-center gap-4 text-[#111b21] border-b border-[#eceff1]">
+                        <aside className={isMobile
+                            ? "fixed inset-0 z-[220] bg-white flex flex-col overflow-hidden"
+                            : "w-[360px] max-w-[42vw] min-w-[320px] h-full bg-white border-l border-[#eceff1] shadow-[-12px_0_28px_rgba(0,0,0,0.08)] flex flex-col overflow-hidden z-20"}
+                        >
+                                <header className="h-[54px] bg-[#f0f2f5] px-3 sm:px-4 flex items-center gap-4 text-[#111b21] border-b border-[#eceff1]">
                                     <X className="w-5 h-5 cursor-pointer hover:text-[#54656f]" onClick={() => setShowContactInfo(false)} />
                                     <h2 className="text-[14px] font-bold">Contact Info</h2>
                                 </header>
@@ -5466,6 +8808,9 @@ export default function App() {
 
                                 <div className="w-full text-center space-y-2">
                                     <div className="flex flex-col items-center gap-2">
+                                        <span className="text-[10px] font-bold uppercase tracking-widest text-[#54656f]">
+                                            Alias
+                                        </span>
                                         <input
                                             className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-4 py-2.5 text-[14px] font-bold text-center focus:outline-none focus:border-[#00a884]"
                                             value={contactDraftName}
@@ -5473,7 +8818,7 @@ export default function App() {
                                                 setContactDraftName(e.target.value);
                                                 setContactDirty(true);
                                             }}
-                                            placeholder="Contact name"
+                                            placeholder="Set alias (optional)"
                                             disabled={selectedChat?.id.endsWith('@g.us')}
                                         />
                                         <button
@@ -5481,7 +8826,7 @@ export default function App() {
                                             disabled={selectedChat?.id.endsWith('@g.us')}
                                             className={`px-3 py-1.5 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all ${contactDirty ? 'bg-[#00a884] text-white' : 'bg-[#f0f2f5] text-[#8696a0]'} `}
                                         >
-                                            Save Contact
+                                            Save Alias
                                         </button>
                                     </div>
                                     <p className="text-[#54656f] text-[13px] mt-1 font-medium">
@@ -5491,6 +8836,18 @@ export default function App() {
 
                                 <div className="w-full space-y-3 bg-[#f8f9fa] p-4 rounded-2xl border border-[#eceff1]">
                                     <div className="flex flex-col gap-1">
+                                        <span className="text-[10px] text-[#00a884] font-bold uppercase tracking-wider">WhatsApp name</span>
+                                        <span className="text-[14px] font-bold text-[#111b21]">
+                                            {selectedChat?.id.endsWith('@g.us') ? 'Enterprise Group' : selectedContactWhatsappName}
+                                        </span>
+                                    </div>
+                                    <div className="flex flex-col gap-1 pt-3 border-t border-[#eceff1]">
+                                        <span className="text-[10px] text-[#00a884] font-bold uppercase tracking-wider">Alias</span>
+                                        <span className="text-[14px] font-bold text-[#111b21]">
+                                            {selectedChat?.id.endsWith('@g.us') ? '--' : (selectedContactAlias || '--')}
+                                        </span>
+                                    </div>
+                                    <div className="flex flex-col gap-1 pt-3 border-t border-[#eceff1]">
                                         <span className="text-[10px] text-[#00a884] font-bold uppercase tracking-wider">Phone number</span>
                                         <span className="text-[14px] font-bold text-[#111b21]">
                                             {selectedChat?.id.endsWith('@g.us') ? 'Enterprise Group' : formatPhoneNumber(getCleanId(selectedChat?.id))}
@@ -5664,30 +9021,65 @@ export default function App() {
                         </aside>
                     )}
                 </div>
-            ) : (
-                <div className="flex-1 flex flex-col items-center justify-center bg-[#fcfdfd] relative">
-                    <div className="absolute inset-x-0 bottom-0 h-1.5 bg-[#00a884] z-20" />
-                    <div className="text-center relative z-10 px-6">
-                        {loadingChats && (
-                            <div className="w-[280px] mx-auto mb-10 animate-pulse space-y-3">
-                                <div className="h-3 rounded bg-[#e8edf1]" />
-                                <div className="h-3 rounded bg-[#eef2f5] w-5/6 mx-auto" />
-                                <div className="h-3 rounded bg-[#eef2f5] w-3/4 mx-auto" />
+            ) : isMobile ? null : (
+                <div className="qm-app-gradient flex-1 px-4 py-6 sm:px-6 lg:px-10">
+                    <div className="mx-auto flex h-full max-w-4xl flex-col justify-center">
+                        <div className="qm-shell p-6 sm:p-8 lg:p-10">
+                            {loadingChats && (
+                                <div className="mb-6 space-y-3">
+                                    <div className="qm-loading-block h-3.5 w-48 rounded-full" />
+                                    <div className="qm-loading-block h-3.5 w-80 rounded-full" />
+                                </div>
+                            )}
+                            <div className="flex flex-col gap-6 lg:flex-row lg:items-center">
+                                <div className="flex-1">
+                                    <p className="qm-eyebrow">Workspace Overview</p>
+                                    <h1 className="mt-2 text-3xl font-black tracking-tight text-[var(--qm-text)] lg:text-4xl">
+                                        Welcome to your QMessage command center
+                                    </h1>
+                                    <p className="mt-3 max-w-2xl text-sm leading-relaxed text-[var(--qm-text-muted)]">
+                                        Open a chat to start handling conversations, launch automation setup, or review delivery insights across your WABA operations.
+                                    </p>
+                                    <div className="mt-5 flex flex-wrap gap-2">
+                                        <button
+                                            type="button"
+                                            onClick={() => setShowNewChatModal(true)}
+                                            className="qm-btn qm-btn-primary h-10 px-4"
+                                        >
+                                            <Plus className="h-4 w-4" />
+                                            New Chat
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => setWorkspaceSection('automations')}
+                                            className="qm-btn qm-btn-secondary h-10 px-4"
+                                        >
+                                            <Workflow className="h-4 w-4" />
+                                            Open Automations
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div className="w-full max-w-[320px] shrink-0 space-y-2">
+                                    <div className="qm-kpi">
+                                        <div className="qm-kpi-label">Coverage</div>
+                                        <div className="qm-kpi-value">Inbox + Automation</div>
+                                    </div>
+                                    <div className="qm-kpi">
+                                        <div className="qm-kpi-label">Security</div>
+                                        <div className="qm-kpi-value flex items-center gap-2">
+                                            <ShieldCheck className="h-4 w-4 text-[var(--qm-brand)]" />
+                                            Company-isolated
+                                        </div>
+                                    </div>
+                                    <div className="qm-kpi">
+                                        <div className="qm-kpi-label">Operational Flow</div>
+                                        <div className="qm-kpi-value">Capture → Route → Respond</div>
+                                    </div>
+                                </div>
                             </div>
-                        )}
-                        <div className="mb-12 flex justify-center scale-110">
-                            <img src="https://static.whatsapp.net/rsrc.php/v4/y6/r/wa699kaDcnU.png" className="w-[300px] opacity-80" />
-                        </div>
-                        <h1 className="text-[32px] font-bold text-[#111b21] mb-2 tracking-tight">Nexus WABA Console</h1>
-                        <p className="text-[#54656f] text-[15px] leading-relaxed mb-12 max-w-sm mx-auto font-medium">
-                            Manage WhatsApp Business API conversations in one clean dashboard.
-                        </p>
-                        <div className="flex items-center justify-center gap-2 text-[#54656f] text-[12px] font-bold uppercase tracking-widest bg-[#f0f2f5] py-2 px-6 rounded-full w-fit mx-auto shadow-sm">
-                            <ShieldCheck className="w-4 h-4 text-[#00a884]" />
-                            Enterprise Grade Security
                         </div>
                     </div>
-
                 </div>
             )}
 
@@ -5782,6 +9174,7 @@ export default function App() {
                         profileId={activeProfileId || ''}
                         sessionToken={session?.access_token || null}
                         isAdmin={isAdmin}
+                        isSuperAdmin={isSuperAdmin}
                         quickReplies={quickReplies}
                         quickRepliesLoading={quickRepliesLoading}
                         quickRepliesSaving={quickRepliesSaving}
@@ -5789,69 +9182,93 @@ export default function App() {
                         onRefreshQuickReplies={fetchQuickReplies}
                         onSaveQuickReplies={saveQuickReplies}
                         onRefreshUiControls={fetchUiControls}
+                        showCallSettings={!isUiFeatureHidden('calls')}
+                        notificationPermission={notificationPermissionState}
+                        notificationSoundEnabled={notificationSoundEnabled}
+                        onToggleNotificationSound={handleToggleNotificationSound}
+                        onRequestNotifications={() => {
+                            void handleRequestNotificationPermission();
+                        }}
+                        onTestNotificationSound={() => {
+                            void handleTestNotificationSound();
+                        }}
                         WebhookViewComponent={LazyWebhookView}
                     />
                 )
             }
 
             {showAnalytics && (
-                <div className="fixed inset-0 bg-[#f8f9fa] z-[160] flex flex-col">
-                    <header className="h-[70px] bg-[#f0f2f5] px-6 flex items-center justify-between border-b border-[#eceff1]">
-                        <div className="flex items-center gap-4">
-                            <CircleDashed className="text-[#00a884] w-7 h-7" />
-                            <h1 className="text-xl font-bold text-[#111b21]">Analytics</h1>
-                        </div>
-                        <button onClick={() => setShowAnalytics(false)} className="p-2 hover:bg-white rounded-xl transition-all">
-                            <X className="w-6 h-6 text-[#54656f]" />
-                        </button>
-                    </header>
-                    <div className="flex-1 overflow-y-auto p-8 custom-scrollbar">
-                        <div className="bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] mb-8">
-                            <div className="flex flex-col lg:flex-row lg:items-end gap-4">
+                <div
+                    className="fixed inset-0 z-[110] bg-[#f8f9fa] text-[#111b21] font-sans pt-[64px] lg:pt-[72px]"
+                    style={{
+                        ...(mobileHeaderOffsetStyle || {}),
+                        ...(mobileBottomNavPaddingStyle || {})
+                    }}
+                    onTouchStart={handleMobileWorkspaceTouchStart}
+                    onTouchEnd={handleMobileWorkspaceTouchEnd}
+                >
+                    <div
+                        className={`h-full overflow-y-auto custom-scrollbar ${isMobile ? 'p-4' : 'p-6'}`}
+                        style={mobileBottomNavContentPaddingStyle}
+                    >
+                        <div className="mx-auto w-full max-w-[1280px] space-y-6">
+                        <div className={`${isMobile ? 'px-1 py-1' : 'bg-white border border-[#e6ebef] rounded-2xl p-4 md:p-5'}`}>
+                            <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4">
                                 <div>
-                                    <label className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">Start Date</label>
-                                    <input
-                                        type="date"
-                                        value={analyticsStart}
-                                        onChange={(e) => setAnalyticsStart(e.target.value)}
-                                        className="mt-2 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-4 py-2 text-sm font-bold text-[#111b21]"
-                                    />
+                                    <h2 className="text-lg md:text-xl font-semibold text-[#111b21] tracking-tight">Analytics</h2>
+                                    <p className="text-[11px] text-[#54656f] mt-1">
+                                        Message volume, response rates, and team performance.
+                                    </p>
                                 </div>
-                                <div>
-                                    <label className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">End Date</label>
-                                    <input
-                                        type="date"
-                                        value={analyticsEnd}
-                                        onChange={(e) => setAnalyticsEnd(e.target.value)}
-                                        className="mt-2 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-4 py-2 text-sm font-bold text-[#111b21]"
-                                    />
+                                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-[160px_160px_minmax(180px,1fr)_auto] gap-2">
+                                    <div>
+                                        <label className="text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">Start Date</label>
+                                        <input
+                                            type="date"
+                                            value={analyticsStart}
+                                            onChange={(e) => setAnalyticsStart(e.target.value)}
+                                            className="mt-1.5 w-full bg-[#f8f9fa] border border-[#dfe6eb] rounded-xl px-3 py-2 text-sm font-semibold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">End Date</label>
+                                        <input
+                                            type="date"
+                                            value={analyticsEnd}
+                                            onChange={(e) => setAnalyticsEnd(e.target.value)}
+                                            className="mt-1.5 w-full bg-[#f8f9fa] border border-[#dfe6eb] rounded-xl px-3 py-2 text-sm font-semibold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">Tag</label>
+                                        <select
+                                            value={analyticsTag}
+                                            onChange={(e) => setAnalyticsTag(e.target.value)}
+                                            className="mt-1.5 w-full bg-[#f8f9fa] border border-[#dfe6eb] rounded-xl px-3 py-2 text-sm font-semibold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                        >
+                                            <option value="">All tags</option>
+                                            {(analyticsData?.tags || []).map((tag: string) => (
+                                                <option key={tag} value={tag}>{tag}</option>
+                                            ))}
+                                        </select>
+                                    </div>
+                                    <div className="sm:col-span-2 lg:col-span-1 flex items-end">
+                                        <button
+                                            onClick={fetchAnalytics}
+                                            disabled={analyticsLoading}
+                                            className="h-10 px-4 rounded-lg bg-[#00a884] text-white text-[11px] font-semibold uppercase tracking-wide hover:bg-[#008f6f] transition-all disabled:opacity-60"
+                                        >
+                                            {analyticsLoading ? 'Loading...' : 'Apply'}
+                                        </button>
+                                    </div>
                                 </div>
-                                <div className="flex-1">
-                                    <label className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">Tag</label>
-                                    <select
-                                        value={analyticsTag}
-                                        onChange={(e) => setAnalyticsTag(e.target.value)}
-                                        className="mt-2 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-4 py-2 text-sm font-bold text-[#111b21]"
-                                    >
-                                        <option value="">All tags</option>
-                                        {(analyticsData?.tags || []).map((tag: string) => (
-                                            <option key={tag} value={tag}>{tag}</option>
-                                        ))}
-                                    </select>
-                                </div>
-                                <button
-                                    onClick={fetchAnalytics}
-                                    disabled={analyticsLoading}
-                                    className="h-[42px] px-5 rounded-xl bg-[#111b21] text-white text-xs font-bold uppercase tracking-widest hover:bg-[#202c33] transition-all disabled:opacity-50"
-                                >
-                                    {analyticsLoading ? 'Loading…' : 'Apply'}
-                                </button>
                             </div>
                             {analyticsError && (
-                                <div className="mt-4 text-sm text-rose-600 font-medium">{analyticsError}</div>
+                                <div className="mt-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-[11px] text-rose-700">
+                                    {analyticsError}
+                                </div>
                             )}
                         </div>
-
                         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-6 gap-6 mb-8">
                             <div className="bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
                                 <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-2">Total Messages</div>
@@ -5878,6 +9295,28 @@ export default function App() {
                                 <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-2">Expired Rate</div>
                                 <div className="text-3xl font-black text-rose-600">{analyticsInsights.expiredRate.toFixed(1)}%</div>
                                 <div className="text-[11px] text-[#8696a0] mt-1">Expired over sent</div>
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+                            <div className="bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                                <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-2">Staff Online</div>
+                                <div className="text-3xl font-black text-[#00a884]">{analyticsStaffInsights.onlineCount}</div>
+                                <div className="text-[11px] text-[#8696a0] mt-1">Active in last 10 minutes</div>
+                            </div>
+                            <div className="bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                                <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-2">Staff Response Time</div>
+                                <div className="text-3xl font-black text-[#111b21]">
+                                    {analyticsStaffInsights.averageResponseSeconds > 0
+                                        ? formatAnalyticsDuration(analyticsStaffInsights.averageResponseSeconds)
+                                        : '--'}
+                                </div>
+                                <div className="text-[11px] text-[#8696a0] mt-1">Weighted average reply time</div>
+                            </div>
+                            <div className="bg-white p-6 rounded-[24px] border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                                <div className="text-[#54656f] text-[10px] uppercase font-black tracking-widest mb-2">Staff Total Message</div>
+                                <div className="text-3xl font-black text-[#111b21]">{analyticsStaffInsights.totalMessages}</div>
+                                <div className="text-[11px] text-[#8696a0] mt-1">Outbound messages by staff</div>
                             </div>
                         </div>
 
@@ -6003,6 +9442,9 @@ export default function App() {
                                     <thead className="bg-[#fcfdfd] text-[#54656f] text-[10px] uppercase font-black tracking-widest border-b border-[#eceff1]">
                                         <tr>
                                             <th className="px-6 py-4">Staff</th>
+                                            <th className="px-6 py-4">Online</th>
+                                            <th className="px-6 py-4">Response Time</th>
+                                            <th className="px-6 py-4">Total Messages</th>
                                             <th className="px-6 py-4">Sent</th>
                                             <th className="px-6 py-4">Reply Rate</th>
                                             <th className="px-6 py-4">Replied / Inbound</th>
@@ -6014,7 +9456,7 @@ export default function App() {
                                     <tbody className="divide-y divide-[#f0f2f5]">
                                         {analyticsStaffRows.length === 0 ? (
                                             <tr>
-                                                <td className="px-6 py-6 text-sm text-[#8696a0]" colSpan={7}>
+                                                <td className="px-6 py-6 text-sm text-[#8696a0]" colSpan={10}>
                                                     No staff analytics for this range yet.
                                                 </td>
                                             </tr>
@@ -6030,6 +9472,19 @@ export default function App() {
                                                             {row.name || row.user_id}
                                                         </span>
                                                     </td>
+                                                    <td className="px-6 py-4 text-sm font-medium">
+                                                        <span className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-black uppercase tracking-wide ${row.is_online
+                                                            ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                                            : 'border-slate-200 bg-slate-50 text-slate-600'
+                                                            }`}>
+                                                            <span className={`h-1.5 w-1.5 rounded-full ${row.is_online ? 'bg-emerald-500' : 'bg-slate-400'}`} />
+                                                            {row.is_online ? 'Online' : 'Offline'}
+                                                        </span>
+                                                    </td>
+                                                    <td className="px-6 py-4 text-sm text-[#54656f] font-medium">
+                                                        {row.avg_response_seconds > 0 ? formatAnalyticsDuration(row.avg_response_seconds) : '--'}
+                                                    </td>
+                                                    <td className="px-6 py-4 text-sm text-[#54656f] font-medium">{row.total_messages}</td>
                                                     <td className="px-6 py-4 text-sm text-[#54656f] font-medium">{row.sent}</td>
                                                     <td className="px-6 py-4 text-sm font-bold text-[#111b21]">{row.reply_rate.toFixed(1)}%</td>
                                                     <td className="px-6 py-4 text-sm text-[#54656f] font-medium">
@@ -6082,55 +9537,15 @@ export default function App() {
                                 </table>
                             </div>
                         </div>
+                        </div>
                     </div>
                 </div>
             )}
 
             {/* Admin View is handled above - deleting redundant block if any */}
 
+            {!isMobile && (
             <div className="fixed bottom-6 right-6 z-[200] flex flex-col items-end gap-3">
-                {import.meta.env.DEV && (
-                    <DebugButton
-                        payload={{
-                            ts: new Date().toISOString(),
-                            env: {
-                                mode: import.meta.env.MODE,
-                                socketUrl: SOCKET_URL
-                            },
-                            session: {
-                                userId: session.user.id,
-                                email: session.user.email || null,
-                                companyId:
-                                    (session.user.user_metadata as any)?.company_id ||
-                                    (session.user.app_metadata as any)?.company_id ||
-                                    null,
-                                expiresAt: session.expires_at || null,
-                                accessToken: redactSecret(session.access_token)
-                            },
-                            socket: {
-                                connected: Boolean(socket?.connected),
-                                id: socket?.id || null
-                            },
-                            state: {
-                                isAdmin,
-                                activeView,
-                                activeProfileId: activeProfileId || null,
-                                connectionStatus,
-                                selectedChatId: selectedChatId || null,
-                                windowOpen,
-                                forceTemplateMode,
-                                lastProfileError
-                            },
-                            counts: {
-                                profiles: profiles.length,
-                                chats: chatList.length,
-                                messages: allMessages.length,
-                                logs: logEntries.length
-                            },
-                            serverStats
-                        }}
-                    />
-                )}
                 {logOpen && (
                     <div className="w-[360px] max-h-[60vh] bg-white border border-[#eceff1] rounded-2xl shadow-[0_12px_40px_rgba(0,0,0,0.12)] overflow-hidden">
                         <div className="px-4 py-3 border-b border-[#eceff1] flex items-center gap-2">
@@ -6204,84 +9619,74 @@ export default function App() {
                         </div>
                     </div>
                 )}
-                <button
-                    onClick={() => setLogOpen(prev => !prev)}
-                    className="flex items-center gap-2 bg-[#111b21] text-white px-4 py-2 rounded-full shadow-lg hover:bg-[#202c33] transition-all"
-                >
-                    <Bug className="w-4 h-4" />
-                    <span className="text-xs font-bold uppercase tracking-widest">Logs</span>
-                    {logEntries.length > 0 && (
-                        <span className="ml-1 bg-[#00a884] text-white text-[10px] font-bold px-2 py-0.5 rounded-full">
-                            {logEntries.length}
-                        </span>
-                    )}
-                </button>
             </div>
+            )}
 
-            <style dangerouslySetInnerHTML={{
-                __html: `
-                .custom-scrollbar::-webkit-scrollbar {
-                  width: 6px !important;
-                }
-                .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
-                .custom-scrollbar::-webkit-scrollbar-thumb { background: #ced0d6; border-radius: 10px; }
-                .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #aebac1; }
-                
-                input::placeholder { color: #54656f; opacity: 0.5; }
-                textarea::placeholder { color: #54656f; opacity: 0.5; }
-                
-                * { font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important; }
-            ` }} />
                 </div>
             ) : workspaceSection === 'broadcast' ? (
-                <BroadcastView
-                    broadcastNav={broadcastNav}
-                    broadcastSection={broadcastSection}
-                    setBroadcastSection={setBroadcastSection}
-                    activeProfileId={activeProfileId}
-                    sessionToken={session?.access_token || null}
-                    BroadcastTemplateBuilder={LazyBroadcastTemplateBuilder}
-                    BroadcastTemplatesList={LazyBroadcastTemplatesList}
-                />
+                <div onTouchStart={handleMobileWorkspaceTouchStart} onTouchEnd={handleMobileWorkspaceTouchEnd}>
+                    <BroadcastView
+                        broadcastNav={broadcastNav}
+                        broadcastSection={broadcastSection}
+                        setBroadcastSection={setBroadcastSection}
+                        activeProfileId={activeProfileId}
+                        sessionToken={session?.access_token || null}
+                        BroadcastTemplateBuilder={LazyBroadcastTemplateBuilder}
+                        BroadcastTemplatesList={LazyBroadcastTemplatesList}
+                    />
+                </div>
             ) : workspaceSection === 'automations' ? (
-                <AutomationsView
-                    workflows={automationWorkflows}
-                    workflowsLoading={workflowsLoading}
-                    profileId={activeProfileId}
-                    sessionToken={session?.access_token || null}
-                    apiBaseUrl={SOCKET_URL}
-                    onOpenBuilder={openAutomationBuilder}
-                    onCreateWorkflow={handleCreateAutomation}
-                    onToggleWorkflowEnabled={handleToggleAutomationEnabled}
-                    onCopyWorkflow={handleCopyAutomation}
-                    onQuickRepliesUpdated={fetchQuickReplies}
-                    onSaveWorkflowTrigger={handleSaveWorkflowTrigger}
-                />
+                <div onTouchStart={handleMobileWorkspaceTouchStart} onTouchEnd={handleMobileWorkspaceTouchEnd}>
+                    <AutomationsView
+                        workflows={automationWorkflows}
+                        workflowsLoading={workflowsLoading}
+                        isMobileView={isMobile}
+                        profileId={activeProfileId}
+                        sessionToken={session?.access_token || null}
+                        apiBaseUrl={SOCKET_URL}
+                        onOpenBuilder={openAutomationBuilder}
+                        onCreateWorkflow={handleCreateAutomation}
+                        onToggleWorkflowEnabled={handleToggleAutomationEnabled}
+                        onCopyWorkflow={handleCopyAutomation}
+                        onQuickRepliesUpdated={fetchQuickReplies}
+                        onSaveWorkflowTrigger={handleSaveWorkflowTrigger}
+                    />
+                </div>
             ) : workspaceSection === 'chatbots' ? (
-                <ChatbotsView
-                    profileId={activeProfileId}
-                    sessionToken={session?.access_token || null}
-                    apiBaseUrl={SOCKET_URL}
-                />
+                <div onTouchStart={handleMobileWorkspaceTouchStart} onTouchEnd={handleMobileWorkspaceTouchEnd}>
+                    <ChatbotsView
+                        profileId={activeProfileId}
+                        sessionToken={session?.access_token || null}
+                        apiBaseUrl={SOCKET_URL}
+                    />
+                </div>
             ) : workspaceSection === 'more' ? (
-                <div className="h-screen pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans">
-                    <div className="h-full p-6 overflow-y-auto custom-scrollbar">
+                <div
+                    className={`${isMobile ? 'h-[100dvh]' : 'h-screen'} qm-workspace-page qm-app-gradient text-[var(--qm-text)] font-sans`}
+                    style={{
+                        ...(mobileHeaderOffsetStyle || {}),
+                        ...(mobileBottomNavPaddingStyle || {})
+                    }}
+                    onTouchStart={handleMobileWorkspaceTouchStart}
+                    onTouchEnd={handleMobileWorkspaceTouchEnd}
+                >
+                    <div className="h-full qm-workspace-body overflow-y-auto custom-scrollbar">
                         <div className="max-w-3xl mx-auto space-y-4">
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 {!isUiFeatureHidden(SETTINGS_UI_FEATURE_KEY) && (
                                     <button
                                         type="button"
                                         onClick={openSettingsFromMore}
-                                        className="text-left bg-white border border-[#eceff1] rounded-2xl p-5 hover:bg-[#f8f9fa] transition-all cursor-pointer pointer-events-auto"
+                                        className="text-left qm-card p-5 hover:bg-[#f8fbff] transition-all cursor-pointer pointer-events-auto"
                                     >
                                         <div className="flex items-center gap-3 mb-2">
-                                            <div className="w-9 h-9 rounded-xl bg-[#00a884]/10 border border-[#00a884]/20 text-[#00a884] flex items-center justify-center">
+                                            <div className="w-9 h-9 rounded-xl bg-[var(--qm-brand-soft)] border border-[var(--qm-border)] text-[var(--qm-brand)] flex items-center justify-center">
                                                 <Settings className="w-5 h-5" />
                                             </div>
-                                            <div className="text-lg font-black text-[#111b21]">Settings</div>
+                                            <div className="text-lg font-black text-[var(--qm-text)]">Settings</div>
                                         </div>
-                                        <p className="text-sm text-[#54656f]">
-                                            Webhooks, onboarding, team users, and workspace configuration.
+                                        <p className="text-sm text-[var(--qm-text-muted)]">
+                                            Webhooks, team users, credentials, and workspace configuration.
                                         </p>
                                     </button>
                                 )}
@@ -6290,42 +9695,68 @@ export default function App() {
                                     <button
                                         type="button"
                                         onClick={openAnalyticsFromMore}
-                                        className="text-left bg-white border border-[#eceff1] rounded-2xl p-5 hover:bg-[#f8f9fa] transition-all cursor-pointer pointer-events-auto"
+                                        className="text-left qm-card p-5 hover:bg-[#f8fbff] transition-all cursor-pointer pointer-events-auto"
                                     >
                                         <div className="flex items-center gap-3 mb-2">
-                                            <div className="w-9 h-9 rounded-xl bg-[#111b21]/5 border border-[#111b21]/10 text-[#111b21] flex items-center justify-center">
-                                                <CircleDashed className="w-5 h-5" />
+                                            <div className="w-9 h-9 rounded-xl bg-[#edf4ff] border border-[var(--qm-border)] text-[var(--qm-accent)] flex items-center justify-center">
+                                                <BarChart3 className="w-5 h-5" />
                                             </div>
-                                            <div className="text-lg font-black text-[#111b21]">Analytics</div>
+                                            <div className="text-lg font-black text-[var(--qm-text)]">Analytics</div>
                                         </div>
-                                        <p className="text-sm text-[#54656f]">
+                                        <p className="text-sm text-[var(--qm-text-muted)]">
                                             View message totals, workflow metrics, and date-based performance.
                                         </p>
                                     </button>
                                 )}
+
+                                <a
+                                    href="mailto:hello@2fast.xyz"
+                                    className="text-left qm-card p-5 hover:bg-[#f8fbff] transition-all cursor-pointer pointer-events-auto"
+                                >
+                                    <div className="flex items-center gap-3 mb-2">
+                                        <div className="w-9 h-9 rounded-xl bg-[#eef6ff] border border-[var(--qm-border)] text-[var(--qm-accent)] flex items-center justify-center">
+                                            <LifeBuoy className="w-5 h-5" />
+                                        </div>
+                                        <div className="text-lg font-black text-[var(--qm-text)]">Support</div>
+                                    </div>
+                                    <p className="text-sm text-[var(--qm-text-muted)]">
+                                        Need help with WABA setup, delivery issues, or account operations? Contact support directly.
+                                    </p>
+                                </a>
                             </div>
                         </div>
                     </div>
                 </div>
             ) : workspaceSection === 'contacts' ? (
-                <ContactsView
-                    contactsList={contactsList}
-                    teamUsersLoading={teamUsersLoading}
-                    teamUsers={teamUsers}
-                    contactsSearchQuery={contactsSearchQuery}
-                    onContactsSearchChange={setContactsSearchQuery}
-                    assigningContactId={assigningContactId}
-                    onToggleAssignMenu={(contactId) => {
-                        if (!teamUsers.length && !teamUsersLoading) fetchTeamUsers();
-                        setAssignMenuContactId(prev => (prev === contactId ? null : contactId));
-                    }}
-                    onOpenChat={(contactId) => {
-                        handleOpenChat(contactId);
-                        setWorkspaceSection(defaultWorkspaceSection);
-                    }}
-                />
+                <div onTouchStart={handleMobileWorkspaceTouchStart} onTouchEnd={handleMobileWorkspaceTouchEnd}>
+                    <ContactsView
+                        contactsList={contactsList}
+                        isMobileView={isMobile}
+                        teamUsersLoading={teamUsersLoading}
+                        teamUsers={teamUsers}
+                        contactsSearchQuery={contactsSearchQuery}
+                        onContactsSearchChange={setContactsSearchQuery}
+                        assigningContactId={assigningContactId}
+                        onToggleAssignMenu={(contactId) => {
+                            if (!teamUsers.length && !teamUsersLoading) fetchTeamUsers();
+                            setAssignMenuContactId(prev => (prev === contactId ? null : contactId));
+                        }}
+                        onOpenChat={(contactId) => {
+                            handleOpenChat(contactId);
+                            setWorkspaceSection(defaultWorkspaceSection);
+                        }}
+                    />
+                </div>
             ) : (
-                <div className="h-screen pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans">
+                <div
+                    className={`${isMobile ? 'h-[100dvh]' : 'h-screen'} pt-[64px] lg:pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans`}
+                    style={{
+                        ...(mobileHeaderOffsetStyle || {}),
+                        ...(mobileBottomNavPaddingStyle || {})
+                    }}
+                    onTouchStart={handleMobileWorkspaceTouchStart}
+                    onTouchEnd={handleMobileWorkspaceTouchEnd}
+                >
                     <div className="h-full flex items-center justify-center p-6">
                         <div className="w-full max-w-xl bg-white border border-[#eceff1] rounded-3xl p-8 shadow-[0_12px_40px_rgba(0,0,0,0.06)]">
                             <h2 className="text-2xl font-black text-[#111b21] mb-3">{activeWorkspaceLabel}</h2>
@@ -6337,6 +9768,57 @@ export default function App() {
                                 className="px-5 py-3 rounded-xl bg-[#00a884] text-white text-sm font-bold hover:bg-[#008f6f] transition-all"
                             >
                                 Open Workspace
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {shouldShowMobileBottomNav && mobileWorkspaceTabs.length > 0 && (
+                <BottomNavBar
+                    items={mobileWorkspaceTabs.map((tab) => ({
+                        id: tab.id,
+                        label: tab.label,
+                        icon: tab.icon,
+                        badgeCount: tab.id === 'team-inbox' ? totalUnreadBadgeCount : undefined
+                    }))}
+                    activeId={showAnalytics ? 'more' : workspaceSection}
+                    onSelect={(id) => {
+                        if (id === 'more') {
+                            openAnalyticsFromMore();
+                            return;
+                        }
+                        setShowAnalytics(false);
+                        setShowContactInfo(false);
+                        if (id === 'team-inbox') {
+                            setSelectedChatId(null);
+                        }
+                        setWorkspaceSection(id as typeof workspaceSection);
+                    }}
+                />
+            )}
+
+            {showPwaUpdateBanner && (
+                <div className="fixed left-0 right-0 top-0 z-[320] pointer-events-none px-3 pt-[calc(env(safe-area-inset-top,0px)+12px)]">
+                    <div className="mx-auto max-w-md pointer-events-auto rounded-2xl border border-white/15 bg-[#111b21] px-4 py-3 text-white shadow-[0_12px_34px_rgba(0,0,0,0.34)]">
+                        <div className="text-[13px] font-bold">New update available</div>
+                        <div className="mt-1 text-[11px] text-white/80">
+                            A newer version is ready. Update now for the latest fixes.
+                        </div>
+                        <div className="mt-3 flex items-center justify-end gap-2">
+                            <button
+                                type="button"
+                                onClick={() => setShowPwaUpdateBanner(false)}
+                                className="px-3 py-1.5 rounded-lg border border-white/20 text-[11px] font-semibold text-white/85 hover:bg-white/10 transition-all"
+                            >
+                                Later
+                            </button>
+                            <button
+                                type="button"
+                                onClick={handleApplyPwaUpdate}
+                                className="px-3 py-1.5 rounded-lg bg-[#00a884] text-[11px] font-semibold text-white hover:bg-[#008f72] transition-all"
+                            >
+                                Update now
                             </button>
                         </div>
                     </div>
@@ -6420,17 +9902,76 @@ export default function App() {
                 </div>
             )}
             {appToast && (
-                <div className="fixed top-4 right-4 z-[280] max-w-[360px]">
-                    <div
-                        className={`rounded-xl border px-4 py-2.5 text-sm font-semibold shadow-lg ${appToast.tone === 'success'
-                                ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
-                                : 'bg-rose-50 border-rose-200 text-rose-700'
-                            }`}
-                    >
-                        {appToast.message}
+                <div
+                    className="fixed top-4 right-4 z-[280] max-w-[360px]"
+                    style={{
+                        top: 'max(calc(env(safe-area-inset-top) + 0.5rem), 1rem)',
+                        right: 'max(calc(env(safe-area-inset-right) + 0.5rem), 1rem)',
+                        left: isMobile ? 'max(env(safe-area-inset-left), 0.75rem)' : undefined
+                    }}
+                >
+                    {appToast.variant === 'chat' ? (
+                        <div className="rounded-2xl border border-[#d8e1e6] bg-white px-3.5 py-3 shadow-[0_12px_30px_rgba(0,0,0,0.18)]">
+                            <div className="flex items-start gap-3">
+                                <div className="w-10 h-10 rounded-full bg-[#dcf8c6] border border-[#b9e3ad] text-[#128c7e] text-xs font-black flex items-center justify-center shrink-0">
+                                    {appToast.avatarLabel || getInitials(appToast.title || 'M')}
+                                </div>
+                                <div className="min-w-0">
+                                    <div className="flex items-center gap-2">
+                                        <p className="text-[13px] font-bold text-[#111b21] truncate">
+                                            {appToast.title || 'New message'}
+                                        </p>
+                                        <span className="text-[10px] font-bold text-[#00a884] uppercase tracking-wide">Now</span>
+                                    </div>
+                                    <p className="mt-0.5 text-[12px] leading-5 text-[#54656f] break-words">
+                                        {appToast.message}
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                    ) : (
+                        <div
+                            className={`rounded-xl border px-4 py-2.5 text-sm font-semibold shadow-lg ${appToast.tone === 'success'
+                                    ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                                    : 'bg-rose-50 border-rose-200 text-rose-700'
+                                }`}
+                        >
+                            {appToast.message}
+                        </div>
+                    )}
+                </div>
+            )}
+            {debugOverlayEnabled && isMobile && (
+                <div
+                    className="fixed z-[285] left-2 right-2"
+                    style={{
+                        bottom: 'calc(env(safe-area-inset-bottom) + 4.75rem)'
+                    }}
+                >
+                    <div className="rounded-xl border border-[#d7dee4] bg-white/95 shadow-[0_10px_30px_rgba(0,0,0,0.18)] backdrop-blur-sm overflow-hidden">
+                        <button
+                            type="button"
+                            onClick={() => setDebugPanelOpen((prev) => !prev)}
+                            className="w-full px-3 py-2 flex items-center justify-between text-[11px] font-extrabold uppercase tracking-[0.12em] text-[#334155] bg-[#f8fbff] border-b border-[#e4ebf1]"
+                        >
+                            <span>Mobile Debug</span>
+                            <span>{debugPanelOpen ? 'Hide' : 'Show'}</span>
+                        </button>
+                        {debugPanelOpen && (
+                            <div className="max-h-[42vh] overflow-y-auto custom-scrollbar px-3 py-2">
+                                <pre className="text-[11px] leading-5 text-[#1f2937] whitespace-pre-wrap break-all">{JSON.stringify(debugSnapshot, null, 2)}</pre>
+                            </div>
+                        )}
                     </div>
                 </div>
             )}
         </>
     );
 }
+
+
+
+
+
+
+

@@ -31,6 +31,7 @@ export type WabaMedia = {
 export type WabaInboundMessage = {
     phoneNumberId: string
     from: string
+    groupId?: string
     id: string
     timestamp: number
     type: string
@@ -71,12 +72,40 @@ export type WabaStatus = {
     status: string
     timestamp: number
     recipientId?: string
+    recipientType?: string
+    recipientParticipantId?: string
+    participantRecipientId?: string
     conversation?: any
     pricing?: any
+    raw: any
+}
+
+export type WabaCallUpdate = {
+    phoneNumberId: string
+    id: string
+    event: string
+    timestamp: number
+    to?: string
+    from?: string
+    direction?: string
+    status?: string[]
+    startTime?: number
+    endTime?: number
+    duration?: number
+    deeplinkPayload?: string
+    ctaPayload?: string
+    bizOpaqueCallbackData?: string
+    session?: {
+        sdp_type?: string
+        sdp?: string
+    }
+    contactName?: string
+    errors?: any[]
     raw: any
 }
 
 export type WabaWebhookParseResult = {
     messages: WabaInboundMessage[]
     statuses: WabaStatus[]
+    calls: WabaCallUpdate[]
 }

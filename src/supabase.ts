@@ -4,13 +4,24 @@ import dotenv from 'dotenv'
 
 dotenv.config()
 
-// Default fallback to the keys provided by user in conversation
-const DEFAULT_URL = 'https://hafkwvdcmfenbbzvufkv.supabase.co'
-const DEFAULT_PUBLISHABLE_KEY = 'sb_publishable_McTQKF73jZv_ekbxLFw2IQ_LG8YuZ0o'
+function readRequiredEnv(keys: string[]): string {
+    for (const key of keys) {
+        const value = process.env[key]?.trim()
+        if (value) return value
+    }
+    throw new Error(`Missing required Supabase env var. Set one of: ${keys.join(', ')}`)
+}
 
-const SUPABASE_URL = process.env.SUPABASE_URL || DEFAULT_URL
-const SUPABASE_PUBLISHABLE_KEY = process.env.SUPABASE_KEY || process.env.SUPABASE_ANON_KEY || DEFAULT_PUBLISHABLE_KEY
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY || SUPABASE_PUBLISHABLE_KEY
+const SUPABASE_URL = readRequiredEnv(['SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_URL'])
+const SUPABASE_PUBLISHABLE_KEY = readRequiredEnv([
+    'SUPABASE_KEY',
+    'SUPABASE_ANON_KEY',
+    'NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY'
+])
+const SUPABASE_SERVICE_KEY =
+    process.env.SUPABASE_SERVICE_ROLE_KEY?.trim() ||
+    process.env.SUPABASE_SERVICE_KEY?.trim() ||
+    SUPABASE_PUBLISHABLE_KEY
 
 if (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY) {
     console.log('Supabase: Using Service Role Key (Admin Access)')

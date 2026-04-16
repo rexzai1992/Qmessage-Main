@@ -8,13 +8,14 @@ import path from 'path'
 import os from 'os'
 import { createHash, randomBytes } from 'crypto'
 import type { Socket as NetSocket } from 'net'
+import webpush from 'web-push'
 import * as addon from './src/addon'
 import { resolvePath } from './src/config'
 import { supabase, supabaseAuth } from './src/supabase'
 import { WabaRegistry } from './src/waba/registry'
 import { parseWabaWebhook, verifyWabaSignature } from './src/waba/webhook'
-import type { WabaInboundMessage, WabaStatus, WabaConfig } from './src/waba/types'
-import { resolveCompanyId, findOrCreateUser, getMessagesForUsers, getUsersForCompany, insertMessage, getUserByPhone, deleteMessagesForUser, normalizePhoneNumber, updateMessageStatusByMessageId, updateUserName, setUserTags, getUsersWithExpiringWindow, updateUserWindowReminder, activateUserCtaFreeWindow, getUserById, assignUserToAgentIfUnassigned, setUserAssignee, hasHumanTakeover, setUserHumanTakeover, setUserTemplateAttributes } from './src/services/wa-store'
+import type { WabaInboundMessage, WabaStatus, WabaConfig, WabaCallUpdate } from './src/waba/types'
+import { ADS_SHOOT_SIMULATED_TAG, LEGACY_ADS_SHOOT_SIMULATED_TAG, resolveCompanyId, findOrCreateUser, getMessagesForUsers, getMessagesForUsersSince, getUsersForCompany, insertMessage, getUserByPhone, deleteMessagesForUser, deleteUserById, normalizePhoneNumber, isGroupIdentifier, updateMessageStatusByMessageId, updateUserName, setUserAlias, setUserTags, getUsersWithExpiringWindow, updateUserWindowReminder, activateUserCtaFreeWindow, getUserById, assignUserToAgentIfUnassigned, setUserAssignee, hasHumanTakeover, setUserHumanTakeover, setUserTemplateAttributes } from './src/services/wa-store'
 import type { MessageRecord, User as WaStoreUser } from './src/services/wa-store'
 import { sendWhatsAppMessage } from './src/services/whatsapp'
 import { createDownloadUrl, isR2Configured } from './src/services/r2-storage'
@@ -32,6 +33,10 @@ import { registerStoreRoutes } from './dashboard-server/routes/storeRoutes'
 import { registerAiRoutes } from './dashboard-server/routes/aiRoutes'
 import { getCompanyAiSettings } from './dashboard-server/services/aiSettingsSupabase'
 import { loadOpenAiMemoryForUser, requestOpenAiCompletion, type OpenAiChatMessage } from './dashboard-server/services/openaiAssistant'
+import { createPushSubscriptionStore } from './dashboard-server/services/pushSubscriptionStore'
+import { createNativePushTokenStore } from './dashboard-server/services/nativePushTokenStore'
+import { createNativeFcmPushSender } from './dashboard-server/services/fcmNativePush'
+import { createSystemRuntimeStatusStore } from './dashboard-server/services/systemRuntimeStatusStore'
 import { registerSocketHandlers } from './dashboard-server/socket/registerSocketHandlers'
 import { errorHandler } from './dashboard-server/middleware/error'
 import { requireSupabaseUser } from './dashboard-server/middleware/auth'
@@ -48,6 +53,142 @@ app.use(express.json({
 const httpServer = createServer(app)
 const activeSockets = new Set<NetSocket>()
 
+type ApiRequestSample = {
+    ts: number
+    route: string
+    status: number
+    durationMs: number
+    inBytes: number
+    outBytes: number
+}
+
+type ApiRouteAggregate = {
+    count: number
+    errorCount: number
+    totalDurationMs: number
+    maxDurationMs: number
+    inBytes: number
+    outBytes: number
+    lastStatus: number
+    lastHitAt: number
+}
+
+const API_MONITOR_WINDOW_MS = 5 * 60 * 1000
+const API_MONITOR_MAX_RECENT = 4000
+const apiMonitor = {
+    startedAt: Date.now(),
+    totalCalls: 0,
+    status2xx: 0,
+    status3xx: 0,
+    status4xx: 0,
+    status5xx: 0,
+    inBytes: 0,
+    outBytes: 0,
+    recent: [] as ApiRequestSample[],
+    routes: new Map<string, ApiRouteAggregate>()
+}
+
+let socketTrafficTotals = {
+    inBytes: 0,
+    outBytes: 0
+}
+
+function safeParseByteHeader(value: unknown): number {
+    if (typeof value === 'number') {
+        return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
+    }
+    if (typeof value === 'string') {
+        const parsed = Number.parseInt(value, 10)
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : 0
+    }
+    if (Array.isArray(value) && value.length > 0) {
+        return safeParseByteHeader(value[0])
+    }
+    return 0
+}
+
+function normalizeApiPathForMonitoring(pathname: string): string {
+    if (!pathname) return '/'
+    return pathname
+        .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/gi, ':uuid')
+        .replace(/\/\d+(?=\/|$)/g, '/:id')
+        .replace(/\/[A-Za-z0-9_-]{18,}(?=\/|$)/g, '/:token')
+}
+
+function pruneRecentApiMonitorSamples(now = Date.now()) {
+    const threshold = now - API_MONITOR_WINDOW_MS
+    while (apiMonitor.recent.length > 0 && apiMonitor.recent[0].ts < threshold) {
+        apiMonitor.recent.shift()
+    }
+    if (apiMonitor.recent.length > API_MONITOR_MAX_RECENT) {
+        apiMonitor.recent.splice(0, apiMonitor.recent.length - API_MONITOR_MAX_RECENT)
+    }
+}
+
+app.use((req: any, res: any, next: any) => {
+    const rawPath = typeof req.path === 'string' ? req.path : ''
+    const trackAsApi = rawPath.startsWith('/api/') || rawPath === '/health'
+    if (!trackAsApi) {
+        next()
+        return
+    }
+
+    const startedAt = Date.now()
+    const inBytes = safeParseByteHeader(req.headers?.['content-length'])
+    const method = typeof req.method === 'string' ? req.method.toUpperCase() : 'GET'
+    const route = `${method} ${normalizeApiPathForMonitoring(rawPath)}`
+
+    res.on('finish', () => {
+        const endedAt = Date.now()
+        const status = Number.isFinite(res.statusCode) ? Number(res.statusCode) : 0
+        const durationMs = Math.max(0, endedAt - startedAt)
+        const outBytes = safeParseByteHeader(res.getHeader?.('content-length'))
+
+        apiMonitor.totalCalls += 1
+        apiMonitor.inBytes += inBytes
+        apiMonitor.outBytes += outBytes
+        if (status >= 500) apiMonitor.status5xx += 1
+        else if (status >= 400) apiMonitor.status4xx += 1
+        else if (status >= 300) apiMonitor.status3xx += 1
+        else if (status >= 200) apiMonitor.status2xx += 1
+
+        apiMonitor.recent.push({
+            ts: endedAt,
+            route,
+            status,
+            durationMs,
+            inBytes,
+            outBytes
+        })
+        pruneRecentApiMonitorSamples(endedAt)
+
+        const previous = apiMonitor.routes.get(route)
+        if (previous) {
+            previous.count += 1
+            previous.totalDurationMs += durationMs
+            previous.maxDurationMs = Math.max(previous.maxDurationMs, durationMs)
+            previous.inBytes += inBytes
+            previous.outBytes += outBytes
+            previous.lastStatus = status
+            previous.lastHitAt = endedAt
+            if (status >= 500) previous.errorCount += 1
+        } else {
+            apiMonitor.routes.set(route, {
+                count: 1,
+                errorCount: status >= 500 ? 1 : 0,
+                totalDurationMs: durationMs,
+                maxDurationMs: durationMs,
+                inBytes,
+                outBytes,
+                lastStatus: status,
+                lastHitAt: endedAt
+            })
+        }
+    })
+
+    next()
+})
+
 httpServer.on('connection', (socket) => {
     activeSockets.add(socket)
     socket.on('close', () => {
@@ -56,6 +197,10 @@ httpServer.on('connection', (socket) => {
 })
 const io = new Server(httpServer, {
     cors: { origin: '*' }
+})
+
+const systemRuntimeStatus = createSystemRuntimeStatusStore({
+    filePath: resolvePath('system_runtime_status.json')
 })
 
 type TeamRole = 'owner' | 'admin' | 'agent'
@@ -215,9 +360,16 @@ function normalizeTemplateAttributesForContact(value: any): Array<{
 
 function buildContactPayload(user: any) {
     const phone = normalizePhoneNumber(user?.phone_number)
+    const jidDomain = isGroupIdentifier(user?.phone_number || phone) ? '@g.us' : '@s.whatsapp.net'
+    const jid = phone ? `${phone}${jidDomain}` : `${user?.phone_number || ''}${jidDomain}`
+    const whatsappName = typeof user?.name === 'string' && user.name.trim() ? user.name.trim() : null
+    const alias = typeof user?.alias === 'string' && user.alias.trim() ? user.alias.trim() : null
+    const displayName = alias || whatsappName || phone || user?.phone_number || ''
     return {
-        id: phone ? `${phone}@s.whatsapp.net` : `${user?.phone_number || ''}@s.whatsapp.net`,
-        name: user?.name || phone || user?.phone_number || '',
+        id: jid,
+        name: displayName,
+        alias,
+        whatsappName,
         lastInboundAt: user?.last_inbound_at || null,
         tags: user?.tags || [],
         humanTakeover: hasHumanTakeover(user),
@@ -287,6 +439,8 @@ function broadcastServerStats() {
         const elapsedSec = Math.max(1, (now - lastNetSnapshot.timestamp) / 1000)
         const inBytes = Math.max(0, netNow.bytesRead - lastNetSnapshot.bytesRead)
         const outBytes = Math.max(0, netNow.bytesWritten - lastNetSnapshot.bytesWritten)
+        socketTrafficTotals.inBytes += inBytes
+        socketTrafficTotals.outBytes += outBytes
         bandwidth = {
             inBps: inBytes / elapsedSec,
             outBps: outBytes / elapsedSec,
@@ -333,6 +487,660 @@ const DEFAULT_REMINDER_TEXT = 'Heads up! Our 24h reply window closes soon. Reply
 const reminderRunningProfiles = new Set<string>()
 const reminderCache = new Map<string, number>()
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123'
+const ADS_SHOOT_MODE_FILE = resolvePath('ads_shoot_mode.json')
+const ADS_SHOOT_MODE_BATCH_SIZE = 15
+const ADS_SHOOT_MODE_NIGHT_START_HOUR = 20
+const ADS_SHOOT_MODE_NIGHT_END_HOUR = 23
+const GYM_SHOWCASE_WORKFLOW_ID = 'wf-gym-auto-reply'
+const GYM_SHOWCASE_SOURCE = 'gym_showcase_boost'
+const GYM_SHOWCASE_BOOST_COUNT = 5
+const GYM_SHOWCASE_COOLDOWN_MS = 90 * 1000
+const GYM_SHOWCASE_MIN_GAP_MS = 18 * 1000
+
+type AdsShootLeadTemplate = {
+    name: string
+    text: string
+}
+
+type AdsShootLead = AdsShootLeadTemplate & {
+    phone: string
+}
+
+type GymShowcaseLead = {
+    name: string
+    phone: string
+    followupButtonId: 'location' | 'hours'
+    followupButtonTitle: 'Gym Location' | 'Operating Hours'
+}
+
+type AdsShootModeProfileConfig = {
+    companyId: string
+    profileId: string
+    enabled: boolean
+    lastRunLocalDate: string | null
+    updatedAt: string
+}
+
+type AdsShootModeStoreData = {
+    profiles: Record<string, AdsShootModeProfileConfig>
+}
+
+const ADS_SHOOT_LEAD_TEMPLATES: AdsShootLeadTemplate[] = [
+    { name: 'Aiman Rahman', text: 'Hi, how much is the monthly membership?' },
+    { name: 'Nurul Aisyah', text: 'Do you have free trial for new member?' },
+    { name: 'Daniel Lee', text: 'Can I join tonight if I sign up now?' },
+    { name: 'Siti Hajar', text: 'Is there personal trainer package available?' },
+    { name: 'Jonathan Tan', text: 'Hi, what is your gym operating hour today?' },
+    { name: 'Farah Nabila', text: 'Do you have ladies class or ladies area?' },
+    { name: 'Marcus Lim', text: 'Can I pay by card or ewallet for membership?' },
+    { name: 'Syafiq Azman', text: 'Any promo for student membership this month?' },
+    { name: 'Emily Wong', text: 'I want to lose weight. Which plan is best for beginner?' },
+    { name: 'Hafiz Roslan', text: 'If I register now, when can I start using the gym?' },
+    { name: 'Sarah Collins', text: 'Do you offer group class like HIIT or yoga?' },
+    { name: 'Amirul Hakim', text: 'How much for personal trainer per session?' },
+    { name: 'Chloe Adams', text: 'Can I freeze my membership if I travel next month?' },
+    { name: 'Izzati Sofea', text: 'Do you have shower, locker and parking at your gym?' },
+    { name: 'Brandon Clarke', text: 'Hi there, is there any annual package discount?' },
+    { name: 'Hakim Iskandar', text: 'Can my friend and I join together with better price?' },
+    { name: 'Nadia Yasmin', text: 'Is there onboarding session for first timer?' },
+    { name: 'Ethan Miller', text: 'Do you have 24-hour access membership?' },
+    { name: 'Alicia Teoh', text: 'Can I book a gym tour before I decide to join?' },
+    { name: 'Faris Danish', text: 'What documents do I need to register membership?' }
+]
+
+const adsShootModeRunningProfiles = new Set<string>()
+const adsShootModeStore: AdsShootModeStoreData = loadAdsShootModeStore()
+const gymShowcaseRunningProfiles = new Set<string>()
+const gymShowcaseLastTriggeredByProfile = new Map<string, number>()
+
+function normalizeAdsShootModeEnabled(value: unknown): boolean {
+    if (value === true) return true
+    if (value === false) return false
+    if (value === 1) return true
+    if (value === 0) return false
+    if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase()
+        return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on'
+    }
+    return false
+}
+
+function isAdsShootStorePayload(value: unknown): value is AdsShootModeStoreData {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+    const profiles = (value as any).profiles
+    return !!profiles && typeof profiles === 'object' && !Array.isArray(profiles)
+}
+
+function buildAdsShootConfigKey(companyId: string, profileId: string) {
+    return `${companyId}::${profileId}`
+}
+
+function buildDefaultAdsShootModeProfileConfig(companyId: string, profileId: string): AdsShootModeProfileConfig {
+    return {
+        companyId,
+        profileId,
+        enabled: false,
+        lastRunLocalDate: null,
+        updatedAt: new Date().toISOString()
+    }
+}
+
+function loadAdsShootModeStore(): AdsShootModeStoreData {
+    try {
+        if (!fs.existsSync(ADS_SHOOT_MODE_FILE)) return { profiles: {} }
+        const raw = fs.readFileSync(ADS_SHOOT_MODE_FILE, 'utf-8')
+        const parsed = raw ? JSON.parse(raw) : null
+        if (!isAdsShootStorePayload(parsed)) return { profiles: {} }
+
+        const profiles: Record<string, AdsShootModeProfileConfig> = {}
+        for (const [key, value] of Object.entries(parsed.profiles || {})) {
+            if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+            const companyId = typeof (value as any).companyId === 'string' ? (value as any).companyId.trim() : ''
+            const profileId = typeof (value as any).profileId === 'string' ? (value as any).profileId.trim() : ''
+            if (!companyId || !profileId) continue
+            const normalizedKey = buildAdsShootConfigKey(companyId, profileId)
+            profiles[normalizedKey || key] = {
+                companyId,
+                profileId,
+                enabled: normalizeAdsShootModeEnabled((value as any).enabled),
+                lastRunLocalDate: typeof (value as any).lastRunLocalDate === 'string' ? (value as any).lastRunLocalDate : null,
+                updatedAt: typeof (value as any).updatedAt === 'string' ? (value as any).updatedAt : new Date().toISOString()
+            }
+        }
+        return { profiles }
+    } catch (error: any) {
+        console.warn('[AdsShootMode] Failed to load mode store:', error?.message || error)
+        return { profiles: {} }
+    }
+}
+
+function saveAdsShootModeStore() {
+    try {
+        fs.writeFileSync(ADS_SHOOT_MODE_FILE, JSON.stringify(adsShootModeStore, null, 2), 'utf-8')
+    } catch (error: any) {
+        console.warn('[AdsShootMode] Failed to save mode store:', error?.message || error)
+    }
+}
+
+function getAdsShootModeProfileConfig(companyId: string, profileId: string): AdsShootModeProfileConfig {
+    const key = buildAdsShootConfigKey(companyId, profileId)
+    const existing = adsShootModeStore.profiles[key]
+    if (existing) {
+        return {
+            ...existing,
+            companyId,
+            profileId
+        }
+    }
+    return buildDefaultAdsShootModeProfileConfig(companyId, profileId)
+}
+
+function upsertAdsShootModeProfileConfig(config: AdsShootModeProfileConfig) {
+    const key = buildAdsShootConfigKey(config.companyId, config.profileId)
+    adsShootModeStore.profiles[key] = {
+        ...config,
+        updatedAt: new Date().toISOString()
+    }
+    saveAdsShootModeStore()
+}
+
+function getLocalDateKey(date: Date): string {
+    const year = date.getFullYear()
+    const month = String(date.getMonth() + 1).padStart(2, '0')
+    const day = String(date.getDate()).padStart(2, '0')
+    return `${year}-${month}-${day}`
+}
+
+function buildAdsShootLeadPhone(profileId: string, localDateKey: string, index: number): string {
+    const seed = createHash('sha256')
+        .update(`${profileId}:${localDateKey}:${index}`)
+        .digest('hex')
+    const randomPart = 10_000_000 + (Number.parseInt(seed.slice(0, 8), 16) % 90_000_000)
+    return `6011${String(randomPart)}`
+}
+
+function buildAdsShootLeads(profileId: string, localDateKey: string, count: number): AdsShootLead[] {
+    const seed = createHash('sha256')
+        .update(`ads-shoot:${profileId}:${localDateKey}`)
+        .digest('hex')
+    const offset = Number.parseInt(seed.slice(0, 6), 16) % ADS_SHOOT_LEAD_TEMPLATES.length
+    const leads: AdsShootLead[] = []
+    for (let index = 0; index < count; index += 1) {
+        const template = ADS_SHOOT_LEAD_TEMPLATES[(offset + index) % ADS_SHOOT_LEAD_TEMPLATES.length]
+        leads.push({
+            name: template.name,
+            text: template.text,
+            phone: buildAdsShootLeadPhone(profileId, localDateKey, index)
+        })
+    }
+    return leads
+}
+
+function createDeterministicRng(seedText: string): () => number {
+    const digest = createHash('sha256').update(seedText).digest()
+    let state = digest.readUInt32LE(0) || 1
+    return () => {
+        state = (state + 0x6D2B79F5) >>> 0
+        let t = Math.imul(state ^ (state >>> 15), 1 | state)
+        t ^= t + Math.imul(t ^ (t >>> 7), 61 | t)
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+    }
+}
+
+function buildAdsShootRandomizedTimestamps(config: AdsShootModeProfileConfig, source: 'manual' | 'nightly', count: number): number[] {
+    const nowMs = Date.now()
+    const now = new Date(nowMs)
+
+    let windowStartMs = nowMs - (3 * 60 * 60 * 1000)
+    let windowEndMs = nowMs
+    if (source === 'nightly') {
+        const start = new Date(now)
+        start.setHours(ADS_SHOOT_MODE_NIGHT_START_HOUR, 0, 0, 0)
+        windowStartMs = Math.min(start.getTime(), nowMs)
+        windowEndMs = nowMs
+    }
+
+    if (!Number.isFinite(windowStartMs) || !Number.isFinite(windowEndMs) || windowEndMs <= windowStartMs) {
+        const fallback = Math.floor(nowMs / 1000)
+        return Array.from({ length: count }, (_, index) => fallback + index)
+    }
+
+    const rng = createDeterministicRng(`ads-shoot-time:${config.profileId}:${source}:${getLocalDateKey(now)}`)
+    const minGapMs = 25 * 1000
+    const randomMs = Array.from({ length: count }, () => {
+        const value = windowStartMs + Math.floor((windowEndMs - windowStartMs) * rng())
+        return value
+    }).sort((a, b) => a - b)
+
+    for (let index = 1; index < randomMs.length; index += 1) {
+        if (randomMs[index] <= randomMs[index - 1]) {
+            randomMs[index] = randomMs[index - 1] + minGapMs
+        }
+    }
+
+    const capMs = windowEndMs + (count * minGapMs)
+    for (let index = 0; index < randomMs.length; index += 1) {
+        if (randomMs[index] > capMs) randomMs[index] = capMs + (index * 1000)
+    }
+
+    return randomMs.map((value) => Math.max(1, Math.floor(value / 1000)))
+}
+
+function buildRandomizedTimelineUnixSeconds(
+    seedText: string,
+    count: number,
+    windowStartMs: number,
+    windowEndMs: number,
+    minGapMs: number
+): number[] {
+    if (count <= 0) return []
+    const nowMs = Date.now()
+    if (!Number.isFinite(windowStartMs) || !Number.isFinite(windowEndMs) || windowEndMs <= windowStartMs) {
+        const fallback = Math.floor(nowMs / 1000)
+        return Array.from({ length: count }, (_, index) => fallback + index)
+    }
+
+    const rng = createDeterministicRng(seedText)
+    const randomMs = Array.from({ length: count }, () => {
+        const value = windowStartMs + Math.floor((windowEndMs - windowStartMs) * rng())
+        return value
+    }).sort((a, b) => a - b)
+
+    const gap = Math.max(1000, minGapMs)
+    for (let index = 1; index < randomMs.length; index += 1) {
+        if (randomMs[index] <= randomMs[index - 1]) {
+            randomMs[index] = randomMs[index - 1] + gap
+        }
+    }
+
+    const capMs = windowEndMs + (count * gap)
+    for (let index = 0; index < randomMs.length; index += 1) {
+        if (randomMs[index] > capMs) randomMs[index] = capMs + (index * 1000)
+    }
+
+    return randomMs.map((value) => Math.max(1, Math.floor(value / 1000)))
+}
+
+function buildGymShowcaseLeads(profileId: string, triggerPhone: string, count: number): GymShowcaseLead[] {
+    const now = new Date()
+    const seed = createHash('sha256')
+        .update(`gym-showcase:${profileId}:${triggerPhone}:${now.toISOString()}:${randomBytes(4).toString('hex')}`)
+        .digest('hex')
+    const offset = Number.parseInt(seed.slice(0, 6), 16) % ADS_SHOOT_LEAD_TEMPLATES.length
+    const phoneSeedKey = `${getLocalDateKey(now)}-gym-${seed.slice(0, 12)}`
+    const leads: GymShowcaseLead[] = []
+    for (let index = 0; index < count; index += 1) {
+        const template = ADS_SHOOT_LEAD_TEMPLATES[(offset + index) % ADS_SHOOT_LEAD_TEMPLATES.length]
+        let phone = buildAdsShootLeadPhone(profileId, phoneSeedKey, index)
+        if (phone === triggerPhone) {
+            phone = buildAdsShootLeadPhone(profileId, `${phoneSeedKey}-alt`, index)
+        }
+        const rngNibble = Number.parseInt(seed.slice((index * 2) % 60, ((index * 2) % 60) + 2), 16)
+        const chooseLocation = (Number.isFinite(rngNibble) ? rngNibble : index) % 2 === 0
+        leads.push({
+            name: template.name,
+            phone,
+            followupButtonId: chooseLocation ? 'location' : 'hours',
+            followupButtonTitle: chooseLocation ? 'Gym Location' : 'Operating Hours'
+        })
+    }
+    return leads
+}
+
+function buildGymShowcaseTimestamps(profileId: string, triggerPhone: string, count: number): number[] {
+    const nowMs = Date.now()
+    const dynamicWindowMs = Math.max(12 * 60 * 1000, count * GYM_SHOWCASE_MIN_GAP_MS * 2)
+    const windowStartMs = nowMs - dynamicWindowMs - (3 * 60 * 1000)
+    const windowEndMs = nowMs - 20 * 1000
+    return buildRandomizedTimelineUnixSeconds(
+        `gym-showcase-time:${profileId}:${triggerPhone}:${nowMs}:${count}`,
+        count,
+        windowStartMs,
+        windowEndMs,
+        GYM_SHOWCASE_MIN_GAP_MS
+    )
+}
+
+function buildGymShowcaseInbound(
+    config: WabaConfig,
+    lead: GymShowcaseLead,
+    timestamp: number,
+    leadIndex: number,
+    stepIndex: number,
+    payload: {
+        type: string
+        text?: string
+        buttonId?: string
+        buttonTitle?: string
+        buttonDescription?: string
+    },
+    triggerPhone: string
+): WabaInboundMessage {
+    const textBody = typeof payload.text === 'string'
+        ? payload.text
+        : (payload.buttonTitle || payload.buttonId || '')
+    return {
+        phoneNumberId: config.phoneNumberId,
+        from: lead.phone,
+        id: `gym-showcase-${Date.now()}-${leadIndex + 1}-${stepIndex + 1}-${randomBytes(3).toString('hex')}`,
+        timestamp,
+        type: payload.type,
+        text: textBody ? { body: textBody } : undefined,
+        buttonReplyId: payload.buttonId,
+        buttonReplyTitle: payload.buttonTitle,
+        buttonReplyDescription: payload.buttonDescription,
+        contactName: lead.name,
+        raw: {
+            source: GYM_SHOWCASE_SOURCE,
+            simulated: true,
+            profile_id: config.profileId,
+            company_id: config.companyId || null,
+            trigger_phone: triggerPhone,
+            lead_index: leadIndex + 1,
+            step_index: stepIndex + 1
+        }
+    }
+}
+
+async function runGymShowcaseBoost(
+    config: WabaConfig,
+    companyId: string,
+    triggerPhone: string
+): Promise<{ sent: number; failed: number; error?: string }> {
+    const key = buildAdsShootConfigKey(companyId, config.profileId)
+    if (gymShowcaseRunningProfiles.has(key)) {
+        return { sent: 0, failed: 0, error: 'Gym showcase boost is already running for this profile' }
+    }
+
+    const modeConfig = getAdsShootModeProfileConfig(companyId, config.profileId)
+    if (!modeConfig.enabled) {
+        return { sent: 0, failed: 0, error: 'Ads Shoot Mode is disabled for this profile' }
+    }
+
+    const companyForProfile = await getCompanyIdForProfile(config.profileId)
+    if (!companyForProfile) {
+        return { sent: 0, failed: 0, error: 'Company not found for profile' }
+    }
+    if (companyForProfile !== companyId) {
+        return { sent: 0, failed: 0, error: 'Profile does not belong to this company' }
+    }
+
+    const nowMs = Date.now()
+    const lastTriggerMs = gymShowcaseLastTriggeredByProfile.get(key) || 0
+    if (lastTriggerMs && (nowMs - lastTriggerMs) < GYM_SHOWCASE_COOLDOWN_MS) {
+        return { sent: 0, failed: 0, error: 'Gym showcase boost is cooling down' }
+    }
+
+    const leads = buildGymShowcaseLeads(config.profileId, triggerPhone, GYM_SHOWCASE_BOOST_COUNT)
+    const stepsPerLead = 6
+    const timestamps = buildGymShowcaseTimestamps(config.profileId, triggerPhone, leads.length * stepsPerLead)
+    let timelineIndex = 0
+    let sent = 0
+    let failed = 0
+
+    gymShowcaseRunningProfiles.add(key)
+    try {
+        for (let leadIndex = 0; leadIndex < leads.length; leadIndex += 1) {
+            const lead = leads[leadIndex]
+            const steps: Array<{ type: string; text?: string; buttonId?: string; buttonTitle?: string }> = [
+                { type: 'text', text: 'Hi, I want to check gym membership.' },
+                { type: 'button', text: 'Membership', buttonId: 'membership', buttonTitle: 'Membership' },
+                { type: 'button', text: 'Monthly Membership', buttonId: 'monthly_membership', buttonTitle: 'Monthly Membership' },
+                { type: 'button', text: 'Payment Success', buttonId: 'payment_success', buttonTitle: 'Payment Success' },
+                { type: 'button', text: lead.followupButtonTitle, buttonId: lead.followupButtonId, buttonTitle: lead.followupButtonTitle },
+                { type: 'button', text: 'Done', buttonId: 'done', buttonTitle: 'Done' }
+            ]
+
+            for (let stepIndex = 0; stepIndex < steps.length; stepIndex += 1) {
+                const step = steps[stepIndex]
+                const timestamp = timestamps[timelineIndex] || Math.floor(Date.now() / 1000)
+                timelineIndex += 1
+                const inbound = buildGymShowcaseInbound(
+                    config,
+                    lead,
+                    timestamp,
+                    leadIndex,
+                    stepIndex,
+                    step,
+                    triggerPhone
+                )
+                try {
+                    await handleInboundMessage(config, inbound)
+                    sent += 1
+                } catch (error: any) {
+                    failed += 1
+                    console.warn('[GymShowcase] Failed to inject simulated workflow message:', error?.message || error)
+                }
+            }
+        }
+        gymShowcaseLastTriggeredByProfile.set(key, Date.now())
+    } finally {
+        gymShowcaseRunningProfiles.delete(key)
+    }
+
+    return { sent, failed }
+}
+
+async function runAdsShootModeBatch(
+    config: AdsShootModeProfileConfig,
+    source: 'manual' | 'nightly'
+): Promise<{ sent: number; failed: number; leads: AdsShootLead[]; error?: string }> {
+    const companyId = await getCompanyIdForProfile(config.profileId)
+    if (!companyId) {
+        return { sent: 0, failed: 0, leads: [], error: 'Company not found for profile' }
+    }
+    if (companyId !== config.companyId) {
+        return { sent: 0, failed: 0, leads: [], error: 'Profile does not belong to this company' }
+    }
+
+    const wabaConfig = await wabaRegistry.getConfigByProfile(config.profileId)
+    if (!wabaConfig) {
+        return { sent: 0, failed: 0, leads: [], error: 'WABA config is not available for this profile' }
+    }
+
+    const localDateKey = getLocalDateKey(new Date())
+    const leads = buildAdsShootLeads(config.profileId, localDateKey, ADS_SHOOT_MODE_BATCH_SIZE)
+    const timestamps = buildAdsShootRandomizedTimestamps(config, source, leads.length)
+    let sent = 0
+    let failed = 0
+
+    for (let index = 0; index < leads.length; index += 1) {
+        const lead = leads[index]
+        const nowUnix = timestamps[index] || Math.floor(Date.now() / 1000)
+        const inbound: WabaInboundMessage = {
+            phoneNumberId: wabaConfig.phoneNumberId,
+            from: lead.phone,
+            id: `ads-shoot-${source}-${Date.now()}-${index + 1}-${randomBytes(3).toString('hex')}`,
+            timestamp: nowUnix,
+            type: 'text',
+            text: { body: lead.text },
+            contactName: lead.name,
+            raw: {
+                source: 'ads_shoot_mode',
+                mode: source,
+                profile_id: config.profileId,
+                company_id: config.companyId,
+                simulated: true,
+                lead_index: index + 1
+            }
+        }
+        try {
+            await handleInboundMessage(wabaConfig, inbound)
+            sent += 1
+        } catch (error: any) {
+            failed += 1
+            console.warn('[AdsShootMode] Failed to inject simulated lead:', error?.message || error)
+        }
+    }
+
+    return { sent, failed, leads }
+}
+
+async function runAdsShootModeTick() {
+    const now = new Date()
+    const localHour = now.getHours()
+    if (localHour < ADS_SHOOT_MODE_NIGHT_START_HOUR || localHour > ADS_SHOOT_MODE_NIGHT_END_HOUR) return
+
+    const localDateKey = getLocalDateKey(now)
+    const entries = Object.values(adsShootModeStore.profiles)
+    for (const config of entries) {
+        if (!config.enabled) continue
+        if (config.lastRunLocalDate === localDateKey) continue
+
+        const key = buildAdsShootConfigKey(config.companyId, config.profileId)
+        if (adsShootModeRunningProfiles.has(key)) continue
+        adsShootModeRunningProfiles.add(key)
+        try {
+            const result = await runAdsShootModeBatch(config, 'nightly')
+            if (result.error) {
+                console.warn(`[AdsShootMode] ${config.profileId}: ${result.error}`)
+                continue
+            }
+            const nextConfig: AdsShootModeProfileConfig = {
+                ...config,
+                lastRunLocalDate: localDateKey
+            }
+            upsertAdsShootModeProfileConfig(nextConfig)
+            console.log(`[AdsShootMode] ${config.profileId}: injected ${result.sent}/${ADS_SHOOT_MODE_BATCH_SIZE} nightly leads.`)
+        } finally {
+            adsShootModeRunningProfiles.delete(key)
+        }
+    }
+}
+
+function chunkArray<T>(items: T[], size: number): T[][] {
+    const nextSize = Math.max(1, Math.floor(size))
+    const chunks: T[][] = []
+    for (let index = 0; index < items.length; index += nextSize) {
+        chunks.push(items.slice(index, index + nextSize))
+    }
+    return chunks
+}
+
+const ADS_SHOOT_SIMULATED_TAG_VALUES = new Set([
+    ADS_SHOOT_SIMULATED_TAG,
+    LEGACY_ADS_SHOOT_SIMULATED_TAG
+].map((tag) => String(tag || '').trim().toLowerCase()))
+
+function hasAdsShootSimulatedTag(tags: unknown): boolean {
+    if (!Array.isArray(tags)) return false
+    return tags.some((tag) => ADS_SHOOT_SIMULATED_TAG_VALUES.has(String(tag || '').trim().toLowerCase()))
+}
+
+async function collectSimulatedUserIdsByMessageMarker(candidateUserIds: string[], profileId: string): Promise<Set<string>> {
+    const result = new Set<string>()
+    if (candidateUserIds.length === 0) return result
+
+    const contentMarkers: any[] = [
+        { simulated: true, simulated_profile_id: profileId },
+        { raw: { source: 'ads_shoot_mode', profile_id: profileId } },
+        { raw: { source: GYM_SHOWCASE_SOURCE, profile_id: profileId } }
+    ]
+    const userChunks = chunkArray(candidateUserIds, 120)
+    for (const userChunk of userChunks) {
+        for (const marker of contentMarkers) {
+            let offset = 0
+            const pageSize = 500
+            while (true) {
+                const { data, error } = await supabase
+                    .from('messages')
+                    .select('user_id')
+                    .in('user_id', userChunk)
+                    .contains('content', marker)
+                    .range(offset, offset + pageSize - 1)
+
+                if (error) {
+                    console.warn('[AdsShootMode] Failed to collect simulated message markers:', error.message)
+                    break
+                }
+
+                const rows = Array.isArray(data) ? data : []
+                rows.forEach((row: any) => {
+                    if (row?.user_id) result.add(String(row.user_id))
+                })
+
+                if (rows.length < pageSize) break
+                offset += pageSize
+            }
+        }
+    }
+
+    return result
+}
+
+async function clearAdsShootSimulatedConversations(
+    companyId: string,
+    profileId: string
+): Promise<{ candidate_users: number; deleted_messages: number; deleted_users: number }> {
+    const users = await getUsersForCompany(companyId)
+    if (users.length === 0) {
+        return { candidate_users: 0, deleted_messages: 0, deleted_users: 0 }
+    }
+
+    const userIds = users.map((user) => user.id).filter(Boolean)
+    const userById = new Map(users.map((user) => [user.id, user]))
+    const candidateUserIds = new Set<string>()
+    const simulatedByMarker = await collectSimulatedUserIdsByMessageMarker(userIds, profileId)
+    simulatedByMarker.forEach((userId) => candidateUserIds.add(userId))
+
+    if (candidateUserIds.size === 0) {
+        // Fallback for older payloads without simulated_profile_id markers.
+        users.forEach((user) => {
+            if (hasAdsShootSimulatedTag(user.tags)) {
+                candidateUserIds.add(user.id)
+            }
+        })
+    }
+
+    if (candidateUserIds.size === 0) {
+        return { candidate_users: 0, deleted_messages: 0, deleted_users: 0 }
+    }
+
+    let deletedMessages = 0
+    let deletedUsers = 0
+    const candidateList = Array.from(candidateUserIds)
+
+    const messageChunks = chunkArray(candidateList, 80)
+    for (const userChunk of messageChunks) {
+        const { count, error } = await supabase
+            .from('messages')
+            .delete({ count: 'exact' })
+            .in('user_id', userChunk)
+
+        if (error) {
+            console.warn(`[AdsShootMode] Failed to delete simulated messages for profile ${profileId}:`, error.message)
+            continue
+        }
+        deletedMessages += Number(count || 0)
+    }
+
+    const userChunks = chunkArray(candidateList, 80)
+    for (const userChunk of userChunks) {
+        const { count, error } = await supabase
+            .from('users')
+            .delete({ count: 'exact' })
+            .eq('company_id', companyId)
+            .in('id', userChunk)
+
+        if (error) {
+            console.warn(`[AdsShootMode] Failed to delete simulated users for profile ${profileId}:`, error.message)
+            for (const userId of userChunk) {
+                const user = userById.get(userId)
+                if (!user || !Array.isArray(user.tags)) continue
+                const nextTags = user.tags.filter((tag) => !ADS_SHOOT_SIMULATED_TAG_VALUES.has(String(tag || '').trim().toLowerCase()))
+                await setUserTags(user.id, nextTags)
+            }
+            continue
+        }
+        deletedUsers += Number(count || 0)
+    }
+
+    return {
+        candidate_users: candidateList.length,
+        deleted_messages: deletedMessages,
+        deleted_users: deletedUsers
+    }
+}
 
 async function runWindowReminders() {
     const configs = await wabaRegistry.getProfileIds()
@@ -386,6 +1194,14 @@ async function runWindowReminders() {
 setInterval(() => {
     runWindowReminders().catch(err => console.error('[Reminder] tick failed:', err))
 }, 60_000)
+
+setInterval(() => {
+    runAdsShootModeTick().catch(err => console.error('[AdsShootMode] tick failed:', err))
+}, 60_000)
+
+setTimeout(() => {
+    runAdsShootModeTick().catch(err => console.error('[AdsShootMode] initial tick failed:', err))
+}, 8_000)
 
 const workflowEngine = new WorkflowEngine()
 
@@ -497,6 +1313,25 @@ async function getSupabaseUserFromRequest(req: any, res: any) {
         })
         return null
     }
+
+    const runtimeSnapshot = systemRuntimeStatus?.getStatus?.()
+    if (runtimeSnapshot?.maintenance?.enabled && !isSuperAdminUser(ensuredUser)) {
+        const maintenanceMessage = typeof runtimeSnapshot.maintenance.message === 'string'
+            ? runtimeSnapshot.maintenance.message.trim()
+            : ''
+        res.status(503).json({
+            success: false,
+            error: maintenanceMessage || 'Server is currently in maintenance mode',
+            maintenance: {
+                enabled: true,
+                message: maintenanceMessage,
+                updated_at: runtimeSnapshot.maintenance.updatedAt || null,
+                updated_by: runtimeSnapshot.maintenance.updatedBy || null
+            }
+        })
+        return null
+    }
+
     return ensuredUser
 }
 
@@ -658,31 +1493,62 @@ async function ensureUserRoleMembership(user: any, companyId: string): Promise<T
     const userId = typeof user?.id === 'string' ? user.id : ''
     if (!userId || !companyId) return 'agent'
 
-    const { data: existing, error: existingError } = await supabase
+    const { data: companyMembership, error: companyMembershipError } = await supabase
         .from('user_roles')
         .select('user_id, role, company_id')
         .eq('user_id', userId)
+        .eq('company_id', companyId)
         .maybeSingle()
 
-    if (existingError) {
-        console.warn(`[${userId}] Failed to load user role:`, existingError.message)
+    if (companyMembershipError) {
+        console.warn(`[${userId}] Failed to load company role:`, companyMembershipError.message)
     }
 
-    if (existing?.user_id) {
-        const role = normalizeTeamRole(existing.role)
-        const updates: any = {}
-        if (existing.company_id !== companyId) updates.company_id = companyId
-        if (existing.role !== role) updates.role = role
-        if (Object.keys(updates).length > 0) {
+    if (companyMembership?.user_id) {
+        const role = normalizeTeamRole(companyMembership.role)
+        if (companyMembership.role !== role) {
             const { error: updateError } = await supabase
                 .from('user_roles')
-                .update(updates)
+                .update({ role })
                 .eq('user_id', userId)
+                .eq('company_id', companyId)
             if (updateError) {
-                console.warn(`[${userId}] Failed to normalize user role:`, updateError.message)
+                console.warn(`[${userId}] Failed to normalize company role:`, updateError.message)
             }
         }
         return role
+    }
+
+    // Legacy fallback: upgrade old rows where company_id was null into the scoped company row.
+    const { data: legacyMembership, error: legacyMembershipError } = await supabase
+        .from('user_roles')
+        .select('user_id, role')
+        .eq('user_id', userId)
+        .is('company_id', null)
+        .maybeSingle()
+
+    if (legacyMembershipError) {
+        console.warn(`[${userId}] Failed to load legacy role:`, legacyMembershipError.message)
+    }
+
+    if (legacyMembership?.user_id) {
+        const role = normalizeTeamRole(legacyMembership.role)
+        const { error: updateError } = await supabase
+            .from('user_roles')
+            .update({
+                company_id: companyId,
+                role
+            })
+            .eq('user_id', userId)
+            .is('company_id', null)
+
+        if (updateError) {
+            const fallbackRole = await getUserRoleInCompany(userId, companyId)
+            if (fallbackRole) return fallbackRole
+            console.warn(`[${userId}] Failed to migrate legacy role:`, updateError.message)
+        } else {
+            return role
+        }
     }
 
     const { count: companyRoleCount, error: countError } = await supabase
@@ -2667,13 +3533,467 @@ function resolveOauthMode(configId?: string | null) {
     return configId ? 'business_integration' : 'user'
 }
 
+const requireSupabaseUserMiddleware = requireSupabaseUser(getSupabaseUserFromRequest)
+
+const WEB_PUSH_VAPID_FILE = resolvePath('webpush_vapid.json')
+const WEB_PUSH_SUBSCRIPTIONS_FILE = resolvePath('push_subscriptions.json')
+const WEB_PUSH_NOTIFICATION_ICON = '/icons/icon-192.png'
+const WEB_PUSH_NOTIFICATION_BADGE = '/icons/icon-192.png'
+const NATIVE_PUSH_TOKENS_FILE = resolvePath('native_push_tokens.json')
+const NATIVE_PUSH_CHANNEL_ID = 'qmessage-chat-v4'
+const NATIVE_PUSH_SOUND = 'iphone_glass'
+
+const pushSubscriptionStore = createPushSubscriptionStore(WEB_PUSH_SUBSCRIPTIONS_FILE)
+const nativePushTokenStore = createNativePushTokenStore(NATIVE_PUSH_TOKENS_FILE)
+const nativeFcmPushSender = createNativeFcmPushSender(console)
+
+type WebPushVapidDetails = {
+    publicKey: string
+    privateKey: string
+    subject: string
+}
+
+type SendPushNotificationInput = {
+    companyId: string
+    userIds: string[]
+    title: string
+    body: string
+    url?: string
+    tag?: string
+    icon?: string
+    badge?: string
+    data?: Record<string, any>
+    ttlSeconds?: number
+}
+
+const normalizeWebPushSubject = (value: string | null | undefined): string => {
+    const raw = typeof value === 'string' ? value.trim() : ''
+    if (!raw) return `mailto:no-reply@${TENANT_ROOT_DOMAIN}`
+    if (raw.startsWith('mailto:')) return raw
+    if (/^https?:\/\//i.test(raw)) return raw
+    if (raw.includes('@')) return `mailto:${raw}`
+    return `mailto:${raw}`
+}
+
+const loadOrCreateWebPushVapidDetails = (): WebPushVapidDetails | null => {
+    const envPublic = typeof process.env.WEB_PUSH_VAPID_PUBLIC_KEY === 'string' ? process.env.WEB_PUSH_VAPID_PUBLIC_KEY.trim() : ''
+    const envPrivate = typeof process.env.WEB_PUSH_VAPID_PRIVATE_KEY === 'string' ? process.env.WEB_PUSH_VAPID_PRIVATE_KEY.trim() : ''
+    const envSubject = normalizeWebPushSubject(process.env.WEB_PUSH_VAPID_SUBJECT || process.env.WEB_PUSH_SUBJECT || '')
+
+    if (envPublic && envPrivate) {
+        return {
+            publicKey: envPublic,
+            privateKey: envPrivate,
+            subject: envSubject
+        }
+    }
+
+    if (envPublic || envPrivate) {
+        console.warn('[push] WEB_PUSH_VAPID_PUBLIC_KEY / WEB_PUSH_VAPID_PRIVATE_KEY must both be set. Web push is disabled.')
+        return null
+    }
+
+    try {
+        if (fs.existsSync(WEB_PUSH_VAPID_FILE)) {
+            const raw = JSON.parse(fs.readFileSync(WEB_PUSH_VAPID_FILE, 'utf-8')) as any
+            const filePublic = typeof raw?.publicKey === 'string' ? raw.publicKey.trim() : ''
+            const filePrivate = typeof raw?.privateKey === 'string' ? raw.privateKey.trim() : ''
+            const fileSubject = normalizeWebPushSubject(raw?.subject || envSubject)
+            if (filePublic && filePrivate) {
+                return {
+                    publicKey: filePublic,
+                    privateKey: filePrivate,
+                    subject: fileSubject
+                }
+            }
+        }
+    } catch (error: any) {
+        console.warn('[push] Failed to read persisted VAPID key file:', error?.message || error)
+    }
+
+    try {
+        const generated = webpush.generateVAPIDKeys()
+        const subject = envSubject
+        const payload = {
+            publicKey: generated.publicKey,
+            privateKey: generated.privateKey,
+            subject,
+            createdAt: new Date().toISOString()
+        }
+        fs.writeFileSync(WEB_PUSH_VAPID_FILE, JSON.stringify(payload, null, 2))
+        console.log(`[push] Generated VAPID key pair at ${WEB_PUSH_VAPID_FILE}`)
+        return {
+            publicKey: generated.publicKey,
+            privateKey: generated.privateKey,
+            subject
+        }
+    } catch (error: any) {
+        console.warn('[push] Failed to generate VAPID keys. Web push is disabled.', error?.message || error)
+        return null
+    }
+}
+
+const webPushVapidDetails = loadOrCreateWebPushVapidDetails()
+if (webPushVapidDetails) {
+    try {
+        webpush.setVapidDetails(
+            webPushVapidDetails.subject,
+            webPushVapidDetails.publicKey,
+            webPushVapidDetails.privateKey
+        )
+    } catch (error: any) {
+        console.warn('[push] Failed to configure web-push VAPID details. Web push is disabled.', error?.message || error)
+    }
+}
+
+const getCompanyRecipientUserIdsForPush = async (companyId: string, fallbackUserId?: string | null): Promise<string[]> => {
+    const result = new Set<string>()
+    const normalizedCompanyId = normalizeCompanyId(companyId)
+    if (!normalizedCompanyId) return []
+
+    try {
+        const { data: roleRows, error: roleError } = await supabase
+            .from('user_roles')
+            .select('user_id')
+            .eq('company_id', normalizedCompanyId)
+
+        if (roleError) {
+            console.warn(`[push] Failed to load user_roles for company ${normalizedCompanyId}:`, roleError.message)
+        } else {
+            ;(roleRows || []).forEach((row: any) => {
+                const userId = typeof row?.user_id === 'string' ? row.user_id.trim() : ''
+                if (userId) result.add(userId)
+            })
+        }
+    } catch (error: any) {
+        console.warn(`[push] Failed to query user roles for company ${normalizedCompanyId}:`, error?.message || error)
+    }
+
+    if (result.size === 0) {
+        try {
+            const { data: profileRows, error: profileError } = await supabase
+                .from('profiles')
+                .select('user_id')
+                .eq('company_id', normalizedCompanyId)
+
+            if (profileError) {
+                console.warn(`[push] Failed to load profiles for company ${normalizedCompanyId}:`, profileError.message)
+            } else {
+                ;(profileRows || []).forEach((row: any) => {
+                    const userId = typeof row?.user_id === 'string' ? row.user_id.trim() : ''
+                    if (userId) result.add(userId)
+                })
+            }
+        } catch (error: any) {
+            console.warn(`[push] Failed to query profiles for company ${normalizedCompanyId}:`, error?.message || error)
+        }
+    }
+
+    const fallback = typeof fallbackUserId === 'string' ? fallbackUserId.trim() : ''
+    if (fallback) result.add(fallback)
+    return Array.from(result)
+}
+
+const getPushPresenceForUserId = (userId: string): 'active' | 'background' | 'offline' => {
+    const PUSH_ACTIVE_VISIBILITY_TTL_MS = 90_000
+    const normalizedUserId = typeof userId === 'string' ? userId.trim() : ''
+    if (!normalizedUserId) return 'offline'
+
+    const room = io.sockets.adapter.rooms.get(normalizedUserId)
+    if (!room || room.size === 0) return 'offline'
+
+    for (const socketId of room) {
+        const socket = io.sockets.sockets.get(socketId)
+        if (!socket) continue
+        const visibility = typeof socket.data?.appVisibility === 'string'
+            ? socket.data.appVisibility.trim().toLowerCase()
+            : ''
+        const visibilityUpdatedAt = Number(socket.data?.appVisibilityUpdatedAt || 0)
+        const hasFreshVisibleState = visibilityUpdatedAt > 0 && (Date.now() - visibilityUpdatedAt) <= PUSH_ACTIVE_VISIBILITY_TTL_MS
+        if (visibility === 'visible' && hasFreshVisibleState) {
+            return 'active'
+        }
+    }
+
+    return 'background'
+}
+
+const selectBackgroundPushUserIds = (userIds: string[]): string[] => {
+    const uniqueUserIds = Array.from(new Set(
+        (Array.isArray(userIds) ? userIds : [])
+            .map((value) => (typeof value === 'string' ? value.trim() : ''))
+            .filter(Boolean)
+    ))
+    if (uniqueUserIds.length === 0) return []
+    return uniqueUserIds.filter((userId) => getPushPresenceForUserId(userId) !== 'active')
+}
+
+const sendPushNotificationToUsers = async (input: SendPushNotificationInput): Promise<void> => {
+    if (!webPushVapidDetails) return
+
+    const userIds = Array.from(new Set((Array.isArray(input.userIds) ? input.userIds : [])
+        .map((value) => (typeof value === 'string' ? value.trim() : ''))
+        .filter(Boolean)))
+    if (userIds.length === 0) return
+
+    const companyId = normalizeCompanyId(input.companyId)
+    if (!companyId) return
+
+    const subscriptions = pushSubscriptionStore.getByUsers(userIds, companyId)
+    if (subscriptions.length === 0) {
+        console.log(`[push] No active subscriptions for company ${companyId} (${userIds.length} user target(s)).`)
+        return
+    }
+    const startedAt = Date.now()
+
+    const payload = JSON.stringify({
+        title: (input.title || 'QMessage').slice(0, 120),
+        body: (input.body || 'New WhatsApp update available.').slice(0, 240),
+        icon: input.icon || WEB_PUSH_NOTIFICATION_ICON,
+        badge: input.badge || WEB_PUSH_NOTIFICATION_BADGE,
+        tag: input.tag || `company:${companyId}`,
+        url: input.url || '/',
+        data: {
+            ...(input.data || {})
+        }
+    })
+
+    const staleEndpoints: string[] = []
+    let deliveredCount = 0
+    await Promise.all(subscriptions.map(async (entry) => {
+        try {
+            await webpush.sendNotification(
+                {
+                    endpoint: entry.endpoint,
+                    expirationTime: entry.expirationTime ?? null,
+                    keys: entry.keys
+                },
+                payload,
+                {
+                    TTL: Math.max(30, Math.min(3600, Math.floor(input.ttlSeconds || 120))),
+                    urgency: 'high'
+                }
+            )
+            deliveredCount += 1
+        } catch (error: any) {
+            const statusCode = Number(error?.statusCode || error?.status || 0)
+            if (statusCode === 404 || statusCode === 410) {
+                staleEndpoints.push(entry.endpoint)
+                return
+            }
+            console.warn('[push] Failed to send push notification:', error?.message || error)
+        }
+    }))
+
+    if (staleEndpoints.length > 0) {
+        pushSubscriptionStore.removeManyByEndpoint(staleEndpoints)
+    }
+
+    const durationMs = Date.now() - startedAt
+    const summary = `[push] Delivered ${deliveredCount}/${subscriptions.length} push notification(s) in ${durationMs}ms.`
+    if (durationMs > 1500) {
+        console.warn(summary)
+    } else {
+        console.log(summary)
+    }
+}
+
+const sendNativePushNotificationToUsers = async (input: SendPushNotificationInput): Promise<void> => {
+    if (!nativeFcmPushSender.enabled) return
+
+    const userIds = Array.from(new Set((Array.isArray(input.userIds) ? input.userIds : [])
+        .map((value) => (typeof value === 'string' ? value.trim() : ''))
+        .filter(Boolean)))
+    if (userIds.length === 0) return
+
+    const companyId = normalizeCompanyId(input.companyId)
+    if (!companyId) return
+
+    const deviceTokens = nativePushTokenStore.getByUsers(userIds, companyId)
+    if (deviceTokens.length === 0) return
+
+    const startedAt = Date.now()
+    const tokens = Array.from(new Set(deviceTokens.map((entry) => entry.token).filter(Boolean)))
+    if (tokens.length === 0) return
+
+    const sendResult = await nativeFcmPushSender.send({
+        tokens,
+        title: (input.title || 'QMessage').slice(0, 120),
+        body: (input.body || 'New WhatsApp update available.').slice(0, 240),
+        ttlSeconds: Math.max(30, Math.min(3600, Math.floor(input.ttlSeconds || 120))),
+        channelId: NATIVE_PUSH_CHANNEL_ID,
+        sound: NATIVE_PUSH_SOUND,
+        iosCategory: 'QMESSAGE_CHAT',
+        tag: input.tag || `company:${companyId}`,
+        data: {
+            url: input.url || '/',
+            ...(input.data || {})
+        }
+    })
+
+    if (sendResult.staleTokens.length > 0) {
+        nativePushTokenStore.removeManyByToken(sendResult.staleTokens)
+    }
+
+    const durationMs = Date.now() - startedAt
+    const summary = `[native-push] Delivered ${sendResult.successCount}/${sendResult.attempted} FCM push notification(s) in ${durationMs}ms.`
+    if (durationMs > 1500) {
+        console.warn(summary)
+    } else {
+        console.log(summary)
+    }
+}
+
+const getInboundNotificationPreview = (inbound: WabaInboundMessage, text: string): string => {
+    const normalizedText = typeof text === 'string' ? text.trim() : ''
+    if (normalizedText) return normalizedText
+    if (inbound.image) return 'Photo'
+    if (inbound.video) return 'Video'
+    if (inbound.document) return 'Document'
+    if (inbound.audio) return 'Voice message'
+    if (inbound.buttonReplyTitle) return inbound.buttonReplyTitle
+    if (inbound.buttonReplyId) return `Button response: ${inbound.buttonReplyId}`
+    return 'New message'
+}
+
+app.get('/api/push/public-key', requireSupabaseUserMiddleware, async (_req: any, res: any) => {
+    return res.json({
+        success: true,
+        enabled: Boolean(webPushVapidDetails),
+        publicKey: webPushVapidDetails?.publicKey || null
+    })
+})
+
+app.post('/api/push/subscribe', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    if (!webPushVapidDetails) {
+        return res.status(503).json({
+            success: false,
+            error: 'Push notifications are not configured on the server.'
+        })
+    }
+
+    const baseUser = req?.supabaseUser
+    if (!baseUser) {
+        return res.status(401).json({ success: false, error: 'Authentication required.' })
+    }
+
+    const { user, companyId } = await ensureUserCompanyId(baseUser)
+    const normalizedCompanyId = normalizeCompanyId(companyId || getUserCompanyId(user))
+    if (!normalizedCompanyId) {
+        return res.status(400).json({ success: false, error: 'Company ID is missing for this account.' })
+    }
+
+    const input = req?.body?.subscription || req?.body
+    const result = pushSubscriptionStore.upsert(input, {
+        userId: user.id,
+        companyId: normalizedCompanyId,
+        userAgent: typeof req?.headers?.['user-agent'] === 'string' ? req.headers['user-agent'] : null
+    })
+
+    if (!result.success) {
+        return res.status(400).json({ success: false, error: result.error })
+    }
+
+    return res.json({
+        success: true,
+        endpoint: result.endpoint
+    })
+})
+
+app.post('/api/push/unsubscribe', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    const baseUser = req?.supabaseUser
+    if (!baseUser) {
+        return res.status(401).json({ success: false, error: 'Authentication required.' })
+    }
+
+    const { user, companyId } = await ensureUserCompanyId(baseUser)
+    const normalizedCompanyId = normalizeCompanyId(companyId || getUserCompanyId(user))
+    const endpoint = typeof req?.body?.endpoint === 'string'
+        ? req.body.endpoint.trim()
+        : typeof req?.body?.subscription?.endpoint === 'string'
+            ? req.body.subscription.endpoint.trim()
+            : ''
+
+    if (!endpoint) {
+        return res.status(400).json({ success: false, error: 'Push subscription endpoint is required.' })
+    }
+
+    const userSubscriptions = pushSubscriptionStore.getByUser(user.id, normalizedCompanyId)
+    const belongsToUser = userSubscriptions.some((item) => item.endpoint === endpoint)
+    if (!belongsToUser) {
+        return res.status(404).json({ success: false, error: 'Subscription not found for this user.' })
+    }
+
+    const removed = pushSubscriptionStore.removeByEndpoint(endpoint)
+    return res.json({ success: true, removed })
+})
+
+app.post('/api/push/native/register', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    const baseUser = req?.supabaseUser
+    if (!baseUser) {
+        return res.status(401).json({ success: false, error: 'Authentication required.' })
+    }
+
+    const { user, companyId } = await ensureUserCompanyId(baseUser)
+    const normalizedCompanyId = normalizeCompanyId(companyId || getUserCompanyId(user))
+    if (!normalizedCompanyId) {
+        return res.status(400).json({ success: false, error: 'Company ID is missing for this account.' })
+    }
+
+    const input = req?.body?.device || req?.body
+    const result = nativePushTokenStore.upsert(input, {
+        userId: user.id,
+        companyId: normalizedCompanyId,
+        userAgent: typeof req?.headers?.['user-agent'] === 'string' ? req.headers['user-agent'] : null
+    })
+
+    if (!result.success) {
+        return res.status(400).json({ success: false, error: result.error })
+    }
+
+    return res.json({
+        success: true,
+        token: result.token,
+        platform: result.platform
+    })
+})
+
+app.post('/api/push/native/unregister', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    const baseUser = req?.supabaseUser
+    if (!baseUser) {
+        return res.status(401).json({ success: false, error: 'Authentication required.' })
+    }
+
+    const { user, companyId } = await ensureUserCompanyId(baseUser)
+    const normalizedCompanyId = normalizeCompanyId(companyId || getUserCompanyId(user))
+    const token = typeof req?.body?.token === 'string'
+        ? req.body.token.trim()
+        : typeof req?.body?.device?.token === 'string'
+            ? req.body.device.token.trim()
+            : ''
+
+    if (!token) {
+        return res.status(400).json({ success: false, error: 'Native push token is required.' })
+    }
+
+    const userTokens = nativePushTokenStore.getByUser(user.id, normalizedCompanyId)
+    const belongsToUser = userTokens.some((entry) => entry.token === token)
+    if (!belongsToUser) {
+        return res.status(404).json({ success: false, error: 'Native token not found for this user.' })
+    }
+
+    const removed = nativePushTokenStore.removeByToken(token)
+    return res.json({ success: true, removed })
+})
+
 registerFlowRoutes(app, {
     supabase,
-    getCompanyIdForProfile,
     parseDateInput,
     toDayKey,
     lowerBound,
-    WINDOW_MS
+    WINDOW_MS,
+    resolveProfileAccess,
+    requireSupabaseUserMiddleware
 })
 
 registerPublicAuthRoutes(app, { supabase })
@@ -2686,6 +4006,103 @@ const apiKeyStore = createApiKeyStore(resolvePath('api_keys.json'))
 const verifyApiKey = apiKeyStore.middleware
 
 const webhookStore = createWebhookStore(resolvePath('webhooks.json'))
+const INCLUDE_RAW_WEBHOOK_EVENT_PAYLOAD = process.env.WABA_INCLUDE_RAW_WEBHOOK_PAYLOAD === 'true'
+const WEBHOOK_QUEUE_MAX_SIZE = 3000
+const WEBHOOK_PROCESS_CONCURRENCY = Math.max(
+    1,
+    Math.min(16, Number.parseInt(process.env.WABA_WEBHOOK_CONCURRENCY || '4', 10) || 4)
+)
+type QueuedWebhookEvent =
+    | { kind: 'message'; event: WabaInboundMessage }
+    | { kind: 'status'; event: WabaStatus }
+    | { kind: 'call'; event: WabaCallUpdate }
+
+const queuedWebhookEvents: QueuedWebhookEvent[] = []
+let webhookProcessorActive = false
+
+function enqueueWebhookEvents(events: QueuedWebhookEvent[]) {
+    if (!Array.isArray(events) || events.length === 0) return
+    events.forEach((event) => {
+        if (queuedWebhookEvents.length >= WEBHOOK_QUEUE_MAX_SIZE) {
+            queuedWebhookEvents.shift()
+        }
+        queuedWebhookEvents.push(event)
+    })
+    if (!webhookProcessorActive) {
+        webhookProcessorActive = true
+        queueMicrotask(() => {
+            void processWebhookQueue()
+        })
+    }
+}
+
+function toMinimalInboundRaw(inbound: WabaInboundMessage): any | null {
+    if (INCLUDE_RAW_WEBHOOK_EVENT_PAYLOAD) return inbound.raw
+    const raw = inbound.raw && typeof inbound.raw === 'object' ? inbound.raw : null
+    const source = readTrimmed(raw?.source)
+    const minimal: any = {
+        timestamp: inbound.timestamp,
+        referral: inbound.referral || null
+    }
+    if (source) minimal.source = source
+    if (raw && typeof raw.simulated === 'boolean') minimal.simulated = raw.simulated
+    if (raw && typeof raw.mode === 'string') minimal.mode = raw.mode
+    if (raw && typeof raw.lead_index === 'number') minimal.lead_index = raw.lead_index
+    if (raw && typeof raw.trigger_phone === 'string') minimal.trigger_phone = raw.trigger_phone
+    return minimal
+}
+
+function toMinimalStatusRaw(status: WabaStatus): any | null {
+    if (INCLUDE_RAW_WEBHOOK_EVENT_PAYLOAD) return status.raw
+    return {
+        status: status.status,
+        timestamp: status.timestamp
+    }
+}
+
+function toMinimalCallRaw(call: WabaCallUpdate): any | null {
+    if (INCLUDE_RAW_WEBHOOK_EVENT_PAYLOAD) return call.raw
+    return {
+        event: call.event,
+        timestamp: call.timestamp
+    }
+}
+
+async function processWebhookQueue() {
+    try {
+        while (queuedWebhookEvents.length > 0) {
+            const batch = queuedWebhookEvents.splice(0, WEBHOOK_PROCESS_CONCURRENCY)
+            await Promise.allSettled(batch.map(async (item) => {
+                const config = await wabaRegistry.getConfigByPhoneNumberId(item.event.phoneNumberId)
+                if (!config) {
+                    if (item.kind === 'message') {
+                        console.warn('[WABA] No config for phone_number_id:', item.event.phoneNumberId)
+                    }
+                    return
+                }
+                if (item.kind === 'message') {
+                    await handleInboundMessage(config, item.event)
+                    return
+                }
+                if (item.kind === 'status') {
+                    await handleStatusUpdate(config, item.event)
+                    return
+                }
+                await handleCallUpdate(config, item.event)
+            }))
+        }
+    } catch (error) {
+        console.error('WABA webhook queue error:', error)
+    } finally {
+        webhookProcessorActive = false
+        if (queuedWebhookEvents.length > 0) {
+            webhookProcessorActive = true
+            queueMicrotask(() => {
+                void processWebhookQueue()
+            })
+        }
+    }
+}
 
 // ============================================
 // PUBLIC API ENDPOINTS
@@ -2717,8 +4134,20 @@ app.post('/api/send-message', verifyApiKey, async (req: any, res: any) => {
             })
         }
 
-        // Format phone number
-        let jid = phone.includes('@') ? phone : `${phone.replace(/\D/g, '')}@s.whatsapp.net`
+        const rawTarget = typeof phone === 'string' ? phone.trim() : ''
+        const isGroupTarget = isGroupIdentifier(rawTarget) || rawTarget.includes(':')
+        const normalizedTarget = normalizePhoneNumber(rawTarget)
+        const jid = rawTarget.includes('@')
+            ? rawTarget
+            : normalizedTarget
+                ? buildChatJid(normalizedTarget, isGroupTarget)
+                : ''
+        if (!jid) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid phone/group target'
+            })
+        }
 
         const client = await wabaRegistry.getClientByProfile(profileId)
         if (!client) {
@@ -2734,8 +4163,8 @@ app.post('/api/send-message', verifyApiKey, async (req: any, res: any) => {
             return res.status(400).json({ success: false, error: 'Company not found' })
         }
 
-        const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
-        const user = await findOrCreateUser(companyId, phoneNumber)
+        const recipientId = normalizePhoneNumber(jid)
+        const user = await findOrCreateUser(companyId, recipientId)
         if (!user) {
             return res.status(500).json({ success: false, error: 'Failed to resolve user' })
         }
@@ -2743,7 +4172,7 @@ app.post('/api/send-message', verifyApiKey, async (req: any, res: any) => {
         const { messageId } = await sendWhatsAppMessage({
             client,
             userId: user.id,
-            to: phoneNumber,
+            to: recipientId,
             type: 'text',
             content: {
                 text: cleanMessage,
@@ -2784,8 +4213,20 @@ app.post('/api/send-image', verifyApiKey, async (req: any, res: any) => {
             })
         }
 
-        // Format phone number
-        let jid = phone.includes('@') ? phone : `${phone.replace(/\D/g, '')}@s.whatsapp.net`
+        const rawTarget = typeof phone === 'string' ? phone.trim() : ''
+        const isGroupTarget = isGroupIdentifier(rawTarget) || rawTarget.includes(':')
+        const normalizedTarget = normalizePhoneNumber(rawTarget)
+        const jid = rawTarget.includes('@')
+            ? rawTarget
+            : normalizedTarget
+                ? buildChatJid(normalizedTarget, isGroupTarget)
+                : ''
+        if (!jid) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid phone/group target'
+            })
+        }
 
         const client = await wabaRegistry.getClientByProfile(profileId)
         if (!client) {
@@ -2801,13 +4242,13 @@ app.post('/api/send-image', verifyApiKey, async (req: any, res: any) => {
             return res.status(400).json({ success: false, error: 'Company not found' })
         }
 
-        const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
-        const user = await findOrCreateUser(companyId, phoneNumber)
+        const recipientId = normalizePhoneNumber(jid)
+        const user = await findOrCreateUser(companyId, recipientId)
         if (!user) {
             return res.status(500).json({ success: false, error: 'Failed to resolve user' })
         }
 
-        const response = await client.sendImage(phoneNumber, imageUrl, caption || '')
+        const response = await client.sendImage(recipientId, imageUrl, caption || '')
         const messageId = response?.messages?.[0]?.id
 
         await insertMessage({
@@ -2815,7 +4256,7 @@ app.post('/api/send-image', verifyApiKey, async (req: any, res: any) => {
             direction: 'out',
             content: {
                 type: 'image',
-                to: phoneNumber,
+                to: recipientId,
                 message_id: messageId,
                 image_url: imageUrl,
                 caption: caption || '',
@@ -2910,11 +4351,10 @@ registerWabaRoutes(app, {
     validateMarketingTemplateInput,
     validateTemplateSendComponents,
     validateUtilityTemplateInput,
+    systemRuntimeStatus,
     wabaRegistry,
     WABA_OAUTH_SCOPES
 })
-
-const requireSupabaseUserMiddleware = requireSupabaseUser(getSupabaseUserFromRequest)
 
 registerCompanyRoutes(app, {
     requireSupabaseUserMiddleware,
@@ -2943,6 +4383,113 @@ registerAiRoutes(app, {
     encryptToken,
     decryptToken,
     getTokenEncryptionKey
+})
+
+app.get('/api/company/ads-shoot-mode', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const mode = getAdsShootModeProfileConfig(access.companyId, access.profileId)
+        return res.json({
+            success: true,
+            data: {
+                company_id: mode.companyId,
+                profile_id: mode.profileId,
+                enabled: mode.enabled,
+                batch_size: ADS_SHOOT_MODE_BATCH_SIZE,
+                night_start_hour: ADS_SHOOT_MODE_NIGHT_START_HOUR,
+                night_end_hour: ADS_SHOOT_MODE_NIGHT_END_HOUR,
+                last_run_local_date: mode.lastRunLocalDate,
+                updated_at: mode.updatedAt
+            }
+        })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error?.message || 'Failed to load Ads Shoot Mode settings' })
+    }
+})
+
+app.post('/api/company/ads-shoot-mode', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const admin = await isAdminUser(access.user.id, access.companyId)
+        if (!admin) {
+            return res.status(403).json({ success: false, error: 'Admin access required to update Ads Shoot Mode' })
+        }
+
+        const existing = getAdsShootModeProfileConfig(access.companyId, access.profileId)
+        const nextConfig: AdsShootModeProfileConfig = {
+            ...existing,
+            enabled: normalizeAdsShootModeEnabled(req.body?.enabled)
+        }
+        upsertAdsShootModeProfileConfig(nextConfig)
+        const shouldClearSimulated = nextConfig.enabled === false
+        const cleanup = shouldClearSimulated
+            ? await clearAdsShootSimulatedConversations(access.companyId, access.profileId)
+            : null
+
+        return res.json({
+            success: true,
+            data: {
+                company_id: nextConfig.companyId,
+                profile_id: nextConfig.profileId,
+                enabled: nextConfig.enabled,
+                batch_size: ADS_SHOOT_MODE_BATCH_SIZE,
+                night_start_hour: ADS_SHOOT_MODE_NIGHT_START_HOUR,
+                night_end_hour: ADS_SHOOT_MODE_NIGHT_END_HOUR,
+                last_run_local_date: nextConfig.lastRunLocalDate,
+                updated_at: nextConfig.updatedAt,
+                cleanup
+            }
+        })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error?.message || 'Failed to update Ads Shoot Mode settings' })
+    }
+})
+
+app.post('/api/company/ads-shoot-mode/run', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const admin = await isAdminUser(access.user.id, access.companyId)
+        if (!admin) {
+            return res.status(403).json({ success: false, error: 'Admin access required to run Ads Shoot Mode' })
+        }
+
+        const config = getAdsShootModeProfileConfig(access.companyId, access.profileId)
+        const key = buildAdsShootConfigKey(config.companyId, config.profileId)
+        if (adsShootModeRunningProfiles.has(key)) {
+            return res.status(409).json({ success: false, error: 'Ads Shoot Mode is already running for this profile' })
+        }
+
+        adsShootModeRunningProfiles.add(key)
+        try {
+            const result = await runAdsShootModeBatch(config, 'manual')
+            if (result.error) {
+                return res.status(503).json({ success: false, error: result.error })
+            }
+            return res.json({
+                success: true,
+                data: {
+                    sent: result.sent,
+                    failed: result.failed,
+                    batch_size: ADS_SHOOT_MODE_BATCH_SIZE,
+                    sample_leads: result.leads.map((lead) => ({
+                        name: lead.name,
+                        phone: lead.phone,
+                        message: lead.text
+                    }))
+                }
+            })
+        } finally {
+            adsShootModeRunningProfiles.delete(key)
+        }
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error?.message || 'Failed to run Ads Shoot Mode' })
+    }
 })
 
 // WABA WEBHOOK (Meta Cloud API)
@@ -2975,23 +4522,40 @@ app.post('/webhook', async (req: any, res: any) => {
             return res.status(401).send('Invalid signature')
         }
 
-        const { messages, statuses } = parseWabaWebhook(req.body || {})
+        const { messages, statuses, calls } = parseWabaWebhook(req.body || {})
+        const queueItems: QueuedWebhookEvent[] = []
 
-        for (const msg of messages) {
-            const config = await wabaRegistry.getConfigByPhoneNumberId(msg.phoneNumberId)
-            if (!config) {
-                console.warn('[WABA] No config for phone_number_id:', msg.phoneNumberId)
-                continue
-            }
-            await handleInboundMessage(config, msg)
-        }
+        messages.forEach((msg) => {
+            queueItems.push({
+                kind: 'message',
+                event: {
+                    ...msg,
+                    raw: toMinimalInboundRaw(msg)
+                }
+            })
+        })
 
-        for (const status of statuses) {
-            const config = await wabaRegistry.getConfigByPhoneNumberId(status.phoneNumberId)
-            if (!config) continue
-            await handleStatusUpdate(config, status)
-        }
+        statuses.forEach((status) => {
+            queueItems.push({
+                kind: 'status',
+                event: {
+                    ...status,
+                    raw: toMinimalStatusRaw(status)
+                }
+            })
+        })
 
+        calls.forEach((call) => {
+            queueItems.push({
+                kind: 'call',
+                event: {
+                    ...call,
+                    raw: toMinimalCallRaw(call)
+                }
+            })
+        })
+
+        enqueueWebhookEvents(queueItems)
         return res.sendStatus(200)
     } catch (error) {
         console.error('WABA webhook error:', error)
@@ -3066,21 +4630,75 @@ app.get('/api/admin/api-keys', (req: any, res: any) => {
     res.json({ success: true, data: apiKeyStore.getAll() })
 })
 
-function isWabaAdminUser(user: any): boolean {
+const SUPER_ADMIN_ROLE_VALUES = new Set(['super_admin', 'superadmin', 'super-admin'])
+const BUILT_IN_SUPER_ADMIN_EMAILS = ['izzulfitreee@gmail.com']
+
+function normalizeEmailAddress(value: unknown): string {
+    return typeof value === 'string' ? value.trim().toLowerCase() : ''
+}
+
+function parseSuperAdminEmailList(value: unknown): string[] {
+    if (typeof value !== 'string') return []
+    return value
+        .split(/[,\n;]/g)
+        .map((item) => normalizeEmailAddress(item))
+        .filter((item) => Boolean(item) && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(item))
+}
+
+const SUPER_ADMIN_EMAIL_ALLOWLIST = new Set<string>(
+    [
+        ...BUILT_IN_SUPER_ADMIN_EMAILS,
+        ...parseSuperAdminEmailList(process.env.SUPER_ADMIN_EMAILS || '')
+    ].map((item) => normalizeEmailAddress(item)).filter(Boolean)
+)
+
+function isSuperAdminUser(user: any): boolean {
+    const email = normalizeEmailAddress(user?.email)
+    if (email && SUPER_ADMIN_EMAIL_ALLOWLIST.has(email)) return true
+
+    const userMeta = user?.user_metadata || {}
+    const appMeta = user?.app_metadata || {}
+    const roleCandidates = [
+        userMeta.role,
+        appMeta.role
+    ]
+    const flagCandidates = [
+        userMeta.super_admin,
+        userMeta.is_super_admin,
+        appMeta.super_admin,
+        appMeta.is_super_admin
+    ]
+
+    const hasSuperAdminRole = roleCandidates.some((value) => {
+        if (typeof value !== 'string') return false
+        return SUPER_ADMIN_ROLE_VALUES.has(value.trim().toLowerCase())
+    })
+    if (hasSuperAdminRole) return true
+
+    return flagCandidates.some((value) => {
+        if (value === true) return true
+        if (typeof value === 'string') {
+            const normalized = value.trim().toLowerCase()
+            return normalized === 'true' || normalized === '1' || normalized === 'yes'
+        }
+        return false
+    })
+}
+
+function isLegacyWabaAdminUser(user: any): boolean {
     const userMeta = user?.user_metadata || {}
     const appMeta = user?.app_metadata || {}
     const candidates = [
         userMeta.waba_admin,
         userMeta.is_waba_admin,
         appMeta.waba_admin,
-        appMeta.is_waba_admin,
-        appMeta.role
+        appMeta.is_waba_admin
     ]
     return candidates.some((value) => {
         if (value === true) return true
         if (typeof value === 'string') {
             const normalized = value.trim().toLowerCase()
-            return normalized === 'true' || normalized === 'waba_admin' || normalized === 'super_admin'
+            return normalized === 'true' || normalized === 'waba_admin'
         }
         return false
     })
@@ -3119,10 +4737,10 @@ function extractBearerToken(req: any): string {
     return rawAuth.trim()
 }
 
-async function countWabaAdminUsers(): Promise<number> {
+async function countSuperAdminUsers(): Promise<number> {
     const hasServiceRole = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY)
     if (!hasServiceRole) {
-        throw new Error('SUPABASE_SERVICE_ROLE_KEY is required for WABA admin setup')
+        throw new Error('SUPABASE_SERVICE_ROLE_KEY is required for superadmin setup')
     }
 
     let page = 1
@@ -3137,7 +4755,7 @@ async function countWabaAdminUsers(): Promise<number> {
 
         const users = Array.isArray(data?.users) ? data.users : []
         users.forEach((user: any) => {
-            if (isWabaAdminUser(user)) count += 1
+            if (isSuperAdminUser(user)) count += 1
         })
 
         if (users.length < perPage || page >= 50) break
@@ -3147,7 +4765,35 @@ async function countWabaAdminUsers(): Promise<number> {
     return count
 }
 
-async function resolveWabaAdminAccess(req: any, res: any) {
+async function countLegacyWabaAdminUsers(): Promise<number> {
+    const hasServiceRole = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY)
+    if (!hasServiceRole) {
+        throw new Error('SUPABASE_SERVICE_ROLE_KEY is required for superadmin setup')
+    }
+
+    let page = 1
+    const perPage = 200
+    let count = 0
+
+    while (true) {
+        const { data, error } = await supabase.auth.admin.listUsers({ page, perPage })
+        if (error) {
+            throw new Error(error.message)
+        }
+
+        const users = Array.isArray(data?.users) ? data.users : []
+        users.forEach((user: any) => {
+            if (isLegacyWabaAdminUser(user) && !isSuperAdminUser(user)) count += 1
+        })
+
+        if (users.length < perPage || page >= 50) break
+        page += 1
+    }
+
+    return count
+}
+
+async function resolveSuperAdminAccess(req: any, res: any) {
     const token = extractBearerToken(req)
     if (!token) {
         res.status(401).json({ success: false, error: 'Authorization token required' })
@@ -3160,8 +4806,8 @@ async function resolveWabaAdminAccess(req: any, res: any) {
         return null
     }
 
-    if (!isWabaAdminUser(user)) {
-        res.status(403).json({ success: false, error: 'WABA admin access required' })
+    if (!isSuperAdminUser(user)) {
+        res.status(403).json({ success: false, error: 'Superadmin access required' })
         return null
     }
 
@@ -3174,16 +4820,35 @@ const UI_FEATURE_KEYS = new Set([
     'broadcast',
     'chatbots',
     'contacts',
+    'calls',
     'analytics',
     'settings'
 ])
+const UI_FEATURE_ALIASES: Record<string, string> = {
+    'team_inbox': 'team-inbox',
+    'teaminbox': 'team-inbox',
+    'inbox': 'team-inbox',
+    'automation': 'automations',
+    'broadcasts': 'broadcast',
+    'chatbot': 'chatbots',
+    'contact': 'contacts',
+    'call': 'calls',
+    'analytic': 'analytics',
+    'setting': 'settings',
+    'more': 'analytics',
+    'other': 'analytics'
+}
 
 const UI_HIDDEN_FEATURES_MISSING_MESSAGE =
     'UI controls are not initialized. Run migration 20260407_company_ui_hidden_features.sql.'
 
 function normalizeUiFeatureKey(value: unknown): string {
     if (typeof value !== 'string') return ''
-    const normalized = value.trim().toLowerCase().replace(/\s+/g, '-')
+    const raw = value.trim().toLowerCase()
+    const normalizedBase = raw.replace(/\s+/g, '-')
+    const normalized = UI_FEATURE_ALIASES[normalizedBase]
+        || UI_FEATURE_ALIASES[normalizedBase.replace(/-/g, '')]
+        || normalizedBase
     return UI_FEATURE_KEYS.has(normalized) ? normalized : ''
 }
 
@@ -3227,6 +4892,147 @@ function isUiHiddenFeaturesMissingError(error: any): boolean {
     return code === '42703' && message.includes('ui_hidden_features')
 }
 
+function serializeSystemRuntimeStatus(value: any) {
+    const maintenance = value?.maintenance && typeof value.maintenance === 'object'
+        ? value.maintenance
+        : {}
+    const downtimeLog = Array.isArray(value?.downtimeLog) ? value.downtimeLog : []
+    return {
+        online: value?.online === true,
+        started_at: readTrimmed(value?.startedAt),
+        current_time: readTrimmed(value?.currentTime),
+        uptime_ms: Number.isFinite(Number(value?.uptimeMs)) ? Math.max(0, Math.floor(Number(value?.uptimeMs))) : 0,
+        heartbeat_at: readTrimmed(value?.heartbeatAt) || null,
+        maintenance: {
+            enabled: maintenance?.enabled === true,
+            message: readTrimmed(maintenance?.message),
+            updated_at: readTrimmed(maintenance?.updatedAt) || null,
+            updated_by: readTrimmed(maintenance?.updatedBy) || null
+        },
+        last_offline_at: readTrimmed(value?.lastOfflineAt) || null,
+        last_offline_ended_at: readTrimmed(value?.lastOfflineEndedAt) || null,
+        last_offline_duration_ms: Number.isFinite(Number(value?.lastOfflineDurationMs))
+            ? Math.max(0, Math.floor(Number(value?.lastOfflineDurationMs)))
+            : null,
+        downtime_log: downtimeLog.map((entry: any) => ({
+            id: readTrimmed(entry?.id),
+            offline_from: readTrimmed(entry?.offlineFrom),
+            offline_until: readTrimmed(entry?.offlineUntil),
+            duration_ms: Number.isFinite(Number(entry?.durationMs)) ? Math.max(0, Math.floor(Number(entry?.durationMs))) : 0,
+            reason: readTrimmed(entry?.reason)
+        }))
+    }
+}
+
+function buildAdminMonitorPayload() {
+    const now = Date.now()
+    pruneRecentApiMonitorSamples(now)
+    const recent = [...apiMonitor.recent]
+
+    const windowCalls = recent.length
+    const window5xx = recent.filter((entry) => entry.status >= 500).length
+    const window4xx = recent.filter((entry) => entry.status >= 400 && entry.status < 500).length
+    const windowInBytes = recent.reduce((sum, entry) => sum + (entry.inBytes || 0), 0)
+    const windowOutBytes = recent.reduce((sum, entry) => sum + (entry.outBytes || 0), 0)
+    const windowAvgDurationMs = windowCalls > 0
+        ? recent.reduce((sum, entry) => sum + (entry.durationMs || 0), 0) / windowCalls
+        : 0
+    const sortedDurations = recent
+        .map((entry) => Number(entry.durationMs || 0))
+        .filter((value) => Number.isFinite(value))
+        .sort((a, b) => a - b)
+    const p95Index = sortedDurations.length > 0
+        ? Math.min(sortedDurations.length - 1, Math.floor((sortedDurations.length - 1) * 0.95))
+        : -1
+    const windowP95DurationMs = p95Index >= 0 ? sortedDurations[p95Index] : 0
+
+    const oldestWindowTs = recent.length > 0 ? recent[0].ts : now
+    const windowSpanSec = Math.max(1, (now - oldestWindowTs) / 1000)
+    const apiInBps = windowInBytes / windowSpanSec
+    const apiOutBps = windowOutBytes / windowSpanSec
+
+    const socketInBps = Number(lastServerStats?.bandwidth?.inBps || 0)
+    const socketOutBps = Number(lastServerStats?.bandwidth?.outBps || 0)
+
+    const topRoutes = Array.from(apiMonitor.routes.entries())
+        .map(([route, value]) => {
+            const calls = Number(value.count || 0)
+            const avgDurationMs = calls > 0 ? value.totalDurationMs / calls : 0
+            const errorRatePct = calls > 0 ? (value.errorCount / calls) * 100 : 0
+            return {
+                route,
+                calls,
+                errorCount: Number(value.errorCount || 0),
+                errorRatePct: Number(errorRatePct.toFixed(2)),
+                avgDurationMs: Number(avgDurationMs.toFixed(1)),
+                maxDurationMs: Number((value.maxDurationMs || 0).toFixed(1)),
+                inBytes: Number(value.inBytes || 0),
+                outBytes: Number(value.outBytes || 0),
+                lastStatus: Number(value.lastStatus || 0),
+                lastHitAt: value.lastHitAt ? new Date(value.lastHitAt).toISOString() : null
+            }
+        })
+        .sort((a, b) => {
+            if (b.calls !== a.calls) return b.calls - a.calls
+            return b.avgDurationMs - a.avgDurationMs
+        })
+        .slice(0, 12)
+
+    const memUsed = Number(lastServerStats?.memUsed || 0)
+    const memTotal = Number(lastServerStats?.memTotal || 0)
+    const memPct = memTotal > 0 ? (memUsed / memTotal) * 100 : Number(lastServerStats?.memPct || 0)
+
+    const totalInBytes = apiMonitor.inBytes + socketTrafficTotals.inBytes
+    const totalOutBytes = apiMonitor.outBytes + socketTrafficTotals.outBytes
+    const windowErrorRatePct = windowCalls > 0 ? (window5xx / windowCalls) * 100 : 0
+    const windowSuccessRatePct = windowCalls > 0 ? ((windowCalls - window5xx) / windowCalls) * 100 : 100
+
+    return {
+        generatedAt: new Date(now).toISOString(),
+        runtime: {
+            uptimeSec: Math.floor(process.uptime()),
+            activeSockets: activeSockets.size,
+            cpuPct: Number(lastServerStats?.cpu || 0),
+            memUsed,
+            memTotal,
+            memPct: Number(memPct.toFixed(1)),
+            heapUsed: Number(lastServerStats?.heapUsed || 0),
+            rss: Number(lastServerStats?.rss || 0)
+        },
+        systemRuntime: serializeSystemRuntimeStatus(systemRuntimeStatus?.getStatus?.()),
+        api: {
+            windowMs: API_MONITOR_WINDOW_MS,
+            totalCalls: apiMonitor.totalCalls,
+            status2xx: apiMonitor.status2xx,
+            status3xx: apiMonitor.status3xx,
+            status4xx: apiMonitor.status4xx,
+            status5xx: apiMonitor.status5xx,
+            windowCalls,
+            window4xx,
+            window5xx,
+            windowErrorRatePct: Number(windowErrorRatePct.toFixed(2)),
+            windowSuccessRatePct: Number(windowSuccessRatePct.toFixed(2)),
+            windowAvgDurationMs: Number(windowAvgDurationMs.toFixed(1)),
+            windowP95DurationMs: Number(windowP95DurationMs.toFixed(1)),
+            topRoutes
+        },
+        traffic: {
+            apiInBytes: apiMonitor.inBytes,
+            apiOutBytes: apiMonitor.outBytes,
+            socketInBytes: socketTrafficTotals.inBytes,
+            socketOutBytes: socketTrafficTotals.outBytes,
+            totalInBytes,
+            totalOutBytes,
+            inBps: Number((apiInBps + socketInBps).toFixed(1)),
+            outBps: Number((apiOutBps + socketOutBps).toFixed(1)),
+            socketInBps: Number(socketInBps.toFixed(1)),
+            socketOutBps: Number(socketOutBps.toFixed(1)),
+            apiInBps: Number(apiInBps.toFixed(1)),
+            apiOutBps: Number(apiOutBps.toFixed(1))
+        }
+    }
+}
+
 async function buildAdminSummaryPayload() {
     const { data: companies, error } = await supabase
         .from('company')
@@ -3237,7 +5043,57 @@ async function buildAdminSummaryPayload() {
         throw new Error(error.message)
     }
 
-    const companyRows = companies || []
+    const companyRows = Array.isArray(companies) ? [...companies] : []
+    const knownCompanyIds = new Set<string>(
+        companyRows
+            .map((row: any) => (typeof row?.id === 'string' ? row.id.trim() : ''))
+            .filter(Boolean)
+    )
+
+    const [
+        profileCompanyRowsResult,
+        userCompanyRowsResult,
+        workflowCompanyRowsResult,
+        wabaCompanyRowsResult
+    ] = await Promise.all([
+        supabase.from('profiles').select('company_id').not('company_id', 'is', null),
+        supabase.from('users').select('company_id').not('company_id', 'is', null),
+        supabase.from('workflows').select('company_id').not('company_id', 'is', null),
+        supabase.from('waba_configs').select('company_id').not('company_id', 'is', null)
+    ])
+
+    const operationalCompanyIds = new Set<string>()
+    ;[
+        profileCompanyRowsResult,
+        userCompanyRowsResult,
+        workflowCompanyRowsResult,
+        wabaCompanyRowsResult
+    ].forEach((result: any) => {
+        const rows = Array.isArray(result?.data) ? result.data : []
+        rows.forEach((row: any) => {
+            const companyId = typeof row?.company_id === 'string' ? row.company_id.trim() : ''
+            if (companyId) operationalCompanyIds.add(companyId)
+        })
+    })
+
+    operationalCompanyIds.forEach((companyId) => {
+        if (knownCompanyIds.has(companyId)) return
+        knownCompanyIds.add(companyId)
+        companyRows.push({
+            id: companyId,
+            name: companyId,
+            email: null,
+            created_at: null,
+            ui_hidden_features: []
+        })
+    })
+
+    companyRows.sort((a: any, b: any) => {
+        const aTime = a?.created_at ? new Date(a.created_at).getTime() : 0
+        const bTime = b?.created_at ? new Date(b.created_at).getTime() : 0
+        return bTime - aTime
+    })
+
     const activeProfileIds = new Set(await wabaRegistry.getProfileIds())
     const hasServiceRole = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY)
     const authUserEmailCache = new Map<string, string>()
@@ -3370,7 +5226,11 @@ async function buildAdminSummaryPayload() {
         { companies: 0, profiles: 0, contacts: 0, workflows: 0, waba_configs: 0, waba_enabled: 0, waba_active: 0, messages: 0 }
     )
 
-    return { totals, companies: companyStats }
+    return {
+        totals,
+        monitor: buildAdminMonitorPayload(),
+        companies: companyStats
+    }
 }
 
 // ============================================
@@ -3378,12 +5238,15 @@ async function buildAdminSummaryPayload() {
 // ============================================
 app.get('/api/admin/setup-status', async (_req: any, res: any) => {
     try {
-        const admins = await countWabaAdminUsers()
+        const superadmins = await countSuperAdminUsers()
+        const legacyAdmins = await countLegacyWabaAdminUsers()
+
         return res.json({
             success: true,
             data: {
-                setupOpen: admins === 0,
-                admins
+                setupOpen: superadmins === 0 && legacyAdmins === 0,
+                superadmins,
+                legacyAdmins
             }
         })
     } catch (error: any) {
@@ -3395,7 +5258,7 @@ app.post('/api/admin/setup', async (req: any, res: any) => {
     try {
         const hasServiceRole = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY)
         if (!hasServiceRole) {
-            return res.status(500).json({ success: false, error: 'SUPABASE_SERVICE_ROLE_KEY is required to create WABA admin' })
+            return res.status(500).json({ success: false, error: 'SUPABASE_SERVICE_ROLE_KEY is required to create superadmin' })
         }
 
         const email = extractAdminEmail(req)
@@ -3407,9 +5270,16 @@ app.post('/api/admin/setup', async (req: any, res: any) => {
             return res.status(400).json({ success: false, error: 'Password must be at least 8 characters' })
         }
 
-        const admins = await countWabaAdminUsers()
-        if (admins > 0) {
-            return res.status(409).json({ success: false, error: 'Setup is already closed. WABA admin already exists.' })
+        const superadmins = await countSuperAdminUsers()
+        const legacyAdmins = await countLegacyWabaAdminUsers()
+        if (superadmins > 0) {
+            return res.status(409).json({ success: false, error: 'Setup is already closed. Superadmin already exists.' })
+        }
+        if (legacyAdmins > 0) {
+            return res.status(409).json({
+                success: false,
+                error: 'Setup is already closed. Legacy WABA admin accounts detected. Promote one account to super_admin.'
+            })
         }
 
         const created = await supabase.auth.admin.createUser({
@@ -3417,12 +5287,17 @@ app.post('/api/admin/setup', async (req: any, res: any) => {
             password,
             email_confirm: true,
             user_metadata: {
-                waba_admin: true
+                super_admin: true,
+                role: 'super_admin'
+            },
+            app_metadata: {
+                super_admin: true,
+                role: 'super_admin'
             }
         } as any)
 
         if (created.error || !created.data?.user?.id) {
-            const message = created.error?.message || 'Failed to create WABA admin'
+            const message = created.error?.message || 'Failed to create superadmin'
             const isConflict = /already|exists|registered/i.test(message)
             return res.status(isConflict ? 409 : 500).json({ success: false, error: message })
         }
@@ -3435,7 +5310,7 @@ app.post('/api/admin/setup', async (req: any, res: any) => {
             }
         })
     } catch (error: any) {
-        return res.status(500).json({ success: false, error: error?.message || 'Failed to create WABA admin' })
+        return res.status(500).json({ success: false, error: error?.message || 'Failed to create superadmin' })
     }
 })
 
@@ -3447,13 +5322,13 @@ app.post('/api/admin/login', async (req: any, res: any) => {
             return res.status(400).json({ success: false, error: 'Email and password are required' })
         }
 
-        const { data, error } = await supabase.auth.signInWithPassword({ email, password })
+        const { data, error } = await supabaseAuth.auth.signInWithPassword({ email, password })
         if (error || !data?.user || !data?.session) {
             return res.status(401).json({ success: false, error: error?.message || 'Invalid email or password' })
         }
 
-        if (!isWabaAdminUser(data.user)) {
-            return res.status(403).json({ success: false, error: 'WABA admin access required' })
+        if (!isSuperAdminUser(data.user)) {
+            return res.status(403).json({ success: false, error: 'Superadmin access required' })
         }
 
         return res.json({
@@ -3472,7 +5347,7 @@ app.post('/api/admin/login', async (req: any, res: any) => {
 
 app.get('/api/admin/summary', async (req: any, res: any) => {
     try {
-        const access = await resolveWabaAdminAccess(req, res)
+        const access = await resolveSuperAdminAccess(req, res)
         if (!access) return
         const payload = await buildAdminSummaryPayload()
         return res.json({ success: true, ...payload })
@@ -3481,9 +5356,35 @@ app.get('/api/admin/summary', async (req: any, res: any) => {
     }
 })
 
+app.post('/api/admin/maintenance-mode', async (req: any, res: any) => {
+    try {
+        const access = await resolveSuperAdminAccess(req, res)
+        if (!access) return
+        if (!systemRuntimeStatus || typeof systemRuntimeStatus.setMaintenanceMode !== 'function') {
+            return res.status(503).json({ success: false, error: 'Runtime status service unavailable' })
+        }
+
+        const enabled = req.body?.enabled === true
+        const message = readTrimmed(req.body?.message).slice(0, 280)
+        const actor = readTrimmed(access.user?.email || access.user?.id || '')
+        const snapshot = systemRuntimeStatus.setMaintenanceMode({
+            enabled,
+            message,
+            updatedBy: actor || null
+        })
+
+        return res.json({
+            success: true,
+            data: serializeSystemRuntimeStatus(snapshot)
+        })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error?.message || 'Failed to update maintenance mode' })
+    }
+})
+
 app.post('/api/admin/company-ui', async (req: any, res: any) => {
     try {
-        const access = await resolveWabaAdminAccess(req, res)
+        const access = await resolveSuperAdminAccess(req, res)
         if (!access) return
 
         const companyId = normalizeCompanyId(req.body?.companyId || req.body?.company_id || '')
@@ -3532,7 +5433,7 @@ app.post('/api/admin/company-ui', async (req: any, res: any) => {
 // Backward-compatible JSON endpoint
 app.get('/my', async (req: any, res: any) => {
     try {
-        const access = await resolveWabaAdminAccess(req, res)
+        const access = await resolveSuperAdminAccess(req, res)
         if (!access) return
         const payload = await buildAdminSummaryPayload()
         return res.json({ success: true, ...payload })
@@ -3654,16 +5555,31 @@ app.get('/myadmin', (_req: any, res: any) => {
 	    .problem-bad { color: #b42318; font-size: 11px; display: block; margin-bottom: 2px; }
 	    .btn-save { background: #111b21; color: #fff; padding: 8px 10px; border-radius: 8px; font-size: 11px; }
 	    .btn-save:disabled { opacity: 0.65; cursor: not-allowed; }
+	    .route-muted { color: #667085; font-size: 11px; }
+	    .ops-label { display: block; color: #54656f; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+	    .ops-value { display: block; font-size: 20px; font-weight: 800; margin-top: 4px; }
+	    .ops-meta { display: block; color: #667085; font-size: 11px; margin-top: 4px; }
+	    .runtime-card { padding: 16px; margin-bottom: 16px; }
+	    .runtime-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-bottom: 12px; }
+	    .runtime-kpi { border: 1px solid var(--line); border-radius: 10px; background: #fcfdfd; padding: 10px 12px; }
+	    .runtime-kpi b { display: block; font-size: 18px; margin-top: 4px; }
+	    .runtime-maint { border: 1px solid var(--line); border-radius: 10px; background: #fcfdfd; padding: 12px; margin-bottom: 12px; }
+	    .runtime-maint textarea { width: 100%; min-height: 84px; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; resize: vertical; font: inherit; }
+	    .runtime-maint-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+	    .runtime-maint-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+	    .runtime-state-online { color: #027a48; }
+	    .runtime-state-offline { color: #b42318; }
+	    #maintenanceEnabled { width: 14px; height: 14px; margin: 0; }
 	  </style>
 </head>
 <body>
   <div class="wrap">
     <div id="loginPanel" class="card login">
       <h1 class="title">MyAdmin Login</h1>
-      <div class="hint">Use WABA admin credentials to monitor all companies.</div>
+      <div class="hint">Use superadmin credentials to monitor all companies.</div>
       <input id="adminIdInput" type="email" placeholder="Admin email" />
       <input id="adminPasswordInput" type="password" placeholder="Password" />
-      <button id="setupBtn" class="btn-secondary hidden">Create First WABA Admin</button>
+      <button id="setupBtn" class="btn-secondary hidden">Create First Superadmin</button>
       <button id="loginBtn" class="btn-primary">Login</button>
       <div id="loginStatus" class="hint"></div>
     </div>
@@ -3682,6 +5598,61 @@ app.get('/myadmin', (_req: any, res: any) => {
 
       <div id="status" class="card status">Ready.</div>
       <div id="totals" class="card totals" style="display:none"></div>
+      <div id="opsMetrics" class="card totals" style="display:none"></div>
+      <div id="systemRuntimeCard" class="card runtime-card" style="display:none">
+        <div class="panel-head" style="padding:0;margin-bottom:12px;">
+          <div class="inline">
+            <h3 class="title">System Runtime</h3>
+            <span class="hint">Downtime log and maintenance mode</span>
+          </div>
+        </div>
+        <div id="systemRuntimeMetrics" class="runtime-grid"></div>
+        <div class="runtime-maint">
+          <div class="runtime-maint-head">
+            <label class="feature-chip">
+              <input id="maintenanceEnabled" type="checkbox" />
+              <span>Maintenance mode enabled</span>
+            </label>
+          </div>
+          <textarea id="maintenanceMessage" maxlength="280" placeholder="Optional maintenance message shown to users"></textarea>
+          <div class="runtime-maint-row">
+            <span id="maintenanceMeta" class="tiny"></span>
+            <button id="saveMaintenanceBtn" class="btn-save" type="button">Save Maintenance</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Offline From</th>
+                <th>Back Online</th>
+                <th>Duration</th>
+                <th>Reason</th>
+              </tr>
+            </thead>
+            <tbody id="downtimeRows"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="apiRoutesCard" class="card table-wrap" style="display:none">
+        <table>
+          <thead>
+            <tr>
+              <th>API Route</th>
+              <th class="right">Calls</th>
+              <th class="right">Error %</th>
+              <th class="right">Avg (ms)</th>
+              <th class="right">Avg/Max (ms)</th>
+              <th class="right">Traffic In</th>
+              <th class="right">Traffic Out</th>
+              <th>Last Status</th>
+              <th>Last Hit</th>
+            </tr>
+          </thead>
+          <tbody id="apiRouteRows"></tbody>
+        </table>
+      </div>
 
 	      <div class="card table-wrap">
 	        <table>
@@ -3726,6 +5697,16 @@ app.get('/myadmin', (_req: any, res: any) => {
     const logoutBtn = document.getElementById('logoutBtn');
     const statusEl = document.getElementById('status');
     const totalsEl = document.getElementById('totals');
+    const opsMetricsEl = document.getElementById('opsMetrics');
+    const systemRuntimeCardEl = document.getElementById('systemRuntimeCard');
+    const systemRuntimeMetricsEl = document.getElementById('systemRuntimeMetrics');
+    const maintenanceEnabledEl = document.getElementById('maintenanceEnabled');
+    const maintenanceMessageEl = document.getElementById('maintenanceMessage');
+    const maintenanceMetaEl = document.getElementById('maintenanceMeta');
+    const saveMaintenanceBtn = document.getElementById('saveMaintenanceBtn');
+    const downtimeRowsEl = document.getElementById('downtimeRows');
+    const apiRoutesCardEl = document.getElementById('apiRoutesCard');
+    const apiRouteRowsEl = document.getElementById('apiRouteRows');
     const rowsEl = document.getElementById('companyRows');
     const FEATURE_OPTIONS = [
       { key: 'team-inbox', label: 'Team Inbox' },
@@ -3733,10 +5714,25 @@ app.get('/myadmin', (_req: any, res: any) => {
       { key: 'broadcast', label: 'Broadcast' },
       { key: 'chatbots', label: 'Chatbot' },
       { key: 'contacts', label: 'Contacts' },
+      { key: 'calls', label: 'Calls' },
       { key: 'analytics', label: 'Analytics' },
       { key: 'settings', label: 'Settings' }
     ];
     const FEATURE_KEYS = new Set(FEATURE_OPTIONS.map(function(item) { return item.key; }));
+    const FEATURE_ALIASES = {
+      'team_inbox': 'team-inbox',
+      'teaminbox': 'team-inbox',
+      'inbox': 'team-inbox',
+      'automation': 'automations',
+      'broadcasts': 'broadcast',
+      'chatbot': 'chatbots',
+      'contact': 'contacts',
+      'call': 'calls',
+      'analytic': 'analytics',
+      'setting': 'settings',
+      'more': 'analytics',
+      'other': 'analytics'
+    };
 
     function setStatus(message, isError) {
       statusEl.textContent = message;
@@ -3780,10 +5776,10 @@ app.get('/myadmin', (_req: any, res: any) => {
       if (!res.ok || !data || !data.success) {
         throw new Error((data && data.error) || 'Failed to load setup status');
       }
-      return data.data || { setupOpen: false, admins: 0 };
+      return data.data || { setupOpen: false, superadmins: 0, legacyAdmins: 0 };
     }
 
-    async function createFirstAdmin(email, password) {
+    async function createFirstSuperAdmin(email, password) {
       const res = await fetch('/api/admin/setup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3791,7 +5787,7 @@ app.get('/myadmin', (_req: any, res: any) => {
       });
       const data = await res.json().catch(function() { return null; });
       if (!res.ok || !data || !data.success) {
-        throw new Error((data && data.error) || 'Failed to create WABA admin');
+        throw new Error((data && data.error) || 'Failed to create superadmin');
       }
       return data;
     }
@@ -3832,11 +5828,36 @@ app.get('/myadmin', (_req: any, res: any) => {
       return (data.data && data.data.hidden_features) || [];
     }
 
+    async function saveMaintenanceMode(enabled, message) {
+      const creds = readStoredCreds();
+      if (!creds.token) {
+        throw new Error('Session expired. Please login again.');
+      }
+      const res = await fetch('/api/admin/maintenance-mode', {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + creds.token,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          enabled: enabled === true,
+          message: String(message || '').trim().slice(0, 280)
+        })
+      });
+      const data = await res.json().catch(function() { return null; });
+      if (!res.ok || !data || !data.success) {
+        throw new Error((data && data.error) || 'Failed to update maintenance mode');
+      }
+      return data.data || null;
+    }
+
     function normalizeHiddenFeatures(value) {
       const output = [];
       const seen = new Set();
       const push = function(entry) {
-        const normalized = typeof entry === 'string' ? entry.trim().toLowerCase() : '';
+        const raw = typeof entry === 'string' ? entry.trim().toLowerCase() : '';
+        const normalizedBase = raw.replace(/\\s+/g, '-');
+        const normalized = FEATURE_ALIASES[normalizedBase] || FEATURE_ALIASES[normalizedBase.replace(/-/g, '')] || normalizedBase;
         if (!normalized || !FEATURE_KEYS.has(normalized) || seen.has(normalized)) return;
         seen.add(normalized);
         output.push(normalized);
@@ -3884,6 +5905,245 @@ app.get('/myadmin', (_req: any, res: any) => {
         box.appendChild(value);
         totalsEl.appendChild(box);
       });
+    }
+
+    function formatNumber(value) {
+      const num = Number(value || 0);
+      if (!Number.isFinite(num)) return '0';
+      return num.toLocaleString();
+    }
+
+    function formatBytes(value) {
+      const num = Number(value || 0);
+      if (!Number.isFinite(num) || num <= 0) return '0 B';
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let idx = 0;
+      let cur = num;
+      while (cur >= 1024 && idx < units.length - 1) {
+        cur = cur / 1024;
+        idx += 1;
+      }
+      return (cur >= 100 || idx === 0 ? cur.toFixed(0) : cur.toFixed(1)) + ' ' + units[idx];
+    }
+
+    function formatBps(value) {
+      return formatBytes(value) + '/s';
+    }
+
+    function formatDuration(seconds) {
+      const total = Math.max(0, Math.floor(Number(seconds || 0)));
+      const d = Math.floor(total / 86400);
+      const h = Math.floor((total % 86400) / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      if (d > 0) return d + 'd ' + h + 'h';
+      if (h > 0) return h + 'h ' + m + 'm';
+      if (m > 0) return m + 'm ' + s + 's';
+      return s + 's';
+    }
+
+    function formatDurationMs(value) {
+      const num = Number(value);
+      if (!Number.isFinite(num) || num <= 0) return '--';
+      return formatDuration(num / 1000);
+    }
+
+    function formatDateTime(value) {
+      if (!value) return '--';
+      const dt = new Date(value);
+      if (Number.isNaN(dt.getTime())) return '--';
+      return dt.toLocaleString();
+    }
+
+    function renderMonitor(monitor) {
+      opsMetricsEl.innerHTML = '';
+      const runtime = monitor && monitor.runtime ? monitor.runtime : {};
+      const api = monitor && monitor.api ? monitor.api : {};
+      const traffic = monitor && monitor.traffic ? monitor.traffic : {};
+
+      const metricCards = [
+        {
+          label: 'API Calls (Total)',
+          value: formatNumber(api.totalCalls),
+          meta: '2xx ' + formatNumber(api.status2xx) + ' | 4xx ' + formatNumber(api.status4xx) + ' | 5xx ' + formatNumber(api.status5xx)
+        },
+        {
+          label: 'API Calls (5m)',
+          value: formatNumber(api.windowCalls),
+          meta: 'Err ' + String(Number(api.windowErrorRatePct || 0).toFixed(2)) + '% | Success ' + String(Number(api.windowSuccessRatePct || 0).toFixed(2)) + '%'
+        },
+        {
+          label: 'Latency (5m)',
+          value: String(Number(api.windowAvgDurationMs || 0).toFixed(1)) + ' ms',
+          meta: 'P95 ' + String(Number(api.windowP95DurationMs || 0).toFixed(1)) + ' ms'
+        },
+        {
+          label: 'Traffic In / Out',
+          value: formatBytes(traffic.totalInBytes) + ' / ' + formatBytes(traffic.totalOutBytes),
+          meta: formatBps(traffic.inBps) + ' in | ' + formatBps(traffic.outBps) + ' out'
+        },
+        {
+          label: 'CPU / RAM',
+          value: String(Number(runtime.cpuPct || 0).toFixed(1)) + '% / ' + String(Number(runtime.memPct || 0).toFixed(1)) + '%',
+          meta: formatBytes(runtime.memUsed) + ' of ' + formatBytes(runtime.memTotal)
+        },
+        {
+          label: 'Uptime / Sockets',
+          value: formatDuration(runtime.uptimeSec) + ' / ' + formatNumber(runtime.activeSockets),
+          meta: 'Generated ' + (monitor && monitor.generatedAt ? new Date(monitor.generatedAt).toLocaleString() : '-')
+        }
+      ];
+
+      metricCards.forEach(function(item) {
+        const box = document.createElement('div');
+        box.className = 'metric';
+
+        const label = document.createElement('span');
+        label.className = 'ops-label';
+        label.textContent = item.label;
+
+        const value = document.createElement('span');
+        value.className = 'ops-value';
+        value.textContent = item.value;
+
+        const meta = document.createElement('span');
+        meta.className = 'ops-meta';
+        meta.textContent = item.meta;
+
+        box.appendChild(label);
+        box.appendChild(value);
+        box.appendChild(meta);
+        opsMetricsEl.appendChild(box);
+      });
+
+      opsMetricsEl.style.display = 'grid';
+      renderSystemRuntime(monitor && monitor.systemRuntime ? monitor.systemRuntime : {});
+      renderApiRoutes(api.topRoutes);
+    }
+
+    function renderSystemRuntime(systemRuntime) {
+      const runtime = systemRuntime && typeof systemRuntime === 'object' ? systemRuntime : {};
+      const maintenance = runtime.maintenance && typeof runtime.maintenance === 'object'
+        ? runtime.maintenance
+        : {};
+      const downtime = Array.isArray(runtime.downtime_log) ? runtime.downtime_log : [];
+
+      systemRuntimeMetricsEl.innerHTML = '';
+      const metricCards = [
+        {
+          label: 'Server State',
+          value: runtime.online === true ? 'ONLINE' : 'OFFLINE',
+          meta: 'Heartbeat: ' + formatDateTime(runtime.heartbeat_at),
+          state: runtime.online === true ? 'online' : 'offline'
+        },
+        {
+          label: 'Current Uptime',
+          value: formatDurationMs(runtime.uptime_ms),
+          meta: 'Started: ' + formatDateTime(runtime.started_at)
+        },
+        {
+          label: 'Last Downtime',
+          value: formatDurationMs(runtime.last_offline_duration_ms),
+          meta: 'Offline at: ' + formatDateTime(runtime.last_offline_at)
+        }
+      ];
+
+      metricCards.forEach(function(item) {
+        const box = document.createElement('div');
+        box.className = 'runtime-kpi';
+        const label = document.createElement('span');
+        label.className = 'ops-label';
+        label.textContent = item.label;
+        const value = document.createElement('b');
+        value.textContent = item.value;
+        if (item.state === 'online') value.classList.add('runtime-state-online');
+        if (item.state === 'offline') value.classList.add('runtime-state-offline');
+        const meta = document.createElement('span');
+        meta.className = 'ops-meta';
+        meta.textContent = item.meta;
+        box.appendChild(label);
+        box.appendChild(value);
+        box.appendChild(meta);
+        systemRuntimeMetricsEl.appendChild(box);
+      });
+
+      maintenanceEnabledEl.checked = maintenance.enabled === true;
+      maintenanceMessageEl.value = typeof maintenance.message === 'string' ? maintenance.message : '';
+      maintenanceMetaEl.textContent =
+        'Updated: ' + formatDateTime(maintenance.updated_at) +
+        (maintenance.updated_by ? ' by ' + maintenance.updated_by : '');
+
+      downtimeRowsEl.innerHTML = '';
+      if (downtime.length === 0) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 4;
+        td.className = 'route-muted';
+        td.textContent = 'No downtime entries logged yet.';
+        tr.appendChild(td);
+        downtimeRowsEl.appendChild(tr);
+      } else {
+        downtime.forEach(function(entry) {
+          const tr = document.createElement('tr');
+          const values = [
+            formatDateTime(entry && entry.offline_from),
+            formatDateTime(entry && entry.offline_until),
+            formatDurationMs(entry && entry.duration_ms),
+            (entry && entry.reason) ? String(entry.reason) : 'server_unavailable'
+          ];
+          values.forEach(function(item) {
+            const td = document.createElement('td');
+            td.textContent = item;
+            tr.appendChild(td);
+          });
+          downtimeRowsEl.appendChild(tr);
+        });
+      }
+
+      systemRuntimeCardEl.style.display = 'block';
+    }
+
+    function renderApiRoutes(routes) {
+      apiRouteRowsEl.innerHTML = '';
+      const list = Array.isArray(routes) ? routes : [];
+      if (list.length === 0) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 9;
+        td.className = 'route-muted';
+        td.textContent = 'No API route activity yet.';
+        tr.appendChild(td);
+        apiRouteRowsEl.appendChild(tr);
+        apiRoutesCardEl.style.display = 'block';
+        return;
+      }
+
+      list.forEach(function(route) {
+        const tr = document.createElement('tr');
+        const values = [
+          { v: route.route || '-', mono: true },
+          { v: formatNumber(route.calls), right: true },
+          { v: String(Number(route.errorRatePct || 0).toFixed(2)) + '%', right: true },
+          { v: String(Number(route.avgDurationMs || 0).toFixed(1)), right: true },
+          { v: 'Avg ' + String(Number(route.avgDurationMs || 0).toFixed(1)) + ' / Max ' + String(Number(route.maxDurationMs || 0).toFixed(1)), right: true },
+          { v: formatBytes(route.inBytes), right: true },
+          { v: formatBytes(route.outBytes), right: true },
+          { v: route.lastStatus == null ? '-' : String(route.lastStatus) },
+          { v: route.lastHitAt ? new Date(route.lastHitAt).toLocaleString() : '-' }
+        ];
+
+        values.forEach(function(item) {
+          const td = document.createElement('td');
+          td.textContent = item.v == null ? '-' : String(item.v);
+          if (item.mono) td.className = 'mono';
+          if (item.right) td.className = (td.className ? td.className + ' ' : '') + 'right';
+          tr.appendChild(td);
+        });
+
+        apiRouteRowsEl.appendChild(tr);
+      });
+
+      apiRoutesCardEl.style.display = 'block';
     }
 
     function renderRows(companies) {
@@ -4027,8 +6287,12 @@ app.get('/myadmin', (_req: any, res: any) => {
           throw new Error((data && data.error) || 'Failed to load admin summary');
         }
         renderTotals(data.totals || {});
+        renderMonitor(data.monitor || {});
         renderRows(Array.isArray(data.companies) ? data.companies : []);
-        setStatus('Loaded ' + String((data.totals && data.totals.companies) || 0) + ' companies.', false);
+        const companyCount = String((data.totals && data.totals.companies) || 0);
+        const apiCalls5m = String((data.monitor && data.monitor.api && data.monitor.api.windowCalls) || 0);
+        const errorRate = Number(data.monitor && data.monitor.api ? data.monitor.api.windowErrorRatePct || 0 : 0).toFixed(2);
+        setStatus('Loaded ' + companyCount + ' companies. API calls (5m): ' + apiCalls5m + ', 5xx error rate: ' + errorRate + '%.', false);
       } catch (err) {
         clearCreds();
         showLogin(err && err.message ? err.message : 'Session expired. Please login again.', true);
@@ -4043,10 +6307,13 @@ app.get('/myadmin', (_req: any, res: any) => {
         if (setup.setupOpen) {
           setupBtn.classList.remove('hidden');
           if (!loginStatus.textContent) {
-            showLogin('Setup is open. Create the first WABA admin account.', false);
+            showLogin('Setup is open. Create the first superadmin account.', false);
           }
         } else {
           setupBtn.classList.add('hidden');
+          if (setup.legacyAdmins > 0 && !loginStatus.textContent) {
+            showLogin('Legacy WABA admin accounts found. Promote one account to super_admin in Supabase metadata.', false);
+          }
         }
       } catch (err) {
         showLogin(err && err.message ? err.message : 'Failed to load setup status.', true);
@@ -4083,7 +6350,7 @@ app.get('/myadmin', (_req: any, res: any) => {
       }
       setupBtn.disabled = true;
       try {
-        await createFirstAdmin(email, password);
+        await createFirstSuperAdmin(email, password);
         const data = await login(email, password);
         if (!data.accessToken) throw new Error('Missing access token');
         saveCreds(data.email || email, data.accessToken);
@@ -4101,11 +6368,38 @@ app.get('/myadmin', (_req: any, res: any) => {
       if (event.key === 'Enter') loginBtn.click();
     });
 
+    saveMaintenanceBtn.addEventListener('click', async function() {
+      const enabled = maintenanceEnabledEl.checked === true;
+      const message = (maintenanceMessageEl.value || '').trim().slice(0, 280);
+      saveMaintenanceBtn.disabled = true;
+      setStatus('Saving maintenance mode...', false);
+      try {
+        const runtime = await saveMaintenanceMode(enabled, message);
+        if (runtime) {
+          renderSystemRuntime(runtime);
+        }
+        setStatus('Maintenance mode updated.', false);
+      } catch (err) {
+        setStatus(err && err.message ? err.message : 'Failed to update maintenance mode.', true);
+      } finally {
+        saveMaintenanceBtn.disabled = false;
+      }
+    });
+
     refreshBtn.addEventListener('click', loadSummary);
     logoutBtn.addEventListener('click', function() {
       clearCreds();
       totalsEl.style.display = 'none';
       totalsEl.innerHTML = '';
+      opsMetricsEl.style.display = 'none';
+      opsMetricsEl.innerHTML = '';
+      systemRuntimeCardEl.style.display = 'none';
+      systemRuntimeMetricsEl.innerHTML = '';
+      downtimeRowsEl.innerHTML = '';
+      maintenanceMessageEl.value = '';
+      maintenanceMetaEl.textContent = '';
+      apiRoutesCardEl.style.display = 'none';
+      apiRouteRowsEl.innerHTML = '';
       rowsEl.innerHTML = '';
       adminPasswordInput.value = '';
       showLogin('Logged out.', false);
@@ -4144,9 +6438,477 @@ app.use(
     )
 )
 
+function normalizeSimulatedPaymentStatus(value: unknown): 'payment_success' | 'payment_not_success' | null {
+    const raw = typeof value === 'string' ? value.trim().toLowerCase() : ''
+    if (!raw) return null
+    if (raw === 'payment_success' || raw === 'success' || raw === 'paid' || raw === 'done' || raw === 'ok') {
+        return 'payment_success'
+    }
+    if (raw === 'payment_not_success' || raw === 'not_success' || raw === 'failed' || raw === 'fail' || raw === 'not_paid' || raw === 'pending') {
+        return 'payment_not_success'
+    }
+    return null
+}
+
+function normalizeSimulatedPaymentReturnUrl(value: unknown): string {
+    const raw = typeof value === 'string' ? value.trim() : ''
+    if (!raw) return ''
+    try {
+        const parsed = new URL(raw)
+        const protocol = parsed.protocol.toLowerCase()
+        if (protocol === 'https:' || protocol === 'http:' || protocol === 'whatsapp:') {
+            return raw
+        }
+        return ''
+    } catch {
+        return ''
+    }
+}
+
+app.get('/simulated-payment', async (req: any, res: any) => {
+    const profileId = typeof req.query?.profileId === 'string' ? req.query.profileId.trim() : ''
+    const phoneRaw = typeof req.query?.phone === 'string' ? req.query.phone : ''
+    const phone = normalizePhoneNumber(phoneRaw)
+    const merchant = (typeof req.query?.merchant === 'string' ? req.query.merchant.trim() : '') || '2Fast Merchant Simulation'
+    const amount = (typeof req.query?.amount === 'string' ? req.query.amount.trim() : '') || '59.90'
+    const currency = (typeof req.query?.currency === 'string' ? req.query.currency.trim().toUpperCase() : '') || 'MYR'
+    const invoice = (typeof req.query?.invoice === 'string' ? req.query.invoice.trim() : '') || `SIM-${Date.now().toString().slice(-8)}`
+    const reference = (typeof req.query?.reference === 'string' ? req.query.reference.trim() : '') || invoice
+    const returnUrl = normalizeSimulatedPaymentReturnUrl(req.query?.returnUrl)
+    const returnFallback = normalizeSimulatedPaymentReturnUrl(req.query?.returnFallback)
+    const returnSuccessUrl = normalizeSimulatedPaymentReturnUrl(req.query?.returnSuccessUrl)
+    const returnFailUrl = normalizeSimulatedPaymentReturnUrl(req.query?.returnFailUrl)
+    const returnSuccessFallback = normalizeSimulatedPaymentReturnUrl(req.query?.returnSuccessFallback)
+    const returnFailFallback = normalizeSimulatedPaymentReturnUrl(req.query?.returnFailFallback)
+
+    const missingRequired = !profileId || !phone
+    const defaultWhatsappDeepLink = phone ? `whatsapp://send?phone=${phone}` : 'whatsapp://'
+    const defaultWhatsappWebLink = phone ? `https://wa.me/${phone}` : 'https://wa.me/'
+    const qrPayload = JSON.stringify({
+        merchant,
+        amount,
+        currency,
+        invoice,
+        reference,
+        profileId,
+        phone
+    })
+    const qrImageUrl = `https://quickchart.io/qr?size=280&margin=1&text=${encodeURIComponent(qrPayload)}`
+
+    const cfgJson = JSON.stringify({
+        profileId,
+        phone,
+        reference,
+        merchant,
+        amount,
+        currency,
+        invoice,
+        returnUrl: returnUrl || defaultWhatsappDeepLink,
+        returnFallback: returnFallback || defaultWhatsappWebLink,
+        returnSuccessUrl: returnSuccessUrl || '',
+        returnFailUrl: returnFailUrl || '',
+        returnSuccessFallback: returnSuccessFallback || '',
+        returnFailFallback: returnFailFallback || '',
+        redirectFallbackDelayMs: 850
+    }).replace(/</g, '\\u003c')
+
+    const missingMessage = missingRequired
+        ? 'Missing profileId or phone in URL. Add ?profileId=...&phone=... to allow workflow updates.'
+        : ''
+
+    const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Simulated Merchant Payment</title>
+  <style>
+    :root {
+      --bg: #f5f7f9;
+      --panel: #ffffff;
+      --line: #d8e2e8;
+      --text: #0f1720;
+      --muted: #536471;
+      --brand: #0f766e;
+      --accent: #134e4a;
+      --good: #0f8f49;
+      --bad: #b42318;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Space Grotesk", "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(1200px 480px at 15% -10%, #d1fae5 0%, transparent 55%),
+        radial-gradient(1000px 420px at 95% 110%, #dbeafe 0%, transparent 55%),
+        var(--bg);
+    }
+    .page { max-width: 1080px; margin: 0 auto; padding: 24px 18px 28px; }
+    .hero {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: 0 12px 30px rgba(15, 23, 32, 0.08);
+    }
+    h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: -0.03em; }
+    .sub { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.5; }
+    .meta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 16px; }
+    .meta div { background: #f8fbfc; border: 1px solid #e7eef2; border-radius: 12px; padding: 10px 12px; }
+    .meta b { display: block; font-size: 11px; color: #647481; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 3px; }
+    .meta span { font-size: 14px; font-weight: 700; }
+    .amount { font-size: 34px; font-weight: 800; line-height: 1; margin-top: 14px; color: var(--accent); }
+
+    .qr-wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; }
+    .qr {
+      width: 280px;
+      height: 280px;
+      border-radius: 16px;
+      border: 1px solid #dce7ee;
+      background: #fff;
+      object-fit: cover;
+    }
+    .caption { font-size: 12px; color: var(--muted); text-align: center; }
+
+    .methods { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 16px; }
+    .method {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: #fff;
+      cursor: pointer;
+      text-align: left;
+      transition: transform .12s ease, border-color .12s ease, background .12s ease;
+    }
+    .method:hover { transform: translateY(-1px); border-color: #9fc8c5; }
+    .method.active { border-color: #0f766e; background: #effcf8; }
+    .method b { display: block; font-size: 12px; margin-bottom: 4px; letter-spacing: 0.03em; }
+    .method span { display: block; font-size: 11px; color: var(--muted); line-height: 1.4; }
+
+    .detail {
+      margin-top: 12px;
+      border: 1px dashed #c6d6df;
+      border-radius: 12px;
+      padding: 12px;
+      background: #fbfdff;
+      font-size: 13px;
+      color: #384956;
+      min-height: 72px;
+      line-height: 1.5;
+    }
+
+    .controls {
+      margin-top: 18px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .btn {
+      border: 0;
+      border-radius: 14px;
+      padding: 14px 16px;
+      font-weight: 800;
+      font-size: 13px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: transform .12s ease, opacity .12s ease;
+    }
+    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    .btn:hover:not(:disabled) { transform: translateY(-1px); }
+    .btn.success { background: #0f8f49; color: #fff; }
+    .btn.fail { background: #b42318; color: #fff; }
+
+    .status {
+      margin-top: 12px;
+      font-size: 13px;
+      border-radius: 12px;
+      padding: 10px 12px;
+      border: 1px solid #d7e3ea;
+      background: #fff;
+      color: #334155;
+      min-height: 40px;
+    }
+    .status.good { border-color: #9dd9b8; background: #f1fcf5; color: #166534; }
+    .status.bad { border-color: #f3b3af; background: #fff4f3; color: #991b1b; }
+
+    .warn {
+      margin-top: 12px;
+      border: 1px solid #f6c3b8;
+      background: #fff3f0;
+      color: #9f1f10;
+      border-radius: 12px;
+      padding: 10px 12px;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    @media (max-width: 980px) {
+      .hero { grid-template-columns: 1fr; }
+      .methods { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .qr { width: 240px; height: 240px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="hero">
+      <section class="panel">
+        <h1>Simulated Payment Merchant</h1>
+        <p class="sub">Use this page for testing only. Choose a payment method preview, then press success or not success.</p>
+        <div class="amount">${escapeHtml(currency)} ${escapeHtml(amount)}</div>
+        <div class="meta">
+          <div><b>Merchant</b><span>${escapeHtml(merchant)}</span></div>
+          <div><b>Invoice</b><span>${escapeHtml(invoice)}</span></div>
+          <div><b>Reference</b><span>${escapeHtml(reference)}</span></div>
+          <div><b>Phone</b><span>${escapeHtml(phone || '-')}</span></div>
+        </div>
+
+        <div class="methods" id="methodGrid">
+          <button class="method active" data-method="qr"><b>QR</b><span>Scan for instant payment simulation</span></button>
+          <button class="method" data-method="card"><b>Card</b><span>Visa / Mastercard simulation</span></button>
+          <button class="method" data-method="ewallet"><b>E-Wallet</b><span>TNG / GrabPay / ShopeePay style flow</span></button>
+          <button class="method" data-method="bank"><b>Bank Transfer</b><span>Virtual account and FPX simulation</span></button>
+        </div>
+        <div class="detail" id="methodDetail"></div>
+
+        ${missingMessage ? `<div class="warn">${escapeHtml(missingMessage)}</div>` : ''}
+
+        <div class="controls">
+          <button id="btnSuccess" class="btn success">Payment Success</button>
+          <button id="btnFail" class="btn fail">Payment Not Success</button>
+        </div>
+        <div id="statusLine" class="status">Waiting for your action.</div>
+      </section>
+
+      <section class="panel qr-wrap">
+        <img class="qr" src="${qrImageUrl}" alt="Simulated payment QR code" />
+        <div class="caption">QR payload is simulated for testing. No real transaction is processed.</div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const cfg = ${cfgJson};
+    const statusLine = document.getElementById('statusLine');
+    const btnSuccess = document.getElementById('btnSuccess');
+    const btnFail = document.getElementById('btnFail');
+    const methodGrid = document.getElementById('methodGrid');
+    const methodDetail = document.getElementById('methodDetail');
+
+    const methodCopy = {
+      qr: 'QR simulation mode: customer scans QR and confirms inside banking app.',
+      card: 'Card simulation mode: enter card, expiry, CVV and complete 3DS challenge.',
+      ewallet: 'E-wallet simulation mode: redirect to wallet app, approve, and return.',
+      bank: 'Bank transfer simulation mode: customer pays via FPX/VA and callback updates status.'
+    };
+
+    function setStatus(text, type) {
+      statusLine.textContent = text;
+      statusLine.classList.remove('good', 'bad');
+      if (type === 'good') statusLine.classList.add('good');
+      if (type === 'bad') statusLine.classList.add('bad');
+    }
+
+    function setBusy(busy) {
+      btnSuccess.disabled = busy;
+      btnFail.disabled = busy;
+      btnSuccess.textContent = busy ? 'Processing...' : 'Payment Success';
+      btnFail.textContent = busy ? 'Processing...' : 'Payment Not Success';
+    }
+
+    function updateMethod(method) {
+      const nodes = Array.from(methodGrid.querySelectorAll('.method'));
+      nodes.forEach((node) => node.classList.toggle('active', node.dataset.method === method));
+      methodDetail.textContent = methodCopy[method] || methodCopy.qr;
+    }
+
+    function getRedirectTargets(status) {
+      if (status === 'payment_success') {
+        return {
+          primary: cfg.returnSuccessUrl || cfg.returnUrl || '',
+          fallback: cfg.returnSuccessFallback || cfg.returnFallback || ''
+        };
+      }
+      return {
+        primary: cfg.returnFailUrl || cfg.returnUrl || '',
+        fallback: cfg.returnFailFallback || cfg.returnFallback || ''
+      };
+    }
+
+    function navigateTo(url) {
+      if (!url) return false;
+      try {
+        window.location.assign(url);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    function redirectAfterUpdate(status) {
+      const targets = getRedirectTargets(status);
+      const primary = typeof targets.primary === 'string' ? targets.primary : '';
+      const fallback = typeof targets.fallback === 'string' ? targets.fallback : '';
+      const delay = Number(cfg.redirectFallbackDelayMs);
+      const fallbackDelayMs = Number.isFinite(delay) ? Math.max(300, delay) : 850;
+      if (!primary && !fallback) return;
+
+      setStatus('Update sent. Redirecting back to WhatsApp...', 'good');
+      if (fallback) {
+        setTimeout(() => {
+          if (document.visibilityState === 'visible') {
+            navigateTo(fallback);
+          }
+        }, fallbackDelayMs);
+      }
+
+      if (!navigateTo(primary) && fallback) {
+        navigateTo(fallback);
+      }
+    }
+
+    methodGrid.addEventListener('click', (event) => {
+      const btn = event.target && event.target.closest ? event.target.closest('.method') : null;
+      if (!btn) return;
+      updateMethod(btn.dataset.method || 'qr');
+    });
+
+    updateMethod('qr');
+
+    async function submit(status) {
+      if (!cfg.profileId || !cfg.phone) {
+        setStatus('Missing profileId or phone. Cannot notify workflow.', 'bad');
+        return;
+      }
+      setBusy(true);
+      setStatus('Sending update to automation component...', '');
+      try {
+        const response = await fetch('/api/simulated-payment/update', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            profileId: cfg.profileId,
+            phone: cfg.phone,
+            status,
+            reference: cfg.reference,
+            invoice: cfg.invoice,
+            merchant: cfg.merchant,
+            amount: cfg.amount,
+            currency: cfg.currency
+          })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data?.success === false) {
+          throw new Error(data?.error || 'Failed to update simulated payment status');
+        }
+        redirectAfterUpdate(status);
+      } catch (error) {
+        const message = error && error.message ? error.message : String(error || 'Unknown error');
+        setStatus(message, 'bad');
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    btnSuccess.addEventListener('click', () => submit('payment_success'));
+    btnFail.addEventListener('click', () => submit('payment_not_success'));
+  </script>
+</body>
+</html>`
+
+    res.setHeader('content-type', 'text/html; charset=utf-8')
+    return res.send(html)
+})
+
+app.post('/api/simulated-payment/update', async (req: any, res: any) => {
+    try {
+        const profileId = typeof req.body?.profileId === 'string' ? req.body.profileId.trim() : ''
+        const phoneRaw = typeof req.body?.phone === 'string' ? req.body.phone : ''
+        const phoneNumber = normalizePhoneNumber(phoneRaw)
+        const status = normalizeSimulatedPaymentStatus(req.body?.status)
+
+        if (!profileId) {
+            return res.status(400).json({ success: false, error: 'profileId is required' })
+        }
+        if (!phoneNumber) {
+            return res.status(400).json({ success: false, error: 'phone is required' })
+        }
+        if (!status) {
+            return res.status(400).json({ success: false, error: 'status must be payment_success or payment_not_success' })
+        }
+
+        const companyId = await getCompanyIdForProfile(profileId)
+        if (!companyId) {
+            return res.status(404).json({ success: false, error: 'Company not found for profile' })
+        }
+
+        const client = await wabaRegistry.getClientByProfile(profileId)
+        if (!client) {
+            return res.status(503).json({ success: false, error: 'WABA client not available for profile' })
+        }
+
+        const result = await workflowEngine.processInbound({
+            companyId,
+            profileId,
+            client,
+            phoneNumber,
+            messageType: 'button',
+            text: status,
+            buttonId: status,
+            buttonTitle: status === 'payment_success' ? 'Payment Success' : 'Payment Not Success',
+            raw: {
+                source: 'simulated-payment-web',
+                simulated_payment: true,
+                status,
+                invoice: req.body?.invoice || null,
+                reference: req.body?.reference || null,
+                merchant: req.body?.merchant || null,
+                amount: req.body?.amount || null,
+                currency: req.body?.currency || null
+            }
+        })
+
+        if (result?.error) {
+            return res.status(500).json({
+                success: false,
+                error: result.error,
+                handled: result.handled,
+                replied: result.replied
+            })
+        }
+
+        return res.json({
+            success: true,
+            handled: Boolean(result?.handled),
+            replied: Boolean(result?.replied),
+            status
+        })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error?.message || 'Failed to update simulated payment status' })
+    }
+})
+
+function buildChatJid(target: string | null | undefined, preferGroup = false) {
+    const normalized = normalizePhoneNumber(target)
+    if (!normalized) return ''
+    if (preferGroup || isGroupIdentifier(target || normalized)) {
+        return `${normalized}@g.us`
+    }
+    return `${normalized}@s.whatsapp.net`
+}
+
 function buildSyntheticMessage(inbound: WabaInboundMessage) {
-    const from = (inbound.from || '').replace(/\D/g, '')
-    const remoteJid = `${from}@s.whatsapp.net`
+    const from = normalizePhoneNumber(inbound.from || '')
+    const groupId = normalizePhoneNumber(inbound.groupId || '')
+    const remoteJid = groupId ? buildChatJid(groupId, true) : buildChatJid(from)
     const timestamp = inbound.timestamp ? Number(inbound.timestamp) : Math.floor(Date.now() / 1000)
 
     let text = inbound.text?.body || ''
@@ -4192,7 +6954,8 @@ function buildSyntheticMessage(inbound: WabaInboundMessage) {
         key: {
             remoteJid,
             fromMe: false,
-            id: inbound.id
+            id: inbound.id,
+            ...(groupId && from ? { participant: buildChatJid(from) } : {})
         },
         messageTimestamp: timestamp,
         pushName: inbound.contactName,
@@ -4211,7 +6974,7 @@ async function recordToSyntheticMessage(
     const cleanPhone = normalizePhoneNumber(info?.phone || '')
     if (!cleanPhone) return null
 
-    const remoteJid = `${cleanPhone}@s.whatsapp.net`
+    const remoteJid = buildChatJid(cleanPhone, isGroupIdentifier(info?.phone || cleanPhone))
     const timestamp = Math.floor(new Date(record.created_at).getTime() / 1000)
     const content = record.content || {}
     const type = content.type || content.payload?.type || 'text'
@@ -4431,7 +7194,11 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
     const profileId = config.profileId
     const profileCompanyId = await getCompanyIdForProfile(profileId)
     const companyId = profileCompanyId || await resolveCompanyId(config.companyId || profileId)
-    const phoneNumber = remoteJid.replace(/@s\\.whatsapp\\.net$/, '')
+    const phoneNumber = normalizePhoneNumber(remoteJid)
+    const isGroupMessage = Boolean(inbound.groupId || remoteJid.endsWith('@g.us'))
+    const inboundSource = readTrimmed((inbound.raw as any)?.source).toLowerCase()
+    const isGymShowcaseSource = inboundSource === GYM_SHOWCASE_SOURCE
+    const isSimulatedInbound = Boolean((inbound.raw as any)?.simulated) || inboundSource === 'simulated-payment-web'
 
     const client = await wabaRegistry.getClientByProfile(profileId)
     if (!client || !companyId) {
@@ -4447,17 +7214,17 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
         profileId,
         client,
         phoneNumber,
-        automationDisabled: humanTakeoverActive,
+        automationDisabled: humanTakeoverActive || isGroupMessage,
         messageType: inbound.type,
         text,
         buttonId: inbound.buttonReplyId,
         buttonTitle: inbound.buttonReplyTitle,
         media: inbound.image || inbound.document || inbound.audio || inbound.video,
-        raw: inbound.raw
+        raw: toMinimalInboundRaw(inbound)
     })
 
     const user = (await getUserByPhone(companyId, phoneNumber)) || baseUser
-    if (user && inbound.contactName) {
+    if (user && inbound.contactName && !isGroupMessage) {
         const trimmedName = inbound.contactName.trim()
         const nameDigits = trimmedName.replace(/\D/g, '')
         const looksLikePhone = nameDigits.length >= 6 && nameDigits === phoneNumber
@@ -4467,25 +7234,62 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
         }
     }
 
-    const { data: profile } = await supabase.from('profiles').select('*').eq('id', profileId).single()
-
-    if (profile) {
-        const newCount = (profile.unreadCount || 0) + 1
-        await supabase.from('profiles').update({ unreadCount: newCount }).eq('id', profileId)
-        const room = getCompanyRoom(companyId)
-        const { data: companyProfiles } = await supabase
+    let profileUnreadCount: number | null = null
+    try {
+        const { data: profile } = await supabase
             .from('profiles')
-            .select('*')
-            .eq('company_id', companyId)
-            .order('created_at', { ascending: true })
-        io.to(room).emit('profiles.update', companyProfiles || [])
+            .select('id, unreadCount')
+            .eq('id', profileId)
+            .maybeSingle()
+
+        if (profile) {
+            const newCount = (profile.unreadCount || 0) + 1
+            const { error: updateUnreadError } = await supabase
+                .from('profiles')
+                .update({ unreadCount: newCount })
+                .eq('id', profileId)
+
+            if (updateUnreadError) {
+                console.warn(`[${profileId}] Failed to update profile unread count:`, updateUnreadError.message)
+            } else {
+                profileUnreadCount = newCount
+            }
+        }
+    } catch (error: any) {
+        console.warn(`[${profileId}] Profile unread update skipped:`, error?.message || error)
     }
 
-    if (profile && workflowResult?.error) {
+    if (typeof profileUnreadCount === 'number') {
+        io.to(getCompanyRoom(companyId)).emit('profile.unread', { profileId, unreadCount: profileUnreadCount })
+    }
+
+    if (workflowResult?.error) {
         io.to(getCompanyRoom(companyId)).emit('profile.error', { message: `Workflow error: ${workflowResult.error}` })
     }
 
-    if (user) {
+    if (
+        !workflowResult?.error &&
+        workflowResult?.completedWorkflowId === GYM_SHOWCASE_WORKFLOW_ID &&
+        !isGroupMessage &&
+        !isGymShowcaseSource
+    ) {
+        const modeConfig = getAdsShootModeProfileConfig(companyId, profileId)
+        if (modeConfig.enabled) {
+            void runGymShowcaseBoost(config, companyId, phoneNumber)
+                .then((result) => {
+                    if (result.error) {
+                        console.log(`[GymShowcase] ${profileId}: skipped (${result.error}).`)
+                        return
+                    }
+                    console.log(`[GymShowcase] ${profileId}: injected ${result.sent} simulated workflow messages.`)
+                })
+                .catch((error: any) => {
+                    console.warn('[GymShowcase] Failed to run boost:', error?.message || error)
+                })
+        }
+    }
+
+    if (user && !isSimulatedInbound) {
         try {
             const aiResult = await maybeSendAutoAiReply({
                 companyId,
@@ -4495,7 +7299,7 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
                 phoneNumber,
                 inboundType: inbound.type,
                 inboundText: text || '',
-                workflowHandled: Boolean(workflowResult?.handled && workflowResult?.replied)
+                workflowHandled: isGroupMessage || Boolean(workflowResult?.handled && workflowResult?.replied)
             })
             if (aiResult.sent) {
                 console.log(`[${profileId}] Auto AI reply sent to ${phoneNumber}`)
@@ -4507,31 +7311,31 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
         }
     }
 
-    if (profile) {
-        const inboundAt = inbound.timestamp ? new Date(Number(inbound.timestamp) * 1000).toISOString() : null
-        const contact = user
-            ? {
-                ...buildContactPayload(user),
-                id: remoteJid,
-                lastInboundAt: inboundAt
-            }
-            : {
-                id: remoteJid,
-                name: inbound.contactName || phoneNumber,
-                lastInboundAt: inboundAt,
-                tags: [],
-                assigneeUserId: null,
-                assigneeName: null,
-                assigneeColor: null,
-                ctaReferralAt: null,
-                ctaFreeWindowStartedAt: null,
-                ctaFreeWindowExpiresAt: null
-            }
-        io.to(getCompanyRoom(companyId)).emit('contacts.update', {
-            profileId,
-            contacts: [contact]
-        })
-    }
+    const inboundAt = inbound.timestamp ? new Date(Number(inbound.timestamp) * 1000).toISOString() : null
+    const contact = user
+        ? {
+            ...buildContactPayload(user),
+            id: remoteJid,
+            lastInboundAt: inboundAt
+        }
+        : {
+            id: remoteJid,
+            name: isGroupMessage ? `Group ${phoneNumber}` : (inbound.contactName || phoneNumber),
+            alias: null,
+            whatsappName: isGroupMessage ? null : (inbound.contactName || null),
+            lastInboundAt: inboundAt,
+            tags: [],
+            assigneeUserId: null,
+            assigneeName: null,
+            assigneeColor: null,
+            ctaReferralAt: null,
+            ctaFreeWindowStartedAt: null,
+            ctaFreeWindowExpiresAt: null
+        }
+    io.to(getCompanyRoom(companyId)).emit('contacts.update', {
+        profileId,
+        contacts: [contact]
+    })
 
     const buttonReply = inbound.buttonReplyId
         ? {
@@ -4547,15 +7351,19 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
             jid: remoteJid,
             name: inbound.contactName || null
         },
+        group_id: inbound.groupId || null,
+        participant_wa_id: inbound.from || null,
         referral: inbound.referral || null,
         button_reply: buttonReply,
         interactive: inbound.interactive || null,
-        raw: inbound.raw
+        raw: INCLUDE_RAW_WEBHOOK_EVENT_PAYLOAD ? inbound.raw : null
     })
 
     addon.webhookService.trigger(profileId, 'message_received', {
         messageId: inbound.id,
         from: remoteJid,
+        groupId: inbound.groupId || null,
+        participantWaId: inbound.from || null,
         message: text || inbound.type,
         type: inbound.type,
         timestamp: inbound.timestamp,
@@ -4563,12 +7371,46 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
         referral: inbound.referral || null,
         button_reply: buttonReply,
         interactive: inbound.interactive || null,
-        raw: inbound.raw
+        raw: INCLUDE_RAW_WEBHOOK_EVENT_PAYLOAD ? inbound.raw : null
     })
 
-    if (profile) {
-        io.to(getCompanyRoom(companyId)).emit('messages.upsert', { profileId, messages: [syntheticMsg], type: 'notify' })
-    }
+    io.to(getCompanyRoom(companyId)).emit('messages.upsert', { profileId, messages: [syntheticMsg], type: 'notify' })
+
+    const notificationRecipientUserIds = await getCompanyRecipientUserIdsForPush(companyId)
+    const backgroundNotificationRecipientUserIds = selectBackgroundPushUserIds(notificationRecipientUserIds)
+    const senderName =
+        (contact && typeof contact.name === 'string' && contact.name.trim())
+        || (typeof inbound.contactName === 'string' && inbound.contactName.trim())
+        || (isGroupMessage ? `Group ${phoneNumber}` : phoneNumber)
+        || 'New message'
+
+    void sendPushNotificationToUsers({
+        companyId,
+        userIds: notificationRecipientUserIds,
+        title: senderName,
+        body: getInboundNotificationPreview(inbound, text),
+        url: `/?chat=${encodeURIComponent(remoteJid)}`,
+        tag: `chat:${remoteJid}`,
+        data: {
+            profileId,
+            chat: remoteJid
+        },
+        ttlSeconds: 120
+    })
+
+    void sendNativePushNotificationToUsers({
+        companyId,
+        userIds: backgroundNotificationRecipientUserIds,
+        title: senderName,
+        body: getInboundNotificationPreview(inbound, text),
+        url: `/?chat=${encodeURIComponent(remoteJid)}`,
+        tag: `chat:${remoteJid}`,
+        data: {
+            profileId,
+            chat: remoteJid
+        },
+        ttlSeconds: 120
+    })
 }
 
 async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
@@ -4584,7 +7426,16 @@ async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
 
     if (!eventName) return
 
-    const updatedMessage = await updateMessageStatusByMessageId(status.id, statusName)
+    const recipientParticipantId = status.recipientParticipantId || status.participantRecipientId || null
+    const updatedMessage = await updateMessageStatusByMessageId(status.id, statusName, {
+        timestamp: status.timestamp,
+        recipientId: status.recipientId,
+        recipientType: status.recipientType,
+        recipientParticipantId: status.recipientParticipantId,
+        participantRecipientId: status.participantRecipientId,
+        conversation: status.conversation,
+        pricing: status.pricing
+    })
 
     if (statusName === 'delivered' && updatedMessage?.content?.cta_entry_candidate) {
         const deliveredAt = status.timestamp
@@ -4604,7 +7455,10 @@ async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
         io.to(room).emit('message.status', {
             profileId,
             messageId: status.id,
-            status: statusName
+            status: statusName,
+            recipientId: status.recipientId || null,
+            recipientType: status.recipientType || null,
+            recipientParticipantId
         })
 
         if (statusName === 'delivered' && updatedMessage?.user_id) {
@@ -4622,6 +7476,8 @@ async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
     addon.webhookService.trigger(profileId, eventName, {
         messageId: status.id,
         to: status.recipientId,
+        recipientType: status.recipientType || null,
+        recipientParticipantId,
         status: statusName,
         timestamp: status.timestamp,
         conversation: status.conversation,
@@ -4629,9 +7485,51 @@ async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
     })
 }
 
+async function handleCallUpdate(config: WabaConfig, call: WabaCallUpdate) {
+    const profileId = config.profileId
+    const companyId = await resolveCompanyId(config.companyId || profileId)
+    if (!companyId) return
+
+    const room = getCompanyRoom(companyId)
+    const eventName = readTrimmed(call.event).toLowerCase()
+    const payload = {
+        profileId,
+        callId: call.id,
+        event: eventName || call.event || 'unknown',
+        phoneNumberId: call.phoneNumberId,
+        from: call.from || null,
+        to: call.to || null,
+        direction: call.direction || null,
+        timestamp: call.timestamp || 0,
+        status: Array.isArray(call.status) ? call.status : [],
+        startTime: call.startTime || null,
+        endTime: call.endTime || null,
+        duration: call.duration ?? null,
+        deeplinkPayload: call.deeplinkPayload || null,
+        ctaPayload: call.ctaPayload || null,
+        bizOpaqueCallbackData: call.bizOpaqueCallbackData || null,
+        session: call.session || null,
+        contactName: call.contactName || null,
+        errors: Array.isArray(call.errors) ? call.errors : [],
+        raw: INCLUDE_RAW_WEBHOOK_EVENT_PAYLOAD ? call.raw : null
+    }
+
+    io.to(room).emit('calls.update', payload)
+
+    const statusSummary = payload.status.length > 0 ? ` [${payload.status.join(', ')}]` : ''
+    console.log(
+        `[${profileId}] [Calls] ${payload.event.toUpperCase()} id=${payload.callId} from=${payload.from || '-'} to=${payload.to || '-'}${statusSummary}`
+    )
+
+    webhookStore.send(profileId, 'call', payload)
+
+    addon.webhookService.trigger(profileId, `call_${payload.event}`, payload)
+}
+
 registerSocketHandlers(io, {
     supabase,
     supabaseAuth,
+    systemRuntimeStatus,
     getHostnameFromHeaders,
     resolveCompanyIdFromHostname,
     normalizeCompanyId,
@@ -4645,10 +7543,11 @@ registerSocketHandlers(io, {
     getUsersForCompany,
     buildContactPayload,
     getMessagesForUsers,
+    getMessagesForUsersSince,
     normalizePhoneNumber,
     recordToSyntheticMessage,
     findOrCreateUser,
-    updateUserName,
+    setUserAlias,
     setUserTags,
     setUserHumanTakeover,
     getUserByPhone,
@@ -4666,7 +7565,10 @@ registerSocketHandlers(io, {
     resolveCompanyId,
     hasRoleAtLeast,
     normalizeTeamRole,
-    deleteMessagesForUser
+    deleteMessagesForUser,
+    deleteUserById,
+    sendPushNotificationToUsers,
+    sendNativePushNotificationToUsers
 })
 
 app.use(errorHandler)

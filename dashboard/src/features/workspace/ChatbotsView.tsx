@@ -1,5 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Bot, KeyRound, Loader2, RefreshCw, Save, Trash2 } from 'lucide-react';
+import { KeyRound, Loader2, RefreshCw, Save, Trash2 } from 'lucide-react';
+import {
+    WorkspaceNotice,
+    WorkspacePage,
+    WorkspacePanel,
+    WorkspaceSectionHeader
+} from '../ui/workspacePrimitives';
 
 type AiSettingsPayload = {
     enabled: boolean;
@@ -144,193 +150,181 @@ export default function ChatbotsView({
     }, [apiBaseUrl, apiKeyInput, profileId, sessionToken, settings]);
 
     return (
-        <div className="h-screen pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans">
-            <div className="h-full p-6 overflow-y-auto custom-scrollbar">
-                <div className="max-w-[860px] mx-auto">
-                    <section className="bg-white border border-[#eceff1] rounded-3xl shadow-[0_10px_30px_rgba(0,0,0,0.05)] p-5">
-                        <div className="flex items-start justify-between gap-3">
+        <WorkspacePage>
+            <WorkspacePanel className="mx-auto w-full max-w-[920px] p-4 sm:p-5 lg:p-6">
+                <WorkspaceSectionHeader
+                    eyebrow="AI Assistant"
+                    title="Chatbot Intelligence Settings"
+                    description="Configure model behavior, API key management, and memory controls for WhatsApp response quality."
+                    rightSlot={
+                        <button
+                            type="button"
+                            onClick={loadSettings}
+                            disabled={loading || !canUseApi}
+                            className="qm-btn qm-btn-secondary h-10 px-3"
+                        >
+                            <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
+                            Refresh
+                        </button>
+                    }
+                />
+
+                <div className="mt-5 qm-section-rhythm">
+                    {!canUseApi ? (
+                        <WorkspaceNotice tone="warning">Select an active profile and sign in to configure AI.</WorkspaceNotice>
+                    ) : null}
+                    {settingsError ? <WorkspaceNotice tone="error">{settingsError}</WorkspaceNotice> : null}
+                    {settingsNotice ? <WorkspaceNotice tone="success">{settingsNotice}</WorkspaceNotice> : null}
+
+                    <div className="qm-card-soft p-4">
+                        <label className="flex items-center justify-between gap-3">
                             <div>
-                                <h2 className="text-2xl font-black text-[#111b21] flex items-center gap-2">
-                                    <Bot className="w-6 h-6 text-[#00a884]" />
-                                    Chatbot AI
-                                </h2>
-                                <p className="text-sm text-[#54656f] mt-1">
-                                    Configure API key, model, response behavior, and memory.
+                                <p className="text-sm font-bold text-[var(--qm-text)]">Enable AI assistant</p>
+                                <p className="text-xs text-[var(--qm-text-muted)]">
+                                    Auto-reply when no workflow is triggered, and use AI generation manually.
                                 </p>
                             </div>
+                            <input
+                                type="checkbox"
+                                checked={settings.enabled}
+                                onChange={(e) => setSettings(prev => ({ ...prev, enabled: e.target.checked }))}
+                                disabled={!canUseApi}
+                                className="h-4 w-4 accent-[var(--qm-brand)]"
+                            />
+                        </label>
+                    </div>
+
+                    <div>
+                        <label className="qm-label mb-2">API Key</label>
+                        <div className="relative">
+                            <KeyRound className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--qm-text-soft)]" />
+                            <input
+                                type="password"
+                                value={apiKeyInput}
+                                onChange={(e) => setApiKeyInput(e.target.value)}
+                                disabled={!canUseApi}
+                                placeholder={settings.hasApiKey ? 'Leave blank to keep existing key' : 'Paste OpenAI API key'}
+                                className="qm-input pl-9"
+                            />
+                        </div>
+                        <div className="mt-2 flex items-center justify-between gap-2">
+                            <span className="text-xs text-[var(--qm-text-muted)]">
+                                {settings.hasApiKey ? `Saved: ${settings.apiKeyHint}` : 'No API key saved yet'}
+                            </span>
                             <button
                                 type="button"
-                                onClick={loadSettings}
-                                disabled={loading || !canUseApi}
-                                className="px-3 py-2 rounded-xl border border-[#eceff1] bg-white text-[#111b21] text-xs font-bold hover:bg-[#f8f9fa] transition-all disabled:opacity-50"
+                                onClick={() => saveSettings(true)}
+                                disabled={!canUseApi || saving || !settings.hasApiKey}
+                                className="qm-btn qm-btn-danger h-8 px-3 text-[10px]"
                             >
-                                <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+                                <Trash2 className="h-3.5 w-3.5" />
+                                Remove
                             </button>
                         </div>
+                    </div>
 
-                        {!canUseApi && (
-                            <div className="mt-4 px-3 py-2 rounded-xl bg-amber-50 border border-amber-200 text-amber-700 text-xs font-semibold">
-                                Select a profile and log in to configure AI.
-                            </div>
-                        )}
-                        {settingsError && (
-                            <div className="mt-4 px-3 py-2 rounded-xl bg-rose-50 border border-rose-200 text-rose-600 text-xs font-semibold">
-                                {settingsError}
-                            </div>
-                        )}
-                        {settingsNotice && (
-                            <div className="mt-4 px-3 py-2 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 text-xs font-semibold">
-                                {settingsNotice}
-                            </div>
-                        )}
-
-                        <div className="mt-5 space-y-4">
-                            <label className="flex items-center justify-between gap-3 rounded-2xl border border-[#eceff1] bg-[#f8f9fa] px-4 py-3">
-                                <div>
-                                    <div className="text-sm font-bold text-[#111b21]">Enable AI assistant</div>
-                                    <div className="text-[11px] text-[#6b7280]">Auto-reply when no workflow is triggered, and use generator manually.</div>
-                                </div>
-                                <input
-                                    type="checkbox"
-                                    checked={settings.enabled}
-                                    onChange={(e) => setSettings(prev => ({ ...prev, enabled: e.target.checked }))}
-                                    disabled={!canUseApi}
-                                    className="w-4 h-4 accent-[#00a884]"
-                                />
-                            </label>
-
-                            <div className="space-y-2">
-                                <label className="text-xs font-black uppercase tracking-widest text-[#54656f]">API Key</label>
-                                <div className="relative">
-                                    <KeyRound className="w-4 h-4 text-[#8696a0] absolute left-3 top-1/2 -translate-y-1/2" />
-                                    <input
-                                        type="password"
-                                        value={apiKeyInput}
-                                        onChange={(e) => setApiKeyInput(e.target.value)}
-                                        disabled={!canUseApi}
-                                        placeholder={settings.hasApiKey ? 'Leave blank to keep existing key' : 'Paste OpenAI API key'}
-                                        className="w-full pl-9 pr-3 py-3 rounded-xl border border-[#eceff1] bg-white text-sm text-[#111b21] focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
-                                    />
-                                </div>
-                                <div className="flex items-center justify-between gap-2">
-                                    <span className="text-[11px] text-[#6b7280]">
-                                        {settings.hasApiKey ? `Saved: ${settings.apiKeyHint}` : 'No API key saved yet'}
-                                    </span>
-                                    <button
-                                        type="button"
-                                        onClick={() => saveSettings(true)}
-                                        disabled={!canUseApi || saving || !settings.hasApiKey}
-                                        className="px-2.5 py-1.5 rounded-lg border border-rose-200 text-rose-600 text-[11px] font-bold hover:bg-rose-50 transition-all disabled:opacity-50"
-                                    >
-                                        <Trash2 className="w-3.5 h-3.5 inline mr-1" />
-                                        Remove
-                                    </button>
-                                </div>
-                            </div>
-
-                            <div className="space-y-2">
-                                <label className="text-xs font-black uppercase tracking-widest text-[#54656f]">AI Model</label>
-                                <select
-                                    value={settings.model}
-                                    onChange={(e) => setSettings(prev => ({ ...prev, model: e.target.value }))}
-                                    disabled={!canUseApi}
-                                    className="w-full rounded-xl border border-[#eceff1] bg-white px-3 py-3 text-sm text-[#111b21] focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
-                                >
-                                    {MODEL_OPTIONS.map((option) => (
-                                        <option key={option.value} value={option.value}>
-                                            {option.label}
-                                        </option>
-                                    ))}
-                                </select>
-                            </div>
-
-                            <div className="grid grid-cols-2 gap-3">
-                                <label className="space-y-1">
-                                    <span className="text-[11px] font-black uppercase tracking-widest text-[#54656f]">Temperature</span>
-                                    <input
-                                        type="number"
-                                        min={0}
-                                        max={2}
-                                        step={0.1}
-                                        value={settings.temperature}
-                                        onChange={(e) => setSettings(prev => ({ ...prev, temperature: Number(e.target.value) }))}
-                                        disabled={!canUseApi}
-                                        className="w-full rounded-xl border border-[#eceff1] bg-white px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
-                                    />
-                                </label>
-                                <label className="space-y-1">
-                                    <span className="text-[11px] font-black uppercase tracking-widest text-[#54656f]">Max Tokens</span>
-                                    <input
-                                        type="number"
-                                        min={64}
-                                        max={4096}
-                                        step={1}
-                                        value={settings.maxTokens}
-                                        onChange={(e) => setSettings(prev => ({ ...prev, maxTokens: Number(e.target.value) }))}
-                                        disabled={!canUseApi}
-                                        className="w-full rounded-xl border border-[#eceff1] bg-white px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
-                                    />
-                                </label>
-                            </div>
-
-                            <label className="space-y-1 block">
-                                <span className="text-[11px] font-black uppercase tracking-widest text-[#54656f]">System Prompt</span>
-                                <textarea
-                                    rows={6}
-                                    value={settings.systemPrompt}
-                                    onChange={(e) => setSettings(prev => ({ ...prev, systemPrompt: e.target.value }))}
-                                    disabled={!canUseApi}
-                                    className="w-full rounded-xl border border-[#eceff1] bg-white px-3 py-2.5 text-sm text-[#111b21] focus:outline-none focus:ring-2 focus:ring-[#00a884]/20 resize-y"
-                                />
-                            </label>
-
-                            <div className="rounded-2xl border border-[#eceff1] p-3 bg-[#f8f9fa]">
-                                <label className="flex items-center justify-between gap-3">
-                                    <div>
-                                        <div className="text-sm font-bold text-[#111b21]">Conversation memory</div>
-                                        <div className="text-[11px] text-[#6b7280]">Include previous messages for context.</div>
-                                    </div>
-                                    <input
-                                        type="checkbox"
-                                        checked={settings.memoryEnabled}
-                                        onChange={(e) => setSettings(prev => ({ ...prev, memoryEnabled: e.target.checked }))}
-                                        disabled={!canUseApi}
-                                        className="w-4 h-4 accent-[#00a884]"
-                                    />
-                                </label>
-                                <label className="block mt-3 space-y-1">
-                                    <span className="text-[11px] font-black uppercase tracking-widest text-[#54656f]">Memory Messages</span>
-                                    <input
-                                        type="number"
-                                        min={0}
-                                        max={80}
-                                        step={1}
-                                        value={settings.memoryMessages}
-                                        onChange={(e) => setSettings(prev => ({ ...prev, memoryMessages: Number(e.target.value) }))}
-                                        disabled={!canUseApi || !settings.memoryEnabled}
-                                        className="w-full rounded-xl border border-[#eceff1] bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20"
-                                    />
-                                </label>
-                            </div>
-
-                            <div className="flex items-center justify-between gap-3 pt-2">
-                                <div className="text-[11px] text-[#6b7280]">
-                                    {settings.updatedAt ? `Last saved: ${formatSavedTime(settings.updatedAt)}` : ''}
-                                </div>
-                                <button
-                                    type="button"
-                                    onClick={() => saveSettings(false)}
-                                    disabled={!canUseApi || saving}
-                                    className="px-4 py-2.5 rounded-xl bg-[#00a884] text-white text-xs font-bold uppercase tracking-wider hover:bg-[#008f6f] transition-all disabled:opacity-60 flex items-center gap-2"
-                                >
-                                    {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                                    Save Settings
-                                </button>
-                            </div>
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                        <div className="sm:col-span-1">
+                            <label className="qm-label mb-2">AI Model</label>
+                            <select
+                                value={settings.model}
+                                onChange={(e) => setSettings(prev => ({ ...prev, model: e.target.value }))}
+                                disabled={!canUseApi}
+                                className="qm-select"
+                            >
+                                {MODEL_OPTIONS.map((option) => (
+                                    <option key={option.value} value={option.value}>
+                                        {option.label}
+                                    </option>
+                                ))}
+                            </select>
                         </div>
-                    </section>
+
+                        <div className="sm:col-span-1">
+                            <label className="qm-label mb-2">Temperature</label>
+                            <input
+                                type="number"
+                                min={0}
+                                max={2}
+                                step={0.1}
+                                value={settings.temperature}
+                                onChange={(e) => setSettings(prev => ({ ...prev, temperature: Number(e.target.value) }))}
+                                disabled={!canUseApi}
+                                className="qm-input"
+                            />
+                        </div>
+
+                        <div className="sm:col-span-1">
+                            <label className="qm-label mb-2">Max Tokens</label>
+                            <input
+                                type="number"
+                                min={64}
+                                max={4096}
+                                step={1}
+                                value={settings.maxTokens}
+                                onChange={(e) => setSettings(prev => ({ ...prev, maxTokens: Number(e.target.value) }))}
+                                disabled={!canUseApi}
+                                className="qm-input"
+                            />
+                        </div>
+                    </div>
+
+                    <div>
+                        <label className="qm-label mb-2">System Prompt</label>
+                        <textarea
+                            rows={6}
+                            value={settings.systemPrompt}
+                            onChange={(e) => setSettings(prev => ({ ...prev, systemPrompt: e.target.value }))}
+                            disabled={!canUseApi}
+                            className="qm-textarea"
+                        />
+                    </div>
+
+                    <div className="qm-card-soft p-4">
+                        <label className="flex items-center justify-between gap-3">
+                            <div>
+                                <p className="text-sm font-bold text-[var(--qm-text)]">Conversation memory</p>
+                                <p className="text-xs text-[var(--qm-text-muted)]">Include previous messages for better response context.</p>
+                            </div>
+                            <input
+                                type="checkbox"
+                                checked={settings.memoryEnabled}
+                                onChange={(e) => setSettings(prev => ({ ...prev, memoryEnabled: e.target.checked }))}
+                                disabled={!canUseApi}
+                                className="h-4 w-4 accent-[var(--qm-brand)]"
+                            />
+                        </label>
+                        <div className="mt-3">
+                            <label className="qm-label mb-2">Memory Messages</label>
+                            <input
+                                type="number"
+                                min={0}
+                                max={80}
+                                step={1}
+                                value={settings.memoryMessages}
+                                onChange={(e) => setSettings(prev => ({ ...prev, memoryMessages: Number(e.target.value) }))}
+                                disabled={!canUseApi || !settings.memoryEnabled}
+                                className="qm-input"
+                            />
+                        </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--qm-border)] pt-4">
+                        <div className="text-xs text-[var(--qm-text-soft)]">
+                            {settings.updatedAt ? `Last saved: ${formatSavedTime(settings.updatedAt)}` : ''}
+                        </div>
+                        <button
+                            type="button"
+                            onClick={() => saveSettings(false)}
+                            disabled={!canUseApi || saving}
+                            className="qm-btn qm-btn-primary h-10 px-4"
+                        >
+                            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                            Save Settings
+                        </button>
+                    </div>
                 </div>
-            </div>
-        </div>
+            </WorkspacePanel>
+        </WorkspacePage>
     );
 }

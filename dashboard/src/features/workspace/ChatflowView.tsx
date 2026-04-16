@@ -112,41 +112,43 @@ export default function ChatflowView({
     if (!open) return null;
 
     return (
-        <div className="fixed inset-0 bg-[#f8f9fa] z-[150] flex flex-col">
-            <header className="h-[70px] bg-[#f0f2f5] px-6 flex items-center justify-between border-b border-[#eceff1]">
+        <div className="fixed inset-0 z-[150] flex flex-col qm-app-gradient">
+            <header className="h-[72px] border-b border-[var(--qm-border)] bg-white/90 px-6 backdrop-blur-md flex items-center justify-between">
                 <div className="flex items-center gap-4">
-                    <Workflow className="text-[#00a884] w-8 h-8" />
-                    <h1 className="text-xl font-bold text-[#111b21]">WABA Workflow Builder</h1>
+                    <div className="flex h-10 w-10 items-center justify-center rounded-2xl border border-[var(--qm-border)] bg-[var(--qm-brand-soft)]">
+                        <Workflow className="h-5 w-5 text-[var(--qm-brand)]" />
+                    </div>
+                    <h1 className="text-xl font-extrabold text-[var(--qm-text)]">WABA Workflow Builder</h1>
                 </div>
                 <div className="flex items-center gap-4">
                     <button
                         onClick={onBackToAutomations}
-                        className="px-4 py-2.5 rounded-xl border border-[#d4dbe0] bg-white text-[#111b21] text-xs font-bold hover:bg-[#f8f9fa] transition-all"
+                        className="qm-btn qm-btn-secondary h-10 px-4"
                     >
                         Back to Automations
                     </button>
                     <button
                         onClick={handleSaveEverything}
-                        className="bg-[#00a884] hover:bg-[#008f6f] text-white px-5 py-2.5 rounded-xl font-bold flex items-center gap-2 transition-colors shadow-sm"
+                        className="qm-btn qm-btn-primary h-10 px-5"
                     >
                         <Save className="w-4 h-4" /> Save Everything
                     </button>
                 </div>
             </header>
 
-            <div className="flex-1 overflow-hidden bg-white">
+            <div className="flex-1 overflow-hidden">
                 {selectedWorkflowId ? (
-                    <div className="h-full flex flex-col p-8 gap-6 overflow-y-auto">
+                    <div className="h-full flex flex-col p-5 lg:p-8 gap-6 overflow-y-auto custom-scrollbar">
                         {(() => {
                             const wf = workflows.find(w => w.id === selectedWorkflowId);
                             if (!wf) {
                                 return (
-                                    <div className="flex-1 flex flex-col items-center justify-center text-[#8696a0] gap-4">
+                                    <div className="flex-1 flex flex-col items-center justify-center text-[var(--qm-text-soft)] gap-4">
                                         <GitBranch className="w-12 h-12" />
                                         <p className="text-sm font-bold">Workflow not found</p>
                                         <button
                                             onClick={onBackToAutomations}
-                                            className="px-4 py-2 rounded-xl border border-[#eceff1] bg-white text-[#111b21] text-xs font-bold hover:bg-[#f8f9fa] transition-all"
+                                            className="qm-btn qm-btn-secondary h-10 px-4"
                                         >
                                             Back to Automations
                                         </button>
@@ -155,10 +157,10 @@ export default function ChatflowView({
                             }
                             return (
                                 <>
-                                    <div className="flex items-center justify-between flex-wrap gap-3">
+                                    <div className="qm-card p-4 flex items-center justify-between flex-wrap gap-3">
                                         <div className="flex flex-col">
-                                            <span className="text-[10px] font-black uppercase tracking-widest text-[#8696a0]">Editing Workflow</span>
-                                            <span className="text-sm font-bold text-[#111b21]">
+                                            <span className="text-[10px] font-black uppercase tracking-widest text-[var(--qm-text-soft)]">Editing Workflow</span>
+                                            <span className="text-sm font-bold text-[var(--qm-text)]">
                                                 {(typeof wf?.name === 'string' && wf.name.trim()) || 'Untitled workflow'}
                                             </span>
                                         </div>
@@ -167,8 +169,8 @@ export default function ChatflowView({
                                         <button
                                             onClick={() => setWorkflowEditorMode('visual')}
                                             className={`px-4 py-2 rounded-xl text-xs font-bold border transition-all ${workflowEditorMode === 'visual'
-                                                ? 'bg-[#00a884]/10 border-[#00a884] text-[#00a884]'
-                                                : 'bg-white border-[#eceff1] text-[#54656f] hover:border-[#00a884]/30'
+                                                ? 'bg-[#e8f9f3] border-[#b9e7d5] text-[var(--qm-brand)]'
+                                                : 'bg-white border-[var(--qm-border)] text-[var(--qm-text-muted)] hover:border-[#90d8c0]'
                                                 }`}
                                         >
                                             Visual Builder
@@ -176,24 +178,24 @@ export default function ChatflowView({
                                         <button
                                             onClick={() => setWorkflowEditorMode('json')}
                                             className={`px-4 py-2 rounded-xl text-xs font-bold border transition-all ${workflowEditorMode === 'json'
-                                                ? 'bg-[#00a884]/10 border-[#00a884] text-[#00a884]'
-                                                : 'bg-white border-[#eceff1] text-[#54656f] hover:border-[#00a884]/30'
+                                                ? 'bg-[#e8f9f3] border-[#b9e7d5] text-[var(--qm-brand)]'
+                                                : 'bg-white border-[var(--qm-border)] text-[var(--qm-text-muted)] hover:border-[#90d8c0]'
                                                 }`}
                                         >
                                             JSON Actions
                                         </button>
-                                        <span className="text-[11px] text-[#8696a0]">
-                                            Visual builder supports send message, ask question (save variable), confirm attributes, question choices, list, condition, CTA URL, template send, add tags, assign staff, and trigger workflow.
+                                        <span className="text-[11px] text-[var(--qm-text-soft)]">
+                                            Visual builder supports send message, ask question (save variable), confirm attributes, question choices, list, condition, CTA URL, simulate payment, template send, add tags, assign staff, and trigger workflow.
                                         </span>
                                     </div>
                                     {workflowEditorMode === 'visual' ? (
-                                        <div className="border border-[#eceff1] rounded-2xl overflow-hidden bg-white min-h-[560px] h-[70vh]">
+                                        <div className="qm-card overflow-hidden min-h-[560px] h-[70vh]">
                                             <Suspense fallback={
-                                                <div className="h-full p-6 animate-pulse space-y-4 bg-[#f8f9fa]">
-                                                    <div className="h-8 w-48 rounded-xl bg-[#e8edf1]" />
-                                                    <div className="h-20 rounded-2xl bg-white border border-[#eceff1]" />
-                                                    <div className="h-20 rounded-2xl bg-white border border-[#eceff1]" />
-                                                    <div className="h-[280px] rounded-2xl bg-white border border-[#eceff1]" />
+                                                <div className="h-full p-6 animate-pulse space-y-4 bg-[#f7fbff]">
+                                                    <div className="qm-loading-block h-8 w-48 rounded-xl" />
+                                                    <div className="qm-loading-block h-20 rounded-2xl" />
+                                                    <div className="qm-loading-block h-20 rounded-2xl" />
+                                                    <div className="qm-loading-block h-[280px] rounded-2xl" />
                                                 </div>
                                             }>
                                                 <FlowCanvasComponent
@@ -215,16 +217,16 @@ export default function ChatflowView({
                                         </div>
                                     ) : (
                                         <div className="flex flex-col gap-2">
-                                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-wider">Actions (JSON)</label>
+                                            <label className="text-xs font-bold text-[var(--qm-text-muted)] uppercase tracking-wider">Actions (JSON)</label>
                                             <textarea
-                                                className="bg-[#f8f9fa] border border-[#eceff1] rounded-xl px-4 py-3 text-[#111b21] text-xs h-64 font-mono focus:outline-none focus:border-[#00a884]"
+                                                className="qm-textarea h-64 bg-[#f8f9fc] font-mono text-xs"
                                                 value={workflowDrafts[wf.id] || JSON.stringify(wf.actions || [], null, 2)}
                                                 onChange={(e) => {
                                                     const next = e.target.value;
                                                     setWorkflowDrafts(prev => ({ ...prev, [wf.id]: next }));
                                                 }}
                                             />
-                                            <p className="text-[11px] text-[#8696a0]">
+                                            <p className="text-[11px] text-[var(--qm-text-soft)]">
                                                 Examples:
                                                 {' '}
                                                 <code className="font-mono">[{`{ "type": "send_text", "text": "Hello!" }`}]</code>
@@ -240,8 +242,8 @@ export default function ChatflowView({
                         })()}
                     </div>
                 ) : (
-                    <div className="h-full flex flex-col items-center justify-center text-[#8696a0] gap-4">
-                        <GitBranch className="w-14 h-14" />
+                    <div className="h-full flex flex-col items-center justify-center gap-4 text-[var(--qm-text-soft)]">
+                        <GitBranch className="h-14 w-14" />
                         <p className="text-sm font-bold">No workflow selected</p>
                         <button
                             onClick={() => {
@@ -263,7 +265,7 @@ export default function ChatflowView({
                                 }));
                                 setSelectedWorkflowId(id);
                             }}
-                            className="px-4 py-2 rounded-xl bg-[#00a884] text-white text-xs font-bold uppercase tracking-wider hover:bg-[#008f6f] transition-all"
+                            className="qm-btn qm-btn-primary h-10 px-4"
                         >
                             Create Workflow
                         </button>

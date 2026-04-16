@@ -16,6 +16,7 @@ const UI_FEATURE_KEYS = new Set([
     'broadcast',
     'chatbots',
     'contacts',
+    'calls',
     'analytics',
     'settings'
 ])
@@ -23,7 +24,7 @@ const UI_FEATURE_KEYS = new Set([
 const UI_HIDDEN_FEATURES_MISSING_MESSAGE =
     'UI controls are not initialized. Run migration 20260407_company_ui_hidden_features.sql.'
 const QUICK_REPLIES_MEDIA_MISSING_MESSAGE =
-    'Quick reply media fields are not initialized. Run migrations 20260408_quick_replies_media_support.sql and 20260408_quick_replies_r2_storage.sql.'
+    'Quick reply media fields are not initialized. Run migrations 20260408_quick_replies_media_support.sql, 20260408_quick_replies_r2_storage.sql, and 20260414_quick_replies_multi_media.sql.'
 const APP_LOGO_FIELDS_MISSING_MESSAGE =
     'App logo fields are not initialized. Run migration 20260408_company_app_logo_storage.sql.'
 const DEFAULT_APP_LOGO_MAX_BYTES = 2 * 1024 * 1024
@@ -126,6 +127,7 @@ function isQuickRepliesMediaColumnsMissingError(error: any): boolean {
         || message.includes('media_asset_key')
         || message.includes('media_mime_type')
         || message.includes('media_size_bytes')
+        || message.includes('media_items')
     )
 }
 
@@ -576,6 +578,149 @@ const normalizeQuickReplyMediaSizeBytes = (value: unknown): number | null => {
     return normalized || null
 }
 
+const normalizeQuickReplyMediaItemType = (
+    value: unknown,
+    fallback: 'image' | 'video' | 'document'
+): 'image' | 'video' | 'document' => {
+    const normalized = typeof value === 'string' ? value.trim().toLowerCase() : ''
+    if (normalized === 'image' || normalized === 'video' || normalized === 'document') return normalized
+    return fallback
+}
+
+const normalizeQuickReplyMediaItems = (
+    value: unknown,
+    messageType: 'image' | 'video' | 'document',
+    companyId: string
+): Array<{
+    type: 'image' | 'video' | 'document'
+    media_storage: 'external' | 'r2'
+    media_asset_key: string
+    media_mime_type: string
+    media_size_bytes: number | null
+    media_url: string
+    media_filename: string
+}> => {
+    if (!Array.isArray(value)) return []
+    const normalized: Array<{
+        type: 'image' | 'video' | 'document'
+        media_storage: 'external' | 'r2'
+        media_asset_key: string
+        media_mime_type: string
+        media_size_bytes: number | null
+        media_url: string
+        media_filename: string
+    }> = []
+
+    value.forEach((entry: any) => {
+        const mediaType = normalizeQuickReplyMediaItemType(entry?.type, messageType)
+        if (mediaType !== messageType) return
+        const mediaAssetKeyRaw = normalizeQuickReplyMediaAssetKey(entry?.media_asset_key)
+        const mediaStorage: 'external' | 'r2' = mediaAssetKeyRaw ? 'r2' : normalizeQuickReplyMediaStorage(entry?.media_storage)
+        const mediaUrl = normalizeQuickReplyMediaUrl(entry?.media_url)
+        let mediaAssetKey = ''
+
+        if (mediaStorage === 'r2') {
+            if (!mediaAssetKeyRaw) return
+            try {
+                mediaAssetKey = assertCompanyAssetKey(companyId, mediaAssetKeyRaw)
+            } catch {
+                return
+            }
+        } else if (!mediaUrl) {
+            return
+        }
+
+        normalized.push({
+            type: mediaType,
+            media_storage: mediaStorage,
+            media_asset_key: mediaAssetKey,
+            media_mime_type: normalizeQuickReplyMediaMimeType(entry?.media_mime_type),
+            media_size_bytes: normalizeQuickReplyMediaSizeBytes(entry?.media_size_bytes),
+            media_url: mediaStorage === 'r2' ? '' : mediaUrl,
+            media_filename: mediaType === 'document' ? normalizeQuickReplyMediaFilename(entry?.media_filename) : ''
+        })
+    })
+
+    return normalized
+}
+
+const buildQuickReplyLegacyMediaItems = (
+    row: any,
+    messageType: 'image' | 'video' | 'document',
+    companyId: string
+) => {
+    const mediaAssetKeyRaw = normalizeQuickReplyMediaAssetKey(row?.media_asset_key)
+    const mediaStorage: 'external' | 'r2' = mediaAssetKeyRaw ? 'r2' : normalizeQuickReplyMediaStorage(row?.media_storage)
+    const mediaUrl = normalizeQuickReplyMediaUrl(row?.media_url)
+    let mediaAssetKey = ''
+
+    if (mediaStorage === 'r2') {
+        if (!mediaAssetKeyRaw) return []
+        try {
+            mediaAssetKey = assertCompanyAssetKey(companyId, mediaAssetKeyRaw)
+        } catch {
+            return []
+        }
+    } else if (!mediaUrl) {
+        return []
+    }
+
+    return [{
+        type: messageType,
+        media_storage: mediaStorage,
+        media_asset_key: mediaAssetKey,
+        media_mime_type: normalizeQuickReplyMediaMimeType(row?.media_mime_type),
+        media_size_bytes: normalizeQuickReplyMediaSizeBytes(row?.media_size_bytes),
+        media_url: mediaStorage === 'r2' ? '' : mediaUrl,
+        media_filename: messageType === 'document' ? normalizeQuickReplyMediaFilename(row?.media_filename) : ''
+    }]
+}
+
+const serializeQuickReplyRow = async (companyId: string, row: any) => {
+    const messageType = normalizeQuickReplyMessageType(row?.message_type)
+    let mediaItems = messageType === 'text'
+        ? []
+        : normalizeQuickReplyMediaItems(row?.media_items, messageType, companyId)
+    if (messageType !== 'text' && mediaItems.length === 0) {
+        mediaItems = buildQuickReplyLegacyMediaItems(row, messageType, companyId)
+    }
+
+    const resolvedMediaItems = await Promise.all(mediaItems.map(async (entry) => {
+        let mediaUrl = normalizeQuickReplyMediaUrl(entry?.media_url)
+        if (entry.media_storage === 'r2' && entry.media_asset_key && isR2Configured()) {
+            try {
+                mediaUrl = await createDownloadUrl({
+                    companyId,
+                    assetKey: entry.media_asset_key
+                })
+            } catch {
+                mediaUrl = ''
+            }
+        }
+        return {
+            ...entry,
+            media_url: mediaUrl
+        }
+    }))
+
+    const primaryMedia = resolvedMediaItems[0] || null
+    const primaryStorage: 'external' | 'r2' = primaryMedia
+        ? (primaryMedia.media_asset_key ? 'r2' : normalizeQuickReplyMediaStorage(primaryMedia.media_storage))
+        : 'external'
+
+    return {
+        ...row,
+        message_type: messageType,
+        media_storage: messageType === 'text' ? 'external' : primaryStorage,
+        media_asset_key: messageType === 'text' || primaryStorage !== 'r2' ? null : (primaryMedia?.media_asset_key || null),
+        media_url: messageType === 'text' || primaryStorage === 'r2' ? '' : (primaryMedia?.media_url || ''),
+        media_mime_type: messageType === 'text' || primaryStorage !== 'r2' ? null : (normalizeQuickReplyMediaMimeType(primaryMedia?.media_mime_type) || null),
+        media_size_bytes: messageType === 'text' || primaryStorage !== 'r2' ? null : normalizeQuickReplyMediaSizeBytes(primaryMedia?.media_size_bytes),
+        media_filename: messageType === 'document' ? normalizeQuickReplyMediaFilename(primaryMedia?.media_filename) : '',
+        media_items: resolvedMediaItems
+    }
+}
+
 // Configure quick replies (company-level)
 app.get('/api/company/quick-replies', requireSupabaseUserMiddleware, async (req: any, res: any) => {
     try {
@@ -584,7 +729,7 @@ app.get('/api/company/quick-replies', requireSupabaseUserMiddleware, async (req:
 
         const { data, error } = await supabase
             .from('quick_replies')
-            .select('id, shortcut, text, message_type, media_url, media_filename, media_storage, media_asset_key, media_mime_type, media_size_bytes, created_at, updated_at')
+            .select('id, shortcut, text, message_type, media_url, media_filename, media_storage, media_asset_key, media_mime_type, media_size_bytes, media_items, created_at, updated_at')
             .eq('company_id', access.companyId)
             .order('shortcut', { ascending: true })
 
@@ -599,32 +744,7 @@ app.get('/api/company/quick-replies', requireSupabaseUserMiddleware, async (req:
             return res.status(500).json({ success: false, error: error.message })
         }
 
-        const normalized = await Promise.all((data || []).map(async (row: any) => {
-            const messageType = normalizeQuickReplyMessageType(row?.message_type)
-            const mediaAssetKey = normalizeQuickReplyMediaAssetKey(row?.media_asset_key)
-            const mediaStorage = mediaAssetKey ? 'r2' : normalizeQuickReplyMediaStorage(row?.media_storage)
-            let mediaUrl = normalizeQuickReplyMediaUrl(row?.media_url)
-            if (messageType !== 'text' && mediaStorage === 'r2' && mediaAssetKey && isR2Configured()) {
-                try {
-                    mediaUrl = await createDownloadUrl({
-                        companyId: access.companyId,
-                        assetKey: mediaAssetKey
-                    })
-                } catch {
-                    mediaUrl = ''
-                }
-            }
-            return {
-                ...row,
-                message_type: messageType,
-                media_storage: mediaStorage,
-                media_asset_key: mediaAssetKey || null,
-                media_url: mediaUrl,
-                media_mime_type: normalizeQuickReplyMediaMimeType(row?.media_mime_type) || null,
-                media_size_bytes: normalizeQuickReplyMediaSizeBytes(row?.media_size_bytes),
-                media_filename: normalizeQuickReplyMediaFilename(row?.media_filename)
-            }
-        }))
+        const normalized = await Promise.all((data || []).map((row: any) => serializeQuickReplyRow(access.companyId, row)))
 
         res.json({ success: true, data: normalized })
     } catch (error: any) {
@@ -653,6 +773,15 @@ app.post('/api/company/quick-replies', requireSupabaseUserMiddleware, async (req
             media_mime_type: string | null
             media_size_bytes: number | null
             media_filename: string | null
+            media_items: Array<{
+                type: 'image' | 'video' | 'document'
+                media_storage: 'external' | 'r2'
+                media_asset_key: string
+                media_mime_type: string
+                media_size_bytes: number | null
+                media_url: string
+                media_filename: string
+            }>
         }> = []
         rawItems.forEach((item: any) => {
             const shortcut = normalizeQuickReplyShortcut(item?.shortcut)
@@ -666,6 +795,21 @@ app.post('/api/company/quick-replies', requireSupabaseUserMiddleware, async (req
             const mediaFilename = normalizeQuickReplyMediaFilename(item?.media_filename)
             const mediaStorage: 'external' | 'r2' = mediaAssetKeyRaw ? 'r2' : requestedStorage
             let mediaAssetKey = ''
+            let mediaItems = messageType === 'text'
+                ? []
+                : normalizeQuickReplyMediaItems(item?.media_items, messageType, access.companyId)
+            if (messageType !== 'text' && mediaItems.length === 0) {
+                mediaItems = buildQuickReplyLegacyMediaItems(item, messageType, access.companyId)
+            }
+            const primaryMedia = mediaItems[0] || null
+            const primaryStorage: 'external' | 'r2' = primaryMedia
+                ? (primaryMedia.media_asset_key ? 'r2' : normalizeQuickReplyMediaStorage(primaryMedia.media_storage))
+                : mediaStorage
+            const primaryAssetKey = primaryMedia ? primaryMedia.media_asset_key : mediaAssetKeyRaw
+            const primaryMimeType = primaryMedia ? primaryMedia.media_mime_type : mediaMimeType
+            const primarySizeBytes = primaryMedia ? primaryMedia.media_size_bytes : mediaSizeBytes
+            const primaryUrl = primaryMedia ? primaryMedia.media_url : mediaUrl
+            const primaryFilename = primaryMedia ? primaryMedia.media_filename : mediaFilename
             if (!shortcut) return
             if (!QUICK_REPLY_MESSAGE_TYPES.has(messageType)) return
             if (seen.has(shortcut)) {
@@ -673,27 +817,40 @@ app.post('/api/company/quick-replies', requireSupabaseUserMiddleware, async (req
             }
             if (messageType === 'text') {
                 if (!text) return
-            } else if (mediaStorage === 'r2') {
-                if (!mediaAssetKeyRaw) return
+            } else if (mediaItems.length === 0) {
+                return
+            }
+            if (messageType !== 'text' && primaryStorage === 'r2' && primaryAssetKey) {
                 try {
-                    mediaAssetKey = assertCompanyAssetKey(access.companyId, mediaAssetKeyRaw)
+                    mediaAssetKey = assertCompanyAssetKey(access.companyId, primaryAssetKey)
                 } catch {
                     return
                 }
-            } else if (!mediaUrl) {
-                return
             }
             seen.add(shortcut)
             cleaned.push({
                 shortcut,
                 text,
                 message_type: messageType,
-                media_storage: messageType === 'text' ? 'external' : mediaStorage,
-                media_url: messageType === 'text' || mediaStorage === 'r2' ? null : mediaUrl,
-                media_asset_key: messageType === 'text' || mediaStorage !== 'r2' ? null : mediaAssetKey,
-                media_mime_type: messageType === 'text' || mediaStorage !== 'r2' ? null : (mediaMimeType || null),
-                media_size_bytes: messageType === 'text' || mediaStorage !== 'r2' ? null : mediaSizeBytes,
-                media_filename: messageType === 'document' && mediaFilename ? mediaFilename : null
+                media_storage: messageType === 'text' ? 'external' : primaryStorage,
+                media_url: messageType === 'text' || primaryStorage === 'r2' ? null : primaryUrl,
+                media_asset_key: messageType === 'text' || primaryStorage !== 'r2' ? null : mediaAssetKey,
+                media_mime_type: messageType === 'text' || primaryStorage !== 'r2' ? null : (primaryMimeType || null),
+                media_size_bytes: messageType === 'text' || primaryStorage !== 'r2' ? null : primarySizeBytes,
+                media_filename: messageType === 'document' && primaryFilename ? primaryFilename : null,
+                media_items: messageType === 'text'
+                    ? []
+                    : mediaItems.map((entry) => ({
+                        type: normalizeQuickReplyMediaItemType(entry.type, messageType),
+                        media_storage: entry.media_asset_key ? 'r2' : normalizeQuickReplyMediaStorage(entry.media_storage),
+                        media_asset_key: entry.media_asset_key,
+                        media_mime_type: normalizeQuickReplyMediaMimeType(entry.media_mime_type),
+                        media_size_bytes: normalizeQuickReplyMediaSizeBytes(entry.media_size_bytes),
+                        media_url: normalizeQuickReplyMediaUrl(entry.media_url),
+                        media_filename: normalizeQuickReplyMediaItemType(entry.type, messageType) === 'document'
+                            ? normalizeQuickReplyMediaFilename(entry.media_filename)
+                            : ''
+                    }))
             })
         })
 
@@ -720,6 +877,7 @@ app.post('/api/company/quick-replies', requireSupabaseUserMiddleware, async (req
                     media_mime_type: item.media_mime_type,
                     media_size_bytes: item.media_size_bytes,
                     media_filename: item.media_filename,
+                    media_items: item.message_type === 'text' ? null : item.media_items,
                     updated_at: new Date().toISOString()
                 })))
 
@@ -737,7 +895,7 @@ app.post('/api/company/quick-replies', requireSupabaseUserMiddleware, async (req
 
         const { data, error } = await supabase
             .from('quick_replies')
-            .select('id, shortcut, text, message_type, media_url, media_filename, media_storage, media_asset_key, media_mime_type, media_size_bytes, created_at, updated_at')
+            .select('id, shortcut, text, message_type, media_url, media_filename, media_storage, media_asset_key, media_mime_type, media_size_bytes, media_items, created_at, updated_at')
             .eq('company_id', access.companyId)
             .order('shortcut', { ascending: true })
 
@@ -752,36 +910,29 @@ app.post('/api/company/quick-replies', requireSupabaseUserMiddleware, async (req
             return res.status(500).json({ success: false, error: error.message })
         }
 
-        const normalized = await Promise.all((data || []).map(async (row: any) => {
-            const messageType = normalizeQuickReplyMessageType(row?.message_type)
-            const mediaAssetKey = normalizeQuickReplyMediaAssetKey(row?.media_asset_key)
-            const mediaStorage = mediaAssetKey ? 'r2' : normalizeQuickReplyMediaStorage(row?.media_storage)
-            let mediaUrl = normalizeQuickReplyMediaUrl(row?.media_url)
-            if (messageType !== 'text' && mediaStorage === 'r2' && mediaAssetKey && isR2Configured()) {
-                try {
-                    mediaUrl = await createDownloadUrl({
-                        companyId: access.companyId,
-                        assetKey: mediaAssetKey
-                    })
-                } catch {
-                    mediaUrl = ''
-                }
-            }
-            return {
-                ...row,
-                message_type: messageType,
-                media_storage: mediaStorage,
-                media_asset_key: mediaAssetKey || null,
-                media_url: mediaUrl,
-                media_mime_type: normalizeQuickReplyMediaMimeType(row?.media_mime_type) || null,
-                media_size_bytes: normalizeQuickReplyMediaSizeBytes(row?.media_size_bytes),
-                media_filename: normalizeQuickReplyMediaFilename(row?.media_filename)
-            }
-        }))
+        const normalized = await Promise.all((data || []).map((row: any) => serializeQuickReplyRow(access.companyId, row)))
 
         res.json({ success: true, data: normalized })
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message })
+    }
+})
+
+app.get('/api/company/me', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    try {
+        const access = await resolveCompanyAccess(req, res, 'agent')
+        if (!access) return
+
+        return res.json({
+            success: true,
+            data: {
+                id: access.user.id,
+                role: access.role,
+                companyId: access.companyId
+            }
+        })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error.message })
     }
 })
 

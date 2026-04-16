@@ -16,7 +16,7 @@ This project integrates with the official Meta WhatsApp Business Platform (Cloud
 - `docs/waba.md` - WhatsApp Business Cloud API setup
 - `docs/workflows.md` - Workflow engine and action formats
 - `docs/conversational-components.md` - Conversational components API
-- `docs/schema.sql` - Full database schema
+- `docs/09-database.md` - Database tables, RLS, and migration notes
 
 ## Disclaimer
 This project is not affiliated with Meta or WhatsApp. "WhatsApp" is a trademark of its respective owner.

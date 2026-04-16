@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="gcm_defaultSenderId" translatable="false">435773227890</string>
+    <string name="google_api_key" translatable="false">AIzaSyDiBm3dPOqau8LlcCrd0Mf-7hazGYEGbaA</string>
+    <string name="google_app_id" translatable="false">1:435773227890:android:7469e90d453ca23c0853eb</string>
+    <string name="google_crash_reporting_api_key" translatable="false">AIzaSyDiBm3dPOqau8LlcCrd0Mf-7hazGYEGbaA</string>
+    <string name="google_storage_bucket" translatable="false">qmessage-0001.firebasestorage.app</string>
+    <string name="project_id" translatable="false">qmessage-0001</string>
+</resources>

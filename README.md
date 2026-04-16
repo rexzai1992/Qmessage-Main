@@ -1,30 +1,39 @@
-# WhatsApp Business API Workflow Engine
+# QMessage
 
-This project integrates with the official Meta WhatsApp Business Platform (Cloud API). This is the official WhatsApp API via Meta.
+QMessage is a multi-tenant WhatsApp Cloud API operations platform with:
 
-> [!CAUTION]
-> Breaking change: if you were using a previous WhatsApp Web flow, you must migrate to the official Cloud API setup.
-> See `docs/waba.md` for configuration details.
+- Team inbox and realtime messaging
+- Workflow automations
+- Template management and scheduled broadcasts
+- WABA onboarding/configuration
+- Company settings and superadmin monitoring
 
-## What it does
-- Receives inbound WhatsApp messages via webhook (`/webhook`).
-- Runs keyword-based workflows and conversational components.
-- Sends outbound messages via the official Cloud API.
-- Supports single-company (env) and multi-company (Supabase) configuration.
+## Documentation
 
-## Quick start
-1. Configure environment variables for WABA (see `docs/waba.md`).
-2. Set up the webhook URL and verify token in the Meta developer console.
-3. Create the database tables in `docs/schema.sql`.
+Start here:
 
-## Docs
-- `docs/waba.md` - WhatsApp Business Cloud API setup
-- `docs/workflows.md` - Workflow engine and action formats
-- `docs/conversational-components.md` - Conversational components API
-- `docs/schema.sql` - Full database schema
+- [`docs/README.md`](./docs/README.md)
 
-## Disclaimer
-This project is not affiliated with Meta or WhatsApp. "WhatsApp" is a trademark of its respective owner.
+Full documentation includes:
+
+- architecture and data flow
+- setup and environment variables
+- features/pages and API endpoints
+- authentication and role model
+- database tables and RLS
+- storage and edge/backend logic
+- testing, deployment, troubleshooting, and roadmap
+
+## Quick Local Run
+
+```bash
+npm install
+npm run dev
+```
+
+- Frontend: `http://localhost:5173`
+- Backend: `http://localhost:3000`
 
 ## License
-MIT. See `LICENSE`.
+
+MIT. See [`LICENSE`](./LICENSE).

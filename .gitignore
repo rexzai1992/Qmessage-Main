@@ -9,7 +9,6 @@ baileys_store*.json
 browser-messages.json
 browser-token.json
 decoded-ws.json
-docs
 lib
 messages*.json
 node_modules
@@ -25,3 +24,9 @@ dist
 
 # Centralized Data
 data/
+
+# Local runtime logs
+.codex-logs/
+
+# Local credentials
+secrets/fcm-service-account.json

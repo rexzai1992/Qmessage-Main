@@ -1,0 +1,94 @@
+2026-04-11T06:46:17Z INF Starting tunnel tunnelID=0bcd5d57-0dc6-4353-b5c8-f81c3ac80180
+2026-04-11T06:46:17Z INF Version 2026.2.0 (Checksum b3279f2186a1c3c438ad5865e802bbbec26090c5d3fdb4ac1113f1143a94837a)
+2026-04-11T06:46:17Z INF GOOS: windows, GOVersion: go1.24.13, GoArch: amd64
+2026-04-11T06:46:17Z INF Settings: map[config:cloudflared-2fast.yml cred-file:C:/Users/Admin/.cloudflared/0bcd5d57-0dc6-4353-b5c8-f81c3ac80180.json credentials-file:C:/Users/Admin/.cloudflared/0bcd5d57-0dc6-4353-b5c8-f81c3ac80180.json]
+2026-04-11T06:46:17Z INF cloudflared will not automatically update on Windows systems.
+2026-04-11T06:46:17Z INF Generated Connector ID: 6a9eaeed-8ea5-41ac-a3a8-66822aec36c3
+2026-04-11T06:46:17Z INF Initial protocol quic
+2026-04-11T06:46:17Z INF ICMP proxy will use 192.168.0.149 as source for IPv4
+2026-04-11T06:46:17Z INF ICMP proxy will use fe80::b57a:2d0c:a3e:3c3c in zone Wi-Fi as source for IPv6
+2026-04-11T06:46:18Z INF cloudflared does not support loading the system root certificate pool on Windows. Please use --origin-ca-pool <PATH> to specify the path to the certificate pool
+2026-04-11T06:46:18Z INF cloudflared does not support loading the system root certificate pool on Windows. Please use --origin-ca-pool <PATH> to specify the path to the certificate pool
+2026-04-11T06:46:18Z INF ICMP proxy will use 192.168.0.149 as source for IPv4
+2026-04-11T06:46:18Z INF Tunnel connection curve preferences: [X25519MLKEM768 CurveP256] connIndex=0 event=0 ip=198.41.192.57
+2026-04-11T06:46:18Z INF ICMP proxy will use fe80::b57a:2d0c:a3e:3c3c in zone Wi-Fi as source for IPv6
+2026-04-11T06:46:18Z INF Starting metrics server on 127.0.0.1:20241/metrics
+2026-04-11T06:46:18Z INF Registered tunnel connection connIndex=0 connection=a8e8c2cb-419e-4692-8577-da0314606e48 event=0 ip=198.41.192.57 location=kul05 protocol=quic
+2026-04-11T06:46:18Z INF Tunnel connection curve preferences: [X25519MLKEM768 CurveP256] connIndex=1 event=0 ip=198.41.200.193
+2026-04-11T06:46:19Z INF Registered tunnel connection connIndex=1 connection=535540c1-782f-4e2d-a9a6-af7362463ec7 event=0 ip=198.41.200.193 location=sin13 protocol=quic
+2026-04-11T06:46:19Z INF Tunnel connection curve preferences: [X25519MLKEM768 CurveP256] connIndex=2 event=0 ip=198.41.200.23
+2026-04-11T06:46:20Z INF Registered tunnel connection connIndex=2 connection=bfb1dd97-bd0a-4923-9177-1f58461854ef event=0 ip=198.41.200.23 location=sin11 protocol=quic
+2026-04-11T06:46:20Z INF Tunnel connection curve preferences: [X25519MLKEM768 CurveP256] connIndex=3 event=0 ip=198.41.192.27
+2026-04-11T06:46:21Z INF Registered tunnel connection connIndex=3 connection=93a77e58-8406-4920-953b-de5d50e0ffec event=0 ip=198.41.192.27 location=kul05 protocol=quic
+2026-04-11T06:46:48Z ERR  error="Unable to reach the origin service. The service may be down or it may not be responding to traffic from cloudflared: dial tcp [::1]:3000: connectex: No connection could be made because the target machine actively refused it." connIndex=0 event=1 ingressRule=0 originService=http://localhost:3000
+2026-04-11T06:46:48Z ERR Request failed error="Unable to reach the origin service. The service may be down or it may not be responding to traffic from cloudflared: dial tcp [::1]:3000: connectex: No connection could be made because the target machine actively refused it." connIndex=0 dest=https://2fast.xyz/api/company/ui-controls event=0 ip=198.41.192.57 type=http
+2026-04-11T06:46:48Z ERR  error="Unable to reach the origin service. The service may be down or it may not be responding to traffic from cloudflared: dial tcp [::1]:3000: connectex: No connection could be made because the target machine actively refused it." connIndex=0 event=1 ingressRule=0 originService=http://localhost:3000
+2026-04-11T06:46:48Z ERR Request failed error="Unable to reach the origin service. The service may be down or it may not be responding to traffic from cloudflared: dial tcp [::1]:3000: connectex: No connection could be made because the target machine actively refused it." connIndex=0 dest=https://2fast.xyz/socket.io/?EIO=4&transport=websocket event=0 ip=198.41.192.57 type=ws
+2026-04-11T06:46:52Z ERR  error="Unable to reach the origin service. The service may be down or it may not be responding to traffic from cloudflared: dial tcp [::1]:3000: connectex: No connection could be made because the target machine actively refused it." connIndex=0 event=1 ingressRule=0 originService=http://localhost:3000
+2026-04-11T06:46:52Z ERR Request failed error="Unable to reach the origin service. The service may be down or it may not be responding to traffic from cloudflared: dial tcp [::1]:3000: connectex: No connection could be made because the target machine actively refused it." connIndex=0 dest=https://2fast.xyz/socket.io/?EIO=4&transport=websocket event=0 ip=198.41.192.57 type=ws
+2026-04-11T06:46:54Z ERR  error="Unable to reach the origin service. The service may be down or it may not be responding to traffic from cloudflared: dial tcp [::1]:3000: connectex: No connection could be made because the target machine actively refused it." connIndex=0 event=1 ingressRule=0 originService=http://localhost:3000
+2026-04-11T06:46:54Z ERR Request failed error="Unable to reach the origin service. The service may be down or it may not be responding to traffic from cloudflared: dial tcp [::1]:3000: connectex: No connection could be made because the target machine actively refused it." connIndex=0 dest=https://2fast.xyz/?source=pwa event=0 ip=198.41.192.57 type=http
+2026-04-11T06:46:56Z ERR  error="Unable to reach the origin service. The service may be down or it may not be responding to traffic from cloudflared: dial tcp [::1]:3000: connectex: No connection could be made because the target machine actively refused it." connIndex=0 event=1 ingressRule=0 originService=http://localhost:3000
+2026-04-11T06:46:56Z ERR Request failed error="Unable to reach the origin service. The service may be down or it may not be responding to traffic from cloudflared: dial tcp [::1]:3000: connectex: No connection could be made because the target machine actively refused it." connIndex=0 dest=https://2fast.xyz/sw.js event=0 ip=198.41.192.57 type=http
+2026-04-11T06:55:52Z ERR  error="Incoming request ended abruptly: context canceled" connIndex=0 event=1 ingressRule=0 originService=http://localhost:3000
+2026-04-11T06:55:52Z ERR  error="Incoming request ended abruptly: context canceled" connIndex=0 event=1 ingressRule=0 originService=http://localhost:3000
+2026-04-11T06:55:52Z ERR Request failed error="Incoming request ended abruptly: context canceled" connIndex=0 dest=https://2fast.xyz/api/push/native/register event=0 ip=198.41.192.57 type=http
+2026-04-11T06:55:52Z ERR Request failed error="Incoming request ended abruptly: context canceled" connIndex=0 dest=https://2fast.xyz/api/company/me event=0 ip=198.41.192.57 type=http
+2026-04-11T08:06:23Z ERR Failed to refresh DNS local resolver error="lookup region1.v2.argotunnel.com: i/o timeout"
+2026-04-11T09:44:00Z ERR failed to accept incoming stream requests error="failed to accept QUIC stream: timeout: no recent network activity" connIndex=1 event=0 ip=198.41.200.193
+2026-04-11T09:44:00Z ERR failed to run the datagram handler error="timeout: no recent network activity" connIndex=1 event=0 ip=198.41.200.193
+2026-04-11T09:44:02Z ERR failed to accept incoming stream requests error="failed to accept QUIC stream: timeout: no recent network activity" connIndex=0 event=0 ip=198.41.192.57
+2026-04-11T09:44:02Z ERR failed to run the datagram handler error="timeout: no recent network activity" connIndex=0 event=0 ip=198.41.192.57
+2026-04-11T09:44:02Z ERR failed to accept incoming stream requests error="failed to accept QUIC stream: timeout: no recent network activity" connIndex=2 event=0 ip=198.41.200.23
+2026-04-11T09:44:02Z ERR failed to run the datagram handler error="timeout: no recent network activity" connIndex=2 event=0 ip=198.41.200.23
+2026-04-11T09:44:09Z ERR failed to accept incoming stream requests error="failed to accept QUIC stream: timeout: no recent network activity" connIndex=3 event=0 ip=198.41.192.27
+2026-04-11T09:44:09Z ERR failed to run the datagram handler error="timeout: no recent network activity" connIndex=3 event=0 ip=198.41.192.27
+2026-04-11T09:44:21Z ERR failed to serve tunnel connection error="accept stream listener encountered a failure while serving" connIndex=1 event=0 ip=198.41.200.193
+2026-04-11T09:44:21Z ERR Serve tunnel error error="accept stream listener encountered a failure while serving" connIndex=1 event=0 ip=198.41.200.193
+2026-04-11T09:44:21Z INF Retrying connection in up to 1s connIndex=1 event=0 ip=198.41.200.193
+2026-04-11T09:44:21Z ERR failed to serve tunnel connection error="accept stream listener encountered a failure while serving" connIndex=2 event=0 ip=198.41.200.23
+2026-04-11T09:44:21Z ERR Serve tunnel error error="accept stream listener encountered a failure while serving" connIndex=2 event=0 ip=198.41.200.23
+2026-04-11T09:44:21Z INF Retrying connection in up to 1s connIndex=2 event=0 ip=198.41.200.23
+2026-04-11T09:44:21Z ERR failed to serve tunnel connection error="accept stream listener encountered a failure while serving" connIndex=0 event=0 ip=198.41.192.57
+2026-04-11T09:44:21Z ERR Serve tunnel error error="accept stream listener encountered a failure while serving" connIndex=0 event=0 ip=198.41.192.57
+2026-04-11T09:44:21Z INF Retrying connection in up to 1s connIndex=0 event=0 ip=198.41.192.57
+2026-04-11T09:44:36Z ERR failed to serve tunnel connection error="accept stream listener encountered a failure while serving" connIndex=3 event=0 ip=198.41.192.27
+2026-04-11T09:44:36Z ERR Serve tunnel error error="accept stream listener encountered a failure while serving" connIndex=3 event=0 ip=198.41.192.27
+2026-04-11T09:44:36Z INF Retrying connection in up to 1s connIndex=3 event=0 ip=198.41.192.27
+2026-04-11T09:44:36Z ERR Failed to refresh protocol error="lookup protocol-v2.argotunnel.com: dnsquery: This operation returned because the timeout period expired."
+2026-04-11T09:44:36Z INF Tunnel connection curve preferences: [X25519MLKEM768 CurveP256] connIndex=0 event=0 ip=198.41.192.57
+2026-04-11T09:44:36Z ERR Connection terminated error="accept stream listener encountered a failure while serving" connIndex=2
+2026-04-11T09:44:36Z ERR Connection terminated error="accept stream listener encountered a failure while serving" connIndex=1
+2026-04-11T09:44:36Z ERR Connection terminated error="accept stream listener encountered a failure while serving" connIndex=3
+2026-04-11T09:44:36Z INF Registered tunnel connection connIndex=0 connection=55646415-f147-4808-9400-b9797092d091 event=0 ip=198.41.192.57 location=kul05 protocol=quic
+2026-04-11T09:44:52Z INF Tunnel connection curve preferences: [X25519MLKEM768 CurveP256] connIndex=3 event=0 ip=198.41.192.27
+2026-04-11T09:44:52Z INF Tunnel connection curve preferences: [X25519MLKEM768 CurveP256] connIndex=2 event=0 ip=198.41.200.23
+2026-04-11T09:44:52Z INF Tunnel connection curve preferences: [X25519MLKEM768 CurveP256] connIndex=1 event=0 ip=198.41.200.193
+2026-04-11T09:44:53Z INF Registered tunnel connection connIndex=2 connection=457209b1-1eb8-4708-b29b-77f23497d76e event=0 ip=198.41.200.23 location=sin11 protocol=quic
+2026-04-11T09:44:53Z INF Registered tunnel connection connIndex=1 connection=d3425011-d5d2-4c97-a687-64bf7bd910a7 event=0 ip=198.41.200.193 location=sin13 protocol=quic
+2026-04-11T09:44:53Z INF Registered tunnel connection connIndex=3 connection=a96f13ac-9f00-4b54-89d2-5ccdd8cd14d3 event=0 ip=198.41.192.27 location=kul05 protocol=quic
+2026-04-11T11:30:58Z INF Initiating graceful shutdown due to signal terminated ...
+2026-04-11T11:30:58Z ERR failed to run the datagram handler error="Application error 0x0 (remote)" connIndex=3 event=0 ip=198.41.192.27
+2026-04-11T11:30:58Z ERR failed to serve tunnel connection error="accept stream listener encountered a failure while serving" connIndex=3 event=0 ip=198.41.192.27
+2026-04-11T11:30:58Z ERR Serve tunnel error error="accept stream listener encountered a failure while serving" connIndex=3 event=0 ip=198.41.192.27
+2026-04-11T11:30:58Z INF Retrying connection in up to 1s connIndex=3 event=0 ip=198.41.192.27
+2026-04-11T11:30:58Z ERR Connection terminated connIndex=3
+2026-04-11T11:30:58Z ERR failed to run the datagram handler error="Application error 0x0 (remote)" connIndex=0 event=0 ip=198.41.192.57
+2026-04-11T11:30:58Z ERR failed to run the datagram handler error="context canceled" connIndex=2 event=0 ip=198.41.200.23
+2026-04-11T11:30:58Z ERR failed to run the datagram handler error="context canceled" connIndex=1 event=0 ip=198.41.200.193
+2026-04-11T11:30:58Z ERR failed to serve tunnel connection error="accept stream listener encountered a failure while serving" connIndex=0 event=0 ip=198.41.192.57
+2026-04-11T11:30:58Z ERR failed to serve tunnel connection error="accept stream listener encountered a failure while serving" connIndex=2 event=0 ip=198.41.200.23
+2026-04-11T11:30:58Z ERR failed to serve tunnel connection error="accept stream listener encountered a failure while serving" connIndex=1 event=0 ip=198.41.200.193
+2026-04-11T11:30:58Z ERR Serve tunnel error error="accept stream listener encountered a failure while serving" connIndex=0 event=0 ip=198.41.192.57
+2026-04-11T11:30:58Z ERR Serve tunnel error error="accept stream listener encountered a failure while serving" connIndex=2 event=0 ip=198.41.200.23
+2026-04-11T11:30:58Z ERR Serve tunnel error error="accept stream listener encountered a failure while serving" connIndex=1 event=0 ip=198.41.200.193
+2026-04-11T11:30:58Z INF Retrying connection in up to 1s connIndex=0 event=0 ip=198.41.192.57
+2026-04-11T11:30:58Z INF Retrying connection in up to 1s connIndex=2 event=0 ip=198.41.200.23
+2026-04-11T11:30:58Z INF Retrying connection in up to 1s connIndex=1 event=0 ip=198.41.200.193
+2026-04-11T11:30:58Z ERR Connection terminated connIndex=0
+2026-04-11T11:30:58Z ERR Connection terminated connIndex=2
+2026-04-11T11:30:58Z ERR Connection terminated connIndex=1
+2026-04-11T11:30:58Z ERR no more connections active and exiting
+2026-04-11T11:30:58Z INF Tunnel server stopped
+2026-04-11T11:30:58Z ERR icmp router terminated error="context canceled"
+2026-04-11T11:30:58Z INF Metrics server stopped

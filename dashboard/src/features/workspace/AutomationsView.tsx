@@ -5,6 +5,7 @@ import { uploadFileToCompanyStorage } from '../media/uploadToCompanyStorage';
 type AutomationsViewProps = {
     workflows: any[];
     workflowsLoading: boolean;
+    isMobileView?: boolean;
     profileId: string | null;
     sessionToken: string | null;
     apiBaseUrl: string;
@@ -21,6 +22,16 @@ type ConversationalCommand = {
     command_description: string;
 };
 
+type QuickReplyMediaItem = {
+    type?: 'image' | 'video' | 'document';
+    media_storage?: 'external' | 'r2';
+    media_asset_key?: string;
+    media_mime_type?: string;
+    media_size_bytes?: number | null;
+    media_url?: string;
+    media_filename?: string;
+};
+
 type QuickReply = {
     id?: string;
     shortcut: string;
@@ -32,6 +43,7 @@ type QuickReply = {
     media_size_bytes?: number | null;
     media_url?: string;
     media_filename?: string;
+    media_items?: QuickReplyMediaItem[];
     ui_uploading?: boolean;
     ui_upload_error?: string | null;
 };
@@ -77,6 +89,67 @@ const normalizeQuickReplyMediaSizeBytes = (value: unknown): number | null => {
 
 const normalizeQuickReplyMediaFilename = (value: unknown): string =>
     typeof value === 'string' ? value.trim() : '';
+
+const normalizeQuickReplyMediaItemType = (
+    value: unknown,
+    fallback: 'image' | 'video' | 'document'
+): 'image' | 'video' | 'document' => {
+    const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+    if (normalized === 'image' || normalized === 'video' || normalized === 'document') return normalized;
+    return fallback;
+};
+
+const normalizeQuickReplyMediaItems = (
+    value: unknown,
+    fallbackType: 'image' | 'video' | 'document'
+): QuickReplyMediaItem[] => {
+    if (!Array.isArray(value)) return [];
+    const normalized: QuickReplyMediaItem[] = [];
+    value.forEach((entry: any) => {
+        const mediaType = normalizeQuickReplyMediaItemType(entry?.type, fallbackType);
+        const mediaAssetKey = normalizeQuickReplyMediaAssetKey(entry?.media_asset_key);
+        const mediaStorage: 'external' | 'r2' = mediaAssetKey ? 'r2' : normalizeQuickReplyMediaStorage(entry?.media_storage);
+        const mediaUrl = normalizeQuickReplyMediaUrl(entry?.media_url);
+        if (mediaStorage === 'r2') {
+            if (!mediaAssetKey) return;
+        } else if (!mediaUrl) {
+            return;
+        }
+        normalized.push({
+            type: mediaType,
+            media_storage: mediaStorage,
+            media_asset_key: mediaAssetKey,
+            media_mime_type: normalizeQuickReplyMediaMimeType(entry?.media_mime_type),
+            media_size_bytes: normalizeQuickReplyMediaSizeBytes(entry?.media_size_bytes),
+            media_url: mediaStorage === 'r2' ? '' : mediaUrl,
+            media_filename: mediaType === 'document' ? normalizeQuickReplyMediaFilename(entry?.media_filename) : ''
+        });
+    });
+    return normalized;
+};
+
+const buildQuickReplyLegacyMediaItems = (
+    item: any,
+    messageType: 'image' | 'video' | 'document'
+): QuickReplyMediaItem[] => {
+    const mediaAssetKey = normalizeQuickReplyMediaAssetKey(item?.media_asset_key);
+    const mediaStorage: 'external' | 'r2' = mediaAssetKey ? 'r2' : normalizeQuickReplyMediaStorage(item?.media_storage);
+    const mediaUrl = normalizeQuickReplyMediaUrl(item?.media_url);
+    if (mediaStorage === 'r2') {
+        if (!mediaAssetKey) return [];
+    } else if (!mediaUrl) {
+        return [];
+    }
+    return [{
+        type: messageType,
+        media_storage: mediaStorage,
+        media_asset_key: mediaAssetKey,
+        media_mime_type: normalizeQuickReplyMediaMimeType(item?.media_mime_type),
+        media_size_bytes: normalizeQuickReplyMediaSizeBytes(item?.media_size_bytes),
+        media_url: mediaStorage === 'r2' ? '' : mediaUrl,
+        media_filename: messageType === 'document' ? normalizeQuickReplyMediaFilename(item?.media_filename) : ''
+    }];
+};
 
 const sanitizeCommandInput = (value: unknown): ConversationalCommand[] => {
     if (!Array.isArray(value)) return [];
@@ -133,6 +206,7 @@ const validateCommandsForSave = (commands: ConversationalCommand[]): { commands:
 export default function AutomationsView({
     workflows,
     workflowsLoading,
+    isMobileView = false,
     profileId,
     sessionToken,
     apiBaseUrl,
@@ -221,6 +295,14 @@ export default function AutomationsView({
         onTouchStart: () => runOncePerTap(fn)
     });
     const workflowSkeletonRows = [0, 1, 2, 3, 4];
+    const savedWorkflowCount = React.useMemo(
+        () => workflows.filter((wf: any) => Boolean(getWorkflowId(wf?.id))).length,
+        [workflows]
+    );
+    const activeWorkflowCount = React.useMemo(
+        () => workflows.filter((wf: any) => Boolean(getWorkflowId(wf?.id)) && wf?.enabled !== false).length,
+        [workflows]
+    );
 
     const triggerWorkflowChoices = React.useMemo(() => {
         return workflows
@@ -464,8 +546,31 @@ export default function AutomationsView({
 
     const normalizeQuickReplyRecord = React.useCallback((item: any): QuickReply => {
         const message_type = normalizeQuickReplyMessageType(item?.message_type);
-        const media_asset_key = normalizeQuickReplyMediaAssetKey(item?.media_asset_key);
-        const media_storage = media_asset_key ? 'r2' : normalizeQuickReplyMediaStorage(item?.media_storage);
+        let media_items = message_type === 'text'
+            ? []
+            : normalizeQuickReplyMediaItems(item?.media_items, message_type);
+        if (message_type !== 'text' && media_items.length === 0) {
+            media_items = buildQuickReplyLegacyMediaItems(item, message_type);
+        }
+        const primaryMedia = media_items[0] || null;
+        const media_asset_key = primaryMedia
+            ? normalizeQuickReplyMediaAssetKey(primaryMedia.media_asset_key)
+            : normalizeQuickReplyMediaAssetKey(item?.media_asset_key);
+        const media_storage = primaryMedia
+            ? (media_asset_key ? 'r2' : normalizeQuickReplyMediaStorage(primaryMedia.media_storage))
+            : (media_asset_key ? 'r2' : normalizeQuickReplyMediaStorage(item?.media_storage));
+        const media_mime_type = primaryMedia
+            ? normalizeQuickReplyMediaMimeType(primaryMedia.media_mime_type)
+            : normalizeQuickReplyMediaMimeType(item?.media_mime_type);
+        const media_size_bytes = primaryMedia
+            ? normalizeQuickReplyMediaSizeBytes(primaryMedia.media_size_bytes)
+            : normalizeQuickReplyMediaSizeBytes(item?.media_size_bytes);
+        const media_url = primaryMedia
+            ? normalizeQuickReplyMediaUrl(primaryMedia.media_url)
+            : normalizeQuickReplyMediaUrl(item?.media_url);
+        const media_filename = primaryMedia
+            ? normalizeQuickReplyMediaFilename(primaryMedia.media_filename)
+            : normalizeQuickReplyMediaFilename(item?.media_filename);
         return {
             id: typeof item?.id === 'string' ? item.id : undefined,
             shortcut: typeof item?.shortcut === 'string' ? item.shortcut : '',
@@ -473,10 +578,11 @@ export default function AutomationsView({
             message_type,
             media_storage,
             media_asset_key,
-            media_mime_type: normalizeQuickReplyMediaMimeType(item?.media_mime_type),
-            media_size_bytes: normalizeQuickReplyMediaSizeBytes(item?.media_size_bytes),
-            media_url: normalizeQuickReplyMediaUrl(item?.media_url),
-            media_filename: message_type === 'document' ? normalizeQuickReplyMediaFilename(item?.media_filename) : '',
+            media_mime_type,
+            media_size_bytes,
+            media_url,
+            media_filename: message_type === 'document' ? media_filename : '',
+            media_items,
             ui_uploading: false,
             ui_upload_error: null
         };
@@ -535,6 +641,7 @@ export default function AutomationsView({
                 media_size_bytes: null,
                 media_url: '',
                 media_filename: '',
+                media_items: [],
                 ui_uploading: false,
                 ui_upload_error: null
             }
@@ -559,6 +666,7 @@ export default function AutomationsView({
                 media_size_bytes: null,
                 media_url: '',
                 media_filename: '',
+                media_items: [],
                 ui_uploading: false,
                 ui_upload_error: null
             };
@@ -573,18 +681,33 @@ export default function AutomationsView({
                     updated.media_size_bytes = null;
                     updated.media_url = '';
                     updated.media_filename = '';
+                    updated.media_items = [];
                 } else if (normalizeQuickReplyMessageType(current.message_type) !== messageType) {
                     updated.media_storage = 'external';
                     updated.media_asset_key = '';
                     updated.media_mime_type = '';
                     updated.media_size_bytes = null;
                     updated.media_url = '';
+                    updated.media_filename = '';
+                    updated.media_items = [];
                 } else if (messageType !== 'document') {
                     updated.media_filename = '';
+                    updated.media_items = normalizeQuickReplyMediaItems(current.media_items, messageType).map((mediaItem) => ({
+                        ...mediaItem,
+                        media_filename: ''
+                    }));
                 }
             }
             if (field === 'media_filename') {
                 updated.media_filename = value;
+                if (normalizeQuickReplyMessageType(updated.message_type) === 'document') {
+                    const existingItems = normalizeQuickReplyMediaItems(updated.media_items, 'document');
+                    if (existingItems.length > 0) {
+                        const nextItems = [...existingItems];
+                        nextItems[0] = { ...nextItems[0], media_filename: value };
+                        updated.media_items = nextItems;
+                    }
+                }
             }
             updated.ui_upload_error = null;
             next[index] = updated;
@@ -592,8 +715,8 @@ export default function AutomationsView({
         });
     }, []);
 
-    const handleUploadQuickReplyMedia = React.useCallback(async (index: number, file: File | null) => {
-        if (!file) return;
+    const handleUploadQuickReplyMedia = React.useCallback(async (index: number, files: File[]) => {
+        if (!Array.isArray(files) || files.length === 0) return;
         if (!profileId || !sessionToken) {
             setQuickRepliesError('Select a profile and log in before uploading media.');
             return;
@@ -604,6 +727,7 @@ export default function AutomationsView({
             setQuickRepliesError('Set the quick reply type to image, video, or document before uploading.');
             return;
         }
+        const queue = messageType === 'video' ? files.slice(0, 1) : files;
 
         setQuickRepliesNotice(null);
         setQuickRepliesDraft((prev) => prev.map((item, idx) => (
@@ -612,29 +736,63 @@ export default function AutomationsView({
                 : item
         )));
         try {
-            const uploaded = await uploadFileToCompanyStorage({
-                apiBaseUrl,
-                profileId,
-                sessionToken,
-                purpose: 'quick_reply',
-                messageType,
-                file
-            });
-            setQuickRepliesDraft((prev) => prev.map((item, idx) => (
-                idx === index
-                    ? {
-                        ...item,
+            const uploadedItems: QuickReplyMediaItem[] = [];
+            let failedUploads = 0;
+            let firstUploadError = '';
+            for (const file of queue) {
+                try {
+                    const uploaded = await uploadFileToCompanyStorage({
+                        apiBaseUrl,
+                        profileId,
+                        sessionToken,
+                        purpose: 'quick_reply',
+                        messageType,
+                        file
+                    });
+                    uploadedItems.push({
+                        type: messageType,
                         media_storage: 'r2',
                         media_asset_key: uploaded.assetKey,
                         media_mime_type: uploaded.mimeType,
                         media_size_bytes: uploaded.sizeBytes,
                         media_url: '',
-                        media_filename: messageType === 'document' ? (uploaded.fileName || item.media_filename || '') : '',
+                        media_filename: messageType === 'document' ? (uploaded.fileName || '') : ''
+                    });
+                } catch (error: any) {
+                    failedUploads += 1;
+                    if (!firstUploadError) firstUploadError = error?.message || 'Upload failed.';
+                }
+            }
+            setQuickRepliesDraft((prev) => prev.map((item, idx) => (
+                idx === index
+                    ? {
+                        ...item,
+                        media_storage: uploadedItems[0]?.media_storage || normalizeQuickReplyMediaStorage(item.media_storage),
+                        media_asset_key: uploadedItems[0]?.media_asset_key || normalizeQuickReplyMediaAssetKey(item.media_asset_key),
+                        media_mime_type: uploadedItems[0]?.media_mime_type || normalizeQuickReplyMediaMimeType(item.media_mime_type),
+                        media_size_bytes: uploadedItems[0]?.media_size_bytes ?? normalizeQuickReplyMediaSizeBytes(item.media_size_bytes),
+                        media_url: uploadedItems[0]?.media_url || '',
+                        media_filename: messageType === 'document'
+                            ? (
+                                uploadedItems[0]?.media_filename
+                                || normalizeQuickReplyMediaFilename(item.media_filename)
+                                || ''
+                            )
+                            : '',
+                        media_items: [
+                            ...normalizeQuickReplyMediaItems(item.media_items, messageType),
+                            ...uploadedItems
+                        ],
                         ui_uploading: false,
-                        ui_upload_error: null
+                        ui_upload_error: failedUploads > 0
+                            ? `${failedUploads} file${failedUploads > 1 ? 's' : ''} failed to upload.`
+                            : null
                     }
                     : item
             )));
+            if (failedUploads > 0 && firstUploadError) {
+                setQuickRepliesError(firstUploadError);
+            }
         } catch (error: any) {
             setQuickRepliesDraft((prev) => prev.map((item, idx) => (
                 idx === index
@@ -643,6 +801,34 @@ export default function AutomationsView({
             )));
         }
     }, [apiBaseUrl, profileId, quickRepliesDraft, sessionToken]);
+
+    const handleRemoveQuickReplyMediaItem = React.useCallback((quickReplyIndex: number, mediaIndex: number) => {
+        setQuickRepliesNotice(null);
+        setQuickRepliesDraft((prev) => prev.map((item, idx) => {
+            if (idx !== quickReplyIndex) return item;
+            const messageType = normalizeQuickReplyMessageType(item.message_type);
+            const existingItems = messageType === 'text'
+                ? []
+                : normalizeQuickReplyMediaItems(item.media_items, messageType);
+            const nextItems = existingItems.filter((_, entryIndex) => entryIndex !== mediaIndex);
+            const firstMedia = nextItems[0] || null;
+            return {
+                ...item,
+                media_storage: firstMedia
+                    ? (normalizeQuickReplyMediaAssetKey(firstMedia.media_asset_key) ? 'r2' : normalizeQuickReplyMediaStorage(firstMedia.media_storage))
+                    : 'external',
+                media_asset_key: firstMedia ? normalizeQuickReplyMediaAssetKey(firstMedia.media_asset_key) : '',
+                media_mime_type: firstMedia ? normalizeQuickReplyMediaMimeType(firstMedia.media_mime_type) : '',
+                media_size_bytes: firstMedia ? normalizeQuickReplyMediaSizeBytes(firstMedia.media_size_bytes) : null,
+                media_url: firstMedia ? normalizeQuickReplyMediaUrl(firstMedia.media_url) : '',
+                media_filename: firstMedia && messageType === 'document'
+                    ? normalizeQuickReplyMediaFilename(firstMedia.media_filename)
+                    : '',
+                media_items: nextItems,
+                ui_upload_error: null
+            };
+        }));
+    }, []);
 
     const handleRemoveQuickReply = React.useCallback((index: number) => {
         setQuickRepliesNotice(null);
@@ -666,6 +852,7 @@ export default function AutomationsView({
             media_size_bytes: number | null;
             media_url: string | null;
             media_filename: string | null;
+            media_items: QuickReplyMediaItem[];
         }> = [];
 
         for (const item of quickRepliesDraft) {
@@ -679,6 +866,31 @@ export default function AutomationsView({
             const mediaSizeBytes = normalizeQuickReplyMediaSizeBytes(item.media_size_bytes);
             const mediaUrl = normalizeQuickReplyMediaUrl(item.media_url);
             const mediaFilename = normalizeQuickReplyMediaFilename(item.media_filename);
+            let mediaItems = messageType === 'text'
+                ? []
+                : normalizeQuickReplyMediaItems(item.media_items, messageType);
+            if (messageType !== 'text' && mediaItems.length === 0) {
+                mediaItems = buildQuickReplyLegacyMediaItems(item, messageType);
+            }
+            const primaryMedia = mediaItems[0] || null;
+            const primaryMediaStorage = primaryMedia
+                ? (normalizeQuickReplyMediaAssetKey(primaryMedia.media_asset_key) ? 'r2' : normalizeQuickReplyMediaStorage(primaryMedia.media_storage))
+                : resolvedMediaStorage;
+            const primaryMediaAssetKey = primaryMedia
+                ? normalizeQuickReplyMediaAssetKey(primaryMedia.media_asset_key)
+                : mediaAssetKey;
+            const primaryMediaMimeType = primaryMedia
+                ? normalizeQuickReplyMediaMimeType(primaryMedia.media_mime_type)
+                : mediaMimeType;
+            const primaryMediaSizeBytes = primaryMedia
+                ? normalizeQuickReplyMediaSizeBytes(primaryMedia.media_size_bytes)
+                : mediaSizeBytes;
+            const primaryMediaUrl = primaryMedia
+                ? normalizeQuickReplyMediaUrl(primaryMedia.media_url)
+                : mediaUrl;
+            const primaryMediaFilename = primaryMedia
+                ? normalizeQuickReplyMediaFilename(primaryMedia.media_filename)
+                : mediaFilename;
             if (!shortcut) continue;
             if (seen.has(shortcut)) {
                 setQuickRepliesError(`Duplicate shortcut: /${shortcut}`);
@@ -687,9 +899,7 @@ export default function AutomationsView({
             }
             if (messageType === 'text') {
                 if (!text) continue;
-            } else if (resolvedMediaStorage === 'r2') {
-                if (!mediaAssetKey) continue;
-            } else if (!mediaUrl) {
+            } else if (mediaItems.length === 0) {
                 continue;
             }
             seen.add(shortcut);
@@ -697,12 +907,28 @@ export default function AutomationsView({
                 shortcut,
                 text,
                 message_type: messageType,
-                media_storage: messageType === 'text' ? 'external' : resolvedMediaStorage,
-                media_asset_key: messageType === 'text' || resolvedMediaStorage !== 'r2' ? null : mediaAssetKey,
-                media_mime_type: messageType === 'text' || resolvedMediaStorage !== 'r2' ? null : (mediaMimeType || null),
-                media_size_bytes: messageType === 'text' || resolvedMediaStorage !== 'r2' ? null : mediaSizeBytes,
-                media_url: messageType === 'text' || resolvedMediaStorage === 'r2' ? null : mediaUrl,
-                media_filename: messageType === 'document' && mediaFilename ? mediaFilename : null
+                media_storage: messageType === 'text' ? 'external' : primaryMediaStorage,
+                media_asset_key: messageType === 'text' || primaryMediaStorage !== 'r2' ? null : primaryMediaAssetKey,
+                media_mime_type: messageType === 'text' || primaryMediaStorage !== 'r2' ? null : (primaryMediaMimeType || null),
+                media_size_bytes: messageType === 'text' || primaryMediaStorage !== 'r2' ? null : primaryMediaSizeBytes,
+                media_url: messageType === 'text' || primaryMediaStorage === 'r2' ? null : primaryMediaUrl,
+                media_filename: messageType === 'document' && primaryMediaFilename ? primaryMediaFilename : null,
+                media_items: messageType === 'text'
+                    ? []
+                    : mediaItems.map((entry) => {
+                        const entryAssetKey = normalizeQuickReplyMediaAssetKey(entry.media_asset_key);
+                        const entryStorage: 'external' | 'r2' = entryAssetKey ? 'r2' : normalizeQuickReplyMediaStorage(entry.media_storage);
+                        const entryType = normalizeQuickReplyMediaItemType(entry.type, messageType);
+                        return {
+                            type: entryType,
+                            media_storage: entryStorage,
+                            media_asset_key: entryStorage === 'r2' ? entryAssetKey : '',
+                            media_mime_type: entryStorage === 'r2' ? normalizeQuickReplyMediaMimeType(entry.media_mime_type) : '',
+                            media_size_bytes: entryStorage === 'r2' ? normalizeQuickReplyMediaSizeBytes(entry.media_size_bytes) : null,
+                            media_url: entryStorage === 'r2' ? '' : normalizeQuickReplyMediaUrl(entry.media_url),
+                            media_filename: entryType === 'document' ? normalizeQuickReplyMediaFilename(entry.media_filename) : ''
+                        };
+                    })
             });
         }
 
@@ -827,9 +1053,14 @@ export default function AutomationsView({
     };
 
     return (
-        <div className="h-screen pt-[72px] bg-[#f8f9fa] text-[#111b21] font-sans">
-            <div className="h-full max-w-6xl mx-auto flex flex-col p-4 md:p-6 gap-3 overflow-hidden">
-                <div className="bg-white border border-[#e6ebef] rounded-2xl p-4 md:p-5">
+        <div className={`h-screen pt-[64px] lg:pt-[72px] pb-[76px] lg:pb-0 text-[#111b21] font-sans ${isMobileView
+            ? 'bg-[linear-gradient(180deg,#f5f9ff_0%,#f8fafd_58%,#f6f8fb_100%)]'
+            : 'bg-[#f8f9fa]'
+            }`}>
+            <div className={`h-full max-w-6xl mx-auto flex flex-col p-3 sm:p-4 md:p-6 gap-3 ${isMobileView ? 'overflow-y-auto custom-scrollbar' : 'overflow-hidden'}`}>
+                <div className={isMobileView
+                    ? 'rounded-2xl border border-[#dbe6f3] bg-[linear-gradient(155deg,#ffffff_0%,#f4f9ff_100%)] p-4 shadow-[0_12px_34px_rgba(18,40,66,0.08)]'
+                    : 'rounded-2xl border border-[#dbe6f3] bg-[linear-gradient(155deg,#ffffff_0%,#f4f9ff_100%)] p-4 md:p-5 shadow-[0_12px_34px_rgba(18,40,66,0.06)]'}>
                     <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
                         <div>
                             <h2 className="text-lg md:text-xl font-semibold text-[#111b21] tracking-tight">Automations</h2>
@@ -837,28 +1068,80 @@ export default function AutomationsView({
                                 Your saved workflows for this company profile.
                             </p>
                         </div>
-                        <div className="flex items-center gap-1.5">
-                            <button
-                                type="button"
-                                {...bindOpenHandlers(onCreateWorkflow)}
-                                className="h-8 px-3 rounded-lg bg-[#00a884] text-white text-[10px] font-semibold uppercase tracking-wide hover:bg-[#008f6f] transition-all inline-flex items-center gap-1 cursor-pointer"
-                            >
-                                <Plus className="w-3 h-3" />
-                                New Automation
-                            </button>
-                            <button
-                                type="button"
-                                {...bindOpenHandlers(handleOpenWorkflowBuilder)}
-                                className="h-8 px-3 rounded-lg border border-[#d8dee4] bg-white text-[#1f2a33] text-[10px] font-semibold uppercase tracking-wide hover:bg-[#f7f9fb] transition-all inline-flex items-center gap-1 cursor-pointer pointer-events-auto"
-                            >
-                                <Workflow className="w-3 h-3" />
-                                Open Workflow Builder
-                            </button>
-                        </div>
+                        {!isMobileView && (
+                            <div className="flex items-center gap-1.5">
+                                <button
+                                    type="button"
+                                    {...bindOpenHandlers(onCreateWorkflow)}
+                                    className="h-8 px-3 rounded-lg bg-[#00a884] text-white text-[10px] font-semibold uppercase tracking-wide hover:bg-[#008f6f] transition-all inline-flex items-center gap-1 cursor-pointer"
+                                >
+                                    <Plus className="w-3 h-3" />
+                                    New Automation
+                                </button>
+                                <button
+                                    type="button"
+                                    {...bindOpenHandlers(handleOpenWorkflowBuilder)}
+                                    className="h-8 px-3 rounded-lg border border-[#d8dee4] bg-white text-[#1f2a33] text-[10px] font-semibold uppercase tracking-wide hover:bg-[#f7f9fb] transition-all inline-flex items-center gap-1 cursor-pointer pointer-events-auto"
+                                >
+                                    <Workflow className="w-3 h-3" />
+                                    Open Workflow Builder
+                                </button>
+                            </div>
+                        )}
                     </div>
+                    {isMobileView && (
+                        <>
+                            <div className="mt-3 grid grid-cols-2 gap-2">
+                                <div className="rounded-xl border border-[#d6e3f2] bg-white px-3 py-2">
+                                    <p className="text-[10px] font-black uppercase tracking-[0.12em] text-[#7a8b97]">Active</p>
+                                    <p className="mt-1 text-base font-extrabold text-[#111b21]">{activeWorkflowCount}</p>
+                                </div>
+                                <div className="rounded-xl border border-[#d6e3f2] bg-white px-3 py-2">
+                                    <p className="text-[10px] font-black uppercase tracking-[0.12em] text-[#7a8b97]">Saved</p>
+                                    <p className="mt-1 text-base font-extrabold text-[#111b21]">{savedWorkflowCount}</p>
+                                </div>
+                            </div>
+                            <div className="mt-3 grid grid-cols-2 gap-2">
+                                <button
+                                    type="button"
+                                    {...bindOpenHandlers(onCreateWorkflow)}
+                                    className="h-9 rounded-xl bg-[#00a884] text-white text-[11px] font-extrabold uppercase tracking-[0.08em] shadow-[0_8px_16px_rgba(0,168,132,0.26)]"
+                                >
+                                    + New
+                                </button>
+                                <button
+                                    type="button"
+                                    {...bindOpenHandlers(handleOpenWorkflowBuilder)}
+                                    className="h-9 rounded-xl border border-[#d5e0ee] bg-white text-[#1f2a33] text-[11px] font-extrabold uppercase tracking-[0.08em]"
+                                >
+                                    Open Builder
+                                </button>
+                            </div>
+                        </>
+                    )}
+                    {!isMobileView && (
+                        <div className="mt-4 grid grid-cols-3 gap-2.5">
+                            <div className="rounded-xl border border-[#d6e3f2] bg-white px-3 py-2.5">
+                                <p className="text-[10px] font-black uppercase tracking-[0.12em] text-[#7a8b97]">Active</p>
+                                <p className="mt-1 text-lg font-extrabold text-[#111b21]">{activeWorkflowCount}</p>
+                            </div>
+                            <div className="rounded-xl border border-[#d6e3f2] bg-white px-3 py-2.5">
+                                <p className="text-[10px] font-black uppercase tracking-[0.12em] text-[#7a8b97]">Saved</p>
+                                <p className="mt-1 text-lg font-extrabold text-[#111b21]">{savedWorkflowCount}</p>
+                            </div>
+                            <div className="rounded-xl border border-[#d6e3f2] bg-white px-3 py-2.5">
+                                <p className="text-[10px] font-black uppercase tracking-[0.12em] text-[#7a8b97]">Coverage</p>
+                                <p className="mt-1 text-lg font-extrabold text-[#111b21]">
+                                    {savedWorkflowCount > 0 ? `${Math.round((activeWorkflowCount / savedWorkflowCount) * 100)}%` : '0%'}
+                                </p>
+                            </div>
+                        </div>
+                    )}
                 </div>
 
-                <div className="bg-white border border-[#e6ebef] rounded-2xl p-4 md:p-5">
+                <div className={isMobileView
+                    ? 'rounded-2xl border border-[#dbe6f3] bg-white p-4 shadow-[0_10px_28px_rgba(18,40,66,0.06)]'
+                    : 'rounded-2xl border border-[#dbe6f3] bg-white p-4 md:p-5 shadow-[0_10px_28px_rgba(18,40,66,0.05)]'}>
                     <div className="flex items-center justify-between gap-3">
                         <div>
                             <h3 className="text-base md:text-lg font-semibold text-[#111b21] tracking-tight">Automation Tools</h3>
@@ -868,56 +1151,71 @@ export default function AutomationsView({
                         </div>
                     </div>
 
-                    <div className="mt-3 flex flex-wrap gap-2">
+                    <div className={`mt-3 ${isMobileView ? 'grid grid-cols-2 gap-2.5' : 'grid grid-cols-2 xl:grid-cols-3 gap-2.5'}`}>
                         <button
                             type="button"
                             onClick={() => {
                                 setShowFallbackModal(true);
                                 fetchFallbackSettings();
                             }}
-                            className="h-8 px-3 rounded-lg border border-[#d8dee4] bg-white text-[#1f2a33] text-[10px] font-semibold uppercase tracking-wide hover:bg-[#f7f9fb] transition-all inline-flex items-center gap-1.5"
+                            className={isMobileView
+                                ? 'min-h-[74px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3 py-2.5 text-left inline-flex flex-col items-start justify-center gap-1.5'
+                                : 'min-h-[84px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3.5 py-3 text-left inline-flex flex-col items-start justify-center gap-1.5 transition-all hover:border-[#c9d9ec] hover:bg-white shadow-[0_6px_16px_rgba(20,36,60,0.05)]'}
                         >
                             <MessageSquare className="w-3.5 h-3.5" />
-                            Fallback Message
+                            <span className={`${isMobileView ? 'text-[11px] font-extrabold text-[#111b21]' : 'text-[11px] font-extrabold text-[#12253a]'}`}>Fallback Message</span>
+                            <span className="text-[10px] text-[#6c7f92]">Default invalid-option reply</span>
                         </button>
                         <button
                             type="button"
                             {...bindOpenHandlers(handleOpenTriggerModal)}
-                            className="h-8 px-3 rounded-lg border border-[#d8dee4] bg-white text-[#1f2a33] text-[10px] font-semibold uppercase tracking-wide hover:bg-[#f7f9fb] transition-all inline-flex items-center gap-1.5"
+                            className={isMobileView
+                                ? 'min-h-[74px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3 py-2.5 text-left inline-flex flex-col items-start justify-center gap-1.5'
+                                : 'min-h-[84px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3.5 py-3 text-left inline-flex flex-col items-start justify-center gap-1.5 transition-all hover:border-[#c9d9ec] hover:bg-white shadow-[0_6px_16px_rgba(20,36,60,0.05)]'}
                         >
                             <Workflow className="w-3.5 h-3.5" />
-                            Trigger
+                            <span className={`${isMobileView ? 'text-[11px] font-extrabold text-[#111b21]' : 'text-[11px] font-extrabold text-[#12253a]'}`}>Trigger</span>
+                            <span className="text-[10px] text-[#6c7f92]">Keyword and new-chat rules</span>
                         </button>
                         <button
                             type="button"
                             {...bindOpenHandlers(handleOpenConversationalModal)}
-                            className="h-8 px-3 rounded-lg border border-[#d8dee4] bg-white text-[#1f2a33] text-[10px] font-semibold uppercase tracking-wide hover:bg-[#f7f9fb] transition-all inline-flex items-center gap-1.5"
+                            className={isMobileView
+                                ? 'min-h-[74px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3 py-2.5 text-left inline-flex flex-col items-start justify-center gap-1.5'
+                                : 'min-h-[84px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3.5 py-3 text-left inline-flex flex-col items-start justify-center gap-1.5 transition-all hover:border-[#c9d9ec] hover:bg-white shadow-[0_6px_16px_rgba(20,36,60,0.05)]'}
                         >
                             <Settings2 className="w-3.5 h-3.5" />
-                            Conversational Components
+                            <span className={`${isMobileView ? 'text-[11px] font-extrabold text-[#111b21]' : 'text-[11px] font-extrabold text-[#12253a]'}`}>Components</span>
+                            <span className="text-[10px] text-[#6c7f92]">Welcome, prompts, commands</span>
                         </button>
                         <button
                             type="button"
                             {...bindOpenHandlers(handleOpenReminderModal)}
-                            className="h-8 px-3 rounded-lg border border-[#d8dee4] bg-white text-[#1f2a33] text-[10px] font-semibold uppercase tracking-wide hover:bg-[#f7f9fb] transition-all inline-flex items-center gap-1.5"
+                            className={isMobileView
+                                ? 'min-h-[74px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3 py-2.5 text-left inline-flex flex-col items-start justify-center gap-1.5'
+                                : 'min-h-[84px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3.5 py-3 text-left inline-flex flex-col items-start justify-center gap-1.5 transition-all hover:border-[#c9d9ec] hover:bg-white shadow-[0_6px_16px_rgba(20,36,60,0.05)]'}
                         >
                             <Settings2 className="w-3.5 h-3.5" />
-                            24h Window Reminder
+                            <span className={`${isMobileView ? 'text-[11px] font-extrabold text-[#111b21]' : 'text-[11px] font-extrabold text-[#12253a]'}`}>24h Reminder</span>
+                            <span className="text-[10px] text-[#6c7f92]">Window expiry nudges</span>
                         </button>
                         <button
                             type="button"
                             {...bindOpenHandlers(handleOpenQuickRepliesModal)}
-                            className="h-8 px-3 rounded-lg border border-[#d8dee4] bg-white text-[#1f2a33] text-[10px] font-semibold uppercase tracking-wide hover:bg-[#f7f9fb] transition-all inline-flex items-center gap-1.5"
+                            className={isMobileView
+                                ? 'col-span-2 min-h-[74px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3 py-2.5 text-left inline-flex flex-col items-start justify-center gap-1.5'
+                                : 'min-h-[84px] rounded-xl border border-[#dbe4ef] bg-[#f8fbff] px-3.5 py-3 text-left inline-flex flex-col items-start justify-center gap-1.5 transition-all hover:border-[#c9d9ec] hover:bg-white shadow-[0_6px_16px_rgba(20,36,60,0.05)]'}
                         >
                             <Settings2 className="w-3.5 h-3.5" />
-                            Quick Reply
+                            <span className={`${isMobileView ? 'text-[11px] font-extrabold text-[#111b21]' : 'text-[11px] font-extrabold text-[#12253a]'}`}>Quick Reply</span>
+                            <span className="text-[10px] text-[#6c7f92]">Reusable text or media shortcuts</span>
                         </button>
                     </div>
                 </div>
 
-                <div className="flex-1 min-h-0 bg-white border border-[#e6ebef] rounded-2xl overflow-hidden">
+                <div className={isMobileView ? 'pb-3' : 'flex-1 min-h-0 bg-white border border-[#e6ebef] rounded-2xl overflow-hidden'}>
                     {workflowsLoading ? (
-                        <div className="h-full overflow-y-auto custom-scrollbar p-4 md:p-5">
+                        <div className={isMobileView ? 'p-2' : 'h-full overflow-y-auto custom-scrollbar p-4 md:p-5'}>
                             <div className="animate-pulse space-y-3">
                                 {workflowSkeletonRows.map((row) => (
                                     <div
@@ -951,27 +1249,39 @@ export default function AutomationsView({
                             <Workflow className="w-12 h-12 text-[#aebac1] mb-3" />
                             <p className="text-[#111b21] font-bold">No workflows yet</p>
                             <p className="text-xs text-[#8696a0] mt-1 mb-4">
-                                Create your first automation workflow in Chatflow builder.
+                                {isMobileView
+                                    ? 'No automations configured yet.'
+                                    : 'Create your first automation workflow in Chatflow builder.'}
                             </p>
-                            <button
-                                type="button"
-                                {...bindOpenHandlers(onCreateWorkflow)}
-                                className="h-8 px-3 rounded-lg bg-[#00a884] text-white text-[10px] font-semibold uppercase tracking-wide hover:bg-[#008f6f] transition-all inline-flex items-center gap-1 cursor-pointer"
-                            >
-                                Create Workflow
-                            </button>
+                            {isMobileView ? (
+                                <button
+                                    type="button"
+                                    {...bindOpenHandlers(onCreateWorkflow)}
+                                    className="h-9 px-4 rounded-xl bg-[#00a884] text-white text-[11px] font-extrabold uppercase tracking-[0.08em] shadow-[0_8px_16px_rgba(0,168,132,0.26)]"
+                                >
+                                    Create Workflow
+                                </button>
+                            ) : (
+                                <button
+                                    type="button"
+                                    {...bindOpenHandlers(onCreateWorkflow)}
+                                    className="h-8 px-3 rounded-lg bg-[#00a884] text-white text-[10px] font-semibold uppercase tracking-wide hover:bg-[#008f6f] transition-all inline-flex items-center gap-1 cursor-pointer"
+                                >
+                                    Create Workflow
+                                </button>
+                            )}
                         </div>
                     ) : (
-                        <div className="h-full overflow-y-auto custom-scrollbar">
-                            <div className="hidden md:grid grid-cols-12 gap-2 px-4 py-2 border-b border-[#eef2f5] bg-[#fcfdfe]">
-                                <span className="col-span-3 text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">Workflow</span>
-                                <span className="col-span-3 text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">Trigger</span>
-                                <span className="col-span-1 text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">Steps</span>
-                                <span className="col-span-1 text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">Status</span>
-                                <span className="col-span-4 text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97] text-right">Actions</span>
+                        <div className={isMobileView ? '' : 'h-full overflow-y-auto custom-scrollbar p-3 md:p-4 bg-[linear-gradient(180deg,#fbfdff_0%,#f7faff_100%)]'}>
+                            <div className="mb-2 hidden md:grid grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)_84px_92px_minmax(0,1fr)] items-center gap-3 px-2 text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">
+                                <span>Workflow</span>
+                                <span>Trigger</span>
+                                <span>Steps</span>
+                                <span>Status</span>
+                                <span className="text-right">Actions</span>
                             </div>
 
-                            <div className="divide-y divide-[#eef2f5]">
+                            <div className="space-y-2.5">
                                 {workflows.map((wf: any, idx: number) => {
                                     const workflowId = getWorkflowId(wf?.id);
                                     const workflowName = getWorkflowName(wf?.name);
@@ -983,110 +1293,182 @@ export default function AutomationsView({
                                         if (workflowId) onOpenBuilder(workflowId);
                                         else handleOpenWorkflowBuilder();
                                     };
+                                    const rowHandlers = isMobileView ? {} : bindOpenHandlers(openRowBuilder);
+                                    if (isMobileView) {
+                                        return (
+                                            <div
+                                                key={`automation-workflow-${workflowLabel}-${idx}`}
+                                                className="rounded-2xl border border-[#dbe6f3] bg-white px-3 py-3 shadow-[0_10px_22px_rgba(16,35,58,0.06)]"
+                                            >
+                                                <div className="flex items-start justify-between gap-2">
+                                                    <div className="min-w-0">
+                                                        <p className="truncate text-[13px] font-extrabold text-[#111b21]">{workflowLabel}</p>
+                                                        <p className="mt-1 truncate text-[10px] font-semibold text-[#5d7285]">
+                                                            Trigger: {triggerKeyword || 'manual only'}
+                                                        </p>
+                                                    </div>
+                                                    <span className={`inline-flex h-5 items-center rounded-full border px-2 text-[9px] font-black uppercase tracking-[0.08em] ${isEnabled
+                                                        ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                                        : 'border-slate-200 bg-slate-50 text-slate-600'
+                                                        }`}>
+                                                        {isEnabled ? 'On' : 'Off'}
+                                                    </span>
+                                                </div>
+
+                                                <div className="mt-2 flex items-center gap-1.5">
+                                                    <span className="inline-flex h-5 items-center rounded-full border border-[#d9e4f2] bg-[#f3f8ff] px-2 text-[9px] font-black uppercase tracking-[0.08em] text-[#4b5c68]">
+                                                        Steps {actionCount}
+                                                    </span>
+                                                    <button
+                                                        type="button"
+                                                        disabled={!workflowId}
+                                                        onClick={() => {
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onCopyWorkflow(workflowId));
+                                                        }}
+                                                        className="inline-flex h-5 items-center gap-1 rounded-full border border-[#d9e4f2] bg-white px-2 text-[9px] font-black uppercase tracking-[0.08em] text-[#4b5c68] disabled:opacity-50"
+                                                    >
+                                                        <Copy className="w-2.5 h-2.5" />
+                                                        Copy
+                                                    </button>
+                                                </div>
+
+                                                <div className="mt-3 grid grid-cols-2 gap-2">
+                                                    <button
+                                                        type="button"
+                                                        disabled={!workflowId}
+                                                        onClick={() => {
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onOpenBuilder(workflowId));
+                                                        }}
+                                                        className="h-8 rounded-xl bg-[#00a884] text-white text-[10px] font-extrabold uppercase tracking-[0.08em] disabled:opacity-60"
+                                                    >
+                                                        Builder
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        disabled={!workflowId}
+                                                        onClick={() => {
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onToggleWorkflowEnabled(workflowId, !isEnabled));
+                                                        }}
+                                                        className={`h-8 rounded-xl border text-[10px] font-extrabold uppercase tracking-[0.08em] disabled:opacity-60 ${isEnabled
+                                                            ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                                            : 'border-slate-200 bg-white text-slate-700'
+                                                            }`}
+                                                    >
+                                                        {isEnabled ? 'Disable' : 'Enable'}
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        );
+                                    }
                                     return (
                                         <div
                                             key={`automation-workflow-${workflowLabel}-${idx}`}
-                                            {...bindOpenHandlers(openRowBuilder)}
-                                            className="grid grid-cols-12 gap-2 px-4 py-3 hover:bg-[#fafcfd] transition-colors cursor-pointer"
+                                            {...rowHandlers}
+                                            className="rounded-2xl border border-[#dbe5f1] bg-white px-3.5 py-3 transition-all hover:border-[#c9d9ec] hover:shadow-[0_10px_22px_rgba(16,35,58,0.08)] cursor-pointer"
                                         >
-                                            <div className="col-span-12 md:col-span-3 min-w-0">
-                                                <p className="text-[12px] font-semibold text-[#111b21] truncate">{workflowLabel}</p>
-                                                {!workflowName && (
-                                                    <p className="text-[10px] text-[#8c9aa4] mt-0.5">Set name in workflow builder</p>
-                                                )}
-                                            </div>
+                                            <div className="grid grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)_84px_92px_minmax(0,1fr)] items-center gap-3">
+                                                <div className="min-w-0">
+                                                    <p className="truncate text-[13px] font-extrabold text-[#111b21]">{workflowLabel}</p>
+                                                    {!workflowName && (
+                                                        <p className="mt-0.5 text-[10px] font-semibold text-[#8c9aa4]">Set name in workflow builder</p>
+                                                    )}
+                                                </div>
 
-                                            <div className="col-span-8 md:col-span-3 min-w-0">
-                                                <p className="text-[11px] text-[#4b5c68] truncate">{triggerKeyword || 'manual only'}</p>
-                                            </div>
+                                                <div className="min-w-0">
+                                                    <p className="truncate text-[11px] font-semibold text-[#4b5c68]">{triggerKeyword || 'manual only'}</p>
+                                                </div>
 
-                                            <div className="col-span-4 md:col-span-1">
-                                                <span className="inline-flex items-center text-[11px] text-[#4b5c68] font-medium">
-                                                    {actionCount}
-                                                </span>
-                                            </div>
+                                                <div>
+                                                    <span className="inline-flex h-6 items-center rounded-full border border-[#d9e4f2] bg-[#f3f8ff] px-2 text-[10px] font-black text-[#4b5c68]">
+                                                        {actionCount}
+                                                    </span>
+                                                </div>
 
-                                            <div className="col-span-6 md:col-span-1">
-                                                <span className={`inline-flex items-center px-2 py-0.5 rounded-full border text-[9px] font-semibold uppercase tracking-wide ${isEnabled
-                                                    ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
-                                                    : 'bg-slate-50 border-slate-200 text-slate-600'
-                                                    }`}>
-                                                    {isEnabled ? 'On' : 'Off'}
-                                                </span>
-                                            </div>
+                                                <div>
+                                                    <span className={`inline-flex h-6 items-center rounded-full border px-2 text-[10px] font-black uppercase tracking-[0.08em] ${isEnabled
+                                                        ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                                        : 'border-slate-200 bg-slate-50 text-slate-600'
+                                                        }`}>
+                                                        {isEnabled ? 'On' : 'Off'}
+                                                    </span>
+                                                </div>
 
-                                            <div className="col-span-6 md:col-span-4 flex items-center justify-end gap-1.5">
-                                                <button
-                                                    type="button"
-                                                    disabled={!workflowId}
-                                                    onClick={(event) => {
-                                                        event.stopPropagation();
-                                                        if (!workflowId) return;
-                                                        runOncePerTap(() => onOpenBuilder(workflowId));
-                                                    }}
-                                                    onMouseDown={(event) => {
-                                                        event.stopPropagation();
-                                                        if (!workflowId) return;
-                                                        runOncePerTap(() => onOpenBuilder(workflowId));
-                                                    }}
-                                                    onTouchStart={(event) => {
-                                                        event.stopPropagation();
-                                                        if (!workflowId) return;
-                                                        runOncePerTap(() => onOpenBuilder(workflowId));
-                                                    }}
-                                                    className="h-7 px-2.5 rounded-md bg-[#00a884] text-white text-[9px] font-semibold uppercase tracking-wide hover:bg-[#008f6f] transition-all cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
-                                                >
-                                                    Builder
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    disabled={!workflowId}
-                                                    onClick={(event) => {
-                                                        event.stopPropagation();
-                                                        if (!workflowId) return;
-                                                        runOncePerTap(() => onCopyWorkflow(workflowId));
-                                                    }}
-                                                    onMouseDown={(event) => {
-                                                        event.stopPropagation();
-                                                        if (!workflowId) return;
-                                                        runOncePerTap(() => onCopyWorkflow(workflowId));
-                                                    }}
-                                                    onTouchStart={(event) => {
-                                                        event.stopPropagation();
-                                                        if (!workflowId) return;
-                                                        runOncePerTap(() => onCopyWorkflow(workflowId));
-                                                    }}
-                                                    className="h-7 px-2.5 rounded-md border border-[#dbe2e8] bg-white text-[#334155] text-[9px] font-semibold uppercase tracking-wide transition-all inline-flex items-center justify-center gap-1 hover:bg-[#f8fafc] disabled:opacity-60 disabled:cursor-not-allowed"
-                                                >
-                                                    <Copy className="w-3 h-3" />
-                                                    Copy
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    disabled={!workflowId}
-                                                    onClick={(event) => {
-                                                        event.stopPropagation();
-                                                        if (!workflowId) return;
-                                                        runOncePerTap(() => onToggleWorkflowEnabled(workflowId, !isEnabled));
-                                                    }}
-                                                    onMouseDown={(event) => {
-                                                        event.stopPropagation();
-                                                        if (!workflowId) return;
-                                                        runOncePerTap(() => onToggleWorkflowEnabled(workflowId, !isEnabled));
-                                                    }}
-                                                    onTouchStart={(event) => {
-                                                        event.stopPropagation();
-                                                        if (!workflowId) return;
-                                                        runOncePerTap(() => onToggleWorkflowEnabled(workflowId, !isEnabled));
-                                                    }}
-                                                    className={`h-7 px-2.5 rounded-md border text-[9px] font-semibold uppercase tracking-wide transition-all inline-flex items-center justify-center gap-1 disabled:opacity-60 disabled:cursor-not-allowed ${isEnabled
-                                                        ? 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
-                                                        : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
-                                                        } cursor-pointer`}
-                                                >
-                                                    <Check className="w-3 h-3" />
-                                                    {isEnabled ? 'Untick To Off' : 'Tick To Run'}
-                                                </button>
+                                                <div className="flex items-center justify-end gap-2">
+                                                    <button
+                                                        type="button"
+                                                        disabled={!workflowId}
+                                                        onClick={(event) => {
+                                                            event.stopPropagation();
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onOpenBuilder(workflowId));
+                                                        }}
+                                                        onMouseDown={(event) => {
+                                                            event.stopPropagation();
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onOpenBuilder(workflowId));
+                                                        }}
+                                                        onTouchStart={(event) => {
+                                                            event.stopPropagation();
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onOpenBuilder(workflowId));
+                                                        }}
+                                                        className="h-8 px-3 rounded-lg bg-[#00a884] text-white text-[10px] font-extrabold uppercase tracking-[0.08em] hover:bg-[#008f6f] transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                                                    >
+                                                        Builder
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        disabled={!workflowId}
+                                                        onClick={(event) => {
+                                                            event.stopPropagation();
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onCopyWorkflow(workflowId));
+                                                        }}
+                                                        onMouseDown={(event) => {
+                                                            event.stopPropagation();
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onCopyWorkflow(workflowId));
+                                                        }}
+                                                        onTouchStart={(event) => {
+                                                            event.stopPropagation();
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onCopyWorkflow(workflowId));
+                                                        }}
+                                                        className="h-8 px-3 rounded-lg border border-[#dbe2e8] bg-white text-[#334155] text-[10px] font-extrabold uppercase tracking-[0.08em] transition-all inline-flex items-center justify-center gap-1 hover:bg-[#f8fafc] disabled:opacity-60 disabled:cursor-not-allowed"
+                                                    >
+                                                        <Copy className="w-3 h-3" />
+                                                        Copy
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        disabled={!workflowId}
+                                                        onClick={(event) => {
+                                                            event.stopPropagation();
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onToggleWorkflowEnabled(workflowId, !isEnabled));
+                                                        }}
+                                                        onMouseDown={(event) => {
+                                                            event.stopPropagation();
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onToggleWorkflowEnabled(workflowId, !isEnabled));
+                                                        }}
+                                                        onTouchStart={(event) => {
+                                                            event.stopPropagation();
+                                                            if (!workflowId) return;
+                                                            runOncePerTap(() => onToggleWorkflowEnabled(workflowId, !isEnabled));
+                                                        }}
+                                                        className={`h-8 px-3 rounded-lg border text-[10px] font-extrabold uppercase tracking-[0.08em] transition-all inline-flex items-center justify-center gap-1 disabled:opacity-60 disabled:cursor-not-allowed ${isEnabled
+                                                            ? 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+                                                            : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                                                            }`}
+                                                    >
+                                                        <Check className="w-3 h-3" />
+                                                        {isEnabled ? 'Disable' : 'Enable'}
+                                                    </button>
+                                                </div>
                                             </div>
                                         </div>
                                     );
@@ -1459,7 +1841,7 @@ export default function AutomationsView({
                                 <div>
                                     <h3 className="text-base md:text-lg font-semibold text-[#111b21] tracking-tight">Quick Replies</h3>
                                     <p className="text-[11px] text-[#54656f] mt-1">
-                                        Type <code className="font-mono">/shortcut</code> in chat to send text or media (image, video, document).
+                                        Type <code className="font-mono">/shortcut</code> in chat to send text, single video, or multiple image/document files.
                                     </p>
                                 </div>
                                 <div className="flex items-center gap-2">
@@ -1515,6 +1897,9 @@ export default function AutomationsView({
                                     ) : (
                                         quickRepliesDraft.map((item, index) => {
                                             const messageType = normalizeQuickReplyMessageType(item.message_type);
+                                            const mediaItems = messageType === 'text'
+                                                ? []
+                                                : normalizeQuickReplyMediaItems(item.media_items, messageType);
                                             return (
                                                 <div key={`quick-reply-${item.id || 'new'}-${index}`} className="rounded-2xl border border-[#dfe6eb] bg-[#f8f9fa] p-3">
                                                     <div className="grid grid-cols-1 md:grid-cols-12 gap-3">
@@ -1574,11 +1959,12 @@ export default function AutomationsView({
                                                                     <input
                                                                         type="file"
                                                                         accept={messageType === 'image' ? 'image/*' : messageType === 'video' ? 'video/*' : '*/*'}
+                                                                        multiple={messageType !== 'video'}
                                                                         className="mt-2 block w-full text-xs text-[#111b21] file:mr-3 file:rounded-lg file:border-0 file:bg-[#00a884] file:px-3 file:py-2 file:text-[11px] file:font-semibold file:text-white hover:file:bg-[#008f6f]"
                                                                         onChange={(e) => {
-                                                                            const file = e.target.files?.[0] || null;
+                                                                            const selectedFiles = Array.from(e.target.files || []);
                                                                             e.target.value = '';
-                                                                            void handleUploadQuickReplyMedia(index, file);
+                                                                            void handleUploadQuickReplyMedia(index, selectedFiles);
                                                                         }}
                                                                         disabled={!canManageFallback || quickRepliesSaving || item.ui_uploading}
                                                                     />
@@ -1593,21 +1979,57 @@ export default function AutomationsView({
                                                                                 {item.ui_upload_error}
                                                                             </div>
                                                                         )}
-                                                                        {item.media_asset_key && (
+                                                                        {mediaItems.length > 0 && (
                                                                             <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-[11px] text-emerald-700">
-                                                                                Media uploaded to secure storage.
+                                                                                {mediaItems.length} file{mediaItems.length > 1 ? 's' : ''} uploaded to secure storage.
                                                                             </div>
                                                                         )}
-                                                                        {!item.media_asset_key && item.media_url && (
+                                                                        {mediaItems.length === 0 && !item.media_asset_key && item.media_url && (
                                                                             <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-700">
                                                                                 Legacy external media URL is still active.
                                                                             </div>
                                                                         )}
                                                                     </div>
+                                                                    {mediaItems.length > 0 && (
+                                                                        <div className="mt-2 space-y-2">
+                                                                            {mediaItems.map((mediaItem, mediaIndex) => {
+                                                                                const mediaType = normalizeQuickReplyMediaItemType(mediaItem.type, messageType);
+                                                                                const mediaSize = normalizeQuickReplyMediaSizeBytes(mediaItem.media_size_bytes);
+                                                                                const mediaFilename = normalizeQuickReplyMediaFilename(mediaItem.media_filename);
+                                                                                const mediaAssetKey = normalizeQuickReplyMediaAssetKey(mediaItem.media_asset_key);
+                                                                                const mediaUrl = normalizeQuickReplyMediaUrl(mediaItem.media_url);
+                                                                                const mediaLabel = mediaType === 'document'
+                                                                                    ? (mediaFilename || `document-${mediaIndex + 1}`)
+                                                                                    : `${mediaType}-${mediaIndex + 1}`;
+                                                                                return (
+                                                                                    <div
+                                                                                        key={`quick-reply-media-${item.id || 'new'}-${index}-${mediaIndex}`}
+                                                                                        className="rounded-xl border border-[#dfe6eb] bg-white px-3 py-2 text-[11px] text-[#4b5c68] flex items-center justify-between gap-3"
+                                                                                    >
+                                                                                        <div className="min-w-0">
+                                                                                            <div className="font-semibold text-[#1f2a33] truncate">{mediaLabel}</div>
+                                                                                            <div className="text-[#7a8b97] truncate">
+                                                                                                {mediaAssetKey ? 'Stored in secure storage' : (mediaUrl || 'Legacy media link')}
+                                                                                                {mediaSize ? ` • ${Math.ceil(mediaSize / 1024)} KB` : ''}
+                                                                                            </div>
+                                                                                        </div>
+                                                                                        <button
+                                                                                            type="button"
+                                                                                            onClick={() => handleRemoveQuickReplyMediaItem(index, mediaIndex)}
+                                                                                            disabled={!canManageFallback || quickRepliesSaving || item.ui_uploading}
+                                                                                            className="h-7 px-2 rounded-lg border border-rose-200 bg-rose-50 text-rose-600 text-[10px] font-semibold uppercase tracking-wide hover:bg-rose-100 transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                                                                                        >
+                                                                                            Remove
+                                                                                        </button>
+                                                                                    </div>
+                                                                                );
+                                                                            })}
+                                                                        </div>
+                                                                    )}
                                                                 </div>
                                                                 {messageType === 'document' && (
                                                                     <div className="md:col-span-12">
-                                                                        <label className="text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">Document Filename (optional)</label>
+                                                                        <label className="text-[10px] font-semibold uppercase tracking-wide text-[#7a8b97]">First Document Filename (optional)</label>
                                                                         <input
                                                                             type="text"
                                                                             className="mt-2 w-full bg-white border border-[#dfe6eb] rounded-lg px-3 py-2 text-sm text-[#111b21] focus:outline-none focus:border-[#00a884]"

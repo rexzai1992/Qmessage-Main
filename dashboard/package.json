@@ -6,13 +6,24 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "cap:copy": "npm run build && node scripts/cap-prep.mjs && npx cap copy",
+    "cap:sync": "npm run build && node scripts/cap-prep.mjs && npx cap sync",
+    "cap:doctor": "npx cap doctor",
+    "cap:add:android": "npx cap add android",
+    "cap:add:ios": "npx cap add ios",
+    "cap:open:android": "npx cap open android",
+    "cap:open:ios": "npx cap open ios"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@capacitor/android": "^7.6.1",
+    "@capacitor/core": "^7.6.1",
+    "@capacitor/ios": "^7.6.1",
+    "@capacitor/push-notifications": "^7.0.3",
     "@supabase/supabase-js": "^2.94.0",
     "@types/react": "^19.2.9",
     "@types/react-dom": "^19.2.3",
@@ -30,6 +41,7 @@
     "vite": "^7.3.1"
   },
   "devDependencies": {
+    "@capacitor/cli": "^7.6.1",
     "@tailwindcss/vite": "^4.1.18",
     "autoprefixer": "^10.4.24",
     "postcss": "^8.5.6",

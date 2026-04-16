@@ -1,0 +1,15 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Start services (backend + frontend + tunnel)",
+			"type": "shell",
+			"command": "npm.cmd run services:start",
+			"options": {
+				"cwd": "${workspaceFolder}"
+			},
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}

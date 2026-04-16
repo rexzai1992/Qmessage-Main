@@ -1,6 +1,6 @@
 
 import React, { useEffect, useRef, useState } from 'react';
-import { Plus, Trash2, Globe, Shield } from 'lucide-react';
+import { Plus, Trash2, Globe, Shield, PhoneCall, Bell } from 'lucide-react';
 import { getSocketUrl } from './runtimeConfig';
 import { supabase } from './supabase';
 import { uploadFileToCompanyStorage } from './features/media/uploadToCompanyStorage';
@@ -33,6 +33,61 @@ type ConversationalCommand = {
     command_description: string;
 };
 
+type CallStatus = 'ENABLED' | 'DISABLED';
+type CallIconVisibility = 'DEFAULT' | 'DISABLE_ALL';
+type CallbackPermissionStatus = 'ENABLED' | 'DISABLED';
+
+type CallSettingsFormState = {
+    status: CallStatus;
+    callIconVisibility: CallIconVisibility;
+    callbackPermissionStatus: CallbackPermissionStatus;
+    restrictToUserCountries: string;
+};
+
+type AdsShootModeState = {
+    enabled: boolean;
+    batchSize: number;
+    nightStartHour: number;
+    nightEndHour: number;
+    lastRunLocalDate: string | null;
+};
+
+type RuntimeDowntimeLog = {
+    id: string;
+    offline_from: string;
+    offline_until: string;
+    duration_ms: number;
+    reason: string;
+};
+
+type SystemRuntimeStatusState = {
+    online: boolean;
+    started_at: string;
+    current_time: string;
+    uptime_ms: number;
+    heartbeat_at: string | null;
+    maintenance: {
+        enabled: boolean;
+        message: string;
+        updated_at: string | null;
+        updated_by: string | null;
+    };
+    last_offline_at: string | null;
+    last_offline_ended_at: string | null;
+    last_offline_duration_ms: number | null;
+    downtime_log: RuntimeDowntimeLog[];
+};
+
+type BusinessProfileFormState = {
+    about: string;
+    address: string;
+    description: string;
+    email: string;
+    websites: string;
+    vertical: string;
+    profilePictureUrl: string;
+};
+
 const TEAM_DEPARTMENT_OPTIONS: Array<{ value: TeamDepartment; label: string }> = [
     { value: 'finance', label: 'Finance' },
     { value: 'sales', label: 'Sales' },
@@ -55,6 +110,13 @@ const COMMAND_DESCRIPTION_MAX_LENGTH = 256;
 const COMMAND_NAME_REGEX = /^[a-z0-9_-]+$/;
 const EMOJI_REGEX = /\p{Extended_Pictographic}/u;
 const DEFAULT_APP_LOGO_MAX_BYTES = 2 * 1024 * 1024;
+const DEFAULT_ADS_SHOOT_MODE_STATE: AdsShootModeState = {
+    enabled: false,
+    batchSize: 15,
+    nightStartHour: 20,
+    nightEndHour: 23,
+    lastRunLocalDate: null
+};
 
 const normalizeCommandName = (value: unknown): string =>
     (typeof value === 'string' ? value.trim() : '').replace(/^\/+/, '').toLowerCase();
@@ -90,6 +152,20 @@ const formatBytes = (value: number): string => {
     }
     const digits = amount >= 10 || unitIndex === 0 ? 0 : 1;
     return `${amount.toFixed(digits)} ${units[unitIndex]}`;
+};
+
+const formatDurationMs = (value: number | null | undefined): string => {
+    if (!Number.isFinite(Number(value)) || Number(value) <= 0) return '--';
+    const totalSeconds = Math.floor(Number(value) / 1000);
+    if (totalSeconds < 60) return `${totalSeconds}s`;
+    const totalMinutes = Math.floor(totalSeconds / 60);
+    if (totalMinutes < 60) return `${totalMinutes}m ${totalSeconds % 60}s`;
+    const totalHours = Math.floor(totalMinutes / 60);
+    const remainingMinutes = totalMinutes % 60;
+    if (totalHours < 24) return `${totalHours}h ${remainingMinutes}m`;
+    const totalDays = Math.floor(totalHours / 24);
+    const remainingHours = totalHours % 24;
+    return `${totalDays}d ${remainingHours}h`;
 };
 
 const sanitizeCommandInput = (value: unknown): ConversationalCommand[] => {
@@ -148,6 +224,7 @@ type WebhookViewProps = {
     profileId: string;
     sessionToken?: string | null;
     isAdmin?: boolean;
+    isSuperAdmin?: boolean;
     quickReplies: QuickReply[];
     quickRepliesLoading: boolean;
     quickRepliesSaving: boolean;
@@ -155,19 +232,32 @@ type WebhookViewProps = {
     onRefreshQuickReplies: () => void;
     onSaveQuickReplies: (items: QuickReply[]) => void;
     onRefreshUiControls: () => void;
+    showCallSettings?: boolean;
+    notificationPermission: NotificationPermission | 'unsupported';
+    notificationSoundEnabled: boolean;
+    onToggleNotificationSound: (enabled: boolean) => void;
+    onRequestNotifications: () => void;
+    onTestNotificationSound: () => void;
 };
 
 export default function WebhookView({
     profileId,
     sessionToken,
     isAdmin,
+    isSuperAdmin = false,
     quickReplies,
     quickRepliesLoading,
     quickRepliesSaving,
     quickRepliesError,
     onRefreshQuickReplies,
     onSaveQuickReplies,
-    onRefreshUiControls
+    onRefreshUiControls,
+    showCallSettings = true,
+    notificationPermission,
+    notificationSoundEnabled,
+    onToggleNotificationSound,
+    onRequestNotifications,
+    onTestNotificationSound
 }: WebhookViewProps) {
     const [webhooks, setWebhooks] = useState<any[]>([]);
     const [webhookError, setWebhookError] = useState<string | null>(null);
@@ -201,14 +291,42 @@ export default function WebhookView({
     const [reminderSaving, setReminderSaving] = useState(false);
     const [connectedBusinesses, setConnectedBusinesses] = useState<any[]>([]);
     const [connectedPaging, setConnectedPaging] = useState<any | null>(null);
-    const [connectedLoading, setConnectedLoading] = useState(Boolean(isAdmin));
+    const [connectedLoading, setConnectedLoading] = useState(Boolean(isSuperAdmin));
     const [connectedError, setConnectedError] = useState<string | null>(null);
     const [connectedAppId, setConnectedAppId] = useState('');
+    const [callSettingsLoading, setCallSettingsLoading] = useState(Boolean(sessionToken));
+    const [callSettingsSaving, setCallSettingsSaving] = useState(false);
+    const [callSettingsError, setCallSettingsError] = useState<string | null>(null);
+    const [callSettingsNotice, setCallSettingsNotice] = useState<string | null>(null);
+    const [callSettingsPhoneNumberId, setCallSettingsPhoneNumberId] = useState('');
+    const [includeSipCredentials, setIncludeSipCredentials] = useState(false);
+    const [callSettingsRaw, setCallSettingsRaw] = useState<any | null>(null);
+    const [callSettingsForm, setCallSettingsForm] = useState<CallSettingsFormState>({
+        status: 'DISABLED',
+        callIconVisibility: 'DEFAULT',
+        callbackPermissionStatus: 'DISABLED',
+        restrictToUserCountries: ''
+    });
+    const [businessProfileLoading, setBusinessProfileLoading] = useState(Boolean(sessionToken));
+    const [businessProfileSaving, setBusinessProfileSaving] = useState(false);
+    const [businessProfileUploading, setBusinessProfileUploading] = useState(false);
+    const [businessProfileError, setBusinessProfileError] = useState<string | null>(null);
+    const [businessProfileNotice, setBusinessProfileNotice] = useState<string | null>(null);
+    const [businessProfilePhoneNumberId, setBusinessProfilePhoneNumberId] = useState('');
+    const [businessProfileForm, setBusinessProfileForm] = useState<BusinessProfileFormState>({
+        about: '',
+        address: '',
+        description: '',
+        email: '',
+        websites: '',
+        vertical: '',
+        profilePictureUrl: ''
+    });
     const [quickRepliesDraft, setQuickRepliesDraft] = useState<QuickReply[]>([]);
     const [connectLoading, setConnectLoading] = useState(false);
     const [connectError, setConnectError] = useState<string | null>(null);
     const [clientConnections, setClientConnections] = useState<any[]>([]);
-    const [clientLoading, setClientLoading] = useState(Boolean(isAdmin));
+    const [clientLoading, setClientLoading] = useState(Boolean(isSuperAdmin));
     const [clientError, setClientError] = useState<string | null>(null);
     const [teamUsers, setTeamUsers] = useState<TeamUser[]>([]);
     const [teamLoading, setTeamLoading] = useState(Boolean(sessionToken));
@@ -270,6 +388,7 @@ export default function WebhookView({
   "vertical": "OTHER"
 }`);
     const [registrationBusy, setRegistrationBusy] = useState<null | 'request' | 'verify' | 'register' | 'profile'>(null);
+    const businessProfileFileInputRef = useRef<HTMLInputElement>(null);
     const appLogoFileInputRef = useRef<HTMLInputElement>(null);
     const [appLogoLoading, setAppLogoLoading] = useState(Boolean(sessionToken));
     const [appLogoUploading, setAppLogoUploading] = useState(false);
@@ -282,6 +401,19 @@ export default function WebhookView({
     const [appLogoFilename, setAppLogoFilename] = useState('');
     const [appLogoSizeBytes, setAppLogoSizeBytes] = useState<number | null>(null);
     const [appLogoMaxBytes, setAppLogoMaxBytes] = useState(DEFAULT_APP_LOGO_MAX_BYTES);
+    const [adsShootModeLoading, setAdsShootModeLoading] = useState(Boolean(sessionToken));
+    const [adsShootModeSaving, setAdsShootModeSaving] = useState(false);
+    const [adsShootModeRunning, setAdsShootModeRunning] = useState(false);
+    const [adsShootModeError, setAdsShootModeError] = useState<string | null>(null);
+    const [adsShootModeNotice, setAdsShootModeNotice] = useState<string | null>(null);
+    const [adsShootMode, setAdsShootMode] = useState<AdsShootModeState>({ ...DEFAULT_ADS_SHOOT_MODE_STATE });
+    const [systemRuntimeLoading, setSystemRuntimeLoading] = useState(Boolean(isSuperAdmin));
+    const [systemRuntimeSaving, setSystemRuntimeSaving] = useState(false);
+    const [systemRuntimeError, setSystemRuntimeError] = useState<string | null>(null);
+    const [systemRuntimeNotice, setSystemRuntimeNotice] = useState<string | null>(null);
+    const [systemRuntimeStatus, setSystemRuntimeStatus] = useState<SystemRuntimeStatusState | null>(null);
+    const [maintenanceEnabledDraft, setMaintenanceEnabledDraft] = useState(false);
+    const [maintenanceMessageDraft, setMaintenanceMessageDraft] = useState('');
     const showLegacyAutomationSettings = false;
 
     useEffect(() => {
@@ -289,16 +421,22 @@ export default function WebhookView({
         fetchWebhooks();
         fetchAutomation();
         fetchWindowReminder();
-        if (isAdmin) {
+        if (isSuperAdmin) {
             fetchConnectedBusinesses();
             fetchClientConnections();
+            fetchSystemRuntimeStatus();
         }
         if (sessionToken) {
             fetchRegistrationConfig();
             fetchTeamUsers();
+            if (showCallSettings) {
+                fetchCallSettings();
+            }
+            fetchBusinessProfile();
+            fetchAdsShootMode();
         }
         onRefreshQuickReplies();
-    }, [profileId, onRefreshQuickReplies, isAdmin, sessionToken]);
+    }, [profileId, onRefreshQuickReplies, isSuperAdmin, sessionToken, showCallSettings]);
 
     useEffect(() => {
         if (!sessionToken) return;
@@ -503,6 +641,116 @@ export default function WebhookView({
     useEffect(() => {
         fetchAppLogoSettings();
     }, [sessionToken]);
+
+    const applyAdsShootModePayload = (payload: any) => {
+        setAdsShootMode({
+            enabled: payload?.enabled === true,
+            batchSize: Number.isFinite(Number(payload?.batch_size)) ? Math.max(1, Math.floor(Number(payload.batch_size))) : 15,
+            nightStartHour: Number.isFinite(Number(payload?.night_start_hour)) ? Math.max(0, Math.min(23, Math.floor(Number(payload.night_start_hour)))) : 20,
+            nightEndHour: Number.isFinite(Number(payload?.night_end_hour)) ? Math.max(0, Math.min(23, Math.floor(Number(payload.night_end_hour)))) : 23,
+            lastRunLocalDate: typeof payload?.last_run_local_date === 'string' ? payload.last_run_local_date : null
+        });
+    };
+
+    const fetchAdsShootMode = async () => {
+        if (!sessionToken || !profileId) {
+            setAdsShootMode({ ...DEFAULT_ADS_SHOOT_MODE_STATE });
+            setAdsShootModeError(null);
+            setAdsShootModeNotice(null);
+            setAdsShootModeLoading(false);
+            return;
+        }
+        setAdsShootModeLoading(true);
+        setAdsShootModeError(null);
+        try {
+            const params = new URLSearchParams();
+            params.set('profileId', profileId);
+            const res = await fetch(`${SOCKET_URL}/api/company/ads-shoot-mode?${params.toString()}`, {
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`
+                }
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to load Ads Shoot Mode settings.');
+            }
+            applyAdsShootModePayload(data?.data || {});
+        } catch (error: any) {
+            setAdsShootModeError(error?.message || 'Failed to load Ads Shoot Mode settings.');
+        } finally {
+            setAdsShootModeLoading(false);
+        }
+    };
+
+    const handleSaveAdsShootMode = async () => {
+        if (!sessionToken || !profileId) return;
+        setAdsShootModeSaving(true);
+        setAdsShootModeError(null);
+        setAdsShootModeNotice(null);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/company/ads-shoot-mode`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    profileId,
+                    enabled: adsShootMode.enabled
+                })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to save Ads Shoot Mode settings.');
+            }
+            applyAdsShootModePayload(data?.data || {});
+            const cleanup = data?.data?.cleanup;
+            const cleanupUsers = Number.isFinite(Number(cleanup?.deleted_users)) ? Number(cleanup.deleted_users) : 0;
+            const cleanupMessages = Number.isFinite(Number(cleanup?.deleted_messages)) ? Number(cleanup.deleted_messages) : 0;
+            if (adsShootMode.enabled) {
+                setAdsShootModeNotice('Ads Shoot Mode enabled.');
+            } else if (cleanup && (cleanupUsers > 0 || cleanupMessages > 0)) {
+                setAdsShootModeNotice(`Ads Shoot Mode disabled. Cleared ${cleanupUsers} simulated contact(s) and ${cleanupMessages} message(s).`);
+            } else {
+                setAdsShootModeNotice('Ads Shoot Mode disabled.');
+            }
+        } catch (error: any) {
+            setAdsShootModeError(error?.message || 'Failed to save Ads Shoot Mode settings.');
+        } finally {
+            setAdsShootModeSaving(false);
+        }
+    };
+
+    const handleRunAdsShootModeNow = async () => {
+        if (!sessionToken || !profileId) return;
+        setAdsShootModeRunning(true);
+        setAdsShootModeError(null);
+        setAdsShootModeNotice(null);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/company/ads-shoot-mode/run`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    profileId
+                })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to run Ads Shoot Mode.');
+            }
+            const sent = Number.isFinite(Number(data?.data?.sent)) ? Number(data.data.sent) : 0;
+            const failed = Number.isFinite(Number(data?.data?.failed)) ? Number(data.data.failed) : 0;
+            setAdsShootModeNotice(`Injected ${sent} fake lead message(s)${failed > 0 ? `, ${failed} failed` : ''}.`);
+            await fetchAdsShootMode();
+        } catch (error: any) {
+            setAdsShootModeError(error?.message || 'Failed to run Ads Shoot Mode.');
+        } finally {
+            setAdsShootModeRunning(false);
+        }
+    };
 
     const handleConnectWhatsapp = async () => {
         if (!sessionToken) {
@@ -772,6 +1020,397 @@ export default function WebhookView({
         }
     };
 
+    const parseBusinessProfileError = (data: any, fallback: string): string => {
+        const message = readTrimmed(data?.error) || fallback;
+        const details = Array.isArray(data?.details)
+            ? data.details.map((item: any) => readTrimmed(item)).filter(Boolean)
+            : [];
+        if (!details.length) return message;
+        return `${message} (${details.join(', ')})`;
+    };
+
+    const applyBusinessProfilePayload = (payload: any) => {
+        const root = payload && typeof payload === 'object' ? payload : {};
+        const candidates = Array.isArray(root?.data)
+            ? root.data
+            : Array.isArray(root)
+                ? root
+                : [];
+        const first = candidates.length > 0 && candidates[0] && typeof candidates[0] === 'object'
+            ? candidates[0]
+            : root;
+        const websites = Array.isArray(first?.websites)
+            ? first.websites.map((item: any) => readTrimmed(item)).filter(Boolean)
+            : typeof first?.websites === 'string'
+                ? first.websites.split(/[\n,;]+/).map((item: string) => readTrimmed(item)).filter(Boolean)
+                : [];
+
+        setBusinessProfileForm({
+            about: readTrimmed(first?.about),
+            address: readTrimmed(first?.address),
+            description: readTrimmed(first?.description),
+            email: readTrimmed(first?.email),
+            websites: websites.join('\n'),
+            vertical: readTrimmed(first?.vertical),
+            profilePictureUrl: readTrimmed(first?.profile_picture_url)
+        });
+    };
+
+    const fetchBusinessProfile = async () => {
+        if (!sessionToken || !profileId) {
+            setBusinessProfileForm({
+                about: '',
+                address: '',
+                description: '',
+                email: '',
+                websites: '',
+                vertical: '',
+                profilePictureUrl: ''
+            });
+            setBusinessProfileError(null);
+            setBusinessProfileNotice(null);
+            setBusinessProfileLoading(false);
+            return;
+        }
+
+        setBusinessProfileLoading(true);
+        setBusinessProfileError(null);
+        try {
+            const params = new URLSearchParams();
+            params.set('profileId', profileId);
+            if (businessProfilePhoneNumberId.trim()) {
+                params.set('phoneNumberId', businessProfilePhoneNumberId.trim());
+            }
+            params.set('fields', 'about,address,description,email,profile_picture_url,websites,vertical');
+
+            const res = await fetch(`${SOCKET_URL}/api/waba/business-profile?${params.toString()}`, {
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`
+                }
+            });
+            const text = await res.text();
+            let data: any = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch {
+                data = null;
+            }
+
+            if (!res.ok || !data?.success) {
+                throw new Error(parseBusinessProfileError(data, 'Failed to load business profile.'));
+            }
+
+            applyBusinessProfilePayload(data?.data || {});
+        } catch (error: any) {
+            setBusinessProfileError(error?.message || 'Failed to load business profile.');
+        } finally {
+            setBusinessProfileLoading(false);
+        }
+    };
+
+    const handleSaveBusinessProfile = async () => {
+        if (!sessionToken || !profileId) return;
+        setBusinessProfileSaving(true);
+        setBusinessProfileError(null);
+        setBusinessProfileNotice(null);
+        try {
+            const websites = businessProfileForm.websites
+                .split(/[\n,;]+/)
+                .map((item) => readTrimmed(item))
+                .filter(Boolean);
+            const payload: any = {};
+
+            const about = readTrimmed(businessProfileForm.about);
+            const address = readTrimmed(businessProfileForm.address);
+            const description = readTrimmed(businessProfileForm.description);
+            const email = readTrimmed(businessProfileForm.email);
+            const vertical = readTrimmed(businessProfileForm.vertical).toUpperCase();
+
+            if (about) payload.about = about;
+            if (address) payload.address = address;
+            if (description) payload.description = description;
+            if (email) payload.email = email;
+            if (vertical) payload.vertical = vertical;
+            payload.websites = websites;
+
+            const body: any = {
+                profileId,
+                ...payload
+            };
+            if (businessProfilePhoneNumberId.trim()) {
+                body.phoneNumberId = businessProfilePhoneNumberId.trim();
+            }
+
+            const res = await fetch(`${SOCKET_URL}/api/waba/business-profile`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(body)
+            });
+            const text = await res.text();
+            let data: any = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch {
+                data = null;
+            }
+
+            if (!res.ok || !data?.success) {
+                throw new Error(parseBusinessProfileError(data, 'Failed to update business profile.'));
+            }
+
+            setBusinessProfileNotice('Business profile updated.');
+            await fetchBusinessProfile();
+        } catch (error: any) {
+            setBusinessProfileError(error?.message || 'Failed to update business profile.');
+        } finally {
+            setBusinessProfileSaving(false);
+        }
+    };
+
+    const uploadBusinessProfilePictureHandle = async (file: File): Promise<string> => {
+        if (!sessionToken) {
+            throw new Error('You must be logged in to upload profile picture.');
+        }
+        const params = new URLSearchParams();
+        params.set('profileId', profileId);
+        params.set('kind', 'image');
+        const res = await fetch(`${SOCKET_URL}/api/waba/template-media/upload-handle?${params.toString()}`, {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${sessionToken}`,
+                'Content-Type': 'application/octet-stream',
+                'x-file-name': file.name || 'profile_picture',
+                'x-file-type': file.type || 'application/octet-stream'
+            },
+            body: file
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data?.success) {
+            throw new Error(data?.error || 'Failed to upload profile picture.');
+        }
+        const handle = readTrimmed(data?.data?.headerHandle);
+        if (!handle) {
+            throw new Error('Upload completed but profile picture handle was not returned.');
+        }
+        return handle;
+    };
+
+    const handleUploadBusinessProfilePicture = async (file: File | null) => {
+        if (!file || !sessionToken || !profileId) return;
+        if (!file.type || !file.type.toLowerCase().startsWith('image/')) {
+            setBusinessProfileError('Please select an image file.');
+            return;
+        }
+        const maxBytes = 10 * 1024 * 1024;
+        if (file.size > maxBytes) {
+            setBusinessProfileError('Profile picture must be 10MB or smaller.');
+            return;
+        }
+
+        setBusinessProfileUploading(true);
+        setBusinessProfileError(null);
+        setBusinessProfileNotice(null);
+        try {
+            const profilePictureHandle = await uploadBusinessProfilePictureHandle(file);
+            const body: any = {
+                profileId,
+                profile_picture_handle: profilePictureHandle
+            };
+            if (businessProfilePhoneNumberId.trim()) {
+                body.phoneNumberId = businessProfilePhoneNumberId.trim();
+            }
+
+            const res = await fetch(`${SOCKET_URL}/api/waba/business-profile`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(body)
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data?.success) {
+                throw new Error(parseBusinessProfileError(data, 'Failed to update profile picture.'));
+            }
+
+            setBusinessProfileNotice('Profile picture updated.');
+            await fetchBusinessProfile();
+        } catch (error: any) {
+            setBusinessProfileError(error?.message || 'Failed to upload profile picture.');
+        } finally {
+            setBusinessProfileUploading(false);
+            if (businessProfileFileInputRef.current) {
+                businessProfileFileInputRef.current.value = '';
+            }
+        }
+    };
+
+    const parseCallSettingsError = (data: any, fallback: string): string => {
+        const message = readTrimmed(data?.error) || fallback;
+        const details = Array.isArray(data?.details)
+            ? data.details.map((item: any) => readTrimmed(item)).filter(Boolean)
+            : [];
+        if (!details.length) return message;
+        return `${message} (${details.join(', ')})`;
+    };
+
+    const normalizeCallStatus = (value: unknown): CallStatus => {
+        const normalized = readTrimmed(value).toUpperCase();
+        return normalized === 'ENABLED' ? 'ENABLED' : 'DISABLED';
+    };
+
+    const normalizeCallIconVisibility = (value: unknown): CallIconVisibility => {
+        const normalized = readTrimmed(value).toUpperCase();
+        return normalized === 'DISABLE_ALL' ? 'DISABLE_ALL' : 'DEFAULT';
+    };
+
+    const normalizeCallbackPermissionStatus = (value: unknown): CallbackPermissionStatus => {
+        const normalized = readTrimmed(value).toUpperCase();
+        return normalized === 'ENABLED' ? 'ENABLED' : 'DISABLED';
+    };
+
+    const parseRestrictedCountries = (value: unknown): string[] => {
+        if (!Array.isArray(value)) return [];
+        return value
+            .map((item) => readTrimmed(item).toUpperCase())
+            .filter(Boolean);
+    };
+
+    const applyCallSettingsPayload = (payload: any) => {
+        const data = payload && typeof payload === 'object' ? payload : {};
+        const calling = data?.calling && typeof data.calling === 'object' && !Array.isArray(data.calling)
+            ? data.calling
+            : {};
+        const countries = parseRestrictedCountries(calling?.call_icons?.restrict_to_user_countries);
+
+        setCallSettingsRaw(data);
+        setCallSettingsForm({
+            status: normalizeCallStatus(calling?.status),
+            callIconVisibility: normalizeCallIconVisibility(calling?.call_icon_visibility),
+            callbackPermissionStatus: normalizeCallbackPermissionStatus(calling?.callback_permission_status),
+            restrictToUserCountries: countries.join(', ')
+        });
+    };
+
+    const fetchCallSettings = async () => {
+        if (!sessionToken || !profileId) {
+            setCallSettingsRaw(null);
+            setCallSettingsForm({
+                status: 'DISABLED',
+                callIconVisibility: 'DEFAULT',
+                callbackPermissionStatus: 'DISABLED',
+                restrictToUserCountries: ''
+            });
+            setCallSettingsError(null);
+            setCallSettingsNotice(null);
+            setCallSettingsLoading(false);
+            return;
+        }
+
+        setCallSettingsLoading(true);
+        setCallSettingsError(null);
+        try {
+            const params = new URLSearchParams();
+            params.set('profileId', profileId);
+            if (callSettingsPhoneNumberId.trim()) {
+                params.set('phoneNumberId', callSettingsPhoneNumberId.trim());
+            }
+            if (includeSipCredentials) {
+                params.set('include_sip_credentials', 'true');
+            }
+
+            const res = await fetch(`${SOCKET_URL}/api/waba/call-settings?${params.toString()}`, {
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`
+                }
+            });
+            const text = await res.text();
+            let data: any = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch {
+                data = null;
+            }
+            if (!res.ok || !data?.success) {
+                throw new Error(parseCallSettingsError(data, 'Failed to load call settings.'));
+            }
+
+            applyCallSettingsPayload(data?.data || {});
+        } catch (error: any) {
+            setCallSettingsError(error?.message || 'Failed to load call settings.');
+            setCallSettingsRaw(null);
+        } finally {
+            setCallSettingsLoading(false);
+        }
+    };
+
+    const handleSaveCallSettings = async () => {
+        if (!sessionToken || !profileId) return;
+        setCallSettingsSaving(true);
+        setCallSettingsError(null);
+        setCallSettingsNotice(null);
+        try {
+            const countries = callSettingsForm.restrictToUserCountries
+                .split(/[\n,;\s]+/)
+                .map((item) => readTrimmed(item).toUpperCase())
+                .filter(Boolean);
+            const existingCalling = callSettingsRaw?.calling && typeof callSettingsRaw.calling === 'object' && !Array.isArray(callSettingsRaw.calling)
+                ? callSettingsRaw.calling
+                : {};
+            const existingCallIcons = existingCalling?.call_icons && typeof existingCalling.call_icons === 'object' && !Array.isArray(existingCalling.call_icons)
+                ? existingCalling.call_icons
+                : {};
+
+            const payload = {
+                ...existingCalling,
+                status: callSettingsForm.status,
+                call_icon_visibility: callSettingsForm.callIconVisibility,
+                callback_permission_status: callSettingsForm.callbackPermissionStatus,
+                call_icons: {
+                    ...existingCallIcons,
+                    restrict_to_user_countries: countries
+                }
+            };
+
+            const body: any = {
+                profileId,
+                calling: payload
+            };
+            if (callSettingsPhoneNumberId.trim()) {
+                body.phoneNumberId = callSettingsPhoneNumberId.trim();
+            }
+
+            const res = await fetch(`${SOCKET_URL}/api/waba/call-settings`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(body)
+            });
+            const text = await res.text();
+            let data: any = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch {
+                data = null;
+            }
+            if (!res.ok || !data?.success) {
+                throw new Error(parseCallSettingsError(data, 'Failed to save call settings.'));
+            }
+
+            setCallSettingsNotice('Call settings updated.');
+            await fetchCallSettings();
+        } catch (error: any) {
+            setCallSettingsError(error?.message || 'Failed to save call settings.');
+        } finally {
+            setCallSettingsSaving(false);
+        }
+    };
+
     const fetchClientConnections = () => {
         if (!sessionToken) {
             setClientConnections([]);
@@ -801,6 +1440,119 @@ export default function WebhookView({
                 }
             })
             .finally(() => setClientLoading(false));
+    };
+
+    const normalizeSystemRuntimeStatus = (value: any): SystemRuntimeStatusState | null => {
+        if (!value || typeof value !== 'object') return null;
+        const maintenanceRaw = value.maintenance && typeof value.maintenance === 'object' ? value.maintenance : {};
+        const downtimeRaw = Array.isArray(value.downtime_log) ? value.downtime_log : [];
+        return {
+            online: value.online === true,
+            started_at: readTrimmed(value.started_at),
+            current_time: readTrimmed(value.current_time),
+            uptime_ms: Number.isFinite(Number(value.uptime_ms)) ? Math.max(0, Math.floor(Number(value.uptime_ms))) : 0,
+            heartbeat_at: readTrimmed(value.heartbeat_at) || null,
+            maintenance: {
+                enabled: maintenanceRaw.enabled === true,
+                message: readTrimmed(maintenanceRaw.message),
+                updated_at: readTrimmed(maintenanceRaw.updated_at) || null,
+                updated_by: readTrimmed(maintenanceRaw.updated_by) || null
+            },
+            last_offline_at: readTrimmed(value.last_offline_at) || null,
+            last_offline_ended_at: readTrimmed(value.last_offline_ended_at) || null,
+            last_offline_duration_ms: Number.isFinite(Number(value.last_offline_duration_ms))
+                ? Math.max(0, Math.floor(Number(value.last_offline_duration_ms)))
+                : null,
+            downtime_log: downtimeRaw.map((entry: any, index: number) => ({
+                id: readTrimmed(entry?.id) || `downtime-${index}`,
+                offline_from: readTrimmed(entry?.offline_from),
+                offline_until: readTrimmed(entry?.offline_until),
+                duration_ms: Number.isFinite(Number(entry?.duration_ms))
+                    ? Math.max(0, Math.floor(Number(entry.duration_ms)))
+                    : 0,
+                reason: readTrimmed(entry?.reason) || 'server_unavailable'
+            }))
+        };
+    };
+
+    const fetchSystemRuntimeStatus = () => {
+        if (!sessionToken || !profileId || !isSuperAdmin) {
+            setSystemRuntimeStatus(null);
+            setSystemRuntimeLoading(false);
+            setSystemRuntimeError(null);
+            return;
+        }
+        setSystemRuntimeLoading(true);
+        setSystemRuntimeError(null);
+        setSystemRuntimeNotice(null);
+        fetch(`${SOCKET_URL}/api/waba/system-runtime-status?profileId=${encodeURIComponent(profileId)}`, {
+            headers: { Authorization: `Bearer ${sessionToken}` }
+        })
+            .then(async (res) => {
+                const text = await res.text();
+                try {
+                    return JSON.parse(text);
+                } catch {
+                    console.error('System runtime status fetch failed:', text);
+                    return null;
+                }
+            })
+            .then((data) => {
+                if (!data?.success) {
+                    setSystemRuntimeStatus(null);
+                    setSystemRuntimeError(data?.error || 'Failed to load system runtime status');
+                    return;
+                }
+                const normalized = normalizeSystemRuntimeStatus(data?.data);
+                setSystemRuntimeStatus(normalized);
+                if (normalized) {
+                    setMaintenanceEnabledDraft(normalized.maintenance.enabled);
+                    setMaintenanceMessageDraft(normalized.maintenance.message || '');
+                }
+            })
+            .finally(() => setSystemRuntimeLoading(false));
+    };
+
+    const handleSaveMaintenanceMode = async () => {
+        if (!sessionToken || !profileId || !isSuperAdmin) return;
+        setSystemRuntimeSaving(true);
+        setSystemRuntimeError(null);
+        setSystemRuntimeNotice(null);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/waba/system-maintenance-mode`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    profileId,
+                    enabled: maintenanceEnabledDraft,
+                    message: maintenanceMessageDraft
+                })
+            });
+            const text = await res.text();
+            let data: any = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch {
+                data = null;
+            }
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to update maintenance mode');
+            }
+            const normalized = normalizeSystemRuntimeStatus(data?.data);
+            setSystemRuntimeStatus(normalized);
+            if (normalized) {
+                setMaintenanceEnabledDraft(normalized.maintenance.enabled);
+                setMaintenanceMessageDraft(normalized.maintenance.message || '');
+            }
+            setSystemRuntimeNotice('Maintenance mode updated.');
+        } catch (error: any) {
+            setSystemRuntimeError(error?.message || 'Failed to update maintenance mode');
+        } finally {
+            setSystemRuntimeSaving(false);
+        }
     };
 
     const handleDisconnectClient = async (targetProfileId: string, revoke = false) => {
@@ -1202,6 +1954,9 @@ export default function WebhookView({
     };
 
     const canManageTeam = teamCurrentRole === 'owner' || teamCurrentRole === 'admin';
+    const callRestrictions = Array.isArray(callSettingsRaw?.calling?.restrictions?.restrictions_list)
+        ? callSettingsRaw.calling.restrictions.restrictions_list
+        : [];
 
     const handleInviteTeamUser = async () => {
         if (!sessionToken) return;
@@ -1334,6 +2089,26 @@ export default function WebhookView({
         }
     };
 
+    const notificationPermissionLabel =
+        notificationPermission === 'granted'
+            ? 'Browser notifications: allowed'
+            : notificationPermission === 'denied'
+                ? 'Browser notifications: blocked'
+                : notificationPermission === 'default'
+                    ? 'Browser notifications: not requested'
+                    : 'Browser notifications: unsupported';
+
+    const notificationPermissionToneClass =
+        notificationPermission === 'granted'
+            ? 'text-emerald-700 bg-emerald-50 border-emerald-200'
+            : notificationPermission === 'denied'
+                ? 'text-rose-700 bg-rose-50 border-rose-200'
+                : 'text-[#54656f] bg-[#f0f2f5] border-[#eceff1]';
+    const settingsSectionCardClass = 'bg-white rounded-[24px] border border-[#eceff1] p-6 sm:p-7 shadow-[0_8px_30px_rgba(0,0,0,0.04)]';
+    const settingsInnerPanelClass = 'bg-[#fcfdfd] border border-[#eceff1] rounded-[20px] p-5';
+    const settingsInnerPanelCompactClass = 'bg-[#fcfdfd] border border-[#eceff1] rounded-[20px] p-4';
+    const settingsInnerTableShellClass = 'bg-[#fcfdfd] border border-[#eceff1] rounded-[20px] overflow-hidden';
+
     return (
         <div className="flex-1 bg-[#fcfdfd] p-10 overflow-y-auto text-[#111b21] h-full font-sans">
             <h2 className="text-3xl font-black mb-10 flex items-center gap-4 tracking-tight">
@@ -1343,7 +2118,7 @@ export default function WebhookView({
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-10">
                 {/* Embedded Signup Section */}
-                <div id="settings-connect" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                <div id="settings-connect" className={settingsSectionCardClass}>
                     <div className="flex items-center gap-3 mb-4">
                         <Shield className="w-6 h-6 text-[#00a884]" />
                         <h3 className="text-xl text-[#111b21] font-bold">Connect WhatsApp Business</h3>
@@ -1368,7 +2143,7 @@ export default function WebhookView({
                 </div>
 
                 {/* Manual Setup Section */}
-                <div id="settings-manual" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                <div id="settings-manual" className={settingsSectionCardClass}>
                     <div className="flex items-center gap-3 mb-4">
                         <Shield className="w-6 h-6 text-[#00a884]" />
                         <h3 className="text-xl text-[#111b21] font-bold">Manual WABA Setup</h3>
@@ -1464,7 +2239,7 @@ export default function WebhookView({
                 </div>
 
                 {/* Number Registration Section */}
-                <div id="settings-register" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                <div id="settings-register" className={settingsSectionCardClass}>
                     <div className="flex items-center gap-3 mb-4">
                         <Shield className="w-6 h-6 text-[#00a884]" />
                         <h3 className="text-xl text-[#111b21] font-bold">Register WhatsApp Number</h3>
@@ -1487,7 +2262,7 @@ export default function WebhookView({
                 </div>
 
                 {/* Webhooks Section */}
-                <div id="settings-webhooks" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                <div id="settings-webhooks" className={settingsSectionCardClass}>
                     <h3 className="text-xl mb-2 text-[#111b21] font-bold">Outgoing Webhooks</h3>
                     <p className="text-sm text-[#54656f] mb-2 font-medium">Configure endpoints to receive real-time updates from this profile.</p>
                     <p className="text-xs text-[#8696a0] mb-6 font-semibold">Active profile: {profileId}</p>
@@ -1511,7 +2286,7 @@ export default function WebhookView({
                             </div>
                         )}
                         {!webhookLoading && webhooksLoaded && webhooks.map((hook, i) => (
-                            <div key={i} className="bg-[#fcfdfd] p-5 rounded-2xl flex items-start justify-between border border-[#eceff1] group hover:border-[#00a884]/30 transition-all">
+                            <div key={i} className={`${settingsInnerPanelClass} flex items-start justify-between group hover:border-[#00a884]/30 transition-all`}>
                                 <div className="min-w-0 pr-4">
                                     <div className="font-mono text-sm break-all mb-2 text-[#111b21] font-bold leading-relaxed">{hook.url}</div>
                                     <div className="flex gap-2 flex-wrap">
@@ -1565,9 +2340,427 @@ export default function WebhookView({
                     </div>
                 </div>
 
-                {/* API Keys Section Removed */}
+                <div id="settings-ads-shoot" className={settingsSectionCardClass}>
+                    <div className="flex items-center justify-between gap-4 mb-5">
+                        <div className="flex items-center gap-3">
+                            <Globe className="w-6 h-6 text-[#00a884]" />
+                            <div>
+                                <h3 className="text-xl text-[#111b21] font-bold">Ads Shoot Mode</h3>
+                                <p className="text-sm text-[#54656f] font-medium mt-1">
+                                    Inject 15 fake lead messages at night ({adsShootMode.nightStartHour}:00-{adsShootMode.nightEndHour}:59), once per night.
+                                </p>
+                            </div>
+                        </div>
+                        <input
+                            type="checkbox"
+                            checked={adsShootMode.enabled}
+                            onChange={(e) => setAdsShootMode(prev => ({ ...prev, enabled: e.target.checked }))}
+                            disabled={!sessionToken || adsShootModeSaving || adsShootModeLoading || !isAdmin}
+                            className="w-4 h-4 accent-[#00a884]"
+                        />
+                    </div>
 
-                <div id="settings-branding" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)]">
+                    <div className={settingsInnerPanelClass}>
+                        <p className="text-sm font-bold text-[#111b21]">Lead simulation examples</p>
+                        <p className="text-xs text-[#54656f] font-medium mt-1">
+                            "Hi, how much is monthly membership?", "Do you have free trial?", "Can I join tonight?", "Is there personal trainer?"
+                        </p>
+                        <p className="text-xs text-[#54656f] font-semibold mt-3">
+                            Last nightly run: {adsShootMode.lastRunLocalDate || 'not yet'}
+                        </p>
+                    </div>
+
+                    <div className="mt-5 flex flex-wrap items-center gap-3">
+                        <button
+                            type="button"
+                            onClick={handleSaveAdsShootMode}
+                            disabled={!sessionToken || adsShootModeSaving || adsShootModeLoading || !isAdmin}
+                            className="bg-[#00a884] hover:bg-[#008f6f] text-white px-4 py-2.5 rounded-xl text-xs font-bold uppercase tracking-widest transition-all disabled:opacity-50"
+                        >
+                            {adsShootModeSaving ? 'Saving...' : 'Save Ads Shoot Mode'}
+                        </button>
+                        <button
+                            type="button"
+                            onClick={handleRunAdsShootModeNow}
+                            disabled={!sessionToken || adsShootModeRunning || adsShootModeLoading || !isAdmin}
+                            className="bg-[#111b21] hover:bg-[#202c33] text-white px-4 py-2.5 rounded-xl text-xs font-bold uppercase tracking-widest transition-all disabled:opacity-50"
+                        >
+                            {adsShootModeRunning ? 'Running...' : 'Run 15 Leads Now'}
+                        </button>
+                        {adsShootModeLoading && (
+                            <span className="text-xs text-[#8696a0] font-semibold uppercase tracking-widest">Loading...</span>
+                        )}
+                        {!isAdmin && (
+                            <span className="text-xs text-[#8696a0] font-semibold">Admin access required to update this mode.</span>
+                        )}
+                    </div>
+
+                    {adsShootModeError && (
+                        <p className="text-sm text-rose-600 mt-4 font-semibold">{adsShootModeError}</p>
+                    )}
+                    {adsShootModeNotice && (
+                        <p className="text-sm text-emerald-600 mt-4 font-semibold">{adsShootModeNotice}</p>
+                    )}
+                </div>
+
+                <div id="settings-notifications" className={settingsSectionCardClass}>
+                    <div className="flex items-center justify-between gap-4 mb-5">
+                        <div className="flex items-center gap-3">
+                            <Bell className="w-6 h-6 text-[#00a884]" />
+                            <div>
+                                <h3 className="text-xl text-[#111b21] font-bold">Notifications</h3>
+                                <p className="text-sm text-[#54656f] font-medium mt-1">
+                                    Control browser alerts and iPhone Glass sound for new messages.
+                                </p>
+                            </div>
+                        </div>
+                        <div className={`text-[11px] font-bold px-3 py-2 rounded-xl border ${notificationPermissionToneClass}`}>
+                            {notificationPermissionLabel}
+                        </div>
+                    </div>
+
+                    <div className={settingsInnerPanelClass}>
+                        <div className="flex items-center justify-between gap-4">
+                            <div>
+                                <p className="text-sm font-bold text-[#111b21]">iPhone Glass Sound</p>
+                                <p className="text-xs text-[#54656f] font-medium mt-1">
+                                    Play the chime when incoming chat notifications arrive.
+                                </p>
+                            </div>
+                            <input
+                                type="checkbox"
+                                checked={notificationSoundEnabled}
+                                onChange={(e) => onToggleNotificationSound(e.target.checked)}
+                                className="w-4 h-4 accent-[#00a884]"
+                            />
+                        </div>
+                    </div>
+
+                    <div className="mt-5 flex flex-wrap items-center gap-3">
+                        {notificationPermission !== 'granted' && notificationPermission !== 'unsupported' && (
+                            <button
+                                type="button"
+                                onClick={onRequestNotifications}
+                                className="text-xs font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-3 py-2 rounded-xl hover:bg-[#00a884]/5 transition-all"
+                            >
+                                Enable Browser Notifications
+                            </button>
+                        )}
+                    </div>
+                </div>
+
+                {showCallSettings && (
+                <div id="settings-calls" className={settingsSectionCardClass}>
+                    <div className="flex items-center justify-between gap-3 mb-5">
+                        <div className="flex items-center gap-3">
+                            <PhoneCall className="w-6 h-6 text-[#00a884]" />
+                            <div>
+                                <h3 className="text-xl text-[#111b21] font-bold">Call Settings</h3>
+                                <p className="text-sm text-[#54656f] font-medium mt-1">
+                                    Configure WhatsApp Calling API behavior for this profile.
+                                </p>
+                            </div>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={fetchCallSettings}
+                            disabled={callSettingsLoading || callSettingsSaving || !sessionToken}
+                            className="text-xs font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-3 py-2 rounded-xl hover:bg-[#00a884]/5 transition-all disabled:opacity-50"
+                        >
+                            Refresh
+                        </button>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                        <div className="lg:col-span-2">
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Phone Number ID (optional)</label>
+                            <input
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20 focus:border-[#00a884] text-[#111b21] font-bold placeholder-[#aebac1]"
+                                placeholder="Leave empty to use phoneNumberId from profile config"
+                                value={callSettingsPhoneNumberId}
+                                onChange={e => setCallSettingsPhoneNumberId(e.target.value)}
+                                disabled={callSettingsSaving}
+                            />
+                        </div>
+
+                        <div>
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Calling Status</label>
+                            <select
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-bold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                value={callSettingsForm.status}
+                                onChange={e => setCallSettingsForm(prev => ({ ...prev, status: (e.target.value as CallStatus) || 'DISABLED' }))}
+                                disabled={callSettingsLoading || callSettingsSaving}
+                            >
+                                <option value="ENABLED">ENABLED</option>
+                                <option value="DISABLED">DISABLED</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Call Icon Visibility</label>
+                            <select
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-bold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                value={callSettingsForm.callIconVisibility}
+                                onChange={e => setCallSettingsForm(prev => ({ ...prev, callIconVisibility: (e.target.value as CallIconVisibility) || 'DEFAULT' }))}
+                                disabled={callSettingsLoading || callSettingsSaving}
+                            >
+                                <option value="DEFAULT">DEFAULT</option>
+                                <option value="DISABLE_ALL">DISABLE_ALL</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Callback Permission</label>
+                            <select
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-bold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                value={callSettingsForm.callbackPermissionStatus}
+                                onChange={e => setCallSettingsForm(prev => ({ ...prev, callbackPermissionStatus: (e.target.value as CallbackPermissionStatus) || 'DISABLED' }))}
+                                disabled={callSettingsLoading || callSettingsSaving}
+                            >
+                                <option value="ENABLED">ENABLED</option>
+                                <option value="DISABLED">DISABLED</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Restrict Call Icons To Countries</label>
+                            <input
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20 focus:border-[#00a884] text-[#111b21] font-bold placeholder-[#aebac1]"
+                                placeholder="US, BR"
+                                value={callSettingsForm.restrictToUserCountries}
+                                onChange={e => setCallSettingsForm(prev => ({ ...prev, restrictToUserCountries: e.target.value }))}
+                                disabled={callSettingsLoading || callSettingsSaving}
+                            />
+                        </div>
+                    </div>
+
+                    <div className="mt-4 flex items-center gap-3">
+                        <label className="inline-flex items-center gap-2 text-xs font-bold text-[#54656f] uppercase tracking-widest cursor-pointer">
+                            <input
+                                type="checkbox"
+                                checked={includeSipCredentials}
+                                onChange={e => setIncludeSipCredentials(e.target.checked)}
+                                disabled={callSettingsLoading || callSettingsSaving}
+                                className="w-4 h-4 accent-[#00a884]"
+                            />
+                            Include SIP Credentials On Refresh
+                        </label>
+                    </div>
+
+                    <p className="mt-3 text-[11px] text-[#8696a0] leading-relaxed">
+                        Save sends the <code className="font-mono">calling</code> object and preserves existing unknown fields from the latest fetch.
+                    </p>
+
+                    {callRestrictions.length > 0 && (
+                        <div className="mt-4 bg-amber-50 border border-amber-200 rounded-2xl p-4">
+                            <p className="text-xs font-bold uppercase tracking-widest text-amber-700 mb-2">Current Restrictions</p>
+                            <div className="space-y-2">
+                                {callRestrictions.map((item: any, index: number) => (
+                                    <div key={`${item?.type || 'restriction'}-${index}`} className="text-xs text-amber-800">
+                                        <span className="font-bold">{readTrimmed(item?.type) || 'Restriction'}:</span> {readTrimmed(item?.reason) || 'No reason provided'}
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+
+                    {callSettingsError && (
+                        <div className="mt-4 bg-rose-50 border border-rose-200 text-rose-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                            {callSettingsError}
+                        </div>
+                    )}
+                    {callSettingsNotice && (
+                        <div className="mt-4 bg-emerald-50 border border-emerald-200 text-emerald-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                            {callSettingsNotice}
+                        </div>
+                    )}
+
+                    <div className="mt-5 flex items-center gap-3">
+                        <button
+                            type="button"
+                            onClick={handleSaveCallSettings}
+                            disabled={!sessionToken || callSettingsLoading || callSettingsSaving}
+                            className="bg-[#111b21] hover:bg-[#202c33] text-white px-5 py-3 rounded-2xl font-bold transition-all disabled:opacity-50"
+                        >
+                            {callSettingsSaving ? 'Saving...' : 'Save Call Settings'}
+                        </button>
+                        {callSettingsLoading && (
+                            <span className="text-xs text-[#8696a0] font-semibold uppercase tracking-widest">Loading current settings...</span>
+                        )}
+                    </div>
+                </div>
+                )}
+
+                <div id="settings-business-profile" className={settingsSectionCardClass}>
+                    <div className="flex items-center justify-between gap-3 mb-5">
+                        <div>
+                            <h3 className="text-xl text-[#111b21] font-bold">Business Profile</h3>
+                            <p className="text-sm text-[#54656f] font-medium mt-1">
+                                Edit your WhatsApp business status/about, address, description, email, websites and category.
+                            </p>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={fetchBusinessProfile}
+                            disabled={businessProfileLoading || businessProfileSaving || businessProfileUploading || !sessionToken}
+                            className="text-xs font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-3 py-2 rounded-xl hover:bg-[#00a884]/5 transition-all disabled:opacity-50"
+                        >
+                            Refresh
+                        </button>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                        <div className="lg:col-span-2">
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Current Profile Picture</label>
+                            <div className="mt-3 h-40 w-full rounded-2xl border border-[#eceff1] bg-[#f8f9fa] flex items-center justify-center overflow-hidden">
+                                {businessProfileForm.profilePictureUrl ? (
+                                    <img
+                                        src={businessProfileForm.profilePictureUrl}
+                                        alt="Current WhatsApp profile picture"
+                                        className="h-full w-auto max-w-full object-contain"
+                                        loading="lazy"
+                                    />
+                                ) : (
+                                    <span className="text-[11px] font-bold uppercase tracking-widest text-[#8696a0]">No Profile Picture</span>
+                                )}
+                            </div>
+                            <input
+                                ref={businessProfileFileInputRef}
+                                type="file"
+                                accept="image/*"
+                                className="hidden"
+                                onChange={(event) => {
+                                    const file = event.target.files?.[0] || null;
+                                    void handleUploadBusinessProfilePicture(file);
+                                }}
+                            />
+                            <div className="mt-3 flex items-center gap-3">
+                                <button
+                                    type="button"
+                                    onClick={() => businessProfileFileInputRef.current?.click()}
+                                    disabled={!sessionToken || businessProfileLoading || businessProfileSaving || businessProfileUploading}
+                                    className="bg-[#00a884] hover:bg-[#008f6f] text-white px-4 py-2.5 rounded-xl font-bold transition-all disabled:opacity-50"
+                                >
+                                    {businessProfileUploading ? 'Uploading...' : 'Upload Picture'}
+                                </button>
+                                <span className="text-[11px] text-[#8696a0] font-medium">JPG/PNG/WebP, max 10MB</span>
+                            </div>
+                            <p className="mt-2 text-[11px] text-[#8696a0] break-all">
+                                URL: <span className="font-mono">{businessProfileForm.profilePictureUrl || '—'}</span>
+                            </p>
+                        </div>
+
+                        <div className="lg:col-span-2">
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Websites (one per line)</label>
+                            <textarea
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884] min-h-[90px]"
+                                placeholder="https://company.com"
+                                value={businessProfileForm.websites}
+                                onChange={e => setBusinessProfileForm(prev => ({ ...prev, websites: e.target.value }))}
+                                disabled={businessProfileLoading || businessProfileSaving || businessProfileUploading}
+                            />
+                        </div>
+
+                        <div className="lg:col-span-2">
+                            <p className="text-[11px] text-[#8696a0] leading-relaxed">
+                                Display/verified name is managed in WhatsApp Manager (Meta), not from this form.
+                            </p>
+                        </div>
+
+                        <div className="lg:col-span-2">
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Phone Number ID (optional)</label>
+                            <input
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20 focus:border-[#00a884] text-[#111b21] font-bold placeholder-[#aebac1]"
+                                placeholder="Leave empty to use phoneNumberId from profile config"
+                                value={businessProfilePhoneNumberId}
+                                onChange={e => setBusinessProfilePhoneNumberId(e.target.value)}
+                                disabled={businessProfileSaving || businessProfileUploading}
+                            />
+                        </div>
+
+                        <div>
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Status / About</label>
+                            <input
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                placeholder="Available now"
+                                value={businessProfileForm.about}
+                                onChange={e => setBusinessProfileForm(prev => ({ ...prev, about: e.target.value }))}
+                                disabled={businessProfileLoading || businessProfileSaving || businessProfileUploading}
+                            />
+                        </div>
+
+                        <div>
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Email</label>
+                            <input
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                placeholder="support@company.com"
+                                value={businessProfileForm.email}
+                                onChange={e => setBusinessProfileForm(prev => ({ ...prev, email: e.target.value }))}
+                                disabled={businessProfileLoading || businessProfileSaving || businessProfileUploading}
+                            />
+                        </div>
+
+                        <div className="lg:col-span-2">
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Address</label>
+                            <input
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                placeholder="1 Hacker Way, Menlo Park, CA"
+                                value={businessProfileForm.address}
+                                onChange={e => setBusinessProfileForm(prev => ({ ...prev, address: e.target.value }))}
+                                disabled={businessProfileLoading || businessProfileSaving || businessProfileUploading}
+                            />
+                        </div>
+
+                        <div className="lg:col-span-2">
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Description</label>
+                            <textarea
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884] min-h-[96px]"
+                                placeholder="Tell customers about your business."
+                                value={businessProfileForm.description}
+                                onChange={e => setBusinessProfileForm(prev => ({ ...prev, description: e.target.value }))}
+                                disabled={businessProfileLoading || businessProfileSaving || businessProfileUploading}
+                            />
+                        </div>
+
+                        <div>
+                            <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Vertical</label>
+                            <input
+                                className="mt-3 w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                placeholder="RETAIL"
+                                value={businessProfileForm.vertical}
+                                onChange={e => setBusinessProfileForm(prev => ({ ...prev, vertical: e.target.value.toUpperCase() }))}
+                                disabled={businessProfileLoading || businessProfileSaving || businessProfileUploading}
+                            />
+                        </div>
+                    </div>
+
+                    {businessProfileError && (
+                        <div className="mt-4 bg-rose-50 border border-rose-200 text-rose-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                            {businessProfileError}
+                        </div>
+                    )}
+                    {businessProfileNotice && (
+                        <div className="mt-4 bg-emerald-50 border border-emerald-200 text-emerald-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                            {businessProfileNotice}
+                        </div>
+                    )}
+
+                    <div className="mt-5 flex items-center gap-3">
+                        <button
+                            type="button"
+                            onClick={handleSaveBusinessProfile}
+                            disabled={!sessionToken || businessProfileLoading || businessProfileSaving || businessProfileUploading}
+                            className="bg-[#111b21] hover:bg-[#202c33] text-white px-5 py-3 rounded-2xl font-bold transition-all disabled:opacity-50"
+                        >
+                            {businessProfileSaving ? 'Saving...' : 'Save Business Profile'}
+                        </button>
+                        {businessProfileLoading && (
+                            <span className="text-xs text-[#8696a0] font-semibold uppercase tracking-widest">Loading profile...</span>
+                        )}
+                    </div>
+                </div>
+
+                <div id="settings-branding" className={settingsSectionCardClass}>
                     <div className="flex items-center justify-between gap-3 mb-5">
                         <div>
                             <h3 className="text-xl text-[#111b21] font-bold">App Logo</h3>
@@ -1585,7 +2778,7 @@ export default function WebhookView({
                         </button>
                     </div>
 
-                    <div className="bg-[#fcfdfd] border border-[#eceff1] rounded-2xl p-4 mb-4">
+                    <div className={`${settingsInnerPanelCompactClass} mb-4`}>
                         <div className="text-[11px] font-bold uppercase tracking-widest text-[#54656f] mb-2">
                             Preview
                         </div>
@@ -1657,7 +2850,7 @@ export default function WebhookView({
                 </div>
 
                 {/* Conversational Components */}
-                <div id="settings-conversational" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                <div id="settings-conversational" className={`${settingsSectionCardClass} lg:col-span-2`}>
                     <div className="flex items-center justify-between mb-6">
                         <div>
                             <h3 className="text-xl text-[#111b21] font-bold">Conversational Components</h3>
@@ -1674,7 +2867,7 @@ export default function WebhookView({
                     </div>
 
                     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1]">
+                        <div className={settingsInnerPanelClass}>
                             <div className="flex items-center justify-between mb-3">
                                 <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Welcome Message</span>
                                 <input
@@ -1691,7 +2884,7 @@ export default function WebhookView({
                             </p>
                         </div>
 
-                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1]">
+                        <div className={settingsInnerPanelClass}>
                             <div className="flex items-center justify-between mb-3">
                                 <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Ice Breakers</span>
                                 <button
@@ -1737,7 +2930,7 @@ export default function WebhookView({
                             </div>
                         </div>
 
-                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1]">
+                        <div className={settingsInnerPanelClass}>
                             <div className="flex items-center justify-between mb-3">
                                 <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Commands</span>
                                 <button
@@ -1839,7 +3032,7 @@ export default function WebhookView({
                 {showLegacyAutomationSettings && (
                     <>
                 {/* 24h Window Reminder */}
-                <div id="settings-reminder" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                <div id="settings-reminder" className={`${settingsSectionCardClass} lg:col-span-2`}>
                     <div className="flex items-center justify-between mb-6">
                         <div>
                             <h3 className="text-xl text-[#111b21] font-bold">24h Window Reminder</h3>
@@ -1856,7 +3049,7 @@ export default function WebhookView({
                     </div>
 
                     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1] flex items-center justify-between">
+                        <div className={`${settingsInnerPanelClass} flex items-center justify-between`}>
                             <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Enabled</span>
                             <input
                                 type="checkbox"
@@ -1866,7 +3059,7 @@ export default function WebhookView({
                             />
                         </div>
 
-                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1]">
+                        <div className={settingsInnerPanelClass}>
                             <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Minutes Before Close</span>
                             <input
                                 type="number"
@@ -1882,7 +3075,7 @@ export default function WebhookView({
                             <p className="text-[11px] text-[#8696a0] mt-2">Set to the number of minutes before the window ends.</p>
                         </div>
 
-                        <div className="bg-[#fcfdfd] p-5 rounded-2xl border border-[#eceff1] lg:col-span-1">
+                        <div className={`${settingsInnerPanelClass} lg:col-span-1`}>
                             <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Reminder Text</span>
                             <textarea
                                 className="mt-3 w-full bg-white border border-[#eceff1] rounded-xl px-3 py-2 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884] h-24 resize-none"
@@ -1905,7 +3098,7 @@ export default function WebhookView({
                 </div>
 
                 {/* Quick Replies */}
-                <div id="settings-quick-replies" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                <div id="settings-quick-replies" className={`${settingsSectionCardClass} lg:col-span-2`}>
                     <div className="flex items-center justify-between mb-6">
                         <div>
                             <h3 className="text-xl text-[#111b21] font-bold">Quick Replies</h3>
@@ -1939,7 +3132,7 @@ export default function WebhookView({
                             </div>
                         ) : (
                             quickRepliesDraft.map((item, index) => (
-                                <div key={`${item.id || 'new'}-${index}`} className="bg-[#fcfdfd] border border-[#eceff1] rounded-2xl p-5">
+                                <div key={`${item.id || 'new'}-${index}`} className={settingsInnerPanelClass}>
                                     <div className="grid grid-cols-1 lg:grid-cols-6 gap-4 items-start">
                                         <div className="lg:col-span-1">
                                             <span className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Shortcut</span>
@@ -1992,7 +3185,7 @@ export default function WebhookView({
                     </>
                 )}
 
-                <div id="settings-team-users" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                <div id="settings-team-users" className={`${settingsSectionCardClass} lg:col-span-2`}>
                     <div className="flex items-center justify-between mb-6">
                         <div>
                             <h3 className="text-xl text-[#111b21] font-bold">Team Users</h3>
@@ -2016,7 +3209,7 @@ export default function WebhookView({
                     )}
 
                     {canManageTeam && (
-                        <div className="mb-6 grid grid-cols-1 lg:grid-cols-6 gap-3 bg-[#fcfdfd] border border-[#eceff1] rounded-2xl p-4">
+                        <div className={`mb-6 grid grid-cols-1 lg:grid-cols-6 gap-3 ${settingsInnerPanelCompactClass}`}>
                             <input
                                 className="lg:col-span-2 bg-white border border-[#eceff1] rounded-xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884]"
                                 placeholder="agent@company.com"
@@ -2075,7 +3268,7 @@ export default function WebhookView({
                         </div>
                     )}
 
-                    <div className="mb-6 grid grid-cols-1 lg:grid-cols-5 gap-3 bg-[#fcfdfd] border border-[#eceff1] rounded-2xl p-4">
+                    <div className={`mb-6 grid grid-cols-1 lg:grid-cols-5 gap-3 ${settingsInnerPanelCompactClass}`}>
                         <input
                             type="password"
                             className="lg:col-span-2 bg-white border border-[#eceff1] rounded-xl px-4 py-3 text-sm font-medium text-[#111b21] focus:outline-none focus:border-[#00a884]"
@@ -2109,7 +3302,7 @@ export default function WebhookView({
                         )}
                     </div>
 
-                    <div className="bg-[#fcfdfd] rounded-2xl border border-[#eceff1] overflow-hidden">
+                    <div className={settingsInnerTableShellClass}>
                         <table className="w-full text-left">
                             <thead className="bg-white text-[#54656f] text-[10px] uppercase font-black tracking-widest border-b border-[#eceff1]">
                                 <tr>
@@ -2219,8 +3412,156 @@ export default function WebhookView({
                     </div>
                 </div>
 
-                {isAdmin && (
-                    <div id="settings-connected-clients" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                {isSuperAdmin && (
+                    <div id="settings-system-runtime" className={`${settingsSectionCardClass} lg:col-span-2`}>
+                        <div className="flex items-center justify-between mb-6">
+                            <div>
+                                <h3 className="text-xl text-[#111b21] font-bold">System Runtime</h3>
+                                <p className="text-sm text-[#54656f] font-medium mt-1">
+                                    Server uptime, last downtime, and maintenance mode controls.
+                                </p>
+                            </div>
+                            <button
+                                onClick={() => fetchSystemRuntimeStatus()}
+                                disabled={systemRuntimeLoading || systemRuntimeSaving}
+                                className="text-xs font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-3 py-2 rounded-xl hover:bg-[#00a884]/5 transition-all disabled:opacity-50"
+                            >
+                                Refresh
+                            </button>
+                        </div>
+
+                        {systemRuntimeError && (
+                            <div className="mb-4 bg-rose-50 border border-rose-200 text-rose-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                                {systemRuntimeError}
+                            </div>
+                        )}
+
+                        {systemRuntimeNotice && (
+                            <div className="mb-4 bg-emerald-50 border border-emerald-200 text-emerald-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                                {systemRuntimeNotice}
+                            </div>
+                        )}
+
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-5">
+                            <div className={settingsInnerPanelClass}>
+                                <div className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">Server State</div>
+                                <div className={`mt-3 text-lg font-black ${systemRuntimeStatus?.online ? 'text-emerald-600' : 'text-rose-600'}`}>
+                                    {systemRuntimeStatus?.online ? 'ONLINE' : 'OFFLINE'}
+                                </div>
+                                <div className="text-xs text-[#54656f] mt-2">
+                                    Last heartbeat: {systemRuntimeStatus?.heartbeat_at ? formatConnectedDate(systemRuntimeStatus.heartbeat_at) : '--'}
+                                </div>
+                            </div>
+                            <div className={settingsInnerPanelClass}>
+                                <div className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">Last Downtime</div>
+                                <div className="mt-3 text-lg font-black text-[#111b21]">
+                                    {formatDurationMs(systemRuntimeStatus?.last_offline_duration_ms ?? null)}
+                                </div>
+                                <div className="text-xs text-[#54656f] mt-2">
+                                    Offline at: {systemRuntimeStatus?.last_offline_at ? formatConnectedDate(systemRuntimeStatus.last_offline_at) : '--'}
+                                </div>
+                            </div>
+                            <div className={settingsInnerPanelClass}>
+                                <div className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">Current Uptime</div>
+                                <div className="mt-3 text-lg font-black text-[#111b21]">
+                                    {formatDurationMs(systemRuntimeStatus?.uptime_ms ?? null)}
+                                </div>
+                                <div className="text-xs text-[#54656f] mt-2">
+                                    Started: {systemRuntimeStatus?.started_at ? formatConnectedDate(systemRuntimeStatus.started_at) : '--'}
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className={`${settingsInnerPanelClass} mb-5`}>
+                            <div className="flex items-center justify-between gap-3">
+                                <div>
+                                    <h4 className="text-sm font-black text-[#111b21]">Maintenance Mode</h4>
+                                    <p className="text-xs text-[#54656f] mt-1">
+                                        Toggle to announce planned service maintenance.
+                                    </p>
+                                </div>
+                                <label className="inline-flex items-center gap-2 text-xs font-bold text-[#111b21]">
+                                    <input
+                                        type="checkbox"
+                                        checked={maintenanceEnabledDraft}
+                                        onChange={(e) => {
+                                            setSystemRuntimeNotice(null);
+                                            setMaintenanceEnabledDraft(e.target.checked);
+                                        }}
+                                        disabled={systemRuntimeSaving}
+                                    />
+                                    Enabled
+                                </label>
+                            </div>
+                            <textarea
+                                className="mt-3 w-full bg-white border border-[#eceff1] rounded-xl px-4 py-3 text-sm text-[#111b21] focus:outline-none focus:border-[#00a884] min-h-[92px] resize-none"
+                                value={maintenanceMessageDraft}
+                                onChange={(e) => {
+                                    setSystemRuntimeNotice(null);
+                                    setMaintenanceMessageDraft(e.target.value);
+                                }}
+                                placeholder="Optional maintenance notice message"
+                                disabled={systemRuntimeSaving}
+                            />
+                            <div className="mt-3 flex items-center justify-between gap-3">
+                                <div className="text-xs text-[#54656f]">
+                                    Updated: {systemRuntimeStatus?.maintenance?.updated_at ? formatConnectedDate(systemRuntimeStatus.maintenance.updated_at) : '--'}
+                                    {systemRuntimeStatus?.maintenance?.updated_by ? ` by ${systemRuntimeStatus.maintenance.updated_by}` : ''}
+                                </div>
+                                <button
+                                    onClick={handleSaveMaintenanceMode}
+                                    disabled={systemRuntimeSaving || systemRuntimeLoading}
+                                    className="bg-[#111b21] text-white px-4 py-2 rounded-xl text-xs font-bold uppercase tracking-widest hover:bg-[#202c33] transition-all disabled:opacity-50"
+                                >
+                                    {systemRuntimeSaving ? 'Saving…' : 'Save Maintenance'}
+                                </button>
+                            </div>
+                        </div>
+
+                        <div className={settingsInnerTableShellClass}>
+                            <table className="w-full text-left">
+                                <thead className="bg-white text-[#54656f] text-[10px] uppercase font-black tracking-widest border-b border-[#eceff1]">
+                                    <tr>
+                                        <th className="px-6 py-4">Offline From</th>
+                                        <th className="px-6 py-4">Back Online</th>
+                                        <th className="px-6 py-4">Duration</th>
+                                        <th className="px-6 py-4">Reason</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-[#f0f2f5]">
+                                    {systemRuntimeLoading ? (
+                                        <tr>
+                                            <td className="px-6 py-6" colSpan={4}>
+                                                <div className="animate-pulse space-y-2">
+                                                    <div className="h-10 rounded-xl bg-[#eef2f5]" />
+                                                    <div className="h-10 rounded-xl bg-[#eef2f5]" />
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    ) : !systemRuntimeStatus || systemRuntimeStatus.downtime_log.length === 0 ? (
+                                        <tr>
+                                            <td className="px-6 py-6 text-sm text-[#8696a0]" colSpan={4}>
+                                                No downtime entries logged yet.
+                                            </td>
+                                        </tr>
+                                    ) : (
+                                        systemRuntimeStatus.downtime_log.map((entry) => (
+                                            <tr key={entry.id} className="hover:bg-white transition-all">
+                                                <td className="px-6 py-4 text-xs text-[#54656f]">{formatConnectedDate(entry.offline_from)}</td>
+                                                <td className="px-6 py-4 text-xs text-[#54656f]">{formatConnectedDate(entry.offline_until)}</td>
+                                                <td className="px-6 py-4 text-xs font-bold text-[#111b21]">{formatDurationMs(entry.duration_ms)}</td>
+                                                <td className="px-6 py-4 text-xs uppercase tracking-widest text-[#54656f]">{entry.reason || 'server_unavailable'}</td>
+                                            </tr>
+                                        ))
+                                    )}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                )}
+
+                {isSuperAdmin && (
+                    <div id="settings-connected-clients" className={`${settingsSectionCardClass} lg:col-span-2`}>
                         <div className="flex items-center justify-between mb-6">
                             <div>
                                 <h3 className="text-xl text-[#111b21] font-bold">Connected Clients</h3>
@@ -2243,7 +3584,7 @@ export default function WebhookView({
                             </div>
                         )}
 
-                        <div className="bg-[#fcfdfd] rounded-2xl border border-[#eceff1] overflow-hidden">
+                        <div className={settingsInnerTableShellClass}>
                             <table className="w-full text-left">
                                 <thead className="bg-white text-[#54656f] text-[10px] uppercase font-black tracking-widest border-b border-[#eceff1]">
                                     <tr>
@@ -2326,8 +3667,8 @@ export default function WebhookView({
                     </div>
                 )}
 
-                {isAdmin && (
-                    <div id="settings-connected-businesses" className="bg-white p-8 rounded-3xl border border-[#eceff1] shadow-[0_8px_30px_rgba(0,0,0,0.04)] lg:col-span-2">
+                {isSuperAdmin && (
+                    <div id="settings-connected-businesses" className={`${settingsSectionCardClass} lg:col-span-2`}>
                     <div className="flex items-center justify-between mb-6">
                         <div>
                             <h3 className="text-xl text-[#111b21] font-bold">Connected Businesses</h3>
@@ -2371,7 +3712,7 @@ export default function WebhookView({
                         </div>
                     )}
 
-                    <div className="bg-[#fcfdfd] rounded-2xl border border-[#eceff1] overflow-hidden">
+                    <div className={settingsInnerTableShellClass}>
                         <table className="w-full text-left">
                             <thead className="bg-white text-[#54656f] text-[10px] uppercase font-black tracking-widest border-b border-[#eceff1]">
                                 <tr>

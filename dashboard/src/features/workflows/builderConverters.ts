@@ -11,13 +11,15 @@ const BUILDER_ACTION_NODE_TYPES = new Set([
     'ASSIGN',
     'WORKFLOW_TRIGGER',
     'END',
-    'CTA_URL'
+    'CTA_URL',
+    'SIMULATE_PAYMENT'
 ]);
 const SUPPORTED_ACTION_TYPES = new Set([
     'send_text',
     'send_buttons',
     'send_list',
     'send_cta_url',
+    'simulate_payment',
     'send_template',
     'ask_question',
     'confirm_attributes',
@@ -319,6 +321,52 @@ const buildActionsFromBuilder = (builder: any) => {
             return;
         }
 
+        if (node.type === 'SIMULATE_PAYMENT') {
+            const actionIndex = actions.length;
+            const action: any = {
+                type: 'simulate_payment',
+                body: node.body || '',
+                payment_url: node.url || '',
+                button_text: node.buttonText || 'Pay now'
+            };
+            const amount = typeof node.amount === 'string' ? node.amount.trim() : '';
+            const currency = typeof node.currency === 'string' ? node.currency.trim().toUpperCase() : '';
+            const successKeywordsRaw =
+                typeof node.successKeywords === 'string'
+                    ? node.successKeywords
+                    : Array.isArray(node.successKeywords)
+                        ? node.successKeywords.join(',')
+                        : '';
+            const successKeywords = successKeywordsRaw
+                .split(',')
+                .map((value: string) => value.trim().toLowerCase())
+                .filter(Boolean);
+            const pendingText = typeof node.pendingText === 'string' ? node.pendingText.trim() : '';
+            const receiptText = typeof node.receiptText === 'string' ? node.receiptText.trim() : '';
+            const expiredText = typeof node.expiredText === 'string' ? node.expiredText.trim() : '';
+            const expiresMinutesRaw = Number(node.expiresInMinutes);
+            const expiresInMinutes = Number.isFinite(expiresMinutesRaw)
+                ? Math.max(1, Math.min(7 * 24 * 60, Math.floor(expiresMinutesRaw)))
+                : null;
+
+            if (!action.body.trim()) {
+                action.body = 'Please complete your payment using the link below.';
+            }
+            if (!action.payment_url.trim()) {
+                warnings.push(`Simulate Payment node ${nodeId} has no payment URL.`);
+            }
+            if (amount) action.amount = amount;
+            if (currency) action.currency = currency;
+            if (successKeywords.length > 0) action.success_keywords = Array.from(new Set(successKeywords));
+            if (pendingText) action.pending_text = pendingText;
+            if (receiptText) action.receipt_text = receiptText;
+            if (expiredText) action.expired_text = expiredText;
+            if (expiresInMinutes) action.expires_in_minutes = expiresInMinutes;
+            actions.push(action);
+            indexByNode[nodeId] = actionIndex;
+            return;
+        }
+
         if (node.type === 'CONDITION') {
             const actionIndex = actions.length;
             const source = typeof node.source === 'string' ? node.source.trim() : '';
@@ -535,6 +583,7 @@ const buildActionsFromBuilder = (builder: any) => {
             node.type === 'MESSAGE' ||
             node.type === 'ASK' ||
             node.type === 'ATTR_CONFIRM' ||
+            node.type === 'SIMULATE_PAYMENT' ||
             node.type === 'IMAGE' ||
             node.type === 'TEMPLATE' ||
             node.type === 'TAG' ||
@@ -664,6 +713,20 @@ const buildBuilderFromActions = (actions: any[], workflowId: string) => {
             base.url = action.url || '';
             base.headerText = action.header?.text || '';
             base.footerText = action.footer || '';
+        } else if (action.type === 'simulate_payment') {
+            base.type = 'SIMULATE_PAYMENT';
+            base.body = action.body || 'Please complete your payment using the link below.';
+            base.buttonText = action.button_text || 'Pay now';
+            base.url = action.payment_url || 'https://2fast.xyz/simulated-payment?profileId={{profile_id}}&phone={{phone}}';
+            base.amount = action.amount || '';
+            base.currency = action.currency || '';
+            base.successKeywords = Array.isArray(action.success_keywords)
+                ? action.success_keywords.join(', ')
+                : 'payment_success, paid, done';
+            base.pendingText = action.pending_text || 'I still have not received payment. Please complete payment and tap "Payment Success".';
+            base.receiptText = action.receipt_text || 'Payment received. Receipt ID: {{receipt_id}}.';
+            base.expiredText = action.expired_text || 'This payment link has expired.';
+            base.expiresInMinutes = typeof action.expires_in_minutes === 'number' ? action.expires_in_minutes : '';
         } else if (action.type === 'end_flow') {
             base.type = 'END';
             base.content = '';

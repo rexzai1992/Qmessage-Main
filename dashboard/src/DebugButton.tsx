@@ -4,6 +4,8 @@ import { Bug, Check, Copy, RefreshCw, X } from 'lucide-react';
 type DebugButtonProps = {
     payload: Record<string, unknown>;
     title?: string;
+    floating?: boolean;
+    storageKey?: string;
 };
 
 type DebugSnapshot = {
@@ -29,7 +31,7 @@ async function copyToClipboard(text: string) {
     document.body.removeChild(el);
 }
 
-export default function DebugButton({ payload, title = 'Debug' }: DebugButtonProps) {
+export default function DebugButton({ payload, title = 'Debug', floating = false }: DebugButtonProps) {
     const [open, setOpen] = useState(false);
     const [copied, setCopied] = useState(false);
     const [snapshot, setSnapshot] = useState<DebugSnapshot | null>(null);
@@ -71,7 +73,7 @@ export default function DebugButton({ payload, title = 'Debug' }: DebugButtonPro
     };
 
     return (
-        <>
+        <div className={floating ? 'fixed bottom-6 right-6 z-[220] flex flex-col items-end gap-3' : 'flex flex-col items-end gap-3'}>
             {open && (
                 <div className="w-[380px] max-h-[60vh] bg-white border border-[#eceff1] rounded-2xl shadow-[0_12px_40px_rgba(0,0,0,0.12)] overflow-hidden">
                     <div className="px-4 py-3 border-b border-[#eceff1] flex items-center gap-2">
@@ -126,6 +128,6 @@ export default function DebugButton({ payload, title = 'Debug' }: DebugButtonPro
                 <Bug className="w-4 h-4 text-[#54656f]" />
                 <span className="text-xs font-bold uppercase tracking-widest">Debug</span>
             </button>
-        </>
+        </div>
     );
 }

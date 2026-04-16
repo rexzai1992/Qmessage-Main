@@ -4,17 +4,20 @@ export const useElementSize = <T extends HTMLElement>() => {
     const [node, setNode] = useState<T | null>(null);
     const [size, setSize] = useState({ width: 0, height: 0 });
     const ref = useCallback((el: T | null) => {
-        setNode(el);
+        setNode((prev) => (prev === el ? prev : el));
     }, []);
 
     useLayoutEffect(() => {
         if (!node) return;
 
         const update = () => {
-            setSize({
-                width: node.clientWidth,
-                height: node.clientHeight
-            });
+            const nextWidth = node.clientWidth;
+            const nextHeight = node.clientHeight;
+            setSize((prev) => (
+                prev.width === nextWidth && prev.height === nextHeight
+                    ? prev
+                    : { width: nextWidth, height: nextHeight }
+            ));
         };
 
         update();

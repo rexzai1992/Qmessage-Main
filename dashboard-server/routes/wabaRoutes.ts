@@ -113,6 +113,70 @@ function toHttpErrorPayload(error: any, fallback = 'Unexpected error'): {
     }
 }
 
+const SUPER_ADMIN_ROLE_VALUES = new Set(['super_admin', 'superadmin', 'super-admin'])
+
+function isSuperAdminUser(user: any): boolean {
+    const userMeta = user?.user_metadata || {}
+    const appMeta = user?.app_metadata || {}
+    const roleCandidates = [
+        userMeta.role,
+        appMeta.role
+    ]
+    const flagCandidates = [
+        userMeta.super_admin,
+        userMeta.is_super_admin,
+        appMeta.super_admin,
+        appMeta.is_super_admin
+    ]
+
+    const hasRole = roleCandidates.some((value) => {
+        if (typeof value !== 'string') return false
+        return SUPER_ADMIN_ROLE_VALUES.has(value.trim().toLowerCase())
+    })
+    if (hasRole) return true
+
+    return flagCandidates.some((value) => {
+        if (value === true) return true
+        if (typeof value === 'string') {
+            const normalized = value.trim().toLowerCase()
+            return normalized === 'true' || normalized === '1' || normalized === 'yes'
+        }
+        return false
+    })
+}
+
+function serializeSystemRuntimeStatus(value: any) {
+    const maintenance = value?.maintenance && typeof value.maintenance === 'object'
+        ? value.maintenance
+        : {}
+    const downtimeLog = Array.isArray(value?.downtimeLog) ? value.downtimeLog : []
+    return {
+        online: value?.online === true,
+        started_at: trimText(value?.startedAt),
+        current_time: trimText(value?.currentTime),
+        uptime_ms: Number.isFinite(Number(value?.uptimeMs)) ? Math.max(0, Math.floor(Number(value.uptimeMs))) : 0,
+        heartbeat_at: trimText(value?.heartbeatAt) || null,
+        maintenance: {
+            enabled: maintenance?.enabled === true,
+            message: trimText(maintenance?.message),
+            updated_at: trimText(maintenance?.updatedAt) || null,
+            updated_by: trimText(maintenance?.updatedBy) || null
+        },
+        last_offline_at: trimText(value?.lastOfflineAt) || null,
+        last_offline_ended_at: trimText(value?.lastOfflineEndedAt) || null,
+        last_offline_duration_ms: Number.isFinite(Number(value?.lastOfflineDurationMs))
+            ? Math.max(0, Math.floor(Number(value.lastOfflineDurationMs)))
+            : null,
+        downtime_log: downtimeLog.map((entry: any) => ({
+            id: trimText(entry?.id),
+            offline_from: trimText(entry?.offlineFrom),
+            offline_until: trimText(entry?.offlineUntil),
+            duration_ms: Number.isFinite(Number(entry?.durationMs)) ? Math.max(0, Math.floor(Number(entry.durationMs))) : 0,
+            reason: trimText(entry?.reason)
+        }))
+    }
+}
+
 function toTemplateText(value: any): string {
     if (value === null || value === undefined) return ''
     return String(value)
@@ -222,6 +286,7 @@ export function registerWabaRoutes(app: Express, ctx: any) {
         setUserTemplateAttributes,
         subscribeWabaApp,
         supabase,
+        systemRuntimeStatus,
         unsubscribeWabaApp,
         validateAuthenticationTemplateInput,
         validateAuthenticationUpsertInput,
@@ -1247,6 +1312,184 @@ app.post('/api/waba/registration/profile', async (req: any, res: any) => {
     }
 })
 
+app.get('/api/waba/business-profile', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const client = await wabaRegistry.getClientByProfile(access.profileId)
+        if (!client) {
+            return res.status(503).json({ success: false, error: 'WABA not configured for this profile.' })
+        }
+
+        const config = await wabaRegistry.getConfigByProfile(access.profileId)
+        const queryPhoneNumberId = readTrimmed(req.query?.phoneNumberId || req.query?.phone_number_id)
+        const phoneNumberId = queryPhoneNumberId || readTrimmed(config?.phoneNumberId)
+        if (!phoneNumberId) {
+            return res.status(400).json({ success: false, error: 'phoneNumberId is required (or must exist in profile config)' })
+        }
+
+        const rawFields = readTrimmed(req.query?.fields)
+        const fields = rawFields
+            ? rawFields.split(',').map((entry) => readTrimmed(entry)).filter(Boolean)
+            : ['about', 'address', 'description', 'email', 'profile_picture_url', 'websites', 'vertical']
+
+        const data = await client.getBusinessProfile(phoneNumberId, fields)
+        res.json({ success: true, data })
+    } catch (error: any) {
+        const normalized = toHttpErrorPayload(error, 'Failed to load business profile')
+        res.status(normalized.status).json(normalized.payload)
+    }
+})
+
+app.post('/api/waba/business-profile', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const client = await wabaRegistry.getClientByProfile(access.profileId)
+        if (!client) {
+            return res.status(503).json({ success: false, error: 'WABA not configured for this profile.' })
+        }
+
+        const config = await wabaRegistry.getConfigByProfile(access.profileId)
+        const bodyPhoneNumberId = readTrimmed(req.body?.phoneNumberId || req.body?.phone_number_id)
+        const phoneNumberId = bodyPhoneNumberId || readTrimmed(config?.phoneNumberId)
+        if (!phoneNumberId) {
+            return res.status(400).json({ success: false, error: 'phoneNumberId is required (or must exist in profile config)' })
+        }
+
+        const baseProfile =
+            req.body?.profile && typeof req.body.profile === 'object'
+                ? { ...req.body.profile }
+                : { ...req.body }
+
+        delete (baseProfile as any).phoneNumberId
+        delete (baseProfile as any).phone_number_id
+        delete (baseProfile as any).profile
+        delete (baseProfile as any).profileId
+
+        const websitesRaw = baseProfile.websites
+        if (typeof websitesRaw === 'string') {
+            const trimmed = websitesRaw.trim()
+            if (!trimmed) {
+                delete baseProfile.websites
+            } else {
+                try {
+                    const parsed = JSON.parse(trimmed)
+                    if (Array.isArray(parsed)) {
+                        baseProfile.websites = parsed
+                            .map((item) => readTrimmed(item))
+                            .filter(Boolean)
+                    } else {
+                        baseProfile.websites = trimmed
+                            .split(/[\n,;]+/)
+                            .map((item) => readTrimmed(item))
+                            .filter(Boolean)
+                    }
+                } catch {
+                    baseProfile.websites = trimmed
+                        .split(/[\n,;]+/)
+                        .map((item) => readTrimmed(item))
+                        .filter(Boolean)
+                }
+            }
+        } else if (Array.isArray(websitesRaw)) {
+            baseProfile.websites = websitesRaw
+                .map((item) => readTrimmed(item))
+                .filter(Boolean)
+        }
+
+        if (!baseProfile || typeof baseProfile !== 'object' || Object.keys(baseProfile).length === 0) {
+            return res.status(400).json({ success: false, error: 'Profile payload is required.' })
+        }
+
+        const data = await client.updateBusinessProfile(phoneNumberId, baseProfile)
+        res.json({ success: true, data })
+    } catch (error: any) {
+        const normalized = toHttpErrorPayload(error, 'Failed to update business profile')
+        res.status(normalized.status).json(normalized.payload)
+    }
+})
+
+app.get('/api/waba/call-settings', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const client = await wabaRegistry.getClientByProfile(access.profileId)
+        if (!client) {
+            return res.status(503).json({ success: false, error: 'WABA not configured for this profile.' })
+        }
+
+        const config = await wabaRegistry.getConfigByProfile(access.profileId)
+        const queryPhoneNumberId = readTrimmed(req.query?.phoneNumberId || req.query?.phone_number_id)
+        const phoneNumberId = queryPhoneNumberId || readTrimmed(config?.phoneNumberId)
+        if (!phoneNumberId) {
+            return res.status(400).json({ success: false, error: 'phoneNumberId is required (or must exist in profile config)' })
+        }
+
+        const includeSipRaw = readTrimmed(req.query?.include_sip_credentials || req.query?.includeSipCredentials).toLowerCase()
+        const includeSipCredentials = includeSipRaw === '1' || includeSipRaw === 'true' || includeSipRaw === 'yes'
+
+        const data = await client.getPhoneNumberSettings(phoneNumberId, {
+            includeSipCredentials
+        })
+
+        res.json({ success: true, data })
+    } catch (error: any) {
+        const normalized = toHttpErrorPayload(error, 'Failed to load call settings')
+        res.status(normalized.status).json(normalized.payload)
+    }
+})
+
+app.post('/api/waba/call-settings', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const client = await wabaRegistry.getClientByProfile(access.profileId)
+        if (!client) {
+            return res.status(503).json({ success: false, error: 'WABA not configured for this profile.' })
+        }
+
+        const config = await wabaRegistry.getConfigByProfile(access.profileId)
+        const bodyPhoneNumberId = readTrimmed(req.body?.phoneNumberId || req.body?.phone_number_id)
+        const phoneNumberId = bodyPhoneNumberId || readTrimmed(config?.phoneNumberId)
+        if (!phoneNumberId) {
+            return res.status(400).json({ success: false, error: 'phoneNumberId is required (or must exist in profile config)' })
+        }
+
+        const rawSettings = req.body?.settings && typeof req.body.settings === 'object'
+            ? req.body.settings
+            : req.body
+        const hasCallingPayload =
+            rawSettings
+            && typeof rawSettings === 'object'
+            && !Array.isArray(rawSettings)
+            && rawSettings.calling
+            && typeof rawSettings.calling === 'object'
+            && !Array.isArray(rawSettings.calling)
+
+        if (!hasCallingPayload) {
+            return res.status(400).json({
+                success: false,
+                error: 'calling object is required. Example: { "calling": { "status": "ENABLED" } }'
+            })
+        }
+
+        const payload = {
+            calling: rawSettings.calling
+        }
+
+        const data = await client.updatePhoneNumberSettings(phoneNumberId, payload)
+        res.json({ success: true, data })
+    } catch (error: any) {
+        const normalized = toHttpErrorPayload(error, 'Failed to update call settings')
+        res.status(normalized.status).json(normalized.payload)
+    }
+})
+
 app.get('/api/waba/templates', async (req: any, res: any) => {
     try {
         const access = await resolveProfileAccess(req, res)
@@ -1413,6 +1656,117 @@ app.post('/api/waba/template-media/upload-handle', express.raw({ type: () => tru
         })
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message })
+    }
+})
+
+// Upload binary media to WhatsApp media store (/PHONE_NUMBER_ID/media).
+app.post('/api/waba/media/upload', express.raw({ type: () => true, limit: '100mb' }), async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const client = await wabaRegistry.getClientByProfile(access.profileId)
+        if (!client) {
+            return res.status(503).json({ success: false, error: 'WABA not configured for this profile.' })
+        }
+
+        let phoneNumberId = readTrimmed(req.query?.phoneNumberId || req.query?.phone_number_id)
+        let messagingProduct = readTrimmed(req.query?.messaging_product || req.query?.messagingProduct) || 'whatsapp'
+        let fileName = ''
+        let fileType = ''
+        let fileBuffer: Buffer | null = null
+
+        const contentTypeRaw = Array.isArray(req.headers?.['content-type'])
+            ? req.headers?.['content-type'][0]
+            : req.headers?.['content-type']
+        const contentType = readTrimmed(contentTypeRaw).toLowerCase()
+        const rawBodyBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '')
+
+        if (!Buffer.isBuffer(req.body) && req.body && typeof req.body === 'object') {
+            const jsonBody = req.body
+            const rawFile = readTrimmed(jsonBody?.file || jsonBody?.file_base64 || jsonBody?.base64)
+            if (rawFile) {
+                const cleanedBase64 = rawFile.includes(',') ? rawFile.split(',').pop() || '' : rawFile
+                fileBuffer = Buffer.from(cleanedBase64, 'base64')
+                fileName = readTrimmed(jsonBody?.fileName || jsonBody?.filename)
+                fileType = readTrimmed(jsonBody?.fileType || jsonBody?.mimeType || jsonBody?.mime_type)
+                messagingProduct = readTrimmed(jsonBody?.messaging_product || jsonBody?.messagingProduct) || messagingProduct
+                phoneNumberId = readTrimmed(jsonBody?.phoneNumberId || jsonBody?.phone_number_id) || phoneNumberId
+            }
+        } else if (contentType.includes('multipart/form-data')) {
+            const parserRequest = new Request('http://localhost/api/waba/media/upload', {
+                method: 'POST',
+                headers: {
+                    'content-type': contentTypeRaw as string
+                },
+                body: rawBodyBuffer
+            })
+            const form = await parserRequest.formData()
+            const filePart: any = form.get('file')
+            if (filePart && typeof filePart.arrayBuffer === 'function') {
+                const arrayBuffer = await filePart.arrayBuffer()
+                fileBuffer = Buffer.from(arrayBuffer)
+                fileName = readTrimmed(filePart?.name)
+                fileType = readTrimmed(filePart?.type)
+            }
+            const productValue = form.get('messaging_product')
+            if (typeof productValue === 'string' && readTrimmed(productValue)) {
+                messagingProduct = readTrimmed(productValue)
+            }
+            const formPhoneNumberId = form.get('phone_number_id') || form.get('phoneNumberId')
+            if (typeof formPhoneNumberId === 'string' && readTrimmed(formPhoneNumberId)) {
+                phoneNumberId = readTrimmed(formPhoneNumberId)
+            }
+        } else {
+            const rawFileName = req.headers?.['x-file-name']
+            const rawFileType = req.headers?.['x-file-type']
+            const rawMessagingProduct = req.headers?.['x-messaging-product']
+            const rawPhoneNumberId = req.headers?.['x-phone-number-id']
+            fileName = Array.isArray(rawFileName) ? readTrimmed(rawFileName[0]) : readTrimmed(rawFileName)
+            fileType = Array.isArray(rawFileType) ? readTrimmed(rawFileType[0]) : readTrimmed(rawFileType)
+            if (Array.isArray(rawMessagingProduct) ? readTrimmed(rawMessagingProduct[0]) : readTrimmed(rawMessagingProduct)) {
+                messagingProduct = Array.isArray(rawMessagingProduct) ? readTrimmed(rawMessagingProduct[0]) : readTrimmed(rawMessagingProduct)
+            }
+            if (Array.isArray(rawPhoneNumberId) ? readTrimmed(rawPhoneNumberId[0]) : readTrimmed(rawPhoneNumberId)) {
+                phoneNumberId = Array.isArray(rawPhoneNumberId) ? readTrimmed(rawPhoneNumberId[0]) : readTrimmed(rawPhoneNumberId)
+            }
+            fileBuffer = rawBodyBuffer
+            if (!fileType) {
+                fileType = contentType || 'application/octet-stream'
+            }
+        }
+
+        if (!fileBuffer || fileBuffer.byteLength === 0) {
+            return res.status(400).json({ success: false, error: 'file is required (multipart file, raw body, or base64 in JSON).' })
+        }
+
+        if (!fileName) {
+            fileName = `media_${Date.now()}`
+        }
+        if (!fileType) {
+            fileType = 'application/octet-stream'
+        }
+
+        const data = await client.uploadMedia({
+            fileBuffer,
+            fileName,
+            fileType,
+            messagingProduct,
+            phoneNumberId: phoneNumberId || undefined
+        })
+
+        res.json({
+            success: true,
+            data,
+            meta: {
+                fileName,
+                fileType,
+                size: fileBuffer.byteLength
+            }
+        })
+    } catch (error: any) {
+        const normalized = toHttpErrorPayload(error, 'Failed to upload media')
+        res.status(normalized.status).json(normalized.payload)
     }
 })
 
@@ -2227,11 +2581,58 @@ app.post('/api/waba/clients/disconnect', async (req: any, res: any) => {
     }
 })
 
+app.get('/api/waba/system-runtime-status', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+        if (!isSuperAdminUser(access.user)) {
+            return res.status(403).json({ success: false, error: 'Superadmin access required' })
+        }
+        if (!systemRuntimeStatus || typeof systemRuntimeStatus.getStatus !== 'function') {
+            return res.status(503).json({ success: false, error: 'Runtime status service unavailable' })
+        }
+
+        const snapshot = systemRuntimeStatus.getStatus()
+        return res.json({ success: true, data: serializeSystemRuntimeStatus(snapshot) })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error?.message || 'Failed to load runtime status' })
+    }
+})
+
+app.post('/api/waba/system-maintenance-mode', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+        if (!isSuperAdminUser(access.user)) {
+            return res.status(403).json({ success: false, error: 'Superadmin access required' })
+        }
+        if (!systemRuntimeStatus || typeof systemRuntimeStatus.setMaintenanceMode !== 'function') {
+            return res.status(503).json({ success: false, error: 'Runtime status service unavailable' })
+        }
+
+        const enabled = req.body?.enabled === true
+        const message = trimText(req.body?.message).slice(0, 280)
+        const actor = trimText(access.user?.email || access.user?.id || '')
+        const snapshot = systemRuntimeStatus.setMaintenanceMode({
+            enabled,
+            message,
+            updatedBy: actor || null
+        })
+
+        return res.json({ success: true, data: serializeSystemRuntimeStatus(snapshot) })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error?.message || 'Failed to update maintenance mode' })
+    }
+})
+
 // Connected client businesses for Meta app
 app.get('/api/waba/connected-client-businesses', async (req: any, res: any) => {
     try {
         const access = await resolveProfileAccess(req, res)
         if (!access) return
+        if (!isSuperAdminUser(access.user)) {
+            return res.status(403).json({ success: false, error: 'Superadmin access required' })
+        }
 
         const client = await wabaRegistry.getClientByProfile(access.profileId)
         if (!client) {
@@ -2240,7 +2641,8 @@ app.get('/api/waba/connected-client-businesses', async (req: any, res: any) => {
 
         const config = await wabaRegistry.getConfigByProfile(access.profileId)
         const rawAppId = req.query?.appId
-        const appId = (Array.isArray(rawAppId) ? rawAppId[0] : rawAppId) || config?.appId
+        const appId = readTrimmed(Array.isArray(rawAppId) ? rawAppId[0] : rawAppId)
+            || readTrimmed(config?.appId || process.env.WABA_APP_ID || process.env.APP_ID)
 
         if (!appId) {
             return res.status(400).json({
@@ -2265,7 +2667,98 @@ app.get('/api/waba/connected-client-businesses', async (req: any, res: any) => {
 
         res.json({ success: true, data: response })
     } catch (error: any) {
-        res.status(500).json({ success: false, error: error.message })
+        const normalized = toHttpErrorPayload(error, 'Failed to load connected client businesses')
+        res.status(normalized.status).json(normalized.payload)
+    }
+})
+
+// Check whether a WhatsApp user can be called and available call actions.
+app.get('/api/waba/call-permissions', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const client = await wabaRegistry.getClientByProfile(access.profileId)
+        if (!client) {
+            return res.status(503).json({ success: false, error: 'WABA not configured for this profile.' })
+        }
+
+        const userWaId = readTrimmed(req.query?.user_wa_id || req.query?.userWaId)
+        if (!userWaId) {
+            return res.status(400).json({ success: false, error: 'user_wa_id (or userWaId) is required' })
+        }
+
+        const phoneNumberId = readTrimmed(req.query?.phoneNumberId || req.query?.phone_number_id) || undefined
+        const data = await client.getCallPermissions(userWaId, phoneNumberId)
+
+        res.json({ success: true, data })
+    } catch (error: any) {
+        const { status, payload } = toHttpErrorPayload(error, 'Failed to check call permissions')
+        res.status(status).json(payload)
+    }
+})
+
+// Start/manage/terminate WhatsApp calls.
+app.post('/api/waba/calls', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const client = await wabaRegistry.getClientByProfile(access.profileId)
+        if (!client) {
+            return res.status(503).json({ success: false, error: 'WABA not configured for this profile.' })
+        }
+
+        const action = readTrimmed(req.body?.action).toLowerCase()
+        const allowedActions = new Set(['connect', 'pre_accept', 'accept', 'reject', 'terminate'])
+        if (!allowedActions.has(action)) {
+            return res.status(400).json({ success: false, error: 'action must be one of: connect, pre_accept, accept, reject, terminate' })
+        }
+
+        const to = readTrimmed(req.body?.to || req.body?.userWaId || req.body?.user_wa_id) || undefined
+        const callId = readTrimmed(req.body?.call_id || req.body?.callId) || undefined
+        const phoneNumberId = readTrimmed(req.body?.phoneNumberId || req.body?.phone_number_id) || undefined
+        const callbackData = readTrimmed(req.body?.biz_opaque_callback_data || req.body?.bizOpaqueCallbackData)
+        if (callbackData.length > 512) {
+            return res.status(400).json({ success: false, error: 'biz_opaque_callback_data max length is 512 characters' })
+        }
+
+        const rawSession = req.body?.session
+        const sessionSdpType = readTrimmed(rawSession?.sdp_type || rawSession?.sdpType).toLowerCase()
+        const sessionSdp = readTrimmed(rawSession?.sdp)
+        const session = sessionSdpType && sessionSdp
+            ? {
+                sdp_type: sessionSdpType as 'offer' | 'answer',
+                sdp: sessionSdp
+            }
+            : undefined
+
+        if ((action === 'pre_accept' || action === 'accept') && (!session || session.sdp_type !== 'answer')) {
+            return res.status(400).json({
+                success: false,
+                error: `${action} action requires session.sdp_type="answer" and session.sdp`
+            })
+        }
+
+        if (action === 'connect' && (!session || session.sdp_type !== 'offer')) {
+            return res.status(400).json({
+                success: false,
+                error: 'connect action requires session.sdp_type="offer" and session.sdp'
+            })
+        }
+
+        const data = await client.manageCall({
+            action: action as 'connect' | 'pre_accept' | 'accept' | 'reject' | 'terminate',
+            to,
+            call_id: callId,
+            session,
+            biz_opaque_callback_data: callbackData || undefined
+        }, phoneNumberId)
+
+        res.json({ success: true, data })
+    } catch (error: any) {
+        const { status, payload } = toHttpErrorPayload(error, 'Failed to manage call')
+        res.status(status).json(payload)
     }
 })
 

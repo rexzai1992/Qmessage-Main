@@ -27,21 +27,24 @@ function normalizeButtons(buttons: Array<{ id: string; title: string }> = []) {
 
 type OutboundInlineMedia = {
     type: 'image' | 'video' | 'document'
-    link: string
+    id?: string
+    link?: string
     assetKey?: string
     filename?: string
 }
 
 function normalizeInlineMedia(raw: any): OutboundInlineMedia | null {
     const type = typeof raw?.type === 'string' ? raw.type.toLowerCase() : ''
+    const id = typeof raw?.id === 'string' ? raw.id.trim() : ''
     const link = typeof raw?.link === 'string' ? raw.link.trim() : ''
     const assetKey = typeof raw?.assetKey === 'string' ? raw.assetKey.trim() : ''
-    if (!link) return null
+    if (!id && !link) return null
     if (type !== 'image' && type !== 'video' && type !== 'document') return null
     const filename = typeof raw?.filename === 'string' ? raw.filename.trim() : ''
     return {
         type,
-        link,
+        ...(id ? { id } : {}),
+        ...(link ? { link } : {}),
         ...(assetKey ? { assetKey } : {}),
         ...(type === 'document' && filename ? { filename } : {})
     }
@@ -104,10 +107,19 @@ export async function sendWhatsAppMessage(input: SendMessageInput) {
             response = await client.sendTemplate(to, content.template.name, content.template.language || 'en_US', content.template.components)
         } else if (type === 'text') {
             if (inlineMedia) {
-                response = await client.sendMedia(to, inlineMedia.type, inlineMedia.link, {
-                    caption: content.text || undefined,
-                    ...(inlineMedia.type === 'document' && inlineMedia.filename ? { filename: inlineMedia.filename } : {})
-                })
+                if (inlineMedia.id) {
+                    response = await client.sendMediaById(to, inlineMedia.type, inlineMedia.id, {
+                        caption: content.text || undefined,
+                        ...(inlineMedia.type === 'document' && inlineMedia.filename ? { filename: inlineMedia.filename } : {})
+                    })
+                } else if (inlineMedia.link) {
+                    response = await client.sendMedia(to, inlineMedia.type, inlineMedia.link, {
+                        caption: content.text || undefined,
+                        ...(inlineMedia.type === 'document' && inlineMedia.filename ? { filename: inlineMedia.filename } : {})
+                    })
+                } else {
+                    throw new Error('Inline media is missing both id and link.')
+                }
             } else {
                 response = await client.sendText(to, content.text)
             }
@@ -168,17 +180,20 @@ export async function sendWhatsAppMessage(input: SendMessageInput) {
         agent: messageActor
     }
     if (inlineMedia) {
+        if (inlineMedia.id) {
+            persistedContent.media_id = inlineMedia.id
+        }
         if (inlineMedia.assetKey) {
             persistedContent.media_asset_key = inlineMedia.assetKey
         }
         if (inlineMedia.type === 'image') {
-            persistedContent.image_url = inlineMedia.link
+            if (inlineMedia.link) persistedContent.image_url = inlineMedia.link
             persistedContent.caption = content.text || ''
         } else if (inlineMedia.type === 'video') {
-            persistedContent.video_url = inlineMedia.link
+            if (inlineMedia.link) persistedContent.video_url = inlineMedia.link
             persistedContent.caption = content.text || ''
         } else if (inlineMedia.type === 'document') {
-            persistedContent.document_url = inlineMedia.link
+            if (inlineMedia.link) persistedContent.document_url = inlineMedia.link
             persistedContent.filename = inlineMedia.filename || 'document'
             persistedContent.caption = content.text || ''
         }

@@ -13,6 +13,7 @@ export type User = {
     company_id: string
     phone_number: string
     name?: string | null
+    alias?: string | null
     tags?: string[] | null
     last_inbound_at?: string | null
     last_window_reminder_at?: string | null
@@ -56,6 +57,8 @@ export type MessageRecord = {
 }
 
 export const HUMAN_TAKEOVER_TAG = 'human_takeover'
+export const ADS_SHOOT_SIMULATED_TAG = 'new_leads'
+export const LEGACY_ADS_SHOOT_SIMULATED_TAG = 'ads_shoot_simulated'
 
 const CTA_REPLY_WINDOW_MS = 24 * 60 * 60 * 1000
 const CTA_FREE_WINDOW_MS = 72 * 60 * 60 * 1000
@@ -65,9 +68,40 @@ const TEMPLATE_ATTRIBUTE_LANGUAGE_MAX_LENGTH = 24
 const TEMPLATE_ATTRIBUTE_KEY_MAX_LENGTH = 120
 const TEMPLATE_ATTRIBUTE_VALUE_MAX_LENGTH = 400
 
+export function isGroupIdentifier(input: string | null | undefined): boolean {
+    if (!input) return false
+    const raw = String(input).trim()
+    if (!raw) return false
+
+    const lower = raw.toLowerCase()
+    const atIndex = lower.indexOf('@')
+    const domain = atIndex >= 0 ? lower.slice(atIndex + 1) : ''
+    const localPart = atIndex >= 0 ? raw.slice(0, atIndex) : raw
+    const localLower = localPart.toLowerCase()
+
+    if (!localPart) return false
+    if (domain === 'g.us') return true
+    if (domain === 's.whatsapp.net' || domain === 'lid') return false
+
+    return localLower.startsWith('y2fwav9ncm91cd') || localPart.includes(':')
+}
+
 export function normalizePhoneNumber(input: string | null | undefined): string {
     if (!input) return ''
-    return input.replace(/@s\.whatsapp\.net$/, '').replace(/\D/g, '')
+    const raw = String(input).trim()
+    if (!raw) return ''
+
+    const lower = raw.toLowerCase()
+    const atIndex = lower.indexOf('@')
+    const domain = atIndex >= 0 ? lower.slice(atIndex + 1) : ''
+    const localPart = (atIndex >= 0 ? raw.slice(0, atIndex) : raw).trim()
+    if (!localPart) return ''
+
+    if (domain === 'g.us') return localPart
+    if (isGroupIdentifier(raw)) return localPart
+
+    const withoutDevice = localPart.includes(':') ? (localPart.split(':')[0] || '') : localPart
+    return withoutDevice.replace(/\D/g, '')
 }
 
 function sanitizeTemplateAttributeText(value: any, maxLength: number): string {
@@ -191,8 +225,15 @@ export async function findOrCreateUser(companyId: string, phoneNumber: string): 
         return null
     }
 
-    const legacy = `${normalized}@s.whatsapp.net`
-    const candidates = legacy === normalized ? [normalized] : [normalized, legacy]
+    const groupJid = `${normalized}@g.us`
+    const individualJid = `${normalized}@s.whatsapp.net`
+    const candidates = Array.from(
+        new Set(
+            isGroupIdentifier(phoneNumber) || isGroupIdentifier(normalized)
+                ? [normalized, groupJid]
+                : [normalized, individualJid]
+        )
+    )
 
     const { data: existing, error: fetchError } = await supabase
         .from('users')
@@ -238,8 +279,15 @@ export async function findOrCreateUser(companyId: string, phoneNumber: string): 
 export async function getUserByPhone(companyId: string, phoneNumber: string): Promise<User | null> {
     const normalized = normalizePhoneNumber(phoneNumber)
     if (!normalized) return null
-    const legacy = `${normalized}@s.whatsapp.net`
-    const candidates = legacy === normalized ? [normalized] : [normalized, legacy]
+    const groupJid = `${normalized}@g.us`
+    const individualJid = `${normalized}@s.whatsapp.net`
+    const candidates = Array.from(
+        new Set(
+            isGroupIdentifier(phoneNumber) || isGroupIdentifier(normalized)
+                ? [normalized, groupJid]
+                : [normalized, individualJid]
+        )
+    )
 
     const { data, error } = await supabase
         .from('users')
@@ -410,6 +458,21 @@ export async function deleteMessagesForUser(userId: string): Promise<boolean> {
     return true
 }
 
+export async function deleteUserById(userId: string): Promise<boolean> {
+    if (!userId) return false
+    const { error } = await supabase
+        .from('users')
+        .delete({ count: 'exact' })
+        .eq('id', userId)
+
+    if (error) {
+        console.warn('[DB] Failed to delete user:', error.message)
+        return false
+    }
+
+    return true
+}
+
 export async function updateUserTags(userId: string, tag: string): Promise<void> {
     const { data: existing, error } = await supabase
         .from('users')
@@ -504,6 +567,22 @@ export async function updateUserName(userId: string, name: string): Promise<void
 
     if (error) {
         console.warn('[DB] Failed to update user name:', error.message)
+    }
+}
+
+export async function setUserAlias(userId: string, alias: string | null | undefined): Promise<void> {
+    if (!userId) return
+    const nextAlias = typeof alias === 'string' ? alias.trim() : ''
+    const payload = nextAlias ? nextAlias : null
+
+    const { error } = await supabase
+        .from('users')
+        .update({ alias: payload })
+        .eq('id', userId)
+
+    if (error) {
+        console.warn('[DB] Failed to set user alias:', error.message)
+        throw new Error(error.message || 'Failed to set user alias')
     }
 }
 
@@ -654,15 +733,21 @@ export async function insertMessage(record: {
     direction: 'in' | 'out'
     content: any
     workflowState?: any | null
+    createdAt?: string | null
 }): Promise<MessageRecord | null> {
+    const payload: any = {
+        user_id: record.userId,
+        direction: record.direction,
+        content: record.content,
+        workflow_state: record.workflowState ?? null
+    }
+    if (record.createdAt) {
+        payload.created_at = record.createdAt
+    }
+
     const { data, error } = await supabase
         .from('messages')
-        .insert({
-            user_id: record.userId,
-            direction: record.direction,
-            content: record.content,
-            workflow_state: record.workflowState ?? null
-        })
+        .insert(payload)
         .select('*')
         .single()
 
@@ -802,7 +887,47 @@ export async function updateUserLastInbound(userId: string, inboundAt?: string |
     }
 }
 
-export async function updateMessageStatusByMessageId(messageId: string, status: string): Promise<MessageRecord | null> {
+function shouldAdvanceMessageStatus(currentStatus: string, nextStatus: string): boolean {
+    const current = (currentStatus || '').toLowerCase().trim()
+    const next = (nextStatus || '').toLowerCase().trim()
+    if (!next) return false
+    if (!current) return true
+    if (current === next) return false
+
+    // Never downgrade from final positive delivery states.
+    if (current === 'read') return false
+    if (current === 'delivered' && (next === 'sent' || next === 'failed' || next === 'pending')) return false
+
+    const rank: Record<string, number> = {
+        pending: 0,
+        sent: 1,
+        failed: 1,
+        delivered: 2,
+        read: 3
+    }
+    const currentRank = rank[current] ?? -1
+    const nextRank = rank[next] ?? -1
+
+    const sentRank = rank.sent ?? 1
+    if (current === 'failed' && nextRank >= sentRank) return true
+    return nextRank >= currentRank
+}
+
+type StatusUpdateMeta = {
+    timestamp?: number
+    recipientId?: string
+    recipientType?: string
+    recipientParticipantId?: string
+    participantRecipientId?: string
+    conversation?: any
+    pricing?: any
+}
+
+export async function updateMessageStatusByMessageId(
+    messageId: string,
+    status: string,
+    meta: StatusUpdateMeta = {}
+): Promise<MessageRecord | null> {
     if (!messageId) return null
 
     const { data: existing, error: fetchError } = await supabase
@@ -820,9 +945,50 @@ export async function updateMessageStatusByMessageId(messageId: string, status: 
 
     if (!existing) return null
 
-    const nextContent = {
-        ...(existing.content || {}),
-        status
+    const currentContent = (existing.content && typeof existing.content === 'object') ? existing.content : {}
+    const currentStatus = typeof currentContent.status === 'string' ? currentContent.status : ''
+    const shouldUpdateStatus = shouldAdvanceMessageStatus(currentStatus, status)
+    const participantId = meta.recipientParticipantId || meta.participantRecipientId || ''
+    const timestamp = Number.isFinite(Number(meta.timestamp)) ? Number(meta.timestamp) : 0
+
+    const groupStatusesRaw =
+        currentContent.group_statuses && typeof currentContent.group_statuses === 'object'
+            ? currentContent.group_statuses
+            : {}
+    const groupStatuses = { ...groupStatusesRaw } as Record<string, any>
+    if ((meta.recipientType || '').toLowerCase() === 'group') {
+        const participantKey = participantId || 'group'
+        const previous = groupStatuses[participantKey]
+        const previousStatus = typeof previous?.status === 'string' ? previous.status : ''
+        if (!previousStatus || shouldAdvanceMessageStatus(previousStatus, status)) {
+            groupStatuses[participantKey] = {
+                status,
+                timestamp: timestamp || previous?.timestamp || 0,
+                recipient_id: meta.recipientId || null,
+                recipient_type: meta.recipientType || null,
+                recipient_participant_id: participantId || null,
+                conversation: meta.conversation || null,
+                pricing: meta.pricing || null
+            }
+        }
+    }
+
+    const nextContent: Record<string, any> = {
+        ...currentContent,
+        ...(shouldUpdateStatus ? { status } : {}),
+        ...(Object.keys(groupStatuses).length > 0 ? { group_statuses: groupStatuses } : {})
+    }
+
+    if (meta.recipientId || meta.recipientType || participantId || meta.conversation || meta.pricing || timestamp) {
+        nextContent.last_status_event = {
+            status,
+            timestamp: timestamp || null,
+            recipient_id: meta.recipientId || null,
+            recipient_type: meta.recipientType || null,
+            recipient_participant_id: participantId || null,
+            conversation: meta.conversation || null,
+            pricing: meta.pricing || null
+        }
     }
 
     const { data, error } = await supabase
@@ -944,10 +1110,57 @@ export async function getWorkflowById(workflowId: string): Promise<any | null> {
 }
 
 export async function getUsersForCompany(companyId: string): Promise<User[]> {
+    const primarySelect = 'id, company_id, phone_number, name, alias, tags, last_inbound_at, last_window_reminder_at, assigned_to_user_id, assigned_to_name, assigned_to_color, assigned_at, cta_referral_at, cta_referral_source, cta_free_window_started_at, cta_free_window_expires_at, template_attributes'
+    const fallbackSelectWithAlias = 'id, company_id, phone_number, name, alias, tags, last_inbound_at, last_window_reminder_at, assigned_to_user_id, assigned_to_name, assigned_to_color, assigned_at'
+    const fallbackSelectLegacy = 'id, company_id, phone_number, name, tags, last_inbound_at, last_window_reminder_at, assigned_to_user_id, assigned_to_name, assigned_to_color, assigned_at'
+    const isMissingColumnError = (error: any): boolean => (
+        error?.code === '42703' || String(error?.message || '').toLowerCase().includes('does not exist')
+    )
+
     const { data, error } = await supabase
         .from('users')
-        .select('*')
+        .select(primarySelect)
         .eq('company_id', companyId)
+
+    if (error && isMissingColumnError(error)) {
+        console.warn('[DB] users schema is missing newer columns, using fallback user projection.')
+        let fallbackData: any[] | null = null
+        let fallbackError: any = null
+
+        const withAliasResult = await supabase
+            .from('users')
+            .select(fallbackSelectWithAlias)
+            .eq('company_id', companyId)
+        fallbackData = withAliasResult.data || null
+        fallbackError = withAliasResult.error
+
+        if (fallbackError && isMissingColumnError(fallbackError)) {
+            const legacyResult = await supabase
+                .from('users')
+                .select(fallbackSelectLegacy)
+                .eq('company_id', companyId)
+            fallbackData = legacyResult.data || null
+            fallbackError = legacyResult.error
+        }
+
+        if (fallbackError) {
+            console.warn('[DB] Failed to load users (fallback):', fallbackError.message)
+            return []
+        }
+
+        return (fallbackData || []).map((row: any) => {
+            const alias = typeof row?.alias === 'string' ? row.alias : null
+            return {
+            ...row,
+            alias,
+            cta_referral_at: null,
+            cta_referral_source: null,
+            cta_free_window_started_at: null,
+            cta_free_window_expires_at: null,
+            template_attributes: []
+            }
+        }) as User[]
+    }
 
     if (error) {
         console.warn('[DB] Failed to load users:', error.message)
@@ -969,6 +1182,37 @@ export async function getMessagesForUsers(userIds: string[], limit = 500): Promi
 
     if (error) {
         console.warn('[DB] Failed to load messages:', error.message)
+        return []
+    }
+
+    return (data || []) as MessageRecord[]
+}
+
+export async function getMessagesForUsersSince(
+    userIds: string[],
+    sinceTimestamp: number,
+    limit = 200
+): Promise<MessageRecord[]> {
+    if (userIds.length === 0) return []
+
+    const parsedSince = Number(sinceTimestamp)
+    if (!Number.isFinite(parsedSince) || parsedSince <= 0) {
+        return getMessagesForUsers(userIds, limit)
+    }
+
+    const sinceIso = new Date(Math.floor(parsedSince) * 1000).toISOString()
+    const boundedLimit = Math.max(1, Math.min(500, Math.floor(limit)))
+
+    const { data, error } = await supabase
+        .from('messages')
+        .select('*')
+        .in('user_id', userIds)
+        .gt('created_at', sinceIso)
+        .order('created_at', { ascending: false })
+        .limit(boundedLimit)
+
+    if (error) {
+        console.warn('[DB] Failed to load incremental messages:', error.message)
         return []
     }
 

@@ -1,5 +1,5 @@
 import crypto from 'crypto'
-import type { WabaInboundMessage, WabaStatus, WabaWebhookParseResult } from './types'
+import type { WabaCallUpdate, WabaInboundMessage, WabaStatus, WabaWebhookParseResult } from './types'
 
 export function verifyWabaSignature(rawBody: Buffer, signatureHeader: string | undefined, appSecrets: string[]): boolean {
     if (!appSecrets || appSecrets.length === 0) return true
@@ -28,6 +28,7 @@ export function verifyWabaSignature(rawBody: Buffer, signatureHeader: string | u
 export function parseWabaWebhook(payload: any): WabaWebhookParseResult {
     const messages: WabaInboundMessage[] = []
     const statuses: WabaStatus[] = []
+    const calls: WabaCallUpdate[] = []
 
     const entries = payload?.entry || []
 
@@ -66,6 +67,7 @@ export function parseWabaWebhook(payload: any): WabaWebhookParseResult {
                 messages.push({
                     phoneNumberId,
                     from: msg.from,
+                    groupId: typeof msg.group_id === 'string' ? msg.group_id : undefined,
                     id: msg.id,
                     timestamp: Number(msg.timestamp || 0),
                     type: msg.type,
@@ -88,19 +90,73 @@ export function parseWabaWebhook(payload: any): WabaWebhookParseResult {
             const statusUpdates = value?.statuses || []
             for (const status of statusUpdates) {
                 if (!status?.id) continue
+                const recipientParticipantId =
+                    typeof status.recipient_participant_id === 'string'
+                        ? status.recipient_participant_id
+                        : undefined
+                const participantRecipientId =
+                    typeof status.participant_recipient_id === 'string'
+                        ? status.participant_recipient_id
+                        : undefined
                 statuses.push({
                     phoneNumberId,
                     id: status.id,
                     status: status.status,
                     timestamp: Number(status.timestamp || 0),
                     recipientId: status.recipient_id,
+                    recipientType: status.recipient_type,
+                    recipientParticipantId,
+                    participantRecipientId,
                     conversation: status.conversation,
-                    pricing: status.pricing,
+                    pricing:
+                        status.pricing ||
+                        (status?.conversation && typeof status.conversation === 'object'
+                            ? status.conversation.pricing
+                            : undefined),
                     raw: status
+                })
+            }
+
+            const callUpdates = value?.calls || []
+            const callErrors = Array.isArray(value?.errors) ? value.errors : []
+            for (const call of callUpdates) {
+                if (!call?.id) continue
+                const callFrom = typeof call.from === 'string' ? call.from : ''
+                calls.push({
+                    phoneNumberId,
+                    id: call.id,
+                    event: typeof call.event === 'string' ? call.event : '',
+                    timestamp: Number(call.timestamp || 0),
+                    to: typeof call.to === 'string' ? call.to : undefined,
+                    from: callFrom || undefined,
+                    direction: typeof call.direction === 'string' ? call.direction : undefined,
+                    status: Array.isArray(call.status)
+                        ? call.status.map((entry: any) => String(entry)).filter(Boolean)
+                        : typeof call.status === 'string'
+                            ? [call.status]
+                            : undefined,
+                    startTime: call.start_time !== undefined ? Number(call.start_time || 0) : undefined,
+                    endTime: call.end_time !== undefined ? Number(call.end_time || 0) : undefined,
+                    duration: call.duration !== undefined ? Number(call.duration || 0) : undefined,
+                    deeplinkPayload: typeof call.deeplink_payload === 'string' ? call.deeplink_payload : undefined,
+                    ctaPayload: typeof call.cta_payload === 'string' ? call.cta_payload : undefined,
+                    bizOpaqueCallbackData:
+                        typeof call.biz_opaque_callback_data === 'string'
+                            ? call.biz_opaque_callback_data
+                            : undefined,
+                    session: call?.session && typeof call.session === 'object'
+                        ? {
+                            sdp_type: typeof call.session.sdp_type === 'string' ? call.session.sdp_type : undefined,
+                            sdp: typeof call.session.sdp === 'string' ? call.session.sdp : undefined
+                        }
+                        : undefined,
+                    contactName: callFrom ? contactMap.get(callFrom) : undefined,
+                    errors: callErrors,
+                    raw: call
                 })
             }
         }
     }
 
-    return { messages, statuses }
+    return { messages, statuses, calls }
 }

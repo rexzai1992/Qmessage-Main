@@ -1,10 +1,12 @@
-import type { Server } from 'socket.io'
+import { createClient } from '@supabase/supabase-js'
+import type { Server, Socket } from 'socket.io'
 import { createDownloadUrl } from '../../src/services/r2-storage'
 
 export function registerSocketHandlers(io: Server, ctx: any) {
     const {
         supabase,
         supabaseAuth,
+        systemRuntimeStatus,
         getHostnameFromHeaders,
         resolveCompanyIdFromHostname,
         normalizeCompanyId,
@@ -18,10 +20,11 @@ export function registerSocketHandlers(io: Server, ctx: any) {
         getUsersForCompany,
         buildContactPayload,
         getMessagesForUsers,
+        getMessagesForUsersSince,
         normalizePhoneNumber,
         recordToSyntheticMessage,
         findOrCreateUser,
-        updateUserName,
+        setUserAlias,
         setUserTags,
         setUserHumanTakeover,
         getUserByPhone,
@@ -39,8 +42,294 @@ export function registerSocketHandlers(io: Server, ctx: any) {
         resolveCompanyId,
         hasRoleAtLeast,
         normalizeTeamRole,
-        deleteMessagesForUser
+        deleteMessagesForUser,
+        deleteUserById,
+        sendPushNotificationToUsers,
+        sendNativePushNotificationToUsers
     } = ctx
+
+    const SUPER_ADMIN_ROLE_VALUES = new Set(['super_admin', 'superadmin', 'super-admin'])
+    const isSuperAdminUser = (user: any): boolean => {
+        const userMeta = user?.user_metadata || {}
+        const appMeta = user?.app_metadata || {}
+        const roleCandidates = [userMeta.role, appMeta.role]
+        const flagCandidates = [
+            userMeta.super_admin,
+            userMeta.is_super_admin,
+            appMeta.super_admin,
+            appMeta.is_super_admin
+        ]
+
+        const hasRole = roleCandidates.some((value) => {
+            if (typeof value !== 'string') return false
+            return SUPER_ADMIN_ROLE_VALUES.has(value.trim().toLowerCase())
+        })
+        if (hasRole) return true
+
+        return flagCandidates.some((value) => {
+            if (value === true) return true
+            if (typeof value === 'string') {
+                const normalized = value.trim().toLowerCase()
+                return normalized === 'true' || normalized === '1' || normalized === 'yes'
+            }
+            return false
+        })
+    }
+
+    const sendNativePushSafe: (input: any) => Promise<void> = typeof sendNativePushNotificationToUsers === 'function'
+        ? sendNativePushNotificationToUsers
+        : async () => { }
+
+    const isLikelyGroupTarget = (value: string | null | undefined): boolean => {
+        const raw = typeof value === 'string' ? value.trim() : ''
+        if (!raw) return false
+        const lower = raw.toLowerCase()
+        if (lower.endsWith('@g.us')) return true
+        if (lower.endsWith('@s.whatsapp.net') || lower.endsWith('@lid')) return false
+        return lower.startsWith('y2fwav9ncm91cd') || raw.includes(':')
+    }
+
+    const toChatJid = (value: string | null | undefined): string => {
+        const raw = typeof value === 'string' ? value.trim() : ''
+        if (!raw) return ''
+        const lower = raw.toLowerCase()
+        if (lower.endsWith('@g.us') || lower.endsWith('@s.whatsapp.net') || lower.endsWith('@lid')) {
+            return raw
+        }
+        const normalized = normalizePhoneNumber(raw)
+        if (!normalized) return ''
+        return isLikelyGroupTarget(raw) ? `${normalized}@g.us` : `${normalized}@s.whatsapp.net`
+    }
+
+    const buildOutgoingSyntheticMessage = (params: {
+        jid: string
+        messageId: string
+        actor?: { user_id: string; name: string; color: string } | null
+        text?: string
+        media?: {
+            type?: string
+            id?: string
+            link?: string
+            assetKey?: string
+            filename?: string
+        } | null
+        fallbackLabel?: string
+        workflowState?: any | null
+    }) => {
+        const message: any = {}
+        const text = typeof params.text === 'string' ? params.text.trim() : ''
+        const mediaType = typeof params.media?.type === 'string' ? params.media.type.toLowerCase() : ''
+
+        if (mediaType === 'image') {
+            message.imageMessage = {
+                ...(text ? { caption: text } : {}),
+                ...(params.media?.id ? { mediaId: params.media.id } : {}),
+                ...(params.media?.assetKey ? { assetKey: params.media.assetKey } : {}),
+                ...(params.media?.link ? { url: params.media.link } : {})
+            }
+        } else if (mediaType === 'video') {
+            message.videoMessage = {
+                ...(text ? { caption: text } : {}),
+                ...(params.media?.id ? { mediaId: params.media.id } : {}),
+                ...(params.media?.assetKey ? { assetKey: params.media.assetKey } : {}),
+                ...(params.media?.link ? { url: params.media.link } : {})
+            }
+        } else if (mediaType === 'document') {
+            message.documentMessage = {
+                ...(text ? { caption: text } : {}),
+                ...(params.media?.id ? { mediaId: params.media.id } : {}),
+                ...(params.media?.filename ? { fileName: params.media.filename } : {}),
+                ...(params.media?.assetKey ? { assetKey: params.media.assetKey } : {}),
+                ...(params.media?.link ? { url: params.media.link } : {})
+            }
+        } else {
+            message.conversation = text || params.fallbackLabel || 'Message sent'
+        }
+
+        return {
+            key: {
+                remoteJid: params.jid,
+                fromMe: true,
+                id: params.messageId
+            },
+            status: 'sent',
+            messageTimestamp: Math.floor(Date.now() / 1000),
+            pushName: params.actor?.name || normalizePhoneNumber(params.jid),
+            message,
+            agent: params.actor || null,
+            workflowState: params.workflowState ?? null
+        }
+    }
+
+    const parseBoundedLimit = (value: unknown, fallback: number, min: number, max: number): number => {
+        const parsed = Number(value)
+        if (!Number.isFinite(parsed)) return fallback
+        return Math.max(min, Math.min(max, Math.floor(parsed)))
+    }
+
+    const FULL_HISTORY_LIMIT = parseBoundedLimit(process.env.SOCKET_FULL_HISTORY_LIMIT, 60, 20, 500)
+    const DELTA_HISTORY_LIMIT = parseBoundedLimit(process.env.SOCKET_DELTA_HISTORY_LIMIT, 40, 10, 500)
+    const CONTACT_CACHE_TTL_MS = 15_000
+    const companySyncCache = new Map<string, {
+        loadedAt: number
+        userIds: string[]
+        contacts: any[]
+        userMap: Map<string, { phone: string; name: string | null }>
+    }>()
+
+    const invalidateCompanySyncCache = (companyId: string | null | undefined) => {
+        if (!companyId) return
+        companySyncCache.delete(companyId)
+    }
+
+    const normalizeRefreshRequest = (value: any): {
+        profileId: string
+        sinceTimestamp: number
+        includeContacts: boolean
+        forceFullHistory: boolean
+    } => {
+        if (typeof value === 'string') {
+            return {
+                profileId: value,
+                sinceTimestamp: 0,
+                includeContacts: true,
+                forceFullHistory: true
+            }
+        }
+
+        const profileId = typeof value?.profileId === 'string' ? value.profileId : ''
+        const parsedSince = Number(value?.sinceTimestamp || 0)
+        return {
+            profileId,
+            sinceTimestamp: Number.isFinite(parsedSince) ? Math.max(0, Math.floor(parsedSince)) : 0,
+            includeContacts: value?.includeContacts === true,
+            forceFullHistory: value?.forceFullHistory === true
+        }
+    }
+
+    const getCompanySyncContext = async (
+        companyId: string,
+        force = false
+    ): Promise<{
+        userIds: string[]
+        contacts: any[]
+        userMap: Map<string, { phone: string; name: string | null }>
+    }> => {
+        const cached = companySyncCache.get(companyId)
+        if (!force && cached && (Date.now() - cached.loadedAt) < CONTACT_CACHE_TTL_MS) {
+            return {
+                userIds: cached.userIds,
+                contacts: cached.contacts,
+                userMap: cached.userMap
+            }
+        }
+
+        const users = await getUsersForCompany(companyId)
+        const contacts = users.map((u: any) => buildContactPayload(u))
+        const userIds = users.map((u: any) => u.id).filter(Boolean)
+        const userMap = new Map(
+            users.map((u: any) => [
+                u.id,
+                {
+                    phone: normalizePhoneNumber(u.phone_number),
+                    name: u.alias || u.name || null
+                }
+            ])
+        )
+
+        companySyncCache.set(companyId, {
+            loadedAt: Date.now(),
+            userIds,
+            contacts,
+            userMap
+        })
+
+        return { userIds, contacts, userMap }
+    }
+
+    const toLatestMessageTimestamp = (messages: any[]): number => {
+        let latest = 0
+        for (const msg of messages) {
+            const ts = Number(msg?.messageTimestamp || 0)
+            if (Number.isFinite(ts) && ts > latest) latest = ts
+        }
+        return latest
+    }
+
+    const emitProfileMessagesSnapshot = async (
+        socket: Socket,
+        profileId: string,
+        companyId: string,
+        options: { includeContacts?: boolean; forceContactsReload?: boolean; historyLimit?: number } = {}
+    ) => {
+        const includeContacts = options.includeContacts !== false
+        const forceContactsReload = options.forceContactsReload === true
+        const historyLimit = Number.isFinite(options.historyLimit)
+            ? Math.max(1, Math.min(500, Math.floor(options.historyLimit || FULL_HISTORY_LIMIT)))
+            : FULL_HISTORY_LIMIT
+
+        const { userIds, contacts, userMap } = await getCompanySyncContext(companyId, forceContactsReload)
+
+        if (includeContacts) {
+            socket.emit('contacts.update', { profileId, contacts })
+        }
+
+        if (userIds.length === 0) {
+            socket.emit('messages.history', { profileId, messages: [], latestTimestamp: 0 })
+            return
+        }
+
+        const messages = await getMessagesForUsers(userIds, historyLimit)
+        const syntheticMessages = (await Promise.all(
+            messages.map((msg: any) => recordToSyntheticMessage(msg, userMap, companyId))
+        ))
+            .filter(Boolean)
+            .reverse()
+
+        socket.emit('messages.history', {
+            profileId,
+            messages: syntheticMessages,
+            latestTimestamp: toLatestMessageTimestamp(syntheticMessages as any[])
+        })
+    }
+
+    const emitProfileMessagesDelta = async (
+        socket: Socket,
+        profileId: string,
+        companyId: string,
+        sinceTimestamp: number,
+        options: { includeContacts?: boolean; forceContactsReload?: boolean; limit?: number } = {}
+    ) => {
+        const includeContacts = options.includeContacts === true
+        const forceContactsReload = options.forceContactsReload === true
+        const limit = Number.isFinite(options.limit)
+            ? Math.max(1, Math.min(500, Math.floor(options.limit || DELTA_HISTORY_LIMIT)))
+            : DELTA_HISTORY_LIMIT
+
+        const { userIds, contacts, userMap } = await getCompanySyncContext(companyId, forceContactsReload)
+
+        if (includeContacts) {
+            socket.emit('contacts.update', { profileId, contacts })
+        }
+
+        if (userIds.length === 0) {
+            socket.emit('messages.delta', { profileId, messages: [], latestTimestamp: sinceTimestamp })
+            return
+        }
+
+        const messages = await getMessagesForUsersSince(userIds, sinceTimestamp, limit)
+        const syntheticMessages = (await Promise.all(
+            messages.map((msg: any) => recordToSyntheticMessage(msg, userMap, companyId))
+        ))
+            .filter(Boolean)
+            .reverse()
+
+        socket.emit('messages.delta', {
+            profileId,
+            messages: syntheticMessages,
+            latestTimestamp: toLatestMessageTimestamp(syntheticMessages as any[])
+        })
+    }
 
 // Auth Middleware for Socket.io
 io.use(async (socket, next) => {
@@ -66,8 +355,19 @@ io.use(async (socket, next) => {
         if (hostCompanyId && ensuredCompanyId !== hostCompanyId) {
             return next(new Error('Authentication error: Company mismatch for this subdomain'))
         }
+
+        const runtimeSnapshot = systemRuntimeStatus?.getStatus?.()
+        if (runtimeSnapshot?.maintenance?.enabled && !isSuperAdminUser(ensuredUser)) {
+            const maintenanceMessage = typeof runtimeSnapshot.maintenance.message === 'string'
+                ? runtimeSnapshot.maintenance.message.trim()
+                : ''
+            const reason = maintenanceMessage || 'Server is currently in maintenance mode'
+            return next(new Error(`Maintenance mode enabled: ${reason}`))
+        }
+
         socket.data.user = ensuredUser
         if (companyId) socket.data.companyId = companyId
+        socket.data.accessToken = token
         next()
     } catch (e) {
         next(new Error('Internal auth error'))
@@ -77,9 +377,11 @@ io.use(async (socket, next) => {
 io.on('connection', async (socket) => {
     const userId = socket.data.user.id
     console.log(`User connected: ${socket.data.user.email} (${userId})`)
-    const companyId = socket.data.companyId
+    const companyId = normalizeCompanyId(
+        socket.data.companyId
         || socket.data.user?.user_metadata?.company_id
         || socket.data.user?.app_metadata?.company_id
+    )
     if (!companyId) {
         socket.emit('profile.error', { message: 'Company ID missing. Please log in again.' })
         socket.disconnect(true)
@@ -87,9 +389,34 @@ io.on('connection', async (socket) => {
     }
     socket.data.companyId = companyId
 
+    const hasServiceRole = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY)
+    const socketAccessToken = typeof socket.data.accessToken === 'string' ? socket.data.accessToken.trim() : ''
+    let profilesDb = supabase
+    if (!hasServiceRole && socketAccessToken) {
+        const supabaseUrl = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '').trim()
+        const publishableKey = (
+            process.env.SUPABASE_KEY
+            || process.env.SUPABASE_ANON_KEY
+            || process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY
+            || ''
+        ).trim()
+
+        if (supabaseUrl && publishableKey) {
+            profilesDb = createClient(supabaseUrl, publishableKey, {
+                auth: { persistSession: false, autoRefreshToken: false },
+                global: {
+                    headers: {
+                        Authorization: `Bearer ${socketAccessToken}`
+                    }
+                }
+            })
+        }
+    }
+
     // Join user-specific room for private emits
     socket.join(userId)
     socket.join(getCompanyRoom(companyId))
+    socket.data.appVisibility = 'visible'
 
     if (lastServerStats) {
         socket.emit('server.stats', lastServerStats)
@@ -98,7 +425,7 @@ io.on('connection', async (socket) => {
     await ensureCompanyRecord(companyId, socket.data.user)
 
     // Send initial profiles for this user
-    let { data: userProfiles, error: fetchError } = await supabase
+    let { data: userProfiles, error: fetchError } = await profilesDb
         .from('profiles')
         .select('*')
         .eq('company_id', companyId)
@@ -107,13 +434,13 @@ io.on('connection', async (socket) => {
     if (fetchError) console.error(`[${userId}] Profile fetch error:`, fetchError.message)
 
     if (!fetchError && (!userProfiles || userProfiles.length === 0)) {
-        const { data: legacyProfiles, error: legacyError } = await supabase
+        const { data: legacyProfiles, error: legacyError } = await profilesDb
             .from('profiles')
             .select('*')
             .eq('user_id', userId)
             .order('created_at', { ascending: true })
         if (!legacyError && legacyProfiles && legacyProfiles.length > 0) {
-            await supabase.from('profiles').update({ company_id: companyId }).eq('user_id', userId)
+            await profilesDb.from('profiles').update({ company_id: companyId }).eq('user_id', userId)
             userProfiles = legacyProfiles.map(p => ({ ...p, company_id: companyId }))
         }
     }
@@ -127,7 +454,7 @@ io.on('connection', async (socket) => {
             let createdProfile = null as any
             const defaultId = companyId
 
-            const { data: existingDefault } = await supabase
+            const { data: existingDefault } = await profilesDb
                 .from('profiles')
                 .select('*')
                 .eq('id', defaultId)
@@ -139,12 +466,12 @@ io.on('connection', async (socket) => {
                 if (existingDefault.user_id !== userId) updates.user_id = userId
                 if (existingDefault.company_id !== companyId) updates.company_id = companyId
                 if (Object.keys(updates).length > 0) {
-                    await supabase.from('profiles').update(updates).eq('id', defaultId)
+                    await profilesDb.from('profiles').update(updates).eq('id', defaultId)
                     Object.assign(existingDefault, updates)
                 }
                 createdProfile = existingDefault
             } else {
-                const { data: newProfile, error: createError } = await supabase
+                const { data: newProfile, error: createError } = await profilesDb
                     .from('profiles')
                     .insert({
                         id: defaultId,
@@ -170,6 +497,14 @@ io.on('connection', async (socket) => {
     }
 
     socket.emit('profiles.update', await enrichProfilesWithConnectionStatus(userProfiles || []))
+
+    let refreshInFlight = false
+    let lastRefreshRequest = {
+        at: 0,
+        profileId: '',
+        sinceTimestamp: 0,
+        forceFullHistory: false
+    }
 
     const resolveConfiguredProfileForCompany = async (requestedProfileId: unknown): Promise<{
         profileId: string
@@ -224,96 +559,222 @@ io.on('connection', async (socket) => {
     }
 
     socket.on('switchProfile', async (profileId) => {
-        if (!profileId) return
+        const normalizedProfileId = typeof profileId === 'string' ? profileId.trim() : ''
+        if (!normalizedProfileId) return
         const currentCompanyId = socket.data.companyId || companyId
         if (!currentCompanyId) {
             socket.emit('profile.error', { message: 'Company ID missing. Please log in again.' })
             return
         }
-        const { data: profileCheck } = await supabase
+        let resolvedProfileId = normalizedProfileId
+        let { data: profileCheck, error: profileCheckError } = await profilesDb
             .from('profiles')
             .select('id')
-            .eq('id', profileId)
+            .eq('id', resolvedProfileId)
             .eq('company_id', currentCompanyId)
             .maybeSingle()
-        if (!profileCheck) {
+        if (profileCheckError) {
+            console.error(`[${userId}] switchProfile check failed:`, profileCheckError.message)
+            socket.emit('profile.error', { message: 'Failed to validate profile access.' })
+            return
+        }
+
+        // Handle stale cached profile ids from app clients by auto-falling back.
+        if (!profileCheck?.id) {
+            const { data: ownedProfile, error: ownedProfileError } = await profilesDb
+                .from('profiles')
+                .select('id, company_id')
+                .eq('id', resolvedProfileId)
+                .eq('user_id', userId)
+                .maybeSingle()
+
+            if (ownedProfileError) {
+                console.error(`[${userId}] switchProfile owned check failed:`, ownedProfileError.message)
+            } else if (ownedProfile?.id) {
+                if (ownedProfile.company_id !== currentCompanyId) {
+                    await profilesDb
+                        .from('profiles')
+                        .update({ company_id: currentCompanyId })
+                        .eq('id', ownedProfile.id)
+                        .eq('user_id', userId)
+                }
+                profileCheck = { id: ownedProfile.id }
+            }
+        }
+
+        if (!profileCheck?.id) {
+            const { data: fallbackProfile, error: fallbackError } = await profilesDb
+                .from('profiles')
+                .select('id')
+                .eq('company_id', currentCompanyId)
+                .order('created_at', { ascending: true })
+                .limit(1)
+                .maybeSingle()
+
+            if (fallbackError) {
+                console.error(`[${userId}] switchProfile fallback fetch failed:`, fallbackError.message)
+                socket.emit('profile.error', { message: 'Failed to load profiles for this company.' })
+                return
+            }
+
+            if (fallbackProfile?.id) {
+                resolvedProfileId = fallbackProfile.id
+                profileCheck = { id: fallbackProfile.id }
+            }
+        }
+
+        if (!profileCheck?.id) {
             socket.emit('profile.error', { message: 'Profile not found for this company.' })
             return
         }
-        const client = await wabaRegistry.getClientByProfile(profileId)
-        socket.emit('connection.update', { profileId, connection: client ? 'open' : 'close' })
+        const client = await wabaRegistry.getClientByProfile(resolvedProfileId)
+        socket.emit('connection.update', { profileId: resolvedProfileId, connection: client ? 'open' : 'close' })
 
-        const profileCompanyId = await getCompanyIdForProfile(profileId)
+        const profileCompanyId = await getCompanyIdForProfile(resolvedProfileId)
         if (!profileCompanyId) {
-            socket.emit('contacts.update', { profileId, contacts: [] })
-            socket.emit('messages.history', { profileId, messages: [] })
+            socket.emit('contacts.update', { profileId: resolvedProfileId, contacts: [] })
+            socket.emit('messages.history', { profileId: resolvedProfileId, messages: [] })
         } else {
-            const users = await getUsersForCompany(profileCompanyId)
-            const contacts = users.map(u => buildContactPayload(u))
-            socket.emit('contacts.update', { profileId, contacts })
-
-            const messages = await getMessagesForUsers(users.map(u => u.id), 500)
-            const userMap = new Map(
-                users.map(u => [
-                    u.id,
-                    {
-                        phone: normalizePhoneNumber(u.phone_number),
-                        name: u.name || null
-                    }
-                ])
-            )
-            const syntheticMessages = (await Promise.all(
-                messages.map((msg) => recordToSyntheticMessage(msg, userMap, profileCompanyId))
-            ))
-                .filter(Boolean)
-                .reverse()
-
-            socket.emit('messages.history', { profileId, messages: syntheticMessages })
+            await emitProfileMessagesSnapshot(socket, resolvedProfileId, profileCompanyId, {
+                includeContacts: true,
+                forceContactsReload: true,
+                historyLimit: FULL_HISTORY_LIMIT
+            })
         }
 
         // Reset unread for this profile when switched to
-        await supabase.from('profiles').update({ unreadCount: 0 }).eq('id', profileId).eq('company_id', currentCompanyId)
-        const { data: refreshed } = await supabase.from('profiles').select('*').eq('company_id', currentCompanyId).order('created_at', { ascending: true })
-        io.to(getCompanyRoom(currentCompanyId)).emit('profiles.update', await enrichProfilesWithConnectionStatus(refreshed || []))
+        await profilesDb.from('profiles').update({ unreadCount: 0 }).eq('id', resolvedProfileId).eq('company_id', currentCompanyId)
+        io.to(getCompanyRoom(currentCompanyId)).emit('profile.unread', { profileId: resolvedProfileId, unreadCount: 0 })
     })
 
     // Lightweight refresh without resetting unread counts
-    socket.on('refreshMessages', async (profileId) => {
+    socket.on('refreshMessages', async (rawRequest) => {
+        const request = normalizeRefreshRequest(rawRequest)
+        const profileId = request.profileId
         if (!profileId) return
-        const client = await wabaRegistry.getClientByProfile(profileId)
-        socket.emit('connection.update', { profileId, connection: client ? 'open' : 'close' })
 
-        const companyId = await getCompanyIdForProfile(profileId)
-        if (!companyId) {
-            socket.emit('contacts.update', { profileId, contacts: [] })
-            socket.emit('messages.history', { profileId, messages: [] })
+        const now = Date.now()
+        const refreshThrottleMs = request.forceFullHistory ? 0 : 1200
+        const isNearDuplicateRequest =
+            !request.forceFullHistory
+            && !lastRefreshRequest.forceFullHistory
+            && lastRefreshRequest.profileId === profileId
+            && Math.abs(lastRefreshRequest.sinceTimestamp - request.sinceTimestamp) <= 2
+            && (now - lastRefreshRequest.at) < refreshThrottleMs
+
+        if (refreshInFlight || isNearDuplicateRequest) {
             return
         }
 
-        const users = await getUsersForCompany(companyId)
-        const contacts = users.map(u => buildContactPayload(u))
-        socket.emit('contacts.update', { profileId, contacts })
+        refreshInFlight = true
+        lastRefreshRequest = {
+            at: now,
+            profileId,
+            sinceTimestamp: request.sinceTimestamp,
+            forceFullHistory: request.forceFullHistory
+        }
 
-        const messages = await getMessagesForUsers(users.map(u => u.id), 500)
-        const userMap = new Map(
-            users.map(u => [
-                u.id,
-                {
-                    phone: normalizePhoneNumber(u.phone_number),
-                    name: u.name || null
+        try {
+            const client = await wabaRegistry.getClientByProfile(profileId)
+            socket.emit('connection.update', { profileId, connection: client ? 'open' : 'close' })
+
+            const companyId = await getCompanyIdForProfile(profileId)
+            if (!companyId) {
+                if (request.includeContacts) {
+                    socket.emit('contacts.update', { profileId, contacts: [] })
                 }
-            ])
-        )
-        const syntheticMessages = (await Promise.all(
-            messages.map((msg) => recordToSyntheticMessage(msg, userMap, companyId))
-        ))
-            .filter(Boolean)
-            .reverse()
+                if (request.forceFullHistory || request.sinceTimestamp <= 0) {
+                    socket.emit('messages.history', { profileId, messages: [], latestTimestamp: 0 })
+                } else {
+                    socket.emit('messages.delta', { profileId, messages: [], latestTimestamp: request.sinceTimestamp })
+                }
+                return
+            }
 
-        socket.emit('messages.history', { profileId, messages: syntheticMessages })
+            if (request.forceFullHistory || request.sinceTimestamp <= 0) {
+                await emitProfileMessagesSnapshot(socket, profileId, companyId, {
+                    includeContacts: request.includeContacts,
+                    forceContactsReload: request.includeContacts,
+                    historyLimit: FULL_HISTORY_LIMIT
+                })
+                return
+            }
+
+            await emitProfileMessagesDelta(socket, profileId, companyId, request.sinceTimestamp, {
+                includeContacts: request.includeContacts,
+                forceContactsReload: request.includeContacts,
+                limit: DELTA_HISTORY_LIMIT
+            })
+        } finally {
+            refreshInFlight = false
+        }
     })
 
-    socket.on('contact.update', async ({ profileId, jid, name, tags }) => {
+    socket.on('notification.test', async (payload, ack) => {
+        try {
+            const rawTitle = typeof payload?.title === 'string' ? payload.title.trim() : ''
+            const rawBody = typeof payload?.body === 'string' ? payload.body.trim() : ''
+            const title = rawTitle || 'QMessage Test Notification'
+            const body = rawBody || `Test sent by ${deriveAgentName(socket.data.user)}`
+            const eventPayload = {
+                id: `test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                title: title.slice(0, 80),
+                body: body.slice(0, 220),
+                fromUserId: userId,
+                fromName: deriveAgentName(socket.data.user),
+                createdAt: new Date().toISOString()
+            }
+
+            // Broadcast only to the same signed-in user on other devices (B/C),
+            // not to every teammate in the company room.
+            socket.to(userId).emit('notification.test', eventPayload)
+            await sendPushNotificationToUsers({
+                companyId,
+                userIds: [userId],
+                title: eventPayload.title,
+                body: eventPayload.body,
+                url: '/',
+                tag: `test-notification:${eventPayload.id}`,
+                data: {
+                    type: 'test',
+                    fromUserId: userId
+                },
+                ttlSeconds: 120
+            })
+            await sendNativePushSafe({
+                companyId,
+                userIds: [userId],
+                title: eventPayload.title,
+                body: eventPayload.body,
+                url: '/',
+                tag: `test-notification:${eventPayload.id}`,
+                data: {
+                    type: 'test',
+                    fromUserId: userId
+                },
+                ttlSeconds: 120
+            })
+            if (typeof ack === 'function') {
+                ack({ success: true, data: eventPayload })
+            }
+        } catch (error: any) {
+            if (typeof ack === 'function') {
+                ack({ success: false, error: error?.message || 'Failed to send notification test.' })
+            }
+        }
+    })
+
+    socket.on('presence.visibility', (payload) => {
+        const rawVisibility = typeof payload === 'string'
+            ? payload
+            : typeof payload?.visibility === 'string'
+                ? payload.visibility
+                : ''
+        const normalizedVisibility = rawVisibility.trim().toLowerCase()
+        socket.data.appVisibility = normalizedVisibility === 'visible' ? 'visible' : 'hidden'
+    })
+
+    socket.on('contact.update', async ({ profileId, jid, alias, name, tags }) => {
         try {
             if (!profileId || !jid) return
             if (jid.endsWith('@g.us')) {
@@ -327,19 +788,25 @@ io.on('connection', async (socket) => {
                 return
             }
 
-            const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
+            const phoneNumber = normalizePhoneNumber(jid)
             const user = await findOrCreateUser(companyId, phoneNumber)
             if (!user) {
                 socket.emit('profile.error', { message: 'Failed to resolve user.' })
                 return
             }
 
-            if (typeof name === 'string') {
-                await updateUserName(user.id, name)
+            const nextAlias = typeof alias === 'string'
+                ? alias
+                : typeof name === 'string'
+                    ? name
+                    : undefined
+            if (nextAlias !== undefined) {
+                await setUserAlias(user.id, nextAlias)
             }
             if (Array.isArray(tags)) {
                 await setUserTags(user.id, tags)
             }
+            invalidateCompanySyncCache(companyId)
 
             const updated = await getUserByPhone(companyId, phoneNumber)
             if (updated) {
@@ -377,7 +844,7 @@ io.on('connection', async (socket) => {
                 return
             }
 
-            const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
+            const phoneNumber = normalizePhoneNumber(jid)
             if (!phoneNumber) {
                 const error = 'Invalid contact phone number.'
                 if (typeof ack === 'function') ack({ success: false, error })
@@ -399,6 +866,7 @@ io.on('connection', async (socket) => {
             }
 
             const contactPayload = { ...buildContactPayload(updated), id: `${phoneNumber}@s.whatsapp.net` }
+            invalidateCompanySyncCache(companyId)
             io.to(getCompanyRoom(companyId)).emit('contacts.update', {
                 profileId,
                 contacts: [contactPayload]
@@ -444,7 +912,7 @@ io.on('connection', async (socket) => {
                 return
             }
 
-            const { data: profileCheck } = await supabase
+            const { data: profileCheck } = await profilesDb
                 .from('profiles')
                 .select('id')
                 .eq('id', profileId)
@@ -456,7 +924,7 @@ io.on('connection', async (socket) => {
                 return
             }
 
-            const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
+            const phoneNumber = normalizePhoneNumber(jid)
             if (!phoneNumber) {
                 const error = 'Invalid contact phone number.'
                 if (typeof ack === 'function') ack({ success: false, error })
@@ -514,6 +982,7 @@ io.on('connection', async (socket) => {
             }
 
             const contactPayload = { ...buildContactPayload(updated), id: `${phoneNumber}@s.whatsapp.net` }
+            invalidateCompanySyncCache(companyId)
             io.to(getCompanyRoom(companyId)).emit('contacts.update', {
                 profileId,
                 contacts: [contactPayload]
@@ -548,7 +1017,7 @@ io.on('connection', async (socket) => {
                 return
             }
 
-            const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
+            const phoneNumber = normalizePhoneNumber(jid)
             if (!phoneNumber) {
                 socket.emit('profile.error', { message: 'Invalid chat ID.' })
                 return
@@ -557,9 +1026,15 @@ io.on('connection', async (socket) => {
             const user = await getUserByPhone(companyId, phoneNumber)
             if (user) {
                 await deleteMessagesForUser(user.id)
+                await deleteUserById(user.id)
+                invalidateCompanySyncCache(companyId)
             }
 
             io.to(getCompanyRoom(companyId)).emit('messages.cleared', { profileId, jid })
+            io.to(getCompanyRoom(companyId)).emit('contacts.update', {
+                profileId,
+                contacts: [{ id: jid, deleted: true }]
+            })
         } catch (error: any) {
             console.error('Clear chat error:', error)
             socket.emit('profile.error', { message: error?.message || 'Failed to clear chat.' })
@@ -579,7 +1054,7 @@ io.on('connection', async (socket) => {
         const id = `profile-${Date.now()}`
         console.log(`[${userId}] Creating new profile: ${name} (${id})`)
 
-        const { data: newProfile, error } = await supabase.from('profiles').insert({
+        const { data: newProfile, error } = await profilesDb.from('profiles').insert({
             id,
             user_id: userId,
             company_id: currentCompanyId,
@@ -594,7 +1069,7 @@ io.on('connection', async (socket) => {
         }
 
         console.log(`[${userId}] Profile saved to DB, refreshing list...`)
-        const { data: refreshed } = await supabase.from('profiles').select('*').eq('company_id', currentCompanyId).order('created_at', { ascending: true })
+        const { data: refreshed } = await profilesDb.from('profiles').select('*').eq('company_id', currentCompanyId).order('created_at', { ascending: true })
         io.to(getCompanyRoom(currentCompanyId)).emit('profiles.update', await enrichProfilesWithConnectionStatus(refreshed || []))
 
         console.log(`[${userId}] Profile ${id} created. WABA config required to activate.`)
@@ -603,25 +1078,25 @@ io.on('connection', async (socket) => {
 
     socket.on('updateProfileName', async ({ profileId, name }) => {
         const currentCompanyId = socket.data.companyId || companyId
-        await supabase.from('profiles').update({ name }).eq('id', profileId).eq('company_id', currentCompanyId)
-        const { data: refreshed } = await supabase.from('profiles').select('*').eq('company_id', currentCompanyId).order('created_at', { ascending: true })
+        await profilesDb.from('profiles').update({ name }).eq('id', profileId).eq('company_id', currentCompanyId)
+        const { data: refreshed } = await profilesDb.from('profiles').select('*').eq('company_id', currentCompanyId).order('created_at', { ascending: true })
         io.to(getCompanyRoom(currentCompanyId)).emit('profiles.update', await enrichProfilesWithConnectionStatus(refreshed || []))
     })
 
     socket.on('deleteProfile', async (profileId: string) => {
         const currentCompanyId = socket.data.companyId || companyId
         // Security check: ensure company owns profile
-        const { data: check } = await supabase.from('profiles').select('id').eq('id', profileId).eq('company_id', currentCompanyId).single()
+        const { data: check } = await profilesDb.from('profiles').select('id').eq('id', profileId).eq('company_id', currentCompanyId).single()
         if (!check) return
 
         // 1. Delete from Supabase
-        await supabase.from('profiles').delete().eq('id', profileId)
+        await profilesDb.from('profiles').delete().eq('id', profileId)
 
         // 2. Clean up files
         if (fs.existsSync(resolvePath(`flows_${profileId}.json`))) fs.unlinkSync(resolvePath(`flows_${profileId}.json`))
         if (fs.existsSync(resolvePath(`sessions_${profileId}.json`))) fs.unlinkSync(resolvePath(`sessions_${profileId}.json`))
 
-        const { data: refreshed } = await supabase.from('profiles').select('*').eq('company_id', currentCompanyId).order('created_at', { ascending: true })
+        const { data: refreshed } = await profilesDb.from('profiles').select('*').eq('company_id', currentCompanyId).order('created_at', { ascending: true })
         io.to(getCompanyRoom(currentCompanyId)).emit('profiles.update', await enrichProfilesWithConnectionStatus(refreshed || []))
     })
 
@@ -645,7 +1120,11 @@ io.on('connection', async (socket) => {
             if (typeof ack === 'function') ack({ success: false, error: 'jid is required.' })
             return
         }
-        if (!jid.includes('@')) jid = `${jid}@s.whatsapp.net`
+        jid = toChatJid(jid)
+        if (!jid) {
+            if (typeof ack === 'function') ack({ success: false, error: 'Invalid jid.' })
+            return
+        }
         try {
             const resolvedProfile = await resolveConfiguredProfileForCompany(profileId)
             if (!resolvedProfile) {
@@ -656,8 +1135,9 @@ io.on('connection', async (socket) => {
             profileId = resolvedProfile.profileId
             const client = resolvedProfile.client
             const resolvedCompanyId = resolvedProfile.companyId
-            const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
-            const user = await findOrCreateUser(resolvedCompanyId, phoneNumber)
+            const recipientId = normalizePhoneNumber(jid)
+            const isGroup = jid.endsWith('@g.us')
+            const user = await findOrCreateUser(resolvedCompanyId, recipientId)
             if (!user) {
                 socket.emit('profile.error', { message: 'Failed to resolve user.' })
                 if (typeof ack === 'function') ack({ success: false, error: 'Failed to resolve user.' })
@@ -666,21 +1146,27 @@ io.on('connection', async (socket) => {
             const actor = buildAgentIdentity(socket.data.user)
             const messageText = typeof text === 'string' ? text.trim() : ''
             const mediaType = typeof media?.type === 'string' ? media.type.toLowerCase() : ''
+            const mediaId = typeof media?.id === 'string' ? media.id.trim() : ''
             const mediaUrl = typeof media?.url === 'string' ? media.url.trim() : ''
             const mediaAssetKey = typeof media?.assetKey === 'string' ? media.assetKey.trim() : ''
             const mediaFilename = typeof media?.filename === 'string' ? media.filename.trim() : ''
             let mediaLink = mediaUrl
-            if ((mediaType === 'image' || mediaType === 'video' || mediaType === 'document') && mediaAssetKey) {
+            if (
+                !mediaId
+                && (mediaType === 'image' || mediaType === 'video' || mediaType === 'document')
+                && mediaAssetKey
+            ) {
                 mediaLink = await createDownloadUrl({
                     companyId: resolvedCompanyId,
                     assetKey: mediaAssetKey
                 })
             }
             const normalizedMedia =
-                (mediaType === 'image' || mediaType === 'video' || mediaType === 'document') && mediaLink
+                (mediaType === 'image' || mediaType === 'video' || mediaType === 'document')
+                    && (mediaId || mediaLink)
                     ? {
                         type: mediaType,
-                        link: mediaLink,
+                        ...(mediaId ? { id: mediaId } : { link: mediaLink }),
                         ...(mediaAssetKey ? { assetKey: mediaAssetKey } : {}),
                         ...(mediaType === 'document' && mediaFilename ? { filename: mediaFilename } : {})
                     }
@@ -693,7 +1179,7 @@ io.on('connection', async (socket) => {
             const sent = await sendWhatsAppMessage({
                 client,
                 userId: user.id,
-                to: phoneNumber,
+                to: recipientId,
                 type: 'text',
                 content: {
                     text: messageText,
@@ -701,12 +1187,34 @@ io.on('connection', async (socket) => {
                 },
                 actor
             })
+            const syntheticOutgoing = buildOutgoingSyntheticMessage({
+                jid,
+                messageId: sent?.messageId || `out-${Date.now()}`,
+                actor,
+                text: messageText,
+                media: normalizedMedia
+                    ? {
+                        type: normalizedMedia.type,
+                        ...(normalizedMedia.id ? { id: normalizedMedia.id } : {}),
+                        ...(normalizedMedia.link ? { link: normalizedMedia.link } : {}),
+                        ...(normalizedMedia.assetKey ? { assetKey: normalizedMedia.assetKey } : {}),
+                        ...(normalizedMedia.filename ? { filename: normalizedMedia.filename } : {})
+                    }
+                    : null
+            })
+            // Current sender socket already renders optimistic message locally.
+            // Broadcast real outbound update to other sockets for live cross-device sync.
+            socket.to(getCompanyRoom(resolvedCompanyId)).emit('messages.upsert', {
+                profileId,
+                messages: [syntheticOutgoing],
+                type: 'notify'
+            })
             if (typeof ack === 'function') {
                 ack({
                     success: true,
                     data: {
                         messageId: sent?.messageId || null,
-                        jid: `${phoneNumber}@s.whatsapp.net`,
+                        jid,
                         profileId,
                         clientTempId: typeof clientTempId === 'string' ? clientTempId : null
                     }
@@ -718,9 +1226,10 @@ io.on('connection', async (socket) => {
                 color: actor.color
             })
             if (assigned) {
+                invalidateCompanySyncCache(resolvedCompanyId)
                 io.to(getCompanyRoom(resolvedCompanyId)).emit('contacts.update', {
                     profileId,
-                    contacts: [{ ...buildContactPayload(assigned), id: `${phoneNumber}@s.whatsapp.net` }]
+                    contacts: [{ ...buildContactPayload(assigned), id: isGroup ? `${recipientId}@g.us` : `${recipientId}@s.whatsapp.net` }]
                 })
             }
         } catch (error: any) {
@@ -732,7 +1241,8 @@ io.on('connection', async (socket) => {
     socket.on('startWorkflow', async (data) => {
         let { profileId, jid, workflowId } = data || {}
         if (!profileId || !jid || !workflowId) return
-        if (!jid.includes('@')) jid = `${jid}@s.whatsapp.net`
+        jid = toChatJid(jid)
+        if (!jid) return
         if (jid.endsWith('@g.us')) {
             socket.emit('profile.error', { message: 'Workflows are not supported for groups.' })
             return
@@ -748,7 +1258,7 @@ io.on('connection', async (socket) => {
             const client = resolvedProfile.client
             const resolvedCompanyId = resolvedProfile.companyId
 
-            const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
+            const phoneNumber = normalizePhoneNumber(jid)
             const result = await workflowEngine.startWorkflow(
                 {
                     companyId: resolvedCompanyId,
@@ -771,10 +1281,11 @@ io.on('connection', async (socket) => {
         }
     })
 
-    socket.on('sendTemplate', async (data) => {
+    socket.on('sendTemplate', async (data, ack) => {
         let { profileId, jid, name, language, components, bodyAttributes } = data
         if (!jid || !name) return
-        if (!jid.includes('@')) jid = `${jid}@s.whatsapp.net`
+        jid = toChatJid(jid)
+        if (!jid) return
 
         try {
             const resolvedProfile = await resolveConfiguredProfileForCompany(profileId)
@@ -785,18 +1296,19 @@ io.on('connection', async (socket) => {
             profileId = resolvedProfile.profileId
             const client = resolvedProfile.client
             const resolvedCompanyId = resolvedProfile.companyId
-            const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
-            const user = await findOrCreateUser(resolvedCompanyId, phoneNumber)
+            const recipientId = normalizePhoneNumber(jid)
+            const isGroup = jid.endsWith('@g.us')
+            const user = await findOrCreateUser(resolvedCompanyId, recipientId)
             if (!user) {
                 socket.emit('profile.error', { message: 'Failed to resolve user.' })
                 return
             }
             const actor = buildAgentIdentity(socket.data.user)
 
-            await sendWhatsAppMessage({
+            const sent = await sendWhatsAppMessage({
                 client,
                 userId: user.id,
-                to: phoneNumber,
+                to: recipientId,
                 type: 'template',
                 content: {
                     name,
@@ -804,6 +1316,19 @@ io.on('connection', async (socket) => {
                     components: Array.isArray(components) && components.length > 0 ? components : undefined
                 },
                 actor
+            })
+            const syntheticOutgoing = buildOutgoingSyntheticMessage({
+                jid,
+                messageId: sent?.messageId || `tpl-${Date.now()}`,
+                actor,
+                fallbackLabel: `Template: ${name}`
+            })
+            // Template sends do not use optimistic local rendering in the UI,
+            // so publish to all clients, including the sender socket.
+            io.to(getCompanyRoom(resolvedCompanyId)).emit('messages.upsert', {
+                profileId,
+                messages: [syntheticOutgoing],
+                type: 'notify'
             })
             if (Array.isArray(bodyAttributes) && bodyAttributes.length > 0) {
                 await setUserTemplateAttributes(
@@ -819,13 +1344,27 @@ io.on('connection', async (socket) => {
                 color: actor.color
             })
             if (assigned) {
+                invalidateCompanySyncCache(resolvedCompanyId)
                 io.to(getCompanyRoom(resolvedCompanyId)).emit('contacts.update', {
                     profileId,
-                    contacts: [{ ...buildContactPayload(assigned), id: `${phoneNumber}@s.whatsapp.net` }]
+                    contacts: [{ ...buildContactPayload(assigned), id: isGroup ? `${recipientId}@g.us` : `${recipientId}@s.whatsapp.net` }]
+                })
+            }
+            if (typeof ack === 'function') {
+                ack({
+                    success: true,
+                    data: {
+                        messageId: sent?.messageId || null,
+                        jid,
+                        profileId
+                    }
                 })
             }
         } catch (error: any) {
             socket.emit('profile.error', { message: error.message || 'Failed to send template' })
+            if (typeof ack === 'function') {
+                ack({ success: false, error: error?.message || 'Failed to send template' })
+            }
         }
     })
 

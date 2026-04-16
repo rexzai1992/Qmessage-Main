@@ -13,7 +13,7 @@ import { resolvePath } from './config'
 import { supabase } from '../src/supabase'
 import { WabaRegistry } from '../src/waba/registry'
 import { parseWabaWebhook, verifyWabaSignature } from '../src/waba/webhook'
-import type { WabaInboundMessage, WabaStatus, WabaConfig } from '../src/waba/types'
+import type { WabaInboundMessage, WabaStatus, WabaConfig, WabaCallUpdate } from '../src/waba/types'
 import { resolveCompanyId, findOrCreateUser, getMessagesForUsers, getUsersForCompany, insertMessage, getUserByPhone, deleteMessagesForUser, normalizePhoneNumber, updateMessageStatusByMessageId, updateUserName, setUserTags, getUsersWithExpiringWindow, updateUserWindowReminder, activateUserCtaFreeWindow, getUserById, assignUserToAgentIfUnassigned, setUserAssignee, hasHumanTakeover, setUserHumanTakeover, setUserTemplateAttributes } from '../src/services/wa-store'
 import type { MessageRecord, User as WaStoreUser } from '../src/services/wa-store'
 import { sendWhatsAppMessage } from '../src/services/whatsapp'
@@ -2983,7 +2983,7 @@ app.post('/webhook', async (req: any, res: any) => {
             return res.status(401).send('Invalid signature')
         }
 
-        const { messages, statuses } = parseWabaWebhook(req.body || {})
+        const { messages, statuses, calls } = parseWabaWebhook(req.body || {})
 
         for (const msg of messages) {
             const config = await wabaRegistry.getConfigByPhoneNumberId(msg.phoneNumberId)
@@ -2998,6 +2998,12 @@ app.post('/webhook', async (req: any, res: any) => {
             const config = await wabaRegistry.getConfigByPhoneNumberId(status.phoneNumberId)
             if (!config) continue
             await handleStatusUpdate(config, status)
+        }
+
+        for (const call of calls) {
+            const config = await wabaRegistry.getConfigByPhoneNumberId(call.phoneNumberId)
+            if (!config) continue
+            await handleCallUpdate(config, call)
         }
 
         return res.sendStatus(200)
@@ -3074,21 +3080,52 @@ app.get('/api/admin/api-keys', (req: any, res: any) => {
     res.json({ success: true, data: apiKeyStore.getAll() })
 })
 
-function isWabaAdminUser(user: any): boolean {
+const SUPER_ADMIN_ROLE_VALUES = new Set(['super_admin', 'superadmin', 'super-admin'])
+
+function isSuperAdminUser(user: any): boolean {
+    const userMeta = user?.user_metadata || {}
+    const appMeta = user?.app_metadata || {}
+    const roleCandidates = [
+        userMeta.role,
+        appMeta.role
+    ]
+    const flagCandidates = [
+        userMeta.super_admin,
+        userMeta.is_super_admin,
+        appMeta.super_admin,
+        appMeta.is_super_admin
+    ]
+
+    const hasSuperAdminRole = roleCandidates.some((value) => {
+        if (typeof value !== 'string') return false
+        return SUPER_ADMIN_ROLE_VALUES.has(value.trim().toLowerCase())
+    })
+    if (hasSuperAdminRole) return true
+
+    return flagCandidates.some((value) => {
+        if (value === true) return true
+        if (typeof value === 'string') {
+            const normalized = value.trim().toLowerCase()
+            return normalized === 'true' || normalized === '1' || normalized === 'yes'
+        }
+        return false
+    })
+}
+
+function isLegacyWabaAdminUser(user: any): boolean {
     const userMeta = user?.user_metadata || {}
     const appMeta = user?.app_metadata || {}
     const candidates = [
         userMeta.waba_admin,
         userMeta.is_waba_admin,
         appMeta.waba_admin,
-        appMeta.is_waba_admin,
-        appMeta.role
+        appMeta.is_waba_admin
     ]
     return candidates.some((value) => {
         if (value === true) return true
         if (typeof value === 'string') {
             const normalized = value.trim().toLowerCase()
-            return normalized === 'true' || normalized === 'waba_admin' || normalized === 'super_admin'
+            return normalized === 'true' || normalized === 'waba_admin'
         }
         return false
     })
@@ -3127,10 +3164,10 @@ function extractBearerToken(req: any): string {
     return rawAuth.trim()
 }
 
-async function countWabaAdminUsers(): Promise<number> {
+async function countSuperAdminUsers(): Promise<number> {
     const hasServiceRole = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY)
     if (!hasServiceRole) {
-        throw new Error('SUPABASE_SERVICE_ROLE_KEY is required for WABA admin setup')
+        throw new Error('SUPABASE_SERVICE_ROLE_KEY is required for superadmin setup')
     }
 
     let page = 1
@@ -3145,7 +3182,7 @@ async function countWabaAdminUsers(): Promise<number> {
 
         const users = Array.isArray(data?.users) ? data.users : []
         users.forEach((user: any) => {
-            if (isWabaAdminUser(user)) count += 1
+            if (isSuperAdminUser(user)) count += 1
         })
 
         if (users.length < perPage || page >= 50) break
@@ -3155,7 +3192,35 @@ async function countWabaAdminUsers(): Promise<number> {
     return count
 }
 
-async function resolveWabaAdminAccess(req: any, res: any) {
+async function countLegacyWabaAdminUsers(): Promise<number> {
+    const hasServiceRole = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY)
+    if (!hasServiceRole) {
+        throw new Error('SUPABASE_SERVICE_ROLE_KEY is required for superadmin setup')
+    }
+
+    let page = 1
+    const perPage = 200
+    let count = 0
+
+    while (true) {
+        const { data, error } = await supabase.auth.admin.listUsers({ page, perPage })
+        if (error) {
+            throw new Error(error.message)
+        }
+
+        const users = Array.isArray(data?.users) ? data.users : []
+        users.forEach((user: any) => {
+            if (isLegacyWabaAdminUser(user) && !isSuperAdminUser(user)) count += 1
+        })
+
+        if (users.length < perPage || page >= 50) break
+        page += 1
+    }
+
+    return count
+}
+
+async function resolveSuperAdminAccess(req: any, res: any) {
     const token = extractBearerToken(req)
     if (!token) {
         res.status(401).json({ success: false, error: 'Authorization token required' })
@@ -3168,8 +3233,8 @@ async function resolveWabaAdminAccess(req: any, res: any) {
         return null
     }
 
-    if (!isWabaAdminUser(user)) {
-        res.status(403).json({ success: false, error: 'WABA admin access required' })
+    if (!isSuperAdminUser(user)) {
+        res.status(403).json({ success: false, error: 'Superadmin access required' })
         return null
     }
 
@@ -3245,12 +3310,15 @@ async function buildAdminSummaryPayload() {
 // ============================================
 app.get('/api/admin/setup-status', async (_req: any, res: any) => {
     try {
-        const admins = await countWabaAdminUsers()
+        const superadmins = await countSuperAdminUsers()
+        const legacyAdmins = await countLegacyWabaAdminUsers()
+
         return res.json({
             success: true,
             data: {
-                setupOpen: admins === 0,
-                admins
+                setupOpen: superadmins === 0 && legacyAdmins === 0,
+                superadmins,
+                legacyAdmins
             }
         })
     } catch (error: any) {
@@ -3262,7 +3330,7 @@ app.post('/api/admin/setup', async (req: any, res: any) => {
     try {
         const hasServiceRole = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY)
         if (!hasServiceRole) {
-            return res.status(500).json({ success: false, error: 'SUPABASE_SERVICE_ROLE_KEY is required to create WABA admin' })
+            return res.status(500).json({ success: false, error: 'SUPABASE_SERVICE_ROLE_KEY is required to create superadmin' })
         }
 
         const email = extractAdminEmail(req)
@@ -3274,9 +3342,16 @@ app.post('/api/admin/setup', async (req: any, res: any) => {
             return res.status(400).json({ success: false, error: 'Password must be at least 8 characters' })
         }
 
-        const admins = await countWabaAdminUsers()
-        if (admins > 0) {
-            return res.status(409).json({ success: false, error: 'Setup is already closed. WABA admin already exists.' })
+        const superadmins = await countSuperAdminUsers()
+        const legacyAdmins = await countLegacyWabaAdminUsers()
+        if (superadmins > 0) {
+            return res.status(409).json({ success: false, error: 'Setup is already closed. Superadmin already exists.' })
+        }
+        if (legacyAdmins > 0) {
+            return res.status(409).json({
+                success: false,
+                error: 'Setup is already closed. Legacy WABA admin accounts detected. Promote one account to super_admin.'
+            })
         }
 
         const created = await supabase.auth.admin.createUser({
@@ -3284,12 +3359,17 @@ app.post('/api/admin/setup', async (req: any, res: any) => {
             password,
             email_confirm: true,
             user_metadata: {
-                waba_admin: true
+                super_admin: true,
+                role: 'super_admin'
+            },
+            app_metadata: {
+                super_admin: true,
+                role: 'super_admin'
             }
         } as any)
 
         if (created.error || !created.data?.user?.id) {
-            const message = created.error?.message || 'Failed to create WABA admin'
+            const message = created.error?.message || 'Failed to create superadmin'
             const isConflict = /already|exists|registered/i.test(message)
             return res.status(isConflict ? 409 : 500).json({ success: false, error: message })
         }
@@ -3302,7 +3382,7 @@ app.post('/api/admin/setup', async (req: any, res: any) => {
             }
         })
     } catch (error: any) {
-        return res.status(500).json({ success: false, error: error?.message || 'Failed to create WABA admin' })
+        return res.status(500).json({ success: false, error: error?.message || 'Failed to create superadmin' })
     }
 })
 
@@ -3319,8 +3399,8 @@ app.post('/api/admin/login', async (req: any, res: any) => {
             return res.status(401).json({ success: false, error: error?.message || 'Invalid email or password' })
         }
 
-        if (!isWabaAdminUser(data.user)) {
-            return res.status(403).json({ success: false, error: 'WABA admin access required' })
+        if (!isSuperAdminUser(data.user)) {
+            return res.status(403).json({ success: false, error: 'Superadmin access required' })
         }
 
         return res.json({
@@ -3339,7 +3419,7 @@ app.post('/api/admin/login', async (req: any, res: any) => {
 
 app.get('/api/admin/summary', async (req: any, res: any) => {
     try {
-        const access = await resolveWabaAdminAccess(req, res)
+        const access = await resolveSuperAdminAccess(req, res)
         if (!access) return
         const payload = await buildAdminSummaryPayload()
         return res.json({ success: true, ...payload })
@@ -3351,7 +3431,7 @@ app.get('/api/admin/summary', async (req: any, res: any) => {
 // Backward-compatible JSON endpoint
 app.get('/my', async (req: any, res: any) => {
     try {
-        const access = await resolveWabaAdminAccess(req, res)
+        const access = await resolveSuperAdminAccess(req, res)
         if (!access) return
         const payload = await buildAdminSummaryPayload()
         return res.json({ success: true, ...payload })
@@ -3458,10 +3538,10 @@ app.get('/myadmin', (_req: any, res: any) => {
   <div class="wrap">
     <div id="loginPanel" class="card login">
       <h1 class="title">MyAdmin Login</h1>
-      <div class="hint">Use WABA admin credentials to monitor all companies.</div>
+      <div class="hint">Use superadmin credentials to monitor all companies.</div>
       <input id="adminIdInput" type="email" placeholder="Admin email" />
       <input id="adminPasswordInput" type="password" placeholder="Password" />
-      <button id="setupBtn" class="btn-secondary hidden">Create First WABA Admin</button>
+      <button id="setupBtn" class="btn-secondary hidden">Create First Superadmin</button>
       <button id="loginBtn" class="btn-primary">Login</button>
       <div id="loginStatus" class="hint"></div>
     </div>
@@ -3563,10 +3643,10 @@ app.get('/myadmin', (_req: any, res: any) => {
       if (!res.ok || !data || !data.success) {
         throw new Error((data && data.error) || 'Failed to load setup status');
       }
-      return data.data || { setupOpen: false, admins: 0 };
+      return data.data || { setupOpen: false, superadmins: 0, legacyAdmins: 0 };
     }
 
-    async function createFirstAdmin(email, password) {
+    async function createFirstSuperAdmin(email, password) {
       const res = await fetch('/api/admin/setup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3574,7 +3654,7 @@ app.get('/myadmin', (_req: any, res: any) => {
       });
       const data = await res.json().catch(function() { return null; });
       if (!res.ok || !data || !data.success) {
-        throw new Error((data && data.error) || 'Failed to create WABA admin');
+        throw new Error((data && data.error) || 'Failed to create superadmin');
       }
       return data;
     }
@@ -3671,10 +3751,13 @@ app.get('/myadmin', (_req: any, res: any) => {
         if (setup.setupOpen) {
           setupBtn.classList.remove('hidden');
           if (!loginStatus.textContent) {
-            showLogin('Setup is open. Create the first WABA admin account.', false);
+            showLogin('Setup is open. Create the first superadmin account.', false);
           }
         } else {
           setupBtn.classList.add('hidden');
+          if (setup.legacyAdmins > 0 && !loginStatus.textContent) {
+            showLogin('Legacy WABA admin accounts found. Promote one account to super_admin in Supabase metadata.', false);
+          }
         }
       } catch (err) {
         showLogin(err && err.message ? err.message : 'Failed to load setup status.', true);
@@ -3711,7 +3794,7 @@ app.get('/myadmin', (_req: any, res: any) => {
       }
       setupBtn.disabled = true;
       try {
-        await createFirstAdmin(email, password);
+        await createFirstSuperAdmin(email, password);
         const data = await login(email, password);
         if (!data.accessToken) throw new Error('Missing access token');
         saveCreds(data.email || email, data.accessToken);
@@ -4212,7 +4295,16 @@ async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
 
     if (!eventName) return
 
-    const updatedMessage = await updateMessageStatusByMessageId(status.id, statusName)
+    const recipientParticipantId = status.recipientParticipantId || status.participantRecipientId || null
+    const updatedMessage = await updateMessageStatusByMessageId(status.id, statusName, {
+        timestamp: status.timestamp,
+        recipientId: status.recipientId,
+        recipientType: status.recipientType,
+        recipientParticipantId: status.recipientParticipantId,
+        participantRecipientId: status.participantRecipientId,
+        conversation: status.conversation,
+        pricing: status.pricing
+    })
 
     if (statusName === 'delivered' && updatedMessage?.content?.cta_entry_candidate) {
         const deliveredAt = status.timestamp
@@ -4232,7 +4324,10 @@ async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
         io.to(room).emit('message.status', {
             profileId,
             messageId: status.id,
-            status: statusName
+            status: statusName,
+            recipientId: status.recipientId || null,
+            recipientType: status.recipientType || null,
+            recipientParticipantId
         })
 
         if (statusName === 'delivered' && updatedMessage?.user_id) {
@@ -4250,11 +4345,54 @@ async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
     addon.webhookService.trigger(profileId, eventName, {
         messageId: status.id,
         to: status.recipientId,
+        recipientType: status.recipientType || null,
+        recipientParticipantId,
         status: statusName,
         timestamp: status.timestamp,
         conversation: status.conversation,
         pricing: status.pricing
     })
+}
+
+async function handleCallUpdate(config: WabaConfig, call: WabaCallUpdate) {
+    const profileId = config.profileId
+    const companyId = await resolveCompanyId(config.companyId || profileId)
+    if (!companyId) return
+
+    const room = getCompanyRoom(companyId)
+    const eventName = readTrimmed(call.event).toLowerCase()
+    const payload = {
+        profileId,
+        callId: call.id,
+        event: eventName || call.event || 'unknown',
+        phoneNumberId: call.phoneNumberId,
+        from: call.from || null,
+        to: call.to || null,
+        direction: call.direction || null,
+        timestamp: call.timestamp || 0,
+        status: Array.isArray(call.status) ? call.status : [],
+        startTime: call.startTime || null,
+        endTime: call.endTime || null,
+        duration: call.duration ?? null,
+        deeplinkPayload: call.deeplinkPayload || null,
+        ctaPayload: call.ctaPayload || null,
+        bizOpaqueCallbackData: call.bizOpaqueCallbackData || null,
+        session: call.session || null,
+        contactName: call.contactName || null,
+        errors: Array.isArray(call.errors) ? call.errors : [],
+        raw: call.raw
+    }
+
+    io.to(room).emit('calls.update', payload)
+
+    const statusSummary = payload.status.length > 0 ? ` [${payload.status.join(', ')}]` : ''
+    console.log(
+        `[${profileId}] [Calls] ${payload.event.toUpperCase()} id=${payload.callId} from=${payload.from || '-'} to=${payload.to || '-'}${statusSummary}`
+    )
+
+    webhookStore.send(profileId, 'call', payload)
+
+    addon.webhookService.trigger(profileId, `call_${payload.event}`, payload)
 }
 
 registerSocketHandlers(io, {

@@ -1,0 +1,711 @@
+{
+  "id": "wf-qpay-lead-funnel",
+  "name": "QPay Lead Funnel",
+  "trigger_keyword": "qpay",
+  "run_on_new_chat": false,
+  "enabled": true,
+  "actions": [
+    {
+      "type": "send_buttons",
+      "text": "Hi, thanks for your interest in QPay. We help businesses run counter POS, mobile POS, self-order kiosk, QR ordering, and more. How can I help you today?",
+      "buttons": [
+        {
+          "id": "know_product",
+          "title": "Know Product"
+        },
+        {
+          "id": "recommend_setup",
+          "title": "Recommend Setup"
+        },
+        {
+          "id": "book_demo",
+          "title": "Book Demo"
+        }
+      ],
+      "fallback_text": "Please tap one of the options so I can help you faster.",
+      "routes": {
+        "know_product": 1,
+        "recommend_setup": 7,
+        "book_demo": 13
+      }
+    },
+    {
+      "type": "send_text",
+      "text": "QPay is an all-in-one commerce system for businesses that want POS, kiosk, QR ordering, webstore, inventory, loyalty, and reporting in one ecosystem.",
+      "next_step": 2
+    },
+    {
+      "type": "send_buttons",
+      "text": "Which part would you like to know more about?",
+      "buttons": [
+        {
+          "id": "counter_pos",
+          "title": "Counter POS"
+        },
+        {
+          "id": "self_order_kiosk",
+          "title": "Self-order Kiosk"
+        },
+        {
+          "id": "all_in_one",
+          "title": "All-in-One Setup"
+        }
+      ],
+      "fallback_text": "Please choose one option below.",
+      "routes": {
+        "counter_pos": 3,
+        "self_order_kiosk": 4,
+        "all_in_one": 5
+      }
+    },
+    {
+      "type": "send_text",
+      "text": "Our counter POS setup is great for cashier flow, inventory control, payment tracking, receipts, and daily sales reporting. It suits stores and front-counter operations that need fast checkout.",
+      "next_step": 6
+    },
+    {
+      "type": "send_text",
+      "text": "Our kiosk setup helps customers order by themselves, reduces queue congestion, and improves upsell opportunities. It works well for high-traffic F&B and self-service environments.",
+      "next_step": 6
+    },
+    {
+      "type": "send_text",
+      "text": "Our all-in-one setup combines counter POS, mobile ordering, kiosk, QR ordering, loyalty, and reporting into one connected system so your business can scale without switching platforms.",
+      "next_step": 6
+    },
+    {
+      "type": "send_buttons",
+      "text": "Would you like to get pricing, book a showroom demo, or talk to sales?",
+      "buttons": [
+        {
+          "id": "pricing",
+          "title": "Get Pricing"
+        },
+        {
+          "id": "demo",
+          "title": "Book Demo"
+        },
+        {
+          "id": "sales",
+          "title": "Talk to Sales"
+        }
+      ],
+      "fallback_text": "Please choose one option below.",
+      "routes": {
+        "pricing": 18,
+        "demo": 13,
+        "sales": 22
+      }
+    },
+    {
+      "type": "send_list",
+      "text": "Tell us what kind of business you run so we can recommend the right setup.",
+      "button_text": "Choose business",
+      "sections": [
+        {
+          "title": "Business Type",
+          "rows": [
+            {
+              "id": "fnb",
+              "title": "F&B",
+              "description": "Cafe, restaurant, kiosk, food court"
+            },
+            {
+              "id": "retail",
+              "title": "Retail",
+              "description": "Shop, mart, boutique, convenience"
+            },
+            {
+              "id": "service",
+              "title": "Service",
+              "description": "Salon, clinic, counter service"
+            }
+          ]
+        }
+      ],
+      "footer": "We will match the setup to your business flow.",
+      "fallback_text": "Please choose your business type from the list.",
+      "routes": {
+        "fnb": 8,
+        "retail": 8,
+        "service": 8
+      }
+    },
+    {
+      "type": "send_list",
+      "text": "What do you need most right now?",
+      "button_text": "Choose need",
+      "sections": [
+        {
+          "title": "Main Need",
+          "rows": [
+            {
+              "id": "need_counter",
+              "title": "Counter POS",
+              "description": "Front counter and payment"
+            },
+            {
+              "id": "need_kiosk",
+              "title": "Self-order Kiosk",
+              "description": "Customer self-ordering"
+            },
+            {
+              "id": "need_mobile",
+              "title": "Mobile POS",
+              "description": "Take orders on the floor"
+            },
+            {
+              "id": "need_all",
+              "title": "Full Setup",
+              "description": "End-to-end complete setup"
+            }
+          ]
+        }
+      ],
+      "footer": "Choose the closest option.",
+      "fallback_text": "Please choose your main need from the list.",
+      "routes": {
+        "need_counter": 9,
+        "need_kiosk": 10,
+        "need_mobile": 11,
+        "need_all": 12
+      }
+    },
+    {
+      "type": "send_text",
+      "text": "Based on your needs, we recommend a counter POS setup focused on faster checkout, stock control, and sales reporting. This is ideal if your team mainly operates at the cashier counter.",
+      "next_step": 6
+    },
+    {
+      "type": "send_text",
+      "text": "Based on your needs, we recommend a self-order kiosk setup to reduce queue time and increase self-service ordering. This is ideal for busy stores and F&B outlets.",
+      "next_step": 6
+    },
+    {
+      "type": "send_text",
+      "text": "Based on your needs, we recommend a mobile POS setup so staff can take orders and payments more flexibly without being tied to the counter.",
+      "next_step": 6
+    },
+    {
+      "type": "send_text",
+      "text": "Based on your needs, we recommend the full QPay setup, combining POS, kiosk, QR ordering, loyalty, inventory, and reporting into one connected system.",
+      "next_step": 6
+    },
+    {
+      "type": "send_text",
+      "text": "Great. To book a showroom demo, please reply with your name.",
+      "next_step": 14
+    },
+    {
+      "type": "send_text",
+      "text": "Thanks. Now reply with your company name.",
+      "next_step": 15
+    },
+    {
+      "type": "send_text",
+      "text": "Please reply with your business type and number of outlets.",
+      "next_step": 16
+    },
+    {
+      "type": "send_text",
+      "text": "Please reply with your preferred demo date and time.",
+      "next_step": 17
+    },
+    {
+      "type": "send_text",
+      "text": "Thanks, we have received your showroom demo request. Our team will contact you shortly to confirm your booking at the QPay showroom in Publika KL.",
+      "next_step": 24
+    },
+    {
+      "type": "send_text",
+      "text": "Sure. To prepare pricing, please reply with your name and company name.",
+      "next_step": 19
+    },
+    {
+      "type": "send_text",
+      "text": "Please reply with your business type, number of outlets, and the setup you are interested in.",
+      "next_step": 20
+    },
+    {
+      "type": "send_text",
+      "text": "Thanks. Our sales team will review your needs and send the pricing details shortly.",
+      "next_step": 24
+    },
+    {
+      "type": "send_buttons",
+      "text": "Would you like to do anything else?",
+      "buttons": [
+        {
+          "id": "back_menu",
+          "title": "Main Menu"
+        },
+        {
+          "id": "talk_sales",
+          "title": "Talk to Sales"
+        },
+        {
+          "id": "done",
+          "title": "Done"
+        }
+      ],
+      "fallback_text": "Please choose one option below.",
+      "routes": {
+        "back_menu": 0,
+        "talk_sales": 22,
+        "done": 24
+      }
+    },
+    {
+      "type": "send_text",
+      "text": "Please reply with your name and phone number, and our sales team will contact you directly.",
+      "next_step": 23
+    },
+    {
+      "type": "send_text",
+      "text": "Thanks, we have passed your details to our sales team. They will get back to you shortly.",
+      "next_step": 24
+    },
+    {
+      "type": "end_flow"
+    }
+  ],
+  "builder": {
+    "id": "wf-qpay-lead-funnel",
+    "meta": {
+      "name": "QPay Lead Funnel",
+      "enabled": true
+    },
+    "nodes": [
+      {
+        "id": "node-start-wf-qpay-lead-funnel",
+        "type": "START",
+        "position": {
+          "x": 120,
+          "y": 80
+        },
+        "nextId": "node-wf-qpay-lead-funnel-0"
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-0",
+        "type": "QUESTION",
+        "position": {
+          "x": 120,
+          "y": 220
+        },
+        "content": "Hi, thanks for your interest in QPay. We help businesses run counter POS, mobile POS, self-order kiosk, QR ordering, and more. How can I help you today?",
+        "options": [
+          "Know Product",
+          "Recommend Setup",
+          "Book Demo"
+        ],
+        "fallbackText": "Please tap one of the options so I can help you faster.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "connections": {
+          "opt-0": "node-wf-qpay-lead-funnel-1",
+          "opt-1": "node-wf-qpay-lead-funnel-7",
+          "opt-2": "node-wf-qpay-lead-funnel-13"
+        }
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-1",
+        "type": "MESSAGE",
+        "position": {
+          "x": -1100,
+          "y": 520
+        },
+        "content": "QPay is an all-in-one commerce system for businesses that want POS, kiosk, QR ordering, webstore, inventory, loyalty, and reporting in one ecosystem.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-qpay-lead-funnel-2"
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-2",
+        "type": "QUESTION",
+        "position": {
+          "x": -1100,
+          "y": 820
+        },
+        "content": "Which part would you like to know more about?",
+        "options": [
+          "Counter POS",
+          "Self-order Kiosk",
+          "All-in-One Setup"
+        ],
+        "fallbackText": "Please choose one option below.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "connections": {
+          "opt-0": "node-wf-qpay-lead-funnel-3",
+          "opt-1": "node-wf-qpay-lead-funnel-4",
+          "opt-2": "node-wf-qpay-lead-funnel-5"
+        }
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-3",
+        "type": "MESSAGE",
+        "position": {
+          "x": -1600,
+          "y": 1120
+        },
+        "content": "Our counter POS setup is great for cashier flow, inventory control, payment tracking, receipts, and daily sales reporting. It suits stores and front-counter operations that need fast checkout.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-qpay-lead-funnel-6"
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-4",
+        "type": "MESSAGE",
+        "position": {
+          "x": -1100,
+          "y": 1120
+        },
+        "content": "Our kiosk setup helps customers order by themselves, reduces queue congestion, and improves upsell opportunities. It works well for high-traffic F&B and self-service environments.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-qpay-lead-funnel-6"
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-5",
+        "type": "MESSAGE",
+        "position": {
+          "x": -600,
+          "y": 1120
+        },
+        "content": "Our all-in-one setup combines counter POS, mobile ordering, kiosk, QR ordering, loyalty, and reporting into one connected system so your business can scale without switching platforms.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-qpay-lead-funnel-6"
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-7",
+        "type": "LIST",
+        "position": {
+          "x": 120,
+          "y": 520
+        },
+        "body": "Tell us what kind of business you run so we can recommend the right setup.",
+        "buttonText": "Choose business",
+        "headerText": "",
+        "footerText": "We will match the setup to your business flow.",
+        "fallbackText": "Please choose your business type from the list.",
+        "sections": [
+          {
+            "title": "Business Type",
+            "rows": [
+              {
+                "id": "fnb",
+                "title": "F&B",
+                "description": "Cafe, restaurant, kiosk, food court"
+              },
+              {
+                "id": "retail",
+                "title": "Retail",
+                "description": "Shop, mart, boutique, convenience"
+              },
+              {
+                "id": "service",
+                "title": "Service",
+                "description": "Salon, clinic, counter service"
+              }
+            ]
+          }
+        ],
+        "connections": {
+          "row-0-0": "node-wf-qpay-lead-funnel-8",
+          "row-0-1": "node-wf-qpay-lead-funnel-8",
+          "row-0-2": "node-wf-qpay-lead-funnel-8"
+        }
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-8",
+        "type": "LIST",
+        "position": {
+          "x": 120,
+          "y": 820
+        },
+        "body": "What do you need most right now?",
+        "buttonText": "Choose need",
+        "headerText": "",
+        "footerText": "Choose the closest option.",
+        "fallbackText": "Please choose your main need from the list.",
+        "sections": [
+          {
+            "title": "Main Need",
+            "rows": [
+              {
+                "id": "need_counter",
+                "title": "Counter POS",
+                "description": "Front counter and payment"
+              },
+              {
+                "id": "need_kiosk",
+                "title": "Self-order Kiosk",
+                "description": "Customer self-ordering"
+              },
+              {
+                "id": "need_mobile",
+                "title": "Mobile POS",
+                "description": "Take orders on the floor"
+              },
+              {
+                "id": "need_all",
+                "title": "Full Setup",
+                "description": "End-to-end complete setup"
+              }
+            ]
+          }
+        ],
+        "connections": {
+          "row-0-0": "node-wf-qpay-lead-funnel-9",
+          "row-0-1": "node-wf-qpay-lead-funnel-10",
+          "row-0-2": "node-wf-qpay-lead-funnel-11",
+          "row-0-3": "node-wf-qpay-lead-funnel-12"
+        }
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-9",
+        "type": "MESSAGE",
+        "position": {
+          "x": -550,
+          "y": 1120
+        },
+        "content": "Based on your needs, we recommend a counter POS setup focused on faster checkout, stock control, and sales reporting. This is ideal if your team mainly operates at the cashier counter.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-qpay-lead-funnel-6"
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-10",
+        "type": "MESSAGE",
+        "position": {
+          "x": 0,
+          "y": 1120
+        },
+        "content": "Based on your needs, we recommend a self-order kiosk setup to reduce queue time and increase self-service ordering. This is ideal for busy stores and F&B outlets.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-qpay-lead-funnel-6"
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-11",
+        "type": "MESSAGE",
+        "position": {
+          "x": 550,
+          "y": 1120
+        },
+        "content": "Based on your needs, we recommend a mobile POS setup so staff can take orders and payments more flexibly without being tied to the counter.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-qpay-lead-funnel-6"
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-12",
+        "type": "MESSAGE",
+        "position": {
+          "x": 1100,
+          "y": 1120
+        },
+        "content": "Based on your needs, we recommend the full QPay setup, combining POS, kiosk, QR ordering, loyalty, inventory, and reporting into one connected system.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-qpay-lead-funnel-6"
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-6",
+        "type": "QUESTION",
+        "position": {
+          "x": 120,
+          "y": 1480
+        },
+        "content": "Would you like to get pricing, book a showroom demo, or talk to sales?",
+        "options": [
+          "Get Pricing",
+          "Book Demo",
+          "Talk to Sales"
+        ],
+        "fallbackText": "Please choose one option below.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "connections": {
+          "opt-0": "node-wf-qpay-lead-funnel-18",
+          "opt-1": "node-wf-qpay-lead-funnel-13",
+          "opt-2": "node-wf-qpay-lead-funnel-22"
+        }
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-13",
+        "type": "MESSAGE",
+        "position": {
+          "x": 120,
+          "y": 1840
+        },
+        "content": "Great. To book a showroom demo, please reply with your name.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-qpay-lead-funnel-14"
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-14",
+        "type": "MESSAGE",
+        "position": {
+          "x": 120,
+          "y": 2120
+        },
+        "content": "Thanks. Now reply with your company name.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-qpay-lead-funnel-15"
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-15",
+        "type": "MESSAGE",
+        "position": {
+          "x": 120,
+          "y": 2400
+        },
+        "content": "Please reply with your business type and number of outlets.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-qpay-lead-funnel-16"
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-16",
+        "type": "MESSAGE",
+        "position": {
+          "x": 120,
+          "y": 2680
+        },
+        "content": "Please reply with your preferred demo date and time.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-qpay-lead-funnel-17"
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-17",
+        "type": "MESSAGE",
+        "position": {
+          "x": 120,
+          "y": 2960
+        },
+        "content": "Thanks, we have received your showroom demo request. Our team will contact you shortly to confirm your booking at the QPay showroom in Publika KL.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-qpay-lead-funnel-24"
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-18",
+        "type": "MESSAGE",
+        "position": {
+          "x": -650,
+          "y": 1840
+        },
+        "content": "Sure. To prepare pricing, please reply with your name and company name.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-qpay-lead-funnel-19"
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-19",
+        "type": "MESSAGE",
+        "position": {
+          "x": -650,
+          "y": 2120
+        },
+        "content": "Please reply with your business type, number of outlets, and the setup you are interested in.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-qpay-lead-funnel-20"
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-20",
+        "type": "MESSAGE",
+        "position": {
+          "x": -650,
+          "y": 2400
+        },
+        "content": "Thanks. Our sales team will review your needs and send the pricing details shortly.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-qpay-lead-funnel-24"
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-22",
+        "type": "MESSAGE",
+        "position": {
+          "x": 900,
+          "y": 1840
+        },
+        "content": "Please reply with your name and phone number, and our sales team will contact you directly.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-qpay-lead-funnel-23"
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-23",
+        "type": "MESSAGE",
+        "position": {
+          "x": 900,
+          "y": 2120
+        },
+        "content": "Thanks, we have passed your details to our sales team. They will get back to you shortly.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "nextId": "node-wf-qpay-lead-funnel-24"
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-24",
+        "type": "QUESTION",
+        "position": {
+          "x": 120,
+          "y": 3320
+        },
+        "content": "Would you like to do anything else?",
+        "options": [
+          "Main Menu",
+          "Talk to Sales",
+          "Done"
+        ],
+        "fallbackText": "Please choose one option below.",
+        "mediaType": "none",
+        "mediaUrl": "",
+        "mediaFilename": "",
+        "connections": {
+          "opt-0": "node-wf-qpay-lead-funnel-0",
+          "opt-1": "node-wf-qpay-lead-funnel-22",
+          "opt-2": "node-wf-qpay-lead-funnel-25"
+        }
+      },
+      {
+        "id": "node-wf-qpay-lead-funnel-25",
+        "type": "END",
+        "position": {
+          "x": 120,
+          "y": 3600
+        },
+        "content": ""
+      }
+    ]
+  }
+}
