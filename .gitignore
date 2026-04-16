@@ -21,6 +21,8 @@ coverage
 contacts_db.json
 dashboard/node_modules
 dist
+dashboard/android/.gradle-build/
+dashboard/android/.gradle-build-v2/
 
 # Centralized Data
 data/
