@@ -22,8 +22,9 @@ This documentation set describes the `Qmessage-Main` repository as implemented i
 16. [Troubleshooting](./16-troubleshooting.md)
 17. [Future Improvements](./17-future-improvements.md)
 18. [Supabase Clone Runbook](./18-supabase-clone-migration.md)
-19. [Capacitor Native Push Setup](./capacitor-native-push.md)
-20. [Native App Setup (RN Migration)](./native-app-setup.md)
+19. [Create New App/Web From This Repo](./19-create-new-app-from-repo.md)
+20. [Capacitor Native Push Setup](./capacitor-native-push.md)
+21. [Native App Setup (RN Migration)](./native-app-setup.md)
 
 ## Quick Start
 
