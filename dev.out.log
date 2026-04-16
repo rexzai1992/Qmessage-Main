@@ -1,4 +1,0 @@
-
-> baileys@7.0.0-rc.9 dev
-> concurrently "npx tsx watch dashboard-server.ts" "npm run dev --prefix dashboard"
-

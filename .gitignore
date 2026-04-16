@@ -27,6 +27,20 @@ data/
 
 # Local runtime logs
 .codex-logs/
+.codex-chat-recovery-*/
+cloudflared-2fast.err.log
+cloudflared-2fast.out.log
+dev.err.log
+dev.out.log
+
+# Local binaries
+cloudflared.exe
+
+# Local scratch files
+Could
+Get
+Run
+dashboard-server.bak.ts
 
 # Local credentials
 secrets/fcm-service-account.json
