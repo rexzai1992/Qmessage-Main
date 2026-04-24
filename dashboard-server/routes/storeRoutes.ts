@@ -12,6 +12,9 @@ const RESERVED_PUBLIC_SEGMENTS = new Set([
     'support',
     'privacy',
     'privacy-policy',
+    'data-deletion',
+    'user-data-deletion',
+    'user-data-deletion-request',
     'terms',
     'terms-and-conditions',
     'customixie'

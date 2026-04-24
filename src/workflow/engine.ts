@@ -9,6 +9,7 @@ export type InboundContext = {
     profileId: string
     client: WabaClient
     phoneNumber: string
+    messageId?: string
     automationDisabled?: boolean
     messageType: string
     text?: string
@@ -666,8 +667,10 @@ export class WorkflowEngine {
         }
 
         const simulatedSourceRaw = typeof ctx.raw?.source === 'string' ? ctx.raw.source.trim().toLowerCase() : ''
+        const inboundMessageId = typeof ctx.messageId === 'string' ? ctx.messageId.trim() : ''
         const inboundContent: any = {
             type: ctx.messageType,
+            message_id: inboundMessageId || undefined,
             text: ctx.text,
             button_id: ctx.buttonId,
             button_title: ctx.buttonTitle,
@@ -726,7 +729,7 @@ export class WorkflowEngine {
         let state: WorkflowState | null = currentState
 
         if (state?.workflow_id) {
-            workflow = await getWorkflowById(state.workflow_id)
+            workflow = await getWorkflowById(state.workflow_id, ctx.companyId)
         }
 
         // If the saved state points past the end of actions (or to end_flow),
@@ -1257,7 +1260,7 @@ export class WorkflowEngine {
         const user = await findOrCreateUser(ctx.companyId, ctx.phoneNumber)
         if (!user) return { handled: false, replied: false }
 
-        const workflow = await getWorkflowById(workflowId)
+        const workflow = await getWorkflowById(workflowId, ctx.companyId)
         if (!workflow) return { error: 'Workflow not found.', handled: false, replied: false }
         if (workflow.company_id && workflow.company_id !== ctx.companyId) {
             return { error: 'Workflow not found for this company.', handled: false, replied: false }
@@ -1581,7 +1584,7 @@ export class WorkflowEngine {
                     lastError = 'trigger_workflow failed: cannot trigger the same workflow.'
                     break
                 }
-                const targetWorkflow = await getWorkflowById(targetWorkflowId)
+                const targetWorkflow = await getWorkflowById(targetWorkflowId, ctx.companyId)
                 if (!targetWorkflow) {
                     lastError = `trigger_workflow failed: workflow not found (${targetWorkflowId})`
                     break

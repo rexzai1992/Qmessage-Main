@@ -820,14 +820,14 @@ export class WabaClient {
         })
     }
 
-    public async requestVerificationCode(phoneNumberId: string, codeMethod: 'SMS' | 'VOICE', locale = 'en_US') {
+    public async requestVerificationCode(phoneNumberId: string, codeMethod: 'SMS' | 'VOICE', language = 'en_US') {
         if (!phoneNumberId) throw new Error('phoneNumberId is required')
-        return this.request(`${phoneNumberId}/request_code`, {
-            method: 'POST',
-            json: {
-                code_method: codeMethod,
-                locale
-            }
+        const params = new URLSearchParams({
+            code_method: codeMethod,
+            language
+        })
+        return this.request(`${phoneNumberId}/request_code?${params.toString()}`, {
+            method: 'POST'
         })
     }
 
@@ -840,15 +840,33 @@ export class WabaClient {
         })
     }
 
-    public async registerPhoneNumber(phoneNumberId: string, pin: string) {
+    public async registerPhoneNumber(
+        phoneNumberId: string,
+        pin: string,
+        options: { dataLocalizationRegion?: string } = {}
+    ) {
         if (!phoneNumberId) throw new Error('phoneNumberId is required')
         if (!pin) throw new Error('pin is required')
+        const dataLocalizationRegion = typeof options.dataLocalizationRegion === 'string'
+            ? options.dataLocalizationRegion.trim().toUpperCase()
+            : ''
+        const payload: Record<string, any> = {
+            messaging_product: 'whatsapp',
+            pin
+        }
+        if (dataLocalizationRegion) {
+            payload.data_localization_region = dataLocalizationRegion
+        }
         return this.request(`${phoneNumberId}/register`, {
             method: 'POST',
-            json: {
-                messaging_product: 'whatsapp',
-                pin
-            }
+            json: payload
+        })
+    }
+
+    public async deregisterPhoneNumber(phoneNumberId: string) {
+        if (!phoneNumberId) throw new Error('phoneNumberId is required')
+        return this.request(`${phoneNumberId}/deregister`, {
+            method: 'POST'
         })
     }
 

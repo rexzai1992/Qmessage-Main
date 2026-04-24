@@ -18,7 +18,13 @@ const UI_FEATURE_KEYS = new Set([
     'contacts',
     'calls',
     'analytics',
-    'settings'
+    'settings',
+    'settings-review',
+    'settings-manual',
+    'settings-register',
+    'settings-webhooks',
+    'settings-ads-shoot',
+    'settings-promo-push'
 ])
 
 const UI_HIDDEN_FEATURES_MISSING_MESSAGE =

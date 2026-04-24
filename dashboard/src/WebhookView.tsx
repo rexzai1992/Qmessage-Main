@@ -78,6 +78,51 @@ type SystemRuntimeStatusState = {
     downtime_log: RuntimeDowntimeLog[];
 };
 
+type AppReviewCheckStatus = 'idle' | 'running' | 'success' | 'error';
+type AppReviewCheckKey =
+    | 'whatsapp_business_management'
+    | 'business_management'
+    | 'whatsapp_business_messaging';
+
+type AppReviewCheckState = {
+    status: AppReviewCheckStatus;
+    message: string;
+    checkedAt: string | null;
+    details: string[];
+};
+type ReviewMessageDeliveryStatus = 'accepted' | 'sent' | 'delivered' | 'read' | 'failed';
+
+type AppReviewReadinessState = {
+    profileId: string;
+    companyId: string;
+    oauth?: {
+        mode?: string;
+        configId?: string | null;
+        redirectUri?: string;
+        returnUrl?: string;
+    };
+    prerequisites: Array<{
+        key: string;
+        label: string;
+        ok: boolean;
+        detail: string;
+    }>;
+    connection: {
+        connected: boolean;
+        runtimeConfigLoaded: boolean;
+        enabled: boolean;
+        phoneNumberId: string | null;
+        wabaId: string | null;
+        businessId: string | null;
+        clientBusinessId: string | null;
+        tokenSource: string | null;
+        accessTokenExpiresAt: string | null;
+        tokenScopes: string[];
+        connectedAt: string | null;
+        updatedAt: string | null;
+    };
+};
+
 type BusinessProfileFormState = {
     about: string;
     address: string;
@@ -117,6 +162,29 @@ const DEFAULT_ADS_SHOOT_MODE_STATE: AdsShootModeState = {
     nightEndHour: 23,
     lastRunLocalDate: null
 };
+
+const DEFAULT_APP_REVIEW_MESSAGE = 'Meta App Review test message from QMessage.';
+
+const createInitialAppReviewCheckState = (): Record<AppReviewCheckKey, AppReviewCheckState> => ({
+    whatsapp_business_management: {
+        status: 'idle',
+        message: 'Not checked yet.',
+        checkedAt: null,
+        details: []
+    },
+    business_management: {
+        status: 'idle',
+        message: 'Not checked yet.',
+        checkedAt: null,
+        details: []
+    },
+    whatsapp_business_messaging: {
+        status: 'idle',
+        message: 'Not checked yet.',
+        checkedAt: null,
+        details: []
+    }
+});
 
 const normalizeCommandName = (value: unknown): string =>
     (typeof value === 'string' ? value.trim() : '').replace(/^\/+/, '').toLowerCase();
@@ -233,11 +301,17 @@ type WebhookViewProps = {
     onSaveQuickReplies: (items: QuickReply[]) => void;
     onRefreshUiControls: () => void;
     showCallSettings?: boolean;
+    showPermissionVerificationConsole?: boolean;
+    showManualWabaSetup?: boolean;
+    showRegisterWhatsAppNumber?: boolean;
+    showOutgoingWebhooks?: boolean;
+    showAdsShootMode?: boolean;
     notificationPermission: NotificationPermission | 'unsupported';
     notificationSoundEnabled: boolean;
     onToggleNotificationSound: (enabled: boolean) => void;
     onRequestNotifications: () => void;
     onTestNotificationSound: () => void;
+    isMobileView?: boolean;
 };
 
 export default function WebhookView({
@@ -253,11 +327,17 @@ export default function WebhookView({
     onSaveQuickReplies,
     onRefreshUiControls,
     showCallSettings = true,
+    showPermissionVerificationConsole = false,
+    showManualWabaSetup = false,
+    showRegisterWhatsAppNumber = false,
+    showOutgoingWebhooks = false,
+    showAdsShootMode = false,
     notificationPermission,
     notificationSoundEnabled,
     onToggleNotificationSound,
     onRequestNotifications,
-    onTestNotificationSound
+    onTestNotificationSound,
+    isMobileView = false
 }: WebhookViewProps) {
     const [webhooks, setWebhooks] = useState<any[]>([]);
     const [webhookError, setWebhookError] = useState<string | null>(null);
@@ -325,6 +405,9 @@ export default function WebhookView({
     const [quickRepliesDraft, setQuickRepliesDraft] = useState<QuickReply[]>([]);
     const [connectLoading, setConnectLoading] = useState(false);
     const [connectError, setConnectError] = useState<string | null>(null);
+    const [disconnectLoading, setDisconnectLoading] = useState(false);
+    const [disconnectError, setDisconnectError] = useState<string | null>(null);
+    const [disconnectNotice, setDisconnectNotice] = useState<string | null>(null);
     const [clientConnections, setClientConnections] = useState<any[]>([]);
     const [clientLoading, setClientLoading] = useState(Boolean(isSuperAdmin));
     const [clientError, setClientError] = useState<string | null>(null);
@@ -388,6 +471,12 @@ export default function WebhookView({
   "vertical": "OTHER"
 }`);
     const [registrationBusy, setRegistrationBusy] = useState<null | 'request' | 'verify' | 'register' | 'profile'>(null);
+    const [appReviewReadiness, setAppReviewReadiness] = useState<AppReviewReadinessState | null>(null);
+    const [appReviewReadinessLoading, setAppReviewReadinessLoading] = useState(Boolean(sessionToken));
+    const [appReviewReadinessError, setAppReviewReadinessError] = useState<string | null>(null);
+    const [appReviewChecks, setAppReviewChecks] = useState<Record<AppReviewCheckKey, AppReviewCheckState>>(() => createInitialAppReviewCheckState());
+    const [appReviewMessageTo, setAppReviewMessageTo] = useState('');
+    const [appReviewMessageText, setAppReviewMessageText] = useState(DEFAULT_APP_REVIEW_MESSAGE);
     const businessProfileFileInputRef = useRef<HTMLInputElement>(null);
     const appLogoFileInputRef = useRef<HTMLInputElement>(null);
     const [appLogoLoading, setAppLogoLoading] = useState(Boolean(sessionToken));
@@ -414,6 +503,16 @@ export default function WebhookView({
     const [systemRuntimeStatus, setSystemRuntimeStatus] = useState<SystemRuntimeStatusState | null>(null);
     const [maintenanceEnabledDraft, setMaintenanceEnabledDraft] = useState(false);
     const [maintenanceMessageDraft, setMaintenanceMessageDraft] = useState('');
+    const [promoPushTitle, setPromoPushTitle] = useState('QMessage Promo');
+    const [promoPushBody, setPromoPushBody] = useState('');
+    const [promoPushUrl, setPromoPushUrl] = useState('/');
+    const [promoPushTag, setPromoPushTag] = useState('');
+    const [promoPushCode, setPromoPushCode] = useState('');
+    const [promoPushTtlSeconds, setPromoPushTtlSeconds] = useState(600);
+    const [promoPushIncludeActiveUsers, setPromoPushIncludeActiveUsers] = useState(true);
+    const [promoPushSending, setPromoPushSending] = useState(false);
+    const [promoPushNotice, setPromoPushNotice] = useState<string | null>(null);
+    const [promoPushError, setPromoPushError] = useState<string | null>(null);
     const showLegacyAutomationSettings = false;
 
     useEffect(() => {
@@ -434,6 +533,7 @@ export default function WebhookView({
             }
             fetchBusinessProfile();
             fetchAdsShootMode();
+            fetchAppReviewReadiness();
         }
         onRefreshQuickReplies();
     }, [profileId, onRefreshQuickReplies, isSuperAdmin, sessionToken, showCallSettings]);
@@ -449,6 +549,10 @@ export default function WebhookView({
             window.history.replaceState({}, '', nextUrl);
         }
     }, [sessionToken]);
+
+    useEffect(() => {
+        setAppReviewChecks(createInitialAppReviewCheckState());
+    }, [profileId]);
 
     useEffect(() => {
         setQuickRepliesDraft(quickReplies.map(item => ({ ...item })));
@@ -759,8 +863,13 @@ export default function WebhookView({
         }
         setConnectLoading(true);
         setConnectError(null);
+        setDisconnectError(null);
+        setDisconnectNotice(null);
         try {
-            const res = await fetch(`${SOCKET_URL}/api/waba/embedded-signup/url?profileId=${encodeURIComponent(profileId)}`, {
+            const params = new URLSearchParams();
+            params.set('profileId', profileId);
+            params.set('returnUrl', `${window.location.origin}${window.location.pathname}`);
+            const res = await fetch(`${SOCKET_URL}/api/waba/embedded-signup/url?${params.toString()}`, {
                 headers: {
                     Authorization: `Bearer ${sessionToken}`
                 }
@@ -774,6 +883,63 @@ export default function WebhookView({
             setConnectError(err?.message || 'Failed to start embedded signup');
         } finally {
             setConnectLoading(false);
+        }
+    };
+
+    const handleDisconnectWhatsapp = async (revoke = false) => {
+        if (!sessionToken) {
+            setDisconnectError('You must be logged in to disconnect WhatsApp.');
+            return;
+        }
+        if (!profileId) {
+            setDisconnectError('Profile ID is missing.');
+            return;
+        }
+
+        if (!confirm(`Disconnect WhatsApp Business from this profile${revoke ? ' and revoke webhook subscription' : ''}?`)) {
+            return;
+        }
+
+        setDisconnectLoading(true);
+        setDisconnectError(null);
+        setDisconnectNotice(null);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/waba/clients/disconnect`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${sessionToken}`
+                },
+                body: JSON.stringify({ profileId, revoke })
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok) {
+                throw new Error(data?.error || 'Failed to disconnect WhatsApp Business');
+            }
+
+            if (data?.success === false && data?.disabled) {
+                setDisconnectNotice(`Disconnected from this profile, but revoke failed: ${data?.error || 'Unknown error'}`);
+            } else if (data?.success) {
+                setDisconnectNotice(
+                    revoke
+                        ? 'WhatsApp Business disconnected and webhook subscription revoked.'
+                        : 'WhatsApp Business disconnected for this profile.'
+                );
+            } else {
+                throw new Error(data?.error || 'Failed to disconnect WhatsApp Business');
+            }
+
+            setConnectError(null);
+            setRegistrationConfig(null);
+            fetchRegistrationConfig();
+            fetchAppReviewReadiness();
+            if (isSuperAdmin) {
+                fetchClientConnections();
+            }
+        } catch (err: any) {
+            setDisconnectError(err?.message || 'Failed to disconnect WhatsApp Business');
+        } finally {
+            setDisconnectLoading(false);
         }
     };
 
@@ -809,6 +975,14 @@ export default function WebhookView({
                 throw new Error(data?.error || 'Manual config failed');
             }
             setManualSuccess(data?.subscribeError ? `Saved. Webhook subscription failed: ${data.subscribeError}` : 'Saved and subscribed.');
+            setConnectError(null);
+            setDisconnectError(null);
+            setDisconnectNotice(null);
+            fetchRegistrationConfig();
+            fetchAppReviewReadiness();
+            if (isSuperAdmin) {
+                fetchClientConnections();
+            }
         } catch (err: any) {
             setManualError(err?.message || 'Manual config failed');
         } finally {
@@ -861,10 +1035,448 @@ export default function WebhookView({
                     setRegistrationError(null);
                 } else {
                     setRegistrationConfig(null);
-                    setRegistrationError(data?.error || 'Failed to load registration config');
+                    const errorMessage = typeof data?.error === 'string' ? data.error : '';
+                    if (errorMessage.toLowerCase().includes('not found')) {
+                        setRegistrationError(null);
+                        return;
+                    }
+                    setRegistrationError(errorMessage || 'Failed to load registration config');
                 }
             })
             .finally(() => setRegistrationLoading(false));
+    };
+
+    const parseAppReviewError = (data: any, fallback: string): { message: string; details: string[] } => {
+        const message = readTrimmed(data?.error) || fallback;
+        const details = Array.isArray(data?.details)
+            ? data.details.map((item: any) => readTrimmed(item)).filter(Boolean)
+            : [];
+        return { message, details };
+    };
+
+    const updateAppReviewCheck = (
+        key: AppReviewCheckKey,
+        patch: Partial<AppReviewCheckState>
+    ) => {
+        setAppReviewChecks(prev => ({
+            ...prev,
+            [key]: {
+                ...prev[key],
+                ...patch
+            }
+        }));
+    };
+
+    const fetchAppReviewReadiness = async () => {
+        if (!sessionToken || !profileId) {
+            setAppReviewReadiness(null);
+            setAppReviewReadinessError(null);
+            setAppReviewReadinessLoading(false);
+            setAppReviewChecks(createInitialAppReviewCheckState());
+            return;
+        }
+
+        setAppReviewReadinessLoading(true);
+        setAppReviewReadinessError(null);
+        try {
+            const params = new URLSearchParams();
+            params.set('profileId', profileId);
+            params.set('returnUrl', `${window.location.origin}${window.location.pathname}`);
+            const res = await fetch(`${SOCKET_URL}/api/waba/review/readiness?${params.toString()}`, {
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`
+                }
+            });
+            const text = await res.text();
+            let data: any = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch {
+                data = null;
+            }
+
+            if (!res.ok || !data?.success) {
+                const parsedError = parseAppReviewError(data, 'Failed to load App Review readiness.');
+                throw new Error(parsedError.message);
+            }
+
+            const payload = data?.data && typeof data.data === 'object' ? data.data : null;
+            setAppReviewReadiness(payload);
+        } catch (error: any) {
+            setAppReviewReadiness(null);
+            setAppReviewReadinessError(error?.message || 'Failed to load App Review readiness.');
+        } finally {
+            setAppReviewReadinessLoading(false);
+        }
+    };
+
+    const runWhatsappBusinessManagementCheck = async () => {
+        if (!sessionToken || !profileId) return;
+        updateAppReviewCheck('whatsapp_business_management', {
+            status: 'running',
+            message: 'Checking business profile and template access...',
+            checkedAt: null,
+            details: []
+        });
+
+        try {
+            const profileParams = new URLSearchParams();
+            profileParams.set('profileId', profileId);
+            profileParams.set('fields', 'about');
+            const profileRes = await fetch(`${SOCKET_URL}/api/waba/business-profile?${profileParams.toString()}`, {
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`
+                }
+            });
+            const profileText = await profileRes.text();
+            let profileData: any = null;
+            try {
+                profileData = profileText ? JSON.parse(profileText) : null;
+            } catch {
+                profileData = null;
+            }
+            if (!profileRes.ok || !profileData?.success) {
+                const parsedError = parseAppReviewError(profileData, 'Business profile check failed.');
+                throw new Error(parsedError.message);
+            }
+
+            const templateParams = new URLSearchParams();
+            templateParams.set('profileId', profileId);
+            templateParams.set('limit', '1');
+            const templateRes = await fetch(`${SOCKET_URL}/api/waba/templates?${templateParams.toString()}`, {
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`
+                }
+            });
+            const templateText = await templateRes.text();
+            let templateData: any = null;
+            try {
+                templateData = templateText ? JSON.parse(templateText) : null;
+            } catch {
+                templateData = null;
+            }
+            if (!templateRes.ok || !templateData?.success) {
+                const parsedError = parseAppReviewError(templateData, 'Template read check failed.');
+                throw new Error(parsedError.message);
+            }
+
+            const templateCount = Number.isFinite(Number(templateData?.meta?.total_count))
+                ? Number(templateData.meta.total_count)
+                : Array.isArray(templateData?.data?.data)
+                    ? templateData.data.data.length
+                    : Array.isArray(templateData?.data)
+                        ? templateData.data.length
+                        : 0;
+
+            updateAppReviewCheck('whatsapp_business_management', {
+                status: 'success',
+                message: 'Business profile and template access checks succeeded.',
+                checkedAt: new Date().toISOString(),
+                details: [
+                    'Business profile API returned success.',
+                    `Template API returned success (sample size: ${templateCount}).`
+                ]
+            });
+        } catch (error: any) {
+            updateAppReviewCheck('whatsapp_business_management', {
+                status: 'error',
+                message: error?.message || 'whatsapp_business_management check failed.',
+                checkedAt: new Date().toISOString(),
+                details: []
+            });
+        }
+    };
+
+    const runBusinessManagementCheck = async () => {
+        if (!sessionToken || !profileId) return;
+        updateAppReviewCheck('business_management', {
+            status: 'running',
+            message: 'Checking business portfolio access...',
+            checkedAt: null,
+            details: []
+        });
+
+        try {
+            const params = new URLSearchParams();
+            params.set('profileId', profileId);
+            const res = await fetch(`${SOCKET_URL}/api/waba/review/businesses?${params.toString()}`, {
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`
+                }
+            });
+            const text = await res.text();
+            let data: any = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch {
+                data = null;
+            }
+            if (!res.ok || !data?.success) {
+                const parsedError = parseAppReviewError(data, 'Business access check failed.');
+                throw new Error(parsedError.message);
+            }
+
+            const count = Number.isFinite(Number(data?.data?.count)) ? Number(data.data.count) : 0;
+            updateAppReviewCheck('business_management', {
+                status: 'success',
+                message: 'Business portfolio listing succeeded.',
+                checkedAt: new Date().toISOString(),
+                details: [`Businesses returned: ${count}`]
+            });
+        } catch (error: any) {
+            updateAppReviewCheck('business_management', {
+                status: 'error',
+                message: error?.message || 'business_management check failed.',
+                checkedAt: new Date().toISOString(),
+                details: []
+            });
+        }
+    };
+
+    const sleep = (ms: number) => new Promise<void>((resolve) => {
+        window.setTimeout(resolve, ms);
+    });
+
+    const normalizeReviewMessageDeliveryStatus = (value: unknown): ReviewMessageDeliveryStatus => {
+        const lower = readTrimmed(value).toLowerCase();
+        if (lower === 'sent') return 'sent';
+        if (lower === 'delivered') return 'delivered';
+        if (lower === 'read') return 'read';
+        if (lower === 'failed') return 'failed';
+        return 'accepted';
+    };
+
+    const formatReviewMessageDeliveryLabel = (status: ReviewMessageDeliveryStatus): string => {
+        if (status === 'accepted') return 'Accepted';
+        if (status === 'sent') return 'Sent';
+        if (status === 'delivered') return 'Delivered';
+        if (status === 'read') return 'Read';
+        return 'Failed';
+    };
+
+    const buildReviewMessageFlowLine = (status: ReviewMessageDeliveryStatus): string => {
+        const sentReached = status === 'sent' || status === 'delivered' || status === 'read' || status === 'failed';
+        const deliveredReached = status === 'delivered' || status === 'read';
+        const readReached = status === 'read';
+        const failedReached = status === 'failed';
+
+        return `Flow: Accepted ${sentReached ? '-> Sent' : '-> ...'} ${failedReached ? '-> Failed' : deliveredReached ? '-> Delivered' : '-> ...'} ${readReached ? '-> Read' : ''}`.trim();
+    };
+
+    const buildReviewMessageDetails = (params: {
+        recipient: string;
+        messageId: string;
+        status: ReviewMessageDeliveryStatus;
+        tracked: boolean;
+        note?: string;
+        lastEventAt?: string;
+    }): string[] => {
+        const details: string[] = [
+            `Recipient: ${params.recipient}`,
+            `Message ID: ${params.messageId}`,
+            buildReviewMessageFlowLine(params.status),
+            `Current status: ${formatReviewMessageDeliveryLabel(params.status)}`
+        ];
+        const note = readTrimmed(params.note);
+        if (note) details.push(`Tracking note: ${note}`);
+        if (params.lastEventAt) details.push(`Last status event: ${params.lastEventAt}`);
+        if (!params.tracked) details.push('Tracking disabled for this send.');
+        return details;
+    };
+
+    const runWhatsappBusinessMessagingCheck = async () => {
+        if (!sessionToken || !profileId) return;
+        const to = readTrimmed(appReviewMessageTo);
+        if (!to) {
+            updateAppReviewCheck('whatsapp_business_messaging', {
+                status: 'error',
+                message: 'Recipient number is required to run the messaging check.',
+                checkedAt: new Date().toISOString(),
+                details: []
+            });
+            return;
+        }
+
+        updateAppReviewCheck('whatsapp_business_messaging', {
+            status: 'running',
+            message: 'Sending test message...',
+            checkedAt: null,
+            details: []
+        });
+
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/waba/review/send-test-message`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    profileId,
+                    to,
+                    text: readTrimmed(appReviewMessageText) || DEFAULT_APP_REVIEW_MESSAGE
+                })
+            });
+            const text = await res.text();
+            let data: any = null;
+            try {
+                data = text ? JSON.parse(text) : null;
+            } catch {
+                data = null;
+            }
+            if (!res.ok || !data?.success) {
+                const parsedError = parseAppReviewError(data, 'Messaging permission check failed.');
+                throw new Error(parsedError.message);
+            }
+
+            const messageId = readTrimmed(data?.data?.messageId);
+            const sentAt = readTrimmed(data?.data?.sentAt);
+            const recipient = readTrimmed(data?.data?.to) || to;
+            const trackingNote = readTrimmed(data?.data?.delivery?.note);
+            const tracked = data?.data?.tracked !== false;
+
+            if (!messageId) {
+                updateAppReviewCheck('whatsapp_business_messaging', {
+                    status: 'success',
+                    message: 'Message accepted by Meta API, but no message ID was returned for status tracking.',
+                    checkedAt: sentAt || new Date().toISOString(),
+                    details: [
+                        `Recipient: ${recipient}`,
+                        'Message ID not returned by Graph API.'
+                    ]
+                });
+                return;
+            }
+
+            updateAppReviewCheck('whatsapp_business_messaging', {
+                status: tracked ? 'running' : 'success',
+                message: tracked
+                    ? 'Accepted by Meta API. Waiting for delivery webhook status...'
+                    : 'Accepted by Meta API. Delivery status tracking is unavailable for this send.',
+                checkedAt: sentAt || new Date().toISOString(),
+                details: buildReviewMessageDetails({
+                    recipient,
+                    messageId,
+                    status: 'accepted',
+                    tracked,
+                    note: trackingNote
+                })
+            });
+
+            if (!tracked) return;
+
+            const maxAttempts = 10;
+            const pollDelayMs = 2000;
+            let lastStatus: ReviewMessageDeliveryStatus = 'accepted';
+            let lastCheckedAt = sentAt || new Date().toISOString();
+            let lastEventAt = '';
+            let lastTrackingNote = trackingNote;
+
+            for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+                if (attempt > 0) {
+                    await sleep(pollDelayMs);
+                }
+
+                const statusParams = new URLSearchParams();
+                statusParams.set('profileId', profileId);
+                statusParams.set('messageId', messageId);
+                const statusRes = await fetch(`${SOCKET_URL}/api/waba/review/message-status?${statusParams.toString()}`, {
+                    headers: {
+                        Authorization: `Bearer ${sessionToken}`
+                    }
+                });
+                const statusText = await statusRes.text();
+                let statusData: any = null;
+                try {
+                    statusData = statusText ? JSON.parse(statusText) : null;
+                } catch {
+                    statusData = null;
+                }
+                if (!statusRes.ok || !statusData?.success) {
+                    continue;
+                }
+
+                const payload = statusData?.data || {};
+                lastStatus = normalizeReviewMessageDeliveryStatus(payload?.status);
+                lastCheckedAt = readTrimmed(payload?.checkedAt) || new Date().toISOString();
+                lastEventAt = readTrimmed(payload?.lastEventAt);
+                const statusTracked = payload?.tracked !== false;
+                if (readTrimmed(payload?.note)) {
+                    lastTrackingNote = readTrimmed(payload.note);
+                }
+
+                const details = buildReviewMessageDetails({
+                    recipient: readTrimmed(payload?.recipient) || recipient,
+                    messageId,
+                    status: lastStatus,
+                    tracked: statusTracked,
+                    note: lastTrackingNote,
+                    lastEventAt
+                });
+
+                if (lastStatus === 'failed') {
+                    updateAppReviewCheck('whatsapp_business_messaging', {
+                        status: 'error',
+                        message: 'Message failed after API acceptance. Check webhook failure reason.',
+                        checkedAt: lastCheckedAt,
+                        details
+                    });
+                    return;
+                }
+
+                if (lastStatus === 'delivered' || lastStatus === 'read') {
+                    updateAppReviewCheck('whatsapp_business_messaging', {
+                        status: 'success',
+                        message: lastStatus === 'read'
+                            ? 'Message reached recipient and was read.'
+                            : 'Message reached recipient (delivered).',
+                        checkedAt: lastCheckedAt,
+                        details
+                    });
+                    return;
+                }
+
+                if (attempt < maxAttempts - 1) {
+                    updateAppReviewCheck('whatsapp_business_messaging', {
+                        status: 'running',
+                        message: `Accepted by Meta API. Latest status: ${formatReviewMessageDeliveryLabel(lastStatus)}.`,
+                        checkedAt: lastCheckedAt,
+                        details
+                    });
+                }
+            }
+
+            const finalDetails = buildReviewMessageDetails({
+                recipient,
+                messageId,
+                status: lastStatus,
+                tracked: true,
+                note: lastTrackingNote,
+                lastEventAt
+            });
+
+            updateAppReviewCheck('whatsapp_business_messaging', {
+                status: 'success',
+                message: lastStatus === 'sent'
+                    ? 'Message accepted and marked sent. Delivered/read webhook may arrive shortly.'
+                    : 'Message accepted by Meta API. Delivery webhook is still pending.',
+                checkedAt: lastCheckedAt,
+                details: finalDetails
+            });
+        } catch (error: any) {
+            updateAppReviewCheck('whatsapp_business_messaging', {
+                status: 'error',
+                message: error?.message || 'whatsapp_business_messaging check failed.',
+                checkedAt: new Date().toISOString(),
+                details: []
+            });
+        }
+    };
+
+    const runAllAppReviewChecks = async () => {
+        await fetchAppReviewReadiness();
+        await runWhatsappBusinessManagementCheck();
+        await runBusinessManagementCheck();
     };
 
     const fetchRegistrationNumbers = () => {
@@ -907,6 +1519,7 @@ export default function WebhookView({
         setRegistrationBusy('request');
         setRegistrationError(null);
         try {
+            const requestedLanguage = registrationLocale.trim() || 'en_US';
             const res = await fetch(`${SOCKET_URL}/api/waba/registration/request-code`, {
                 method: 'POST',
                 headers: {
@@ -917,7 +1530,8 @@ export default function WebhookView({
                     profileId,
                     phoneNumberId: registrationPhoneNumberId.trim(),
                     codeMethod: registrationCodeMethod,
-                    locale: registrationLocale.trim() || 'en_US'
+                    language: requestedLanguage,
+                    locale: requestedLanguage
                 })
             });
             const data = await res.json().catch(() => null);
@@ -1513,6 +2127,66 @@ export default function WebhookView({
             .finally(() => setSystemRuntimeLoading(false));
     };
 
+    const handleSendPromoPush = async () => {
+        if (!sessionToken) {
+            setPromoPushError('You must be logged in.');
+            return;
+        }
+
+        const title = promoPushTitle.trim();
+        const body = promoPushBody.trim();
+        if (!title) {
+            setPromoPushError('Promo title is required.');
+            return;
+        }
+        if (!body) {
+            setPromoPushError('Promo message is required.');
+            return;
+        }
+
+        const ttl = Number.isFinite(Number(promoPushTtlSeconds))
+            ? Math.max(30, Math.min(3600, Math.floor(Number(promoPushTtlSeconds))))
+            : 600;
+
+        setPromoPushSending(true);
+        setPromoPushError(null);
+        setPromoPushNotice(null);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/push/promo`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    profileId,
+                    title,
+                    body,
+                    url: promoPushUrl.trim() || '/',
+                    tag: promoPushTag.trim(),
+                    promoCode: promoPushCode.trim(),
+                    ttlSeconds: ttl,
+                    includeActiveUsers: promoPushIncludeActiveUsers
+                })
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data?.success) {
+                throw new Error(data?.error || 'Failed to send promo push notification');
+            }
+
+            const targetedUsers = Number(data?.data?.targetedUsers || 0);
+            const webSubscriptions = Number(data?.data?.webSubscriptions || 0);
+            const nativeDevices = Number(data?.data?.nativeDevices || 0);
+            setPromoPushNotice(
+                `Promo sent. Target users: ${targetedUsers}. Web subscriptions: ${webSubscriptions}. Native devices: ${nativeDevices}.`
+            );
+        } catch (error: any) {
+            setPromoPushError(error?.message || 'Failed to send promo push notification');
+        } finally {
+            setPromoPushSending(false);
+        }
+    };
+
     const handleSaveMaintenanceMode = async () => {
         if (!sessionToken || !profileId || !isSuperAdmin) return;
         setSystemRuntimeSaving(true);
@@ -1881,6 +2555,20 @@ export default function WebhookView({
         return 'bg-[#f0f2f5] text-[#54656f] border-[#eceff1]';
     };
 
+    const appReviewStatusBadgeClass = (status: AppReviewCheckStatus) => {
+        if (status === 'success') return 'bg-emerald-50 text-emerald-700 border-emerald-200';
+        if (status === 'error') return 'bg-rose-50 text-rose-700 border-rose-200';
+        if (status === 'running') return 'bg-amber-50 text-amber-700 border-amber-200';
+        return 'bg-[#f0f2f5] text-[#54656f] border-[#eceff1]';
+    };
+
+    const appReviewStatusLabel = (status: AppReviewCheckStatus) => {
+        if (status === 'success') return 'PASS';
+        if (status === 'error') return 'FAIL';
+        if (status === 'running') return 'RUNNING';
+        return 'NOT RUN';
+    };
+
     const fetchConnectedBusinesses = (opts: { after?: string; before?: string } = {}) => {
         if (!sessionToken || !profileId) return;
         setConnectedLoading(true);
@@ -2104,17 +2792,271 @@ export default function WebhookView({
             : notificationPermission === 'denied'
                 ? 'text-rose-700 bg-rose-50 border-rose-200'
                 : 'text-[#54656f] bg-[#f0f2f5] border-[#eceff1]';
-    const settingsSectionCardClass = 'bg-white rounded-[24px] border border-[#eceff1] p-6 sm:p-7 shadow-[0_8px_30px_rgba(0,0,0,0.04)]';
-    const settingsInnerPanelClass = 'bg-[#fcfdfd] border border-[#eceff1] rounded-[20px] p-5';
-    const settingsInnerPanelCompactClass = 'bg-[#fcfdfd] border border-[#eceff1] rounded-[20px] p-4';
-    const settingsInnerTableShellClass = 'bg-[#fcfdfd] border border-[#eceff1] rounded-[20px] overflow-hidden';
+    const hasActiveWabaConnection = Boolean(
+        registrationConfig?.enabled === true
+        && (
+            registrationConfig?.phoneNumberId
+            || registrationConfig?.wabaId
+            || registrationConfig?.businessId
+        )
+    );
+    const appReviewPrerequisites = Array.isArray(appReviewReadiness?.prerequisites) ? appReviewReadiness.prerequisites : [];
+    const appReviewReadyCount = appReviewPrerequisites.filter((item) => item?.ok).length;
+    const appReviewChecksList: Array<{ key: AppReviewCheckKey; label: string; description: string }> = [
+        {
+            key: 'whatsapp_business_management',
+            label: 'whatsapp_business_management',
+            description: 'Checks business profile read + template listing.'
+        },
+        {
+            key: 'business_management',
+            label: 'business_management',
+            description: 'Checks business portfolio listing via token.'
+        },
+        {
+            key: 'whatsapp_business_messaging',
+            label: 'whatsapp_business_messaging',
+            description: 'Sends an explicit test message to reviewer number.'
+        }
+    ];
+    const appReviewPassedChecks = appReviewChecksList.filter((item) => appReviewChecks[item.key].status === 'success').length;
+    const settingsSectionCardClass = isMobileView
+        ? 'bg-transparent border-0 rounded-none p-0 shadow-none'
+        : 'bg-white rounded-[24px] border border-[#eceff1] p-6 sm:p-7 shadow-[0_8px_30px_rgba(0,0,0,0.04)]';
+    const settingsInnerPanelClass = isMobileView
+        ? 'bg-transparent border-0 rounded-none p-4'
+        : 'bg-[#fcfdfd] border border-[#eceff1] rounded-[20px] p-5';
+    const settingsInnerPanelCompactClass = isMobileView
+        ? 'bg-transparent border-0 rounded-none p-3'
+        : 'bg-[#fcfdfd] border border-[#eceff1] rounded-[20px] p-4';
+    const settingsInnerTableShellClass = isMobileView
+        ? 'bg-transparent border-0 rounded-none overflow-x-auto'
+        : 'bg-[#fcfdfd] border border-[#eceff1] rounded-[20px] overflow-hidden';
 
     return (
-        <div className="flex-1 bg-[#fcfdfd] p-10 overflow-y-auto text-[#111b21] h-full font-sans">
-            <h2 className="text-3xl font-black mb-10 flex items-center gap-4 tracking-tight">
-                <Globe className="text-[#00a884] w-8 h-8" /> API & Connectivity
+        <div className={`flex-1 overflow-y-auto text-[#111b21] h-full font-sans ${isMobileView ? 'bg-transparent p-0' : 'bg-[#fcfdfd] p-10'}`}>
+            <h2 className="hidden text-3xl font-black mb-10 flex items-center gap-4 tracking-tight">
+                <Globe className="text-[#00a884] w-8 h-8" /> Workspace Settings
                 <span className="text-xs bg-[#f0f2f5] px-4 py-1.5 rounded-full text-[#54656f] font-bold border border-[#eceff1] uppercase tracking-widest">Active profile: {profileId}</span>
             </h2>
+
+            <div id="settings-review" className={`${settingsSectionCardClass} mb-10 ${showPermissionVerificationConsole ? '' : 'hidden'}`}>
+                <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4 mb-6">
+                    <div>
+                        <div className="text-xs font-black uppercase tracking-widest text-[#00a884]">Meta App Review</div>
+                        <h3 className="text-2xl text-[#111b21] font-black mt-2">Permission Verification Console</h3>
+                        <p className="text-sm text-[#54656f] mt-2 font-medium">
+                            Use this section during App Review to run explicit checks for each requested permission and capture clear pass/fail states.
+                        </p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-3">
+                        <span className="text-[11px] px-3 py-2 rounded-xl border border-[#dbe3ea] bg-[#f8fafc] text-[#54656f] font-bold uppercase tracking-widest">
+                            Prechecks {appReviewReadyCount}/{appReviewPrerequisites.length || 0}
+                        </span>
+                        <span className="text-[11px] px-3 py-2 rounded-xl border border-[#dbe3ea] bg-[#f8fafc] text-[#54656f] font-bold uppercase tracking-widest">
+                            Permission checks {appReviewPassedChecks}/{appReviewChecksList.length}
+                        </span>
+                        <button
+                            type="button"
+                            onClick={runAllAppReviewChecks}
+                            disabled={!sessionToken || appReviewReadinessLoading}
+                            className="text-xs font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-3 py-2 rounded-xl hover:bg-[#00a884]/5 transition-all disabled:opacity-50"
+                        >
+                            {appReviewReadinessLoading ? 'Refreshing...' : 'Run Readiness + Permission Checks'}
+                        </button>
+                    </div>
+                </div>
+
+                {appReviewReadinessError && (
+                    <div className="mb-5 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 font-semibold">
+                        {appReviewReadinessError}
+                    </div>
+                )}
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                    <div className={settingsInnerPanelClass}>
+                        <div className="flex items-center justify-between gap-2 mb-3">
+                            <h4 className="text-sm font-black text-[#111b21] uppercase tracking-widest">Environment Prechecks</h4>
+                            <button
+                                type="button"
+                                onClick={fetchAppReviewReadiness}
+                                disabled={!sessionToken || appReviewReadinessLoading}
+                                className="text-[11px] font-bold uppercase tracking-widest text-[#00a884] border border-[#00a884]/30 px-2.5 py-1.5 rounded-lg hover:bg-[#00a884]/5 transition-all disabled:opacity-50"
+                            >
+                                Refresh
+                            </button>
+                        </div>
+                        <div className="space-y-2">
+                            {appReviewPrerequisites.length === 0 ? (
+                                <p className="text-xs text-[#8696a0] font-medium">No precheck data yet.</p>
+                            ) : (
+                                appReviewPrerequisites.map((item) => (
+                                    <div key={item.key} className="flex items-start justify-between gap-3 rounded-xl border border-[#eceff1] bg-white px-3 py-2.5">
+                                        <div className="min-w-0">
+                                            <div className="text-xs font-bold text-[#111b21]">{item.label}</div>
+                                            <div className="text-[11px] text-[#6b7280] break-all">{item.detail || '-'}</div>
+                                        </div>
+                                        <span className={`text-[10px] px-2.5 py-1 rounded-full border font-black uppercase tracking-widest ${item.ok ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-rose-200 bg-rose-50 text-rose-700'}`}>
+                                            {item.ok ? 'PASS' : 'FAIL'}
+                                        </span>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    </div>
+
+                    <div className={settingsInnerPanelClass}>
+                        <h4 className="text-sm font-black text-[#111b21] uppercase tracking-widest mb-3">Current Connection Snapshot</h4>
+                        {appReviewReadiness?.connection ? (
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                <div className="rounded-xl border border-[#eceff1] bg-white px-3 py-2.5">
+                                    <div className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">Connection</div>
+                                    <div className="mt-1 text-sm font-bold text-[#111b21]">{appReviewReadiness.connection.connected ? 'Connected' : 'Not connected'}</div>
+                                </div>
+                                <div className="rounded-xl border border-[#eceff1] bg-white px-3 py-2.5">
+                                    <div className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">Token Source</div>
+                                    <div className="mt-1 text-sm font-bold text-[#111b21]">{appReviewReadiness.connection.tokenSource || '-'}</div>
+                                </div>
+                                <div className="rounded-xl border border-[#eceff1] bg-white px-3 py-2.5">
+                                    <div className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">Phone Number ID</div>
+                                    <div className="mt-1 text-xs font-mono text-[#111b21] break-all">{appReviewReadiness.connection.phoneNumberId || '-'}</div>
+                                </div>
+                                <div className="rounded-xl border border-[#eceff1] bg-white px-3 py-2.5">
+                                    <div className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">WABA ID</div>
+                                    <div className="mt-1 text-xs font-mono text-[#111b21] break-all">{appReviewReadiness.connection.wabaId || '-'}</div>
+                                </div>
+                                <div className="rounded-xl border border-[#eceff1] bg-white px-3 py-2.5">
+                                    <div className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">Business ID</div>
+                                    <div className="mt-1 text-xs font-mono text-[#111b21] break-all">{appReviewReadiness.connection.businessId || '-'}</div>
+                                </div>
+                                <div className="rounded-xl border border-[#eceff1] bg-white px-3 py-2.5">
+                                    <div className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">Token Expiry</div>
+                                    <div className="mt-1 text-xs text-[#111b21]">{formatTokenExpiry(appReviewReadiness.connection.accessTokenExpiresAt || undefined)}</div>
+                                </div>
+                                <div className="rounded-xl border border-[#eceff1] bg-white px-3 py-2.5 sm:col-span-2">
+                                    <div className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">Token Scopes</div>
+                                    <div className="mt-1 text-xs text-[#111b21] break-words">
+                                        {Array.isArray(appReviewReadiness.connection.tokenScopes) && appReviewReadiness.connection.tokenScopes.length > 0
+                                            ? appReviewReadiness.connection.tokenScopes.join(', ')
+                                            : 'No explicit scopes stored for this token source.'}
+                                    </div>
+                                </div>
+                            </div>
+                        ) : (
+                            <p className="text-xs text-[#8696a0] font-medium">No connection snapshot loaded yet.</p>
+                        )}
+                    </div>
+                </div>
+
+                <div className="mt-6 grid grid-cols-1 lg:grid-cols-3 gap-4">
+                    <div className={settingsInnerPanelCompactClass}>
+                        <div className="flex items-center justify-between gap-3">
+                            <div>
+                                <div className="text-xs font-black text-[#111b21]">whatsapp_business_management</div>
+                                <div className="text-[11px] text-[#54656f] mt-1">Business profile + templates read access.</div>
+                            </div>
+                            <span className={`text-[10px] px-2.5 py-1 rounded-full border font-black uppercase tracking-widest ${appReviewStatusBadgeClass(appReviewChecks.whatsapp_business_management.status)}`}>
+                                {appReviewStatusLabel(appReviewChecks.whatsapp_business_management.status)}
+                            </span>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={runWhatsappBusinessManagementCheck}
+                            disabled={!sessionToken || appReviewChecks.whatsapp_business_management.status === 'running'}
+                            className="mt-3 w-full bg-[#111b21] hover:bg-[#202c33] text-white font-bold py-2.5 rounded-xl text-[11px] uppercase tracking-widest transition-all disabled:opacity-50"
+                        >
+                            {appReviewChecks.whatsapp_business_management.status === 'running' ? 'Checking...' : 'Run Check'}
+                        </button>
+                        <div className="mt-2 text-[11px] text-[#54656f]">{appReviewChecks.whatsapp_business_management.message}</div>
+                        {appReviewChecks.whatsapp_business_management.checkedAt && (
+                            <div className="mt-1 text-[10px] text-[#8696a0] uppercase tracking-widest">
+                                Last checked: {formatConnectedDate(appReviewChecks.whatsapp_business_management.checkedAt || undefined)}
+                            </div>
+                        )}
+                        {appReviewChecks.whatsapp_business_management.details.length > 0 && (
+                            <div className="mt-2 text-[11px] text-[#111b21]">
+                                {appReviewChecks.whatsapp_business_management.details.join(' | ')}
+                            </div>
+                        )}
+                    </div>
+
+                    <div className={settingsInnerPanelCompactClass}>
+                        <div className="flex items-center justify-between gap-3">
+                            <div>
+                                <div className="text-xs font-black text-[#111b21]">business_management</div>
+                                <div className="text-[11px] text-[#54656f] mt-1">Business portfolio listing access.</div>
+                            </div>
+                            <span className={`text-[10px] px-2.5 py-1 rounded-full border font-black uppercase tracking-widest ${appReviewStatusBadgeClass(appReviewChecks.business_management.status)}`}>
+                                {appReviewStatusLabel(appReviewChecks.business_management.status)}
+                            </span>
+                        </div>
+                        <button
+                            type="button"
+                            onClick={runBusinessManagementCheck}
+                            disabled={!sessionToken || appReviewChecks.business_management.status === 'running'}
+                            className="mt-3 w-full bg-[#111b21] hover:bg-[#202c33] text-white font-bold py-2.5 rounded-xl text-[11px] uppercase tracking-widest transition-all disabled:opacity-50"
+                        >
+                            {appReviewChecks.business_management.status === 'running' ? 'Checking...' : 'Run Check'}
+                        </button>
+                        <div className="mt-2 text-[11px] text-[#54656f]">{appReviewChecks.business_management.message}</div>
+                        {appReviewChecks.business_management.checkedAt && (
+                            <div className="mt-1 text-[10px] text-[#8696a0] uppercase tracking-widest">
+                                Last checked: {formatConnectedDate(appReviewChecks.business_management.checkedAt || undefined)}
+                            </div>
+                        )}
+                        {appReviewChecks.business_management.details.length > 0 && (
+                            <div className="mt-2 text-[11px] text-[#111b21]">
+                                {appReviewChecks.business_management.details.join(' | ')}
+                            </div>
+                        )}
+                    </div>
+
+                    <div className={settingsInnerPanelCompactClass}>
+                        <div className="flex items-center justify-between gap-3">
+                            <div>
+                                <div className="text-xs font-black text-[#111b21]">whatsapp_business_messaging</div>
+                                <div className="text-[11px] text-[#54656f] mt-1">Explicit outbound message test.</div>
+                            </div>
+                            <span className={`text-[10px] px-2.5 py-1 rounded-full border font-black uppercase tracking-widest ${appReviewStatusBadgeClass(appReviewChecks.whatsapp_business_messaging.status)}`}>
+                                {appReviewStatusLabel(appReviewChecks.whatsapp_business_messaging.status)}
+                            </span>
+                        </div>
+                        <div className="mt-3 space-y-2">
+                            <input
+                                className="w-full bg-white border border-[#eceff1] rounded-xl px-3 py-2 text-xs font-semibold text-[#111b21] placeholder-[#94a3b8]"
+                                placeholder="Reviewer phone number (E.164, digits only)"
+                                value={appReviewMessageTo}
+                                onChange={(e) => setAppReviewMessageTo(e.target.value)}
+                            />
+                            <textarea
+                                className="w-full bg-white border border-[#eceff1] rounded-xl px-3 py-2 text-xs text-[#111b21] min-h-[72px] resize-none"
+                                value={appReviewMessageText}
+                                onChange={(e) => setAppReviewMessageText(e.target.value)}
+                                placeholder="Test message text"
+                            />
+                        </div>
+                        <button
+                            type="button"
+                            onClick={runWhatsappBusinessMessagingCheck}
+                            disabled={!sessionToken || appReviewChecks.whatsapp_business_messaging.status === 'running'}
+                            className="mt-3 w-full bg-[#00a884] hover:bg-[#008f6f] text-white font-bold py-2.5 rounded-xl text-[11px] uppercase tracking-widest transition-all disabled:opacity-50"
+                        >
+                            {appReviewChecks.whatsapp_business_messaging.status === 'running' ? 'Sending...' : 'Send Test Message'}
+                        </button>
+                        <div className="mt-2 text-[11px] text-[#54656f]">{appReviewChecks.whatsapp_business_messaging.message}</div>
+                        {appReviewChecks.whatsapp_business_messaging.checkedAt && (
+                            <div className="mt-1 text-[10px] text-[#8696a0] uppercase tracking-widest">
+                                Last checked: {formatConnectedDate(appReviewChecks.whatsapp_business_messaging.checkedAt || undefined)}
+                            </div>
+                        )}
+                        {appReviewChecks.whatsapp_business_messaging.details.length > 0 && (
+                            <div className="mt-2 text-[11px] text-[#111b21]">
+                                {appReviewChecks.whatsapp_business_messaging.details.join(' | ')}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-10">
                 {/* Embedded Signup Section */}
@@ -2126,16 +3068,70 @@ export default function WebhookView({
                     <p className="text-sm text-[#54656f] mb-6 font-medium">
                         Link a client’s WhatsApp Business account using Meta Embedded Signup. You’ll be redirected to Facebook Login.
                     </p>
+                    <div className="mb-4 flex items-center justify-between gap-3 rounded-xl border border-[#eceff1] bg-[#f8fafc] px-4 py-2.5">
+                        <span className="text-[11px] font-bold uppercase tracking-widest text-[#54656f]">Connection status</span>
+                        <span className={`text-[10px] px-3 py-1 rounded-full border font-bold uppercase tracking-widest ${hasActiveWabaConnection ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-[#dbe3ea] bg-white text-[#64748b]'}`}>
+                            {registrationLoading ? 'Checking...' : hasActiveWabaConnection ? 'Connected' : 'Not connected'}
+                        </span>
+                    </div>
+                    <div className="mb-4 rounded-xl border border-[#eceff1] bg-[#f8fafc] px-4 py-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="text-[11px] font-bold uppercase tracking-widest text-[#54656f]">Company ID</span>
+                            <span className="text-[11px] font-mono text-[#334155]">
+                                Active: {readTrimmed(registrationConfig?.companyId) || '-'}
+                            </span>
+                        </div>
+                        <div className="mt-2 rounded-xl border border-[#dbe3ea] bg-white px-3 py-2.5">
+                            <div className="text-[10px] font-black uppercase tracking-widest text-[#64748b]">Connected Mapping</div>
+                            <div className="mt-1 text-xs font-mono text-[#111b21] break-all">
+                                {readTrimmed(registrationConfig?.connectedCompanyId) || readTrimmed(registrationConfig?.companyId) || '-'}
+                            </div>
+                            <p className="mt-1 text-[10px] text-[#64748b]">
+                                Reference only. Company ID can’t be edited here.
+                            </p>
+                        </div>
+                        {registrationConfig?.connectedCompanyMismatch && (
+                            <p className="text-[11px] text-amber-700 mt-2 font-semibold">
+                                Connected WABA mapping does not match your active company.
+                            </p>
+                        )}
+                    </div>
                     <button
                         onClick={handleConnectWhatsapp}
-                        disabled={connectLoading || !sessionToken}
+                        disabled={connectLoading || disconnectLoading || !sessionToken}
                         className="w-full bg-[#111b21] hover:bg-[#202c33] text-white font-black py-4 rounded-2xl transition-all flex items-center justify-center gap-3 shadow-[0_8px_20px_rgba(17,27,33,0.18)] disabled:opacity-50 active:scale-95"
                     >
                         {connectLoading ? <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" /> : <Globe className="w-5 h-5" />}
                         Connect WhatsApp Business
                     </button>
+                    <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <button
+                            type="button"
+                            onClick={() => handleDisconnectWhatsapp(false)}
+                            disabled={disconnectLoading || connectLoading || !sessionToken || !hasActiveWabaConnection}
+                            className="w-full bg-white hover:bg-[#f8fafc] text-[#334155] border border-[#dce4ee] font-bold py-3 rounded-2xl transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+                        >
+                            {disconnectLoading ? <div className="w-4 h-4 border-2 border-[#334155] border-t-transparent rounded-full animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                            Disconnect
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => handleDisconnectWhatsapp(true)}
+                            disabled={disconnectLoading || connectLoading || !sessionToken || !hasActiveWabaConnection}
+                            className="w-full bg-[#fff1f2] hover:bg-[#ffe4e6] text-rose-700 border border-rose-200 font-bold py-3 rounded-2xl transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+                        >
+                            {disconnectLoading ? <div className="w-4 h-4 border-2 border-rose-700 border-t-transparent rounded-full animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                            Disconnect + Revoke
+                        </button>
+                    </div>
                     {connectError && (
                         <p className="text-sm text-rose-600 mt-4 font-semibold">{connectError}</p>
+                    )}
+                    {disconnectError && (
+                        <p className="text-sm text-rose-600 mt-2 font-semibold">{disconnectError}</p>
+                    )}
+                    {disconnectNotice && (
+                        <p className="text-sm text-emerald-700 mt-2 font-semibold">{disconnectNotice}</p>
                     )}
                     {!sessionToken && (
                         <p className="text-xs text-[#aebac1] mt-3">Login required to connect a client account.</p>
@@ -2143,7 +3139,7 @@ export default function WebhookView({
                 </div>
 
                 {/* Manual Setup Section */}
-                <div id="settings-manual" className={settingsSectionCardClass}>
+                <div id="settings-manual" className={`${settingsSectionCardClass} ${showManualWabaSetup ? '' : 'hidden'}`}>
                     <div className="flex items-center gap-3 mb-4">
                         <Shield className="w-6 h-6 text-[#00a884]" />
                         <h3 className="text-xl text-[#111b21] font-bold">Manual WABA Setup</h3>
@@ -2239,7 +3235,7 @@ export default function WebhookView({
                 </div>
 
                 {/* Number Registration Section */}
-                <div id="settings-register" className={settingsSectionCardClass}>
+                <div id="settings-register" className={`${settingsSectionCardClass} ${showRegisterWhatsAppNumber ? '' : 'hidden'}`}>
                     <div className="flex items-center gap-3 mb-4">
                         <Shield className="w-6 h-6 text-[#00a884]" />
                         <h3 className="text-xl text-[#111b21] font-bold">Register WhatsApp Number</h3>
@@ -2262,7 +3258,7 @@ export default function WebhookView({
                 </div>
 
                 {/* Webhooks Section */}
-                <div id="settings-webhooks" className={settingsSectionCardClass}>
+                <div id="settings-webhooks" className={`${settingsSectionCardClass} ${showOutgoingWebhooks ? '' : 'hidden'}`}>
                     <h3 className="text-xl mb-2 text-[#111b21] font-bold">Outgoing Webhooks</h3>
                     <p className="text-sm text-[#54656f] mb-2 font-medium">Configure endpoints to receive real-time updates from this profile.</p>
                     <p className="text-xs text-[#8696a0] mb-6 font-semibold">Active profile: {profileId}</p>
@@ -2340,7 +3336,7 @@ export default function WebhookView({
                     </div>
                 </div>
 
-                <div id="settings-ads-shoot" className={settingsSectionCardClass}>
+                <div id="settings-ads-shoot" className={`${settingsSectionCardClass} ${showAdsShootMode ? '' : 'hidden'}`}>
                     <div className="flex items-center justify-between gap-4 mb-5">
                         <div className="flex items-center gap-3">
                             <Globe className="w-6 h-6 text-[#00a884]" />
@@ -3413,6 +4409,122 @@ export default function WebhookView({
                 </div>
 
                 {isSuperAdmin && (
+                    <div id="settings-promo-push" className={`${settingsSectionCardClass} lg:col-span-2`}>
+                        <div className="flex items-center justify-between mb-6">
+                            <div>
+                                <h3 className="text-xl text-[#111b21] font-bold">Promo Push Notification</h3>
+                                <p className="text-sm text-[#54656f] font-medium mt-1">
+                                    Send a promotional push alert from qmessage to users in this company.
+                                </p>
+                            </div>
+                        </div>
+
+                        {promoPushError && (
+                            <div className="mb-4 bg-rose-50 border border-rose-200 text-rose-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                                {promoPushError}
+                            </div>
+                        )}
+
+                        {promoPushNotice && (
+                            <div className="mb-4 bg-emerald-50 border border-emerald-200 text-emerald-700 rounded-2xl px-4 py-3 text-sm font-medium">
+                                {promoPushNotice}
+                            </div>
+                        )}
+
+                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                            <div className={settingsInnerPanelClass}>
+                                <label className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">Title</label>
+                                <input
+                                    className="mt-2 w-full bg-white border border-[#eceff1] rounded-xl px-4 py-3 text-sm text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                    value={promoPushTitle}
+                                    onChange={(e) => setPromoPushTitle(e.target.value)}
+                                    placeholder="QMessage Promo"
+                                    maxLength={120}
+                                />
+                            </div>
+
+                            <div className={settingsInnerPanelClass}>
+                                <label className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">Open URL</label>
+                                <input
+                                    className="mt-2 w-full bg-white border border-[#eceff1] rounded-xl px-4 py-3 text-sm text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                    value={promoPushUrl}
+                                    onChange={(e) => setPromoPushUrl(e.target.value)}
+                                    placeholder="/"
+                                    maxLength={512}
+                                />
+                            </div>
+
+                            <div className={`${settingsInnerPanelClass} lg:col-span-2`}>
+                                <label className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">Message</label>
+                                <textarea
+                                    className="mt-2 w-full bg-white border border-[#eceff1] rounded-xl px-4 py-3 text-sm text-[#111b21] focus:outline-none focus:border-[#00a884] min-h-[110px] resize-none"
+                                    value={promoPushBody}
+                                    onChange={(e) => setPromoPushBody(e.target.value)}
+                                    placeholder="Your offer message here..."
+                                    maxLength={240}
+                                />
+                            </div>
+
+                            <div className={settingsInnerPanelClass}>
+                                <label className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">Promo Code (optional)</label>
+                                <input
+                                    className="mt-2 w-full bg-white border border-[#eceff1] rounded-xl px-4 py-3 text-sm text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                    value={promoPushCode}
+                                    onChange={(e) => setPromoPushCode(e.target.value)}
+                                    placeholder="APRILSALE"
+                                    maxLength={64}
+                                />
+                            </div>
+
+                            <div className={settingsInnerPanelClass}>
+                                <label className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">Tag (optional)</label>
+                                <input
+                                    className="mt-2 w-full bg-white border border-[#eceff1] rounded-xl px-4 py-3 text-sm text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                    value={promoPushTag}
+                                    onChange={(e) => setPromoPushTag(e.target.value)}
+                                    placeholder="promo:april-launch"
+                                    maxLength={120}
+                                />
+                            </div>
+                        </div>
+
+                        <div className="mt-4 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+                            <div className="flex flex-wrap items-center gap-3">
+                                <label className="inline-flex items-center gap-2 text-xs font-bold text-[#111b21]">
+                                    <input
+                                        type="checkbox"
+                                        checked={promoPushIncludeActiveUsers}
+                                        onChange={(e) => setPromoPushIncludeActiveUsers(e.target.checked)}
+                                        disabled={promoPushSending}
+                                    />
+                                    Include active users
+                                </label>
+                                <div className="inline-flex items-center gap-2">
+                                    <span className="text-[10px] font-black uppercase tracking-widest text-[#54656f]">TTL (sec)</span>
+                                    <input
+                                        type="number"
+                                        min={30}
+                                        max={3600}
+                                        value={promoPushTtlSeconds}
+                                        onChange={(e) => setPromoPushTtlSeconds(Number(e.target.value || 600))}
+                                        className="w-24 bg-white border border-[#eceff1] rounded-lg px-2 py-1.5 text-xs font-bold text-[#111b21] focus:outline-none focus:border-[#00a884]"
+                                        disabled={promoPushSending}
+                                    />
+                                </div>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={handleSendPromoPush}
+                                disabled={!sessionToken || promoPushSending}
+                                className="bg-[#00a884] hover:bg-[#008f6f] text-white px-5 py-3 rounded-2xl font-bold transition-all shadow-[0_8px_20px_rgba(0,168,132,0.2)] disabled:opacity-50"
+                            >
+                                {promoPushSending ? 'Sending…' : 'Send Promo Push'}
+                            </button>
+                        </div>
+                    </div>
+                )}
+
+                {isSuperAdmin && (
                     <div id="settings-system-runtime" className={`${settingsSectionCardClass} lg:col-span-2`}>
                         <div className="flex items-center justify-between mb-6">
                             <div>
@@ -3874,13 +4986,14 @@ export default function WebhookView({
                                             <option value="SMS">SMS</option>
                                             <option value="VOICE">VOICE</option>
                                         </select>
-                                        <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Locale</label>
+                                        <label className="text-xs font-bold text-[#54656f] uppercase tracking-widest">Language</label>
                                         <input
                                             className="w-full bg-[#f8f9fa] border border-[#eceff1] rounded-2xl px-5 py-3 text-sm font-bold text-[#111b21]"
                                             value={registrationLocale}
                                             onChange={e => setRegistrationLocale(e.target.value)}
                                             placeholder="en_US"
                                         />
+                                        <p className="text-[11px] text-[#8696a0] font-medium">Format: `en_US`, `id_ID`, `es_MX`.</p>
                                     </div>
                                     <button
                                         onClick={handleRequestVerificationCode}

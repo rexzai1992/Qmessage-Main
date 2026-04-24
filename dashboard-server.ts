@@ -1153,7 +1153,7 @@ async function runWindowReminders() {
             const minutes = Number(config.windowReminderMinutes || 0)
             if (!minutes || minutes <= 0) continue
 
-            const companyId = await resolveCompanyId(config.companyId || profileId)
+            const companyId = await getCompanyIdForProfile(profileId)
             if (!companyId) continue
             const client = await wabaRegistry.getClientByProfile(profileId)
             if (!client) continue
@@ -1229,18 +1229,90 @@ function lowerBound(nums: number[], target: number) {
 }
 
 async function getCompanyIdForProfile(profileId: string) {
+    if (!profileId) return null
+
+    let profileCompanyId = ''
+    try {
+        const { data, error } = await supabase
+            .from('profiles')
+            .select('company_id')
+            .eq('id', profileId)
+            .maybeSingle()
+
+        profileCompanyId = typeof data?.company_id === 'string' ? data.company_id.trim() : ''
+        if (error) {
+            console.warn(`[${profileId}] Failed to read company_id from profiles:`, error.message)
+        }
+    } catch (error: any) {
+        console.warn(`[${profileId}] Failed to resolve company_id from profiles:`, error?.message || error)
+    }
+
     const config = await wabaRegistry.getConfigByProfile(profileId)
-    return resolveCompanyId(config?.companyId || config?.profileId || profileId)
+    const configCompanyId = typeof config?.companyId === 'string' ? config.companyId.trim() : ''
+
+    // WABA mapping is the explicit reviewer/operator-controlled source in Settings.
+    if (configCompanyId) {
+        if (profileCompanyId && profileCompanyId !== configCompanyId) {
+            console.warn(
+                `[${profileId}] Company mismatch: profiles.company_id="${profileCompanyId}" vs waba_configs.company_id="${configCompanyId}". Using waba_configs mapping.`
+            )
+        }
+        return resolveCompanyId(configCompanyId)
+    }
+
+    if (profileCompanyId) return profileCompanyId
+
+    try {
+        const { data: fallback } = await supabase
+            .from('waba_configs')
+            .select('company_id')
+            .eq('profile_id', profileId)
+            .maybeSingle()
+        const fallbackCompanyId = typeof fallback?.company_id === 'string' ? fallback.company_id.trim() : ''
+        if (fallbackCompanyId) return resolveCompanyId(fallbackCompanyId)
+    } catch {
+        // no-op fallback
+    }
+
+    return null
+}
+
+async function getProfileIdsForCompany(companyId: string, fallbackProfileId?: string): Promise<string[]> {
+    if (!companyId) {
+        return fallbackProfileId ? [fallbackProfileId] : []
+    }
+
+    try {
+        const { data, error } = await supabase
+            .from('profiles')
+            .select('id')
+            .eq('company_id', companyId)
+
+        if (error) {
+            console.warn(`[${companyId}] Failed to load profile IDs for company broadcast:`, error.message)
+            return fallbackProfileId ? [fallbackProfileId] : []
+        }
+
+        const ids = Array.from(
+            new Set(
+                (data || [])
+                    .map((row: any) => (typeof row?.id === 'string' ? row.id.trim() : ''))
+                    .filter(Boolean)
+            )
+        )
+
+        if (fallbackProfileId && !ids.includes(fallbackProfileId)) {
+            ids.push(fallbackProfileId)
+        }
+
+        return ids.length > 0 ? ids : (fallbackProfileId ? [fallbackProfileId] : [])
+    } catch (error: any) {
+        console.warn(`[${companyId}] Profile broadcast fallback due to error:`, error?.message || error)
+        return fallbackProfileId ? [fallbackProfileId] : []
+    }
 }
 
 async function getCompanyIdForProfileOrProfileTable(profileId: string) {
-    const { data } = await supabase
-        .from('profiles')
-        .select('company_id')
-        .eq('id', profileId)
-        .maybeSingle()
-
-    if (data?.company_id) return data.company_id
     return getCompanyIdForProfile(profileId)
 }
 
@@ -3490,13 +3562,49 @@ function parseMarketingSendOptions(input: any): {
 
 function resolveOauthRedirectUri(req: any) {
     if (process.env.WABA_OAUTH_REDIRECT_URI) return process.env.WABA_OAUTH_REDIRECT_URI
-    const host = req.get('host')
-    const protocol = req.protocol || 'https'
-    return `${protocol}://${host}/auth/waba/callback`
+    const origin = resolveRequestOrigin(req)
+    return `${origin}/auth/waba/callback`
 }
 
 function resolveOauthReturnUrl(req: any) {
-    return process.env.WABA_OAUTH_RETURN_URL || process.env.DASHBOARD_URL || `${req.protocol}://${req.get('host')}`
+    return process.env.WABA_OAUTH_RETURN_URL || process.env.DASHBOARD_URL || resolveRequestOrigin(req)
+}
+
+function resolveRequestOrigin(req: any): string {
+    const protocol = resolveRequestProtocol(req)
+    const host = resolveRequestHost(req)
+    if (host) return `${protocol}://${host}`
+    return `${protocol}://localhost`
+}
+
+function resolveRequestProtocol(req: any): 'http' | 'https' {
+    const forwardedProtoRaw = req?.headers?.['x-forwarded-proto']
+    const forwardedProto = Array.isArray(forwardedProtoRaw)
+        ? String(forwardedProtoRaw[0] || '')
+        : typeof forwardedProtoRaw === 'string'
+            ? forwardedProtoRaw
+            : ''
+    const normalizedForwarded = forwardedProto
+        .split(',')[0]
+        ?.trim()
+        .toLowerCase()
+    if (normalizedForwarded === 'http' || normalizedForwarded === 'https') {
+        return normalizedForwarded
+    }
+
+    const requestProtocol = typeof req?.protocol === 'string' ? req.protocol.trim().toLowerCase() : ''
+    if (requestProtocol === 'http' || requestProtocol === 'https') return requestProtocol
+    if (req?.secure === true) return 'https'
+    return 'http'
+}
+
+function resolveRequestHost(req: any): string {
+    const forwardedHostRaw = req?.headers?.['x-forwarded-host']
+    const hostHeaderRaw = forwardedHostRaw || req?.headers?.host || req?.get?.('host') || ''
+    const hostHeader = Array.isArray(hostHeaderRaw) ? String(hostHeaderRaw[0] || '') : String(hostHeaderRaw || '')
+    const firstHost = hostHeader.split(',')[0]?.trim() || ''
+    if (!firstHost) return ''
+    return firstHost.replace(/[\r\n]/g, '')
 }
 
 function buildEmbeddedSignupUrl(params: {
@@ -3541,7 +3649,7 @@ const WEB_PUSH_NOTIFICATION_ICON = '/icons/icon-192.png'
 const WEB_PUSH_NOTIFICATION_BADGE = '/icons/icon-192.png'
 const NATIVE_PUSH_TOKENS_FILE = resolvePath('native_push_tokens.json')
 const NATIVE_PUSH_CHANNEL_ID = 'qmessage-chat-v4'
-const NATIVE_PUSH_SOUND = 'iphone_glass'
+const NATIVE_PUSH_SOUND = 'default'
 
 const pushSubscriptionStore = createPushSubscriptionStore(WEB_PUSH_SUBSCRIPTIONS_FILE)
 const nativePushTokenStore = createNativePushTokenStore(NATIVE_PUSH_TOKENS_FILE)
@@ -3986,6 +4094,111 @@ app.post('/api/push/native/unregister', requireSupabaseUserMiddleware, async (re
     return res.json({ success: true, removed })
 })
 
+app.post('/api/push/promo', requireSupabaseUserMiddleware, async (req: any, res: any) => {
+    try {
+        const baseUser = req?.supabaseUser
+        if (!baseUser) {
+            return res.status(401).json({ success: false, error: 'Authentication required.' })
+        }
+
+        const { user, companyId } = await ensureUserCompanyId(baseUser)
+        const profileId = readTrimmed(req?.body?.profileId)
+        let normalizedCompanyId = normalizeCompanyId(companyId || getUserCompanyId(user))
+        if (!normalizedCompanyId && profileId && isSuperAdminUser(user)) {
+            const fallbackCompanyId = await getCompanyIdForProfile(profileId)
+            normalizedCompanyId = normalizeCompanyId(fallbackCompanyId)
+        }
+        if (!normalizedCompanyId) {
+            return res.status(400).json({ success: false, error: 'Company ID is missing for this account.' })
+        }
+
+        const hasCompanyAdminAccess = await isAdminUser(user.id, normalizedCompanyId)
+        if (!isSuperAdminUser(user) && !hasCompanyAdminAccess) {
+            return res.status(403).json({ success: false, error: 'Admin access required to send promo notifications.' })
+        }
+
+        const title = readTrimmed(req?.body?.title || 'QMessage Promotion').slice(0, 120)
+        const body = readTrimmed(req?.body?.body).slice(0, 240)
+        const targetUrl = readTrimmed(req?.body?.url || '/').slice(0, 512)
+        const promoTag = readTrimmed(req?.body?.tag || '').slice(0, 120)
+        const promoCode = readTrimmed(req?.body?.promoCode || '').slice(0, 64)
+        const includeActiveUsers = req?.body?.includeActiveUsers !== false
+        const ttlSecondsRaw = Number(req?.body?.ttlSeconds)
+        const ttlSeconds = Number.isFinite(ttlSecondsRaw)
+            ? Math.max(30, Math.min(3600, Math.floor(ttlSecondsRaw)))
+            : 600
+
+        if (!title) {
+            return res.status(400).json({ success: false, error: 'title is required.' })
+        }
+        if (!body) {
+            return res.status(400).json({ success: false, error: 'body is required.' })
+        }
+
+        const allUserIds = await getCompanyRecipientUserIdsForPush(normalizedCompanyId, user.id)
+        const targetUserIds = includeActiveUsers ? allUserIds : selectBackgroundPushUserIds(allUserIds)
+        if (targetUserIds.length === 0) {
+            return res.status(200).json({
+                success: true,
+                data: {
+                    targetedUsers: 0,
+                    webSubscriptions: 0,
+                    nativeDevices: 0,
+                    includeActiveUsers,
+                    delivered: false
+                }
+            })
+        }
+
+        const webSubscriptions = pushSubscriptionStore.getByUsers(targetUserIds, normalizedCompanyId).length
+        const nativeDevices = nativePushTokenStore.getByUsers(targetUserIds, normalizedCompanyId).length
+        const resolvedTag = promoTag || `promo:${Date.now()}`
+
+        await sendPushNotificationToUsers({
+            companyId: normalizedCompanyId,
+            userIds: targetUserIds,
+            title,
+            body,
+            url: targetUrl || '/',
+            tag: resolvedTag,
+            ttlSeconds,
+            data: {
+                type: 'promo',
+                promoCode
+            }
+        })
+
+        await sendNativePushNotificationToUsers({
+            companyId: normalizedCompanyId,
+            userIds: targetUserIds,
+            title,
+            body,
+            url: targetUrl || '/',
+            tag: resolvedTag,
+            ttlSeconds,
+            data: {
+                type: 'promo',
+                promoCode
+            }
+        })
+
+        return res.json({
+            success: true,
+            data: {
+                targetedUsers: targetUserIds.length,
+                webSubscriptions,
+                nativeDevices,
+                includeActiveUsers,
+                ttlSeconds,
+                tag: resolvedTag,
+                delivered: webSubscriptions > 0 || nativeDevices > 0
+            }
+        })
+    } catch (error: any) {
+        return res.status(500).json({ success: false, error: error?.message || 'Failed to send promo push notification.' })
+    }
+})
+
 registerFlowRoutes(app, {
     supabase,
     parseDateInput,
@@ -4072,7 +4285,7 @@ async function processWebhookQueue() {
     try {
         while (queuedWebhookEvents.length > 0) {
             const batch = queuedWebhookEvents.splice(0, WEBHOOK_PROCESS_CONCURRENCY)
-            await Promise.allSettled(batch.map(async (item) => {
+            const settled = await Promise.allSettled(batch.map(async (item) => {
                 const config = await wabaRegistry.getConfigByPhoneNumberId(item.event.phoneNumberId)
                 if (!config) {
                     if (item.kind === 'message') {
@@ -4090,6 +4303,15 @@ async function processWebhookQueue() {
                 }
                 await handleCallUpdate(config, item.event)
             }))
+            settled.forEach((result, index) => {
+                if (result.status !== 'rejected') return
+                const item = batch[index]
+                const phoneNumberId = item?.event?.phoneNumberId || 'unknown'
+                console.error(
+                    `[WABA] Failed to process ${item?.kind || 'unknown'} webhook event for phone_number_id ${phoneNumberId}:`,
+                    result.reason
+                )
+            })
         }
     } catch (error) {
         console.error('WABA webhook queue error:', error)
@@ -4157,8 +4379,7 @@ app.post('/api/send-message', verifyApiKey, async (req: any, res: any) => {
             })
         }
 
-        const config = await wabaRegistry.getConfigByProfile(profileId)
-        const companyId = await resolveCompanyId(config?.companyId || profileId)
+        const companyId = await getCompanyIdForProfile(profileId)
         if (!companyId) {
             return res.status(400).json({ success: false, error: 'Company not found' })
         }
@@ -4236,8 +4457,7 @@ app.post('/api/send-image', verifyApiKey, async (req: any, res: any) => {
             })
         }
 
-        const config = await wabaRegistry.getConfigByProfile(profileId)
-        const companyId = await resolveCompanyId(config?.companyId || profileId)
+        const companyId = await getCompanyIdForProfile(profileId)
         if (!companyId) {
             return res.status(400).json({ success: false, error: 'Company not found' })
         }
@@ -4519,10 +4739,24 @@ app.post('/webhook', async (req: any, res: any) => {
 
         const valid = verifyWabaSignature(rawBody, signature, appSecrets)
         if (!valid) {
+            console.warn('[WABA] Invalid webhook signature.', {
+                hasSignature: Boolean(signature),
+                payloadSize: rawBody.length
+            })
             return res.status(401).send('Invalid signature')
         }
 
         const { messages, statuses, calls } = parseWabaWebhook(req.body || {})
+        const uniquePhoneNumberIds = Array.from(
+            new Set(
+                [...messages, ...statuses, ...calls]
+                    .map((event) => (typeof event.phoneNumberId === 'string' ? event.phoneNumberId.trim() : ''))
+                    .filter(Boolean)
+            )
+        )
+        console.log(
+            `[WABA] Webhook received: messages=${messages.length}, statuses=${statuses.length}, calls=${calls.length}, phone_number_ids=${uniquePhoneNumberIds.join(',') || 'none'}`
+        )
         const queueItems: QueuedWebhookEvent[] = []
 
         messages.forEach((msg) => {
@@ -4822,7 +5056,13 @@ const UI_FEATURE_KEYS = new Set([
     'contacts',
     'calls',
     'analytics',
-    'settings'
+    'settings',
+    'settings-review',
+    'settings-manual',
+    'settings-register',
+    'settings-webhooks',
+    'settings-ads-shoot',
+    'settings-promo-push'
 ])
 const UI_FEATURE_ALIASES: Record<string, string> = {
     'team_inbox': 'team-inbox',
@@ -4836,7 +5076,18 @@ const UI_FEATURE_ALIASES: Record<string, string> = {
     'analytic': 'analytics',
     'setting': 'settings',
     'more': 'analytics',
-    'other': 'analytics'
+    'other': 'analytics',
+    'settingsreview': 'settings-review',
+    'review': 'settings-review',
+    'permission-verification-console': 'settings-review',
+    'settingsmanual': 'settings-manual',
+    'manual-waba-setup': 'settings-manual',
+    'settingsregister': 'settings-register',
+    'register-whatsapp-number': 'settings-register',
+    'settingswebhooks': 'settings-webhooks',
+    'outgoing-webhooks': 'settings-webhooks',
+    'settingsadsshoot': 'settings-ads-shoot',
+    'ads-shoot-mode': 'settings-ads-shoot'
 }
 
 const UI_HIDDEN_FEATURES_MISSING_MESSAGE =
@@ -5489,6 +5740,7 @@ function renderPublicInfoPage(payload: {
       <div class="nav">
         <a class="pill" href="/support">Support</a>
         <a class="pill" href="/privacy-policy">Privacy Policy</a>
+        <a class="pill" href="/data-deletion">User Data Deletion</a>
         <a class="pill" href="/terms-and-conditions">Terms & Conditions</a>
         <a class="pill" href="/">Back to Login</a>
       </div>
@@ -5716,7 +5968,12 @@ app.get('/myadmin', (_req: any, res: any) => {
       { key: 'contacts', label: 'Contacts' },
       { key: 'calls', label: 'Calls' },
       { key: 'analytics', label: 'Analytics' },
-      { key: 'settings', label: 'Settings' }
+      { key: 'settings', label: 'Settings' },
+      { key: 'settings-review', label: 'Permission Console' },
+      { key: 'settings-manual', label: 'Manual WABA Setup' },
+      { key: 'settings-register', label: 'Register Number' },
+      { key: 'settings-webhooks', label: 'Outgoing Webhooks' },
+      { key: 'settings-ads-shoot', label: 'Ads Shoot Mode' }
     ];
     const FEATURE_KEYS = new Set(FEATURE_OPTIONS.map(function(item) { return item.key; }));
     const FEATURE_ALIASES = {
@@ -5731,7 +5988,18 @@ app.get('/myadmin', (_req: any, res: any) => {
       'analytic': 'analytics',
       'setting': 'settings',
       'more': 'analytics',
-      'other': 'analytics'
+      'other': 'analytics',
+      'settingsreview': 'settings-review',
+      'review': 'settings-review',
+      'permission-verification-console': 'settings-review',
+      'settingsmanual': 'settings-manual',
+      'manual-waba-setup': 'settings-manual',
+      'settingsregister': 'settings-register',
+      'register-whatsapp-number': 'settings-register',
+      'settingswebhooks': 'settings-webhooks',
+      'outgoing-webhooks': 'settings-webhooks',
+      'settingsadsshoot': 'settings-ads-shoot',
+      'ads-shoot-mode': 'settings-ads-shoot'
     };
 
     function setStatus(message, isError) {
@@ -7192,8 +7460,7 @@ async function maybeSendAutoAiReply(params: {
 async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMessage) {
     const { syntheticMsg, remoteJid, text } = buildSyntheticMessage(inbound)
     const profileId = config.profileId
-    const profileCompanyId = await getCompanyIdForProfile(profileId)
-    const companyId = profileCompanyId || await resolveCompanyId(config.companyId || profileId)
+    const companyId = await getCompanyIdForProfile(profileId)
     const phoneNumber = normalizePhoneNumber(remoteJid)
     const isGroupMessage = Boolean(inbound.groupId || remoteJid.endsWith('@g.us'))
     const inboundSource = readTrimmed((inbound.raw as any)?.source).toLowerCase()
@@ -7214,6 +7481,7 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
         profileId,
         client,
         phoneNumber,
+        messageId: inbound.id,
         automationDisabled: humanTakeoverActive || isGroupMessage,
         messageType: inbound.type,
         text,
@@ -7332,9 +7600,12 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
             ctaFreeWindowStartedAt: null,
             ctaFreeWindowExpiresAt: null
         }
-    io.to(getCompanyRoom(companyId)).emit('contacts.update', {
-        profileId,
-        contacts: [contact]
+    const companyProfileIds = await getProfileIdsForCompany(companyId, profileId)
+    companyProfileIds.forEach((broadcastProfileId) => {
+        io.to(getCompanyRoom(companyId)).emit('contacts.update', {
+            profileId: broadcastProfileId,
+            contacts: [contact]
+        })
     })
 
     const buttonReply = inbound.buttonReplyId
@@ -7374,7 +7645,13 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
         raw: INCLUDE_RAW_WEBHOOK_EVENT_PAYLOAD ? inbound.raw : null
     })
 
-    io.to(getCompanyRoom(companyId)).emit('messages.upsert', { profileId, messages: [syntheticMsg], type: 'notify' })
+    companyProfileIds.forEach((broadcastProfileId) => {
+        io.to(getCompanyRoom(companyId)).emit('messages.upsert', {
+            profileId: broadcastProfileId,
+            messages: [syntheticMsg],
+            type: 'notify'
+        })
+    })
 
     const notificationRecipientUserIds = await getCompanyRecipientUserIdsForPush(companyId)
     const backgroundNotificationRecipientUserIds = selectBackgroundPushUserIds(notificationRecipientUserIds)
@@ -7415,7 +7692,7 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
 
 async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
     const profileId = config.profileId
-    const companyId = await resolveCompanyId(config.companyId || profileId)
+    const companyId = await getCompanyIdForProfile(profileId)
     const statusName = status.status
     let eventName: string | null = null
 
@@ -7487,7 +7764,7 @@ async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
 
 async function handleCallUpdate(config: WabaConfig, call: WabaCallUpdate) {
     const profileId = config.profileId
-    const companyId = await resolveCompanyId(config.companyId || profileId)
+    const companyId = await getCompanyIdForProfile(profileId)
     if (!companyId) return
 
     const room = getCompanyRoom(companyId)

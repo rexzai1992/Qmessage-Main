@@ -191,12 +191,18 @@ export function createAddonRouter(
             const from = body.from || ''
             const text = body.message || ''
             const phoneNumber = from.replace(/\D/g, '')
+            const inboundMessageId = typeof body?.messageId === 'string'
+                ? body.messageId.trim()
+                : typeof body?.id === 'string'
+                    ? body.id.trim()
+                    : ''
 
             await workflowEngine.processInbound({
                 companyId,
                 profileId,
                 client,
                 phoneNumber,
+                messageId: inboundMessageId || undefined,
                 messageType: 'text',
                 text,
                 raw: body

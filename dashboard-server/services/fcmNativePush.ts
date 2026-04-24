@@ -143,8 +143,8 @@ export function createNativeFcmPushSender(logger: Pick<Console, 'log' | 'warn'> 
             }
 
             const ttlSeconds = Math.max(30, Math.min(3600, Math.floor(Number(input.ttlSeconds || 120))))
-            const sound = normalizeString(input.sound) || 'iphone_glass'
-            const iosSound = normalizeString(input.iosSound) || `${sound}.caf`
+            const sound = normalizeString(input.sound) || 'default'
+            const iosSound = normalizeString(input.iosSound) || 'default'
             const channelId = normalizeString(input.channelId) || 'qmessage-chat-v4'
             const iosCategory = normalizeString(input.iosCategory) || 'QMESSAGE_CHAT'
             const normalizedData: Record<string, string> = {}

@@ -6,6 +6,7 @@ import {
     type PushNotificationSchema,
     type Token
 } from '@capacitor/push-notifications';
+import { LocalNotifications } from '@capacitor/local-notifications';
 
 export const NATIVE_PUSH_CHANNEL_ID = 'qmessage-chat-v4';
 export const NATIVE_PUSH_TOKEN_EVENT = 'qmessage:native-push-token';
@@ -15,6 +16,7 @@ export const NATIVE_PUSH_CHANNEL_STATUS_EVENT = 'qmessage:native-push-channel-st
 
 const ANDROID_HEADS_UP_MIN_IMPORTANCE = 4;
 const LEGACY_ANDROID_CHANNEL_IDS = ['qmessage-chat', 'qmessage-chat-v3'] as const;
+const FOREGROUND_HEADS_UP_DEDUPE_WINDOW_MS = 2500;
 
 export type NativePushTokenEventDetail = {
     value: string;
@@ -46,6 +48,8 @@ export type NativePushChannelStatusEventDetail = {
 
 let initialized = false;
 let listeners: PluginListenerHandle[] = [];
+let foregroundHeadsUpLastKey = '';
+let foregroundHeadsUpLastAt = 0;
 
 const dispatchWindowEvent = <T>(eventName: string, detail: T) => {
     if (typeof window === 'undefined') return;
@@ -69,6 +73,71 @@ const inferPayloadKind = (notification: PushNotificationSchema): 'notification-o
     if ((hasTitle || hasBody) && hasData) return 'mixed';
     if (hasData) return 'data-only';
     return 'notification-only';
+};
+
+const buildForegroundHeadsUpKey = (notification: PushNotificationSchema): string => {
+    const data = notification?.data && typeof notification.data === 'object'
+        ? notification.data as Record<string, unknown>
+        : {};
+    const candidateId = typeof data?.messageId === 'string'
+        ? data.messageId.trim()
+        : typeof data?.id === 'string'
+            ? data.id.trim()
+            : '';
+    const title = typeof notification?.title === 'string' ? notification.title.trim() : '';
+    const body = typeof notification?.body === 'string' ? notification.body.trim() : '';
+    const chat = typeof data?.chat === 'string' ? data.chat.trim() : '';
+    return [candidateId || '-', chat || '-', title || '-', body || '-'].join('|');
+};
+
+const canEmitForegroundHeadsUp = (notification: PushNotificationSchema): boolean => {
+    const now = Date.now();
+    const key = buildForegroundHeadsUpKey(notification);
+    if (foregroundHeadsUpLastKey === key && (now - foregroundHeadsUpLastAt) <= FOREGROUND_HEADS_UP_DEDUPE_WINDOW_MS) {
+        return false;
+    }
+    foregroundHeadsUpLastKey = key;
+    foregroundHeadsUpLastAt = now;
+    return true;
+};
+
+const showForegroundHeadsUpNotification = async (notification: PushNotificationSchema): Promise<void> => {
+    if (!Capacitor.isNativePlatform() || Capacitor.getPlatform() !== 'android') return;
+    if (resolveAppVisibility() !== 'visible') return;
+    if (!canEmitForegroundHeadsUp(notification)) return;
+
+    try {
+        const permissions = await LocalNotifications.checkPermissions();
+        if (permissions.display !== 'granted') {
+            const requested = await LocalNotifications.requestPermissions();
+            if (requested.display !== 'granted') return;
+        }
+
+        const title = typeof notification?.title === 'string' && notification.title.trim()
+            ? notification.title.trim()
+            : 'QMessage';
+        const body = typeof notification?.body === 'string' && notification.body.trim()
+            ? notification.body.trim()
+            : 'New message';
+        const data = notification?.data && typeof notification.data === 'object'
+            ? notification.data as Record<string, unknown>
+            : {};
+
+        await LocalNotifications.schedule({
+            notifications: [
+                {
+                    id: Number(Date.now() % 2147480000),
+                    title,
+                    body,
+                    channelId: NATIVE_PUSH_CHANNEL_ID,
+                    smallIcon: 'ic_launcher',
+                    extra: data
+                }
+            ]
+        });
+    } catch (error) {
+        console.warn('[native-push] Unable to show foreground heads-up notification.', error);
+    }
 };
 
 const getAndroidChannel = async (): Promise<Channel | null> => {
@@ -131,10 +200,22 @@ const ensureAndroidNotificationChannel = async () => {
                 name: 'Chat Messages',
                 description: 'Incoming QMessage chat alerts (heads-up).',
                 importance: 5,
-                visibility: 1,
-                sound: 'iphone_glass'
+                visibility: 1
             });
             console.info(`[native-push] Created channel ${NATIVE_PUSH_CHANNEL_ID} with IMPORTANCE_HIGH.`);
+        }
+
+        try {
+            await LocalNotifications.createChannel({
+                id: NATIVE_PUSH_CHANNEL_ID,
+                name: 'Chat Messages',
+                description: 'Incoming QMessage chat alerts (heads-up).',
+                importance: 5,
+                visibility: 1,
+                vibration: true
+            });
+        } catch {
+            // Keep push initialization resilient even if local notification channel creation fails.
         }
     } catch (error) {
         console.warn('[native-push] Unable to create Android notification channel.', error);
@@ -176,6 +257,7 @@ const attachPushListeners = async () => {
                 appVisibility,
                 payloadKind
             });
+            void showForegroundHeadsUpNotification(notification);
         })
     );
 

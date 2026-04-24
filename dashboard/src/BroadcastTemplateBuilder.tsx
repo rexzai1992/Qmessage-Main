@@ -49,6 +49,8 @@ type BroadcastTemplateBuilderProps = {
     sessionToken?: string | null;
     onClose: () => void;
     embedded?: boolean;
+    onToast?: (message: string, tone?: 'success' | 'error') => void;
+    onSubmitted?: () => void;
 };
 
 const sanitizeTemplateName = (value: string): string => {
@@ -153,7 +155,9 @@ export default function BroadcastTemplateBuilder({
     profileId,
     sessionToken,
     onClose,
-    embedded = false
+    embedded = false,
+    onToast,
+    onSubmitted
 }: BroadcastTemplateBuilderProps) {
     const [templateName, setTemplateName] = useState('');
     const [category, setCategory] = useState<TemplateCategory>('marketing');
@@ -1413,8 +1417,11 @@ export default function BroadcastTemplateBuilder({
             };
             window.localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(payload));
             setResult('Draft saved locally.');
+            onToast?.('Draft saved locally.', 'success');
         } catch (err: any) {
-            setError(err?.message || 'Failed to save draft.');
+            const message = err?.message || 'Failed to save draft.';
+            setError(message);
+            onToast?.(message, 'error');
         } finally {
             setSavingDraft(false);
         }
@@ -1422,11 +1429,15 @@ export default function BroadcastTemplateBuilder({
 
     const handleSubmitTemplate = async () => {
         if (!profileId) {
-            setError('Select a profile before creating templates.');
+            const message = 'Select a profile before creating templates.';
+            setError(message);
+            onToast?.(message, 'error');
             return;
         }
         if (!sessionToken) {
-            setError('You must be logged in to create templates.');
+            const message = 'You must be logged in to create templates.';
+            setError(message);
+            onToast?.(message, 'error');
             return;
         }
 
@@ -1434,7 +1445,9 @@ export default function BroadcastTemplateBuilder({
         try {
             payload = buildPayload();
         } catch (err: any) {
-            setError(err?.message || 'Template form is incomplete.');
+            const message = err?.message || 'Template form is incomplete.';
+            setError(message);
+            onToast?.(message, 'error');
             return;
         }
 
@@ -1460,9 +1473,14 @@ export default function BroadcastTemplateBuilder({
                 throw new Error((data?.error || 'Template creation failed') + details);
             }
 
-            setResult(formatTemplateCreateResult(data?.data));
+            const message = formatTemplateCreateResult(data?.data);
+            setResult(message);
+            onToast?.(message, 'success');
+            onSubmitted?.();
         } catch (err: any) {
-            setError(err?.message || 'Template creation failed');
+            const message = err?.message || 'Template creation failed';
+            setError(message);
+            onToast?.(message, 'error');
         } finally {
             setSubmitting(false);
         }

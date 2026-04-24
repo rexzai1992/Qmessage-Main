@@ -28,6 +28,14 @@ android {
     }
 }
 
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        variant.outputs.each { output ->
+            output.outputFileName.set("qmessage.apk")
+        }
+    }
+}
+
 repositories {
     flatDir{
         dirs '../capacitor-cordova-android-plugins/src/main/libs', 'libs'
@@ -62,10 +70,13 @@ tasks.register('syncLegacyIdeBuildArtifacts') {
         def outputsDstDir = file("${legacyIdeBuildDir}/outputs/apk/debug")
         if (outputsSrcDir.exists()) {
             mkdir outputsDstDir
+            delete fileTree(outputsDstDir) {
+                include '*.apk'
+            }
             copy {
                 from outputsSrcDir
                 into outputsDstDir
-                include 'app-debug.apk', 'output-metadata.json'
+                include '*.apk', 'output-metadata.json'
             }
         }
     }

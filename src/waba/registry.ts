@@ -52,7 +52,7 @@ function rowToConfig(row: WabaConfigRow | null): WabaConfig | null {
 
     return {
         profileId: row.profile_id || row.phone_number_id,
-        companyId: row.company_id || row.profile_id || undefined,
+        companyId: row.company_id || undefined,
         appId: appId || undefined,
         phoneNumberId: row.phone_number_id,
         businessId: row.business_id || undefined,

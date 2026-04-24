@@ -39,8 +39,8 @@ The repository currently has a root `.env` file. Treat all values as secrets and
 | `WABA_EMBEDDED_SIGNUP_CONFIG_ID` | Optional | Embedded signup config |
 | `WABA_EMBEDDED_SIGNUP_PREVERIFIED_IDS` / `WABA_PREVERIFIED_PHONE_IDS` | Optional | Preverified number IDs |
 | `WABA_OAUTH_MODE` | Optional | OAuth mode selection (`user` / `business_integration`) |
-| `WABA_OAUTH_REDIRECT_URI` | Optional | OAuth callback URL |
-| `WABA_OAUTH_RETURN_URL` | Optional | OAuth post-completion return URL |
+| `WABA_OAUTH_REDIRECT_URI` | Optional (recommended in production) | OAuth callback URL |
+| `WABA_OAUTH_RETURN_URL` | Optional (strongly recommended for split frontend/backend origins) | OAuth post-completion return URL |
 | `APP_ID`, `APP_SECRET`, `VERIFY_TOKEN` | Optional legacy aliases | Backward compatibility |
 
 ### Token Encryption

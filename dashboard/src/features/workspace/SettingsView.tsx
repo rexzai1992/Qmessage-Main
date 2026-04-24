@@ -28,12 +28,18 @@ type SettingsViewProps = {
     onSaveQuickReplies: (items: any[]) => void;
     onRefreshUiControls: () => void;
     showCallSettings?: boolean;
+    showPermissionVerificationConsole?: boolean;
+    showManualWabaSetup?: boolean;
+    showRegisterWhatsAppNumber?: boolean;
+    showOutgoingWebhooks?: boolean;
+    showAdsShootMode?: boolean;
     notificationPermission: NotificationPermission | 'unsupported';
     notificationSoundEnabled: boolean;
     onToggleNotificationSound: (enabled: boolean) => void;
     onRequestNotifications: () => void;
     onTestNotificationSound: () => void;
     WebhookViewComponent: React.ComponentType<any>;
+    isMobileView?: boolean;
 };
 
 export default function SettingsView({
@@ -53,12 +59,18 @@ export default function SettingsView({
     onSaveQuickReplies,
     onRefreshUiControls,
     showCallSettings,
+    showPermissionVerificationConsole,
+    showManualWabaSetup,
+    showRegisterWhatsAppNumber,
+    showOutgoingWebhooks,
+    showAdsShootMode,
     notificationPermission,
     notificationSoundEnabled,
     onToggleNotificationSound,
     onRequestNotifications,
     onTestNotificationSound,
-    WebhookViewComponent
+    WebhookViewComponent,
+    isMobileView = false
 }: SettingsViewProps) {
     const firstNavItemId = useMemo(() => settingsNav.flatMap((section) => section.items)[0]?.id || '', [settingsNav]);
     const mobileNavItems = useMemo(() => settingsNav.flatMap((section) => section.items), [settingsNav]);
@@ -76,10 +88,16 @@ export default function SettingsView({
     };
 
     return (
-        <div className="fixed inset-x-0 bottom-0 top-[64px] z-[110] flex flex-col qm-app-gradient lg:top-[72px]">
-            <div className="min-h-0 flex-1 p-2 sm:p-4 lg:p-5">
+        <div
+            className="fixed inset-x-0 bottom-0 z-[110] flex flex-col qm-app-gradient top-[calc(64px+env(safe-area-inset-top))] lg:top-[72px]"
+            style={{
+                paddingLeft: 'max(env(safe-area-inset-left), 0px)',
+                paddingRight: 'max(env(safe-area-inset-right), 0px)'
+            }}
+        >
+            <div className="min-h-0 flex-1 p-2 pb-[max(env(safe-area-inset-bottom),0px)] sm:p-4 lg:p-5">
                 <div className="mx-auto flex h-full w-full max-w-[1480px] min-h-0 flex-col gap-3">
-                    <div className="qm-shell px-3 py-3 sm:px-5 sm:py-4">
+                    <div className={isMobileView ? 'px-2 py-2' : 'qm-shell px-3 py-3 sm:px-5 sm:py-4'}>
                         <div className="flex items-center justify-between gap-3">
                             <div className="flex min-w-0 items-center gap-3">
                                 <div className="flex h-11 w-11 items-center justify-center rounded-2xl border border-[var(--qm-border)] bg-[var(--qm-brand-soft)] text-[var(--qm-brand)]">
@@ -103,8 +121,8 @@ export default function SettingsView({
                         </div>
                     </div>
 
-                    <div className="grid min-h-0 flex-1 overflow-hidden qm-shell lg:grid-cols-[288px_minmax(0,1fr)]">
-                    <aside className="min-h-0 border-b border-[var(--qm-border)] bg-white p-4 lg:overflow-y-auto lg:border-b-0 lg:border-r lg:p-5">
+                    <div className={`min-h-0 flex flex-1 flex-col overflow-hidden ${isMobileView ? '' : 'qm-shell'} lg:grid lg:grid-cols-[288px_minmax(0,1fr)] lg:gap-0`}>
+                    <aside className={`shrink-0 p-4 ${isMobileView ? '' : 'border-b border-[var(--qm-border)] bg-white'} lg:min-h-0 lg:overflow-y-auto lg:border-b-0 lg:border-r lg:p-5`}>
                         <div className="mb-2 flex items-center justify-between lg:mb-4">
                             <p className="qm-eyebrow">Sections</p>
                             <span className="qm-badge qm-badge-info">{mobileNavItems.length} Items</span>
@@ -157,7 +175,7 @@ export default function SettingsView({
                         </div>
                     </aside>
 
-                    <div className="min-h-0 overflow-y-auto bg-[var(--qm-surface-soft)]/60">
+                    <div className={`min-h-0 flex-1 overflow-y-auto ${isMobileView ? '' : 'bg-[var(--qm-surface-soft)]/60'}`}>
                         <Suspense
                             fallback={
                                 <div className="space-y-4 p-5 sm:p-7">
@@ -174,6 +192,7 @@ export default function SettingsView({
                                     sessionToken={sessionToken}
                                     isAdmin={isAdmin}
                                     isSuperAdmin={isSuperAdmin}
+                                    isMobileView={isMobileView}
                                     quickReplies={quickReplies}
                                     quickRepliesLoading={quickRepliesLoading}
                                     quickRepliesSaving={quickRepliesSaving}
@@ -182,6 +201,11 @@ export default function SettingsView({
                                     onSaveQuickReplies={onSaveQuickReplies}
                                     onRefreshUiControls={onRefreshUiControls}
                                     showCallSettings={showCallSettings}
+                                    showPermissionVerificationConsole={showPermissionVerificationConsole}
+                                    showManualWabaSetup={showManualWabaSetup}
+                                    showRegisterWhatsAppNumber={showRegisterWhatsAppNumber}
+                                    showOutgoingWebhooks={showOutgoingWebhooks}
+                                    showAdsShootMode={showAdsShootMode}
                                     notificationPermission={notificationPermission}
                                     notificationSoundEnabled={notificationSoundEnabled}
                                     onToggleNotificationSound={onToggleNotificationSound}

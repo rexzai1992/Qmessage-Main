@@ -158,6 +158,5 @@ Before launch:
 3. Ensure service account files are not committed.
 4. Re-check with:
 
-```bash
-git grep -n "AIzaSy\|gserviceaccount.com\|BEGIN PRIVATE KEY"
+
 ```

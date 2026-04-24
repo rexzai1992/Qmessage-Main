@@ -290,9 +290,7 @@ export default function AutomationsView({
     };
 
     const bindOpenHandlers = (fn: () => void) => ({
-        onClick: () => runOncePerTap(fn),
-        onMouseDown: () => runOncePerTap(fn),
-        onTouchStart: () => runOncePerTap(fn)
+        onClick: () => runOncePerTap(fn)
     });
     const workflowSkeletonRows = [0, 1, 2, 3, 4];
     const savedWorkflowCount = React.useMemo(
@@ -1101,22 +1099,6 @@ export default function AutomationsView({
                                     <p className="mt-1 text-base font-extrabold text-[#111b21]">{savedWorkflowCount}</p>
                                 </div>
                             </div>
-                            <div className="mt-3 grid grid-cols-2 gap-2">
-                                <button
-                                    type="button"
-                                    {...bindOpenHandlers(onCreateWorkflow)}
-                                    className="h-9 rounded-xl bg-[#00a884] text-white text-[11px] font-extrabold uppercase tracking-[0.08em] shadow-[0_8px_16px_rgba(0,168,132,0.26)]"
-                                >
-                                    + New
-                                </button>
-                                <button
-                                    type="button"
-                                    {...bindOpenHandlers(handleOpenWorkflowBuilder)}
-                                    className="h-9 rounded-xl border border-[#d5e0ee] bg-white text-[#1f2a33] text-[11px] font-extrabold uppercase tracking-[0.08em]"
-                                >
-                                    Open Builder
-                                </button>
-                            </div>
                         </>
                     )}
                     {!isMobileView && (
@@ -1253,15 +1235,7 @@ export default function AutomationsView({
                                     ? 'No automations configured yet.'
                                     : 'Create your first automation workflow in Chatflow builder.'}
                             </p>
-                            {isMobileView ? (
-                                <button
-                                    type="button"
-                                    {...bindOpenHandlers(onCreateWorkflow)}
-                                    className="h-9 px-4 rounded-xl bg-[#00a884] text-white text-[11px] font-extrabold uppercase tracking-[0.08em] shadow-[0_8px_16px_rgba(0,168,132,0.26)]"
-                                >
-                                    Create Workflow
-                                </button>
-                            ) : (
+                            {!isMobileView && (
                                 <button
                                     type="button"
                                     {...bindOpenHandlers(onCreateWorkflow)}
@@ -1333,18 +1307,7 @@ export default function AutomationsView({
                                                     </button>
                                                 </div>
 
-                                                <div className="mt-3 grid grid-cols-2 gap-2">
-                                                    <button
-                                                        type="button"
-                                                        disabled={!workflowId}
-                                                        onClick={() => {
-                                                            if (!workflowId) return;
-                                                            runOncePerTap(() => onOpenBuilder(workflowId));
-                                                        }}
-                                                        className="h-8 rounded-xl bg-[#00a884] text-white text-[10px] font-extrabold uppercase tracking-[0.08em] disabled:opacity-60"
-                                                    >
-                                                        Builder
-                                                    </button>
+                                                <div className="mt-3">
                                                     <button
                                                         type="button"
                                                         disabled={!workflowId}
@@ -1352,7 +1315,7 @@ export default function AutomationsView({
                                                             if (!workflowId) return;
                                                             runOncePerTap(() => onToggleWorkflowEnabled(workflowId, !isEnabled));
                                                         }}
-                                                        className={`h-8 rounded-xl border text-[10px] font-extrabold uppercase tracking-[0.08em] disabled:opacity-60 ${isEnabled
+                                                        className={`h-8 w-full rounded-xl border text-[10px] font-extrabold uppercase tracking-[0.08em] disabled:opacity-60 ${isEnabled
                                                             ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
                                                             : 'border-slate-200 bg-white text-slate-700'
                                                             }`}
@@ -1405,16 +1368,6 @@ export default function AutomationsView({
                                                             if (!workflowId) return;
                                                             runOncePerTap(() => onOpenBuilder(workflowId));
                                                         }}
-                                                        onMouseDown={(event) => {
-                                                            event.stopPropagation();
-                                                            if (!workflowId) return;
-                                                            runOncePerTap(() => onOpenBuilder(workflowId));
-                                                        }}
-                                                        onTouchStart={(event) => {
-                                                            event.stopPropagation();
-                                                            if (!workflowId) return;
-                                                            runOncePerTap(() => onOpenBuilder(workflowId));
-                                                        }}
                                                         className="h-8 px-3 rounded-lg bg-[#00a884] text-white text-[10px] font-extrabold uppercase tracking-[0.08em] hover:bg-[#008f6f] transition-all disabled:opacity-60 disabled:cursor-not-allowed"
                                                     >
                                                         Builder
@@ -1423,16 +1376,6 @@ export default function AutomationsView({
                                                         type="button"
                                                         disabled={!workflowId}
                                                         onClick={(event) => {
-                                                            event.stopPropagation();
-                                                            if (!workflowId) return;
-                                                            runOncePerTap(() => onCopyWorkflow(workflowId));
-                                                        }}
-                                                        onMouseDown={(event) => {
-                                                            event.stopPropagation();
-                                                            if (!workflowId) return;
-                                                            runOncePerTap(() => onCopyWorkflow(workflowId));
-                                                        }}
-                                                        onTouchStart={(event) => {
                                                             event.stopPropagation();
                                                             if (!workflowId) return;
                                                             runOncePerTap(() => onCopyWorkflow(workflowId));
@@ -1446,16 +1389,6 @@ export default function AutomationsView({
                                                         type="button"
                                                         disabled={!workflowId}
                                                         onClick={(event) => {
-                                                            event.stopPropagation();
-                                                            if (!workflowId) return;
-                                                            runOncePerTap(() => onToggleWorkflowEnabled(workflowId, !isEnabled));
-                                                        }}
-                                                        onMouseDown={(event) => {
-                                                            event.stopPropagation();
-                                                            if (!workflowId) return;
-                                                            runOncePerTap(() => onToggleWorkflowEnabled(workflowId, !isEnabled));
-                                                        }}
-                                                        onTouchStart={(event) => {
                                                             event.stopPropagation();
                                                             if (!workflowId) return;
                                                             runOncePerTap(() => onToggleWorkflowEnabled(workflowId, !isEnabled));
@@ -2211,19 +2144,21 @@ export default function AutomationsView({
                             ) : triggerWorkflowChoices.length === 0 ? (
                                 <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-3 text-[11px] text-amber-700">
                                     No workflow available yet. Create a workflow first.
-                                    <div className="mt-2">
-                                        <button
-                                            type="button"
-                                            onClick={() => {
-                                                setShowTriggerModal(false);
-                                                onCreateWorkflow();
-                                            }}
-                                            className="h-8 px-3 rounded-lg bg-[#00a884] text-white text-[10px] font-semibold uppercase tracking-wide hover:bg-[#008f6f] transition-all inline-flex items-center gap-1"
-                                        >
-                                            <Plus className="w-3 h-3" />
-                                            Create Workflow
-                                        </button>
-                                    </div>
+                                    {!isMobileView && (
+                                        <div className="mt-2">
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    setShowTriggerModal(false);
+                                                    onCreateWorkflow();
+                                                }}
+                                                className="h-8 px-3 rounded-lg bg-[#00a884] text-white text-[10px] font-semibold uppercase tracking-wide hover:bg-[#008f6f] transition-all inline-flex items-center gap-1"
+                                            >
+                                                <Plus className="w-3 h-3" />
+                                                Create Workflow
+                                            </button>
+                                        </div>
+                                    )}
                                 </div>
                             ) : (
                                 <>

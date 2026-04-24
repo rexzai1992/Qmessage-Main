@@ -247,7 +247,7 @@ export default function ChatflowView({
                         <p className="text-sm font-bold">No workflow selected</p>
                         <button
                             onClick={() => {
-                                const id = `wf-${Date.now()}`;
+                                const id = `wf-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
                                 const actions = [{ type: 'send_text', text: 'Hello! How can we help you?' }];
                                 const newWf = {
                                     id,

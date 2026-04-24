@@ -7,6 +7,22 @@ const COMMAND_NAME_REGEX = /^[a-z0-9_-]+$/
 const EMOJI_REGEX = /\p{Extended_Pictographic}/u
 const SCHEDULED_BROADCAST_MAX_RECIPIENTS = 500
 const SCHEDULED_BROADCAST_TICK_MS = 30_000
+const SUPPORTED_DATA_LOCALIZATION_REGIONS = new Set([
+    'AU',
+    'ID',
+    'IN',
+    'JP',
+    'SG',
+    'KR',
+    'DE',
+    'CH',
+    'GB',
+    'BR',
+    'BH',
+    'ZA',
+    'AE',
+    'CA'
+])
 
 type ConversationalCommand = {
     command_name: string
@@ -233,6 +249,91 @@ function parseScheduledRecipientsInput(value: any): string[] {
     }
 
     return Array.from(deduped)
+}
+
+function parseTokenScopes(value: any): string[] {
+    if (Array.isArray(value)) {
+        return Array.from(
+            new Set(
+                value
+                    .map((entry) => trimText(entry))
+                    .filter(Boolean)
+            )
+        )
+    }
+
+    const raw = trimText(value)
+    if (!raw) return []
+
+    try {
+        const parsed = JSON.parse(raw)
+        if (Array.isArray(parsed)) {
+            return Array.from(
+                new Set(
+                    parsed
+                        .map((entry) => trimText(entry))
+                        .filter(Boolean)
+                )
+            )
+        }
+    } catch {
+        // fall through to comma-separated parsing
+    }
+
+    return Array.from(
+        new Set(
+            raw
+                .split(/[,\s]+/)
+                .map((entry) => trimText(entry))
+                .filter(Boolean)
+        )
+    )
+}
+
+function parseDataLocalizationRegion(value: any): string | null {
+    const raw = trimText(value).toUpperCase()
+    if (!raw) return null
+    if (!SUPPORTED_DATA_LOCALIZATION_REGIONS.has(raw)) return null
+    return raw
+}
+
+type ReviewDeliveryStage = 'accepted' | 'sent' | 'delivered' | 'read' | 'failed'
+
+function normalizeReviewDeliveryStage(value: any): ReviewDeliveryStage {
+    const raw = trimText(value).toLowerCase()
+    if (raw === 'sent') return 'sent'
+    if (raw === 'delivered') return 'delivered'
+    if (raw === 'read') return 'read'
+    if (raw === 'failed') return 'failed'
+    return 'accepted'
+}
+
+function toMetaTimestampIso(value: any): string | null {
+    const numeric = Number(value)
+    if (!Number.isFinite(numeric) || numeric <= 0) return null
+    const milliseconds = numeric > 10_000_000_000 ? numeric : numeric * 1000
+    const date = new Date(milliseconds)
+    if (Number.isNaN(date.getTime())) return null
+    return date.toISOString()
+}
+
+function buildReviewDeliveryTimeline(stage: ReviewDeliveryStage) {
+    const reachedSent = stage === 'sent' || stage === 'delivered' || stage === 'read' || stage === 'failed'
+    const reachedDelivered = stage === 'delivered' || stage === 'read'
+    return {
+        accepted: true,
+        sent: reachedSent,
+        delivered: reachedDelivered,
+        read: stage === 'read',
+        failed: stage === 'failed'
+    }
+}
+
+function isMissingWabaConfigsUpdatedAtError(error: any): boolean {
+    const code = typeof error?.code === 'string' ? error.code : ''
+    const message = String(error?.message || '').toLowerCase()
+    if (code !== '42703') return false
+    return message.includes('waba_configs.updated_at') || message.includes('updated_at')
 }
 
 function formatScheduledBroadcastError(value: any): string {
@@ -484,7 +585,8 @@ app.get('/api/waba/embedded-signup/url', async (req: any, res: any) => {
         ]
         const uniquePreverifiedIds = Array.from(new Set(preverifiedIds))
 
-        const redirectUrl = resolveOauthReturnUrl(req)
+        const requestedReturnUrl = sanitizeReturnUrl(req.query?.returnUrl)
+        const redirectUrl = requestedReturnUrl || resolveOauthReturnUrl(req)
 
         const { error } = await supabase
             .from('waba_oauth_states')
@@ -632,9 +734,85 @@ app.post('/api/waba/manual-config', async (req: any, res: any) => {
     }
 })
 
+function escapeHtml(value: any): string {
+    const text = value === null || value === undefined ? '' : String(value)
+    return text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;')
+}
+
+function sanitizeReturnUrl(value: any): string | null {
+    const raw = typeof value === 'string' ? value.trim() : ''
+    if (!raw) return null
+    try {
+        const parsed = new URL(raw)
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+        return parsed.toString()
+    } catch {
+        return null
+    }
+}
+
+function renderOauthShell(payload: {
+    title: string
+    subtitle: string
+    tone?: 'info' | 'success' | 'error'
+    contentHtml: string
+    returnUrl?: string
+}) {
+    const tone = payload.tone || 'info'
+    const toneBadgeClass = tone === 'success'
+        ? 'background:#e8f9f2;color:#0f805f;border-color:#bae7d3;'
+        : tone === 'error'
+            ? 'background:#fff1f3;color:#be2f42;border-color:#f4cad1;'
+            : 'background:#eef5ff;color:#1f5fb8;border-color:#d3e2fb;'
+    const safeTitle = escapeHtml(payload.title)
+    const safeSubtitle = escapeHtml(payload.subtitle)
+    const safeReturnUrl = sanitizeReturnUrl(payload.returnUrl)
+    const returnLink = safeReturnUrl
+        ? `<a href="${escapeHtml(safeReturnUrl)}" style="display:inline-flex;align-items:center;justify-content:center;padding:11px 16px;border-radius:12px;background:#111b21;color:#fff;text-decoration:none;font-size:13px;font-weight:700;">Return to dashboard</a>`
+        : ''
+
+    return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>${safeTitle}</title>
+</head>
+<body style="margin:0;font-family:Manrope,Segoe UI,Arial,sans-serif;background:radial-gradient(circle at 14% 10%,rgba(14,164,122,.14),transparent 34%),radial-gradient(circle at 86% 0,rgba(42,110,244,.14),transparent 30%),#f6f8fb;color:#12253a;">
+  <main style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:26px 14px;">
+    <section style="width:min(100%,620px);border:1px solid #d7e4f4;border-radius:26px;background:linear-gradient(180deg,#fff 0%,#f8fcff 100%);box-shadow:0 22px 58px rgba(17,35,60,.16);padding:22px 20px;">
+      <div style="display:inline-flex;border:1px solid #dbe8f8;border-radius:999px;padding:5px 10px;font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;${toneBadgeClass}">${escapeHtml(tone)}</div>
+      <h1 style="margin:14px 0 0;font-size:28px;line-height:1.18;letter-spacing:-.02em;">${safeTitle}</h1>
+      <p style="margin:10px 0 0;color:#586b82;font-size:14px;line-height:1.6;">${safeSubtitle}</p>
+      <div style="margin-top:18px;">${payload.contentHtml}</div>
+      ${returnLink ? `<div style="margin-top:20px;">${returnLink}</div>` : ''}
+    </section>
+  </main>
+</body>
+</html>`
+}
+
 function renderOauthHtml(title: string, message: string, returnUrl?: string) {
-    const link = returnUrl ? `<p><a href=\"${returnUrl}\">Return to dashboard</a></p>` : ''
-    return `<!doctype html><html><head><meta charset=\"utf-8\"/><title>${title}</title></head><body style=\"font-family:Arial, sans-serif; padding:24px;\"><h2>${title}</h2><p>${message}</p>${link}</body></html>`
+    const normalizedTitle = typeof title === 'string' ? title.trim() : ''
+    const normalizedMessage = typeof message === 'string' ? message.trim() : ''
+    const tone: 'info' | 'success' | 'error' =
+        /^connected$/i.test(normalizedTitle)
+            ? 'success'
+            : /(failed|error|invalid|expired|no |missing|conflict|already)/i.test(`${normalizedTitle} ${normalizedMessage}`)
+                ? 'error'
+                : 'info'
+    return renderOauthShell({
+        title: normalizedTitle || 'WABA OAuth Status',
+        subtitle: normalizedMessage || 'Completed.',
+        tone,
+        contentHtml: '',
+        returnUrl
+    })
 }
 
 function renderBusinessChoiceHtml(payload: {
@@ -642,13 +820,103 @@ function renderBusinessChoiceHtml(payload: {
     state: string
     returnUrl?: string
 }) {
-    const rows = payload.businesses.map((b) => {
-        const label = `${b.name || 'Business'} (${b.id})`
-        const href = `/auth/waba/callback?state=${encodeURIComponent(payload.state)}&business_id=${encodeURIComponent(b.id)}`
-        return `<li style="margin:12px 0;"><a href="${href}" style="display:inline-block;padding:10px 16px;border-radius:12px;background:#111b21;color:#fff;text-decoration:none;font-weight:700;">${label}</a></li>`
+    const rows = payload.businesses.map((business) => {
+        const businessName = typeof business?.name === 'string' && business.name.trim() ? business.name.trim() : 'Business'
+        const businessId = typeof business?.id === 'string' ? business.id.trim() : ''
+        const href = `/auth/waba/callback?state=${encodeURIComponent(payload.state)}&business_id=${encodeURIComponent(businessId)}`
+        return `<li style="list-style:none;">
+            <a href="${escapeHtml(href)}" style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 14px;border-radius:14px;border:1px solid #d9e5f3;background:#fff;color:#12253a;text-decoration:none;font-weight:700;">
+              <span style="display:block;min-width:0;">
+                <span style="display:block;font-size:14px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(businessName)}</span>
+                <span style="display:block;margin-top:4px;font-size:11px;color:#6a7e95;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;">${escapeHtml(businessId)}</span>
+              </span>
+              <span style="display:inline-flex;align-items:center;justify-content:center;padding:7px 10px;border-radius:10px;background:#111b21;color:#fff;font-size:11px;white-space:nowrap;">Select</span>
+            </a>
+          </li>`
     }).join('')
-    const link = payload.returnUrl ? `<p><a href=\"${payload.returnUrl}\">Return to dashboard</a></p>` : ''
-    return `<!doctype html><html><head><meta charset=\"utf-8\"/><title>Select Business</title></head><body style=\"font-family:Arial, sans-serif; padding:24px;\"><h2>Select Business</h2><p>Choose the business to connect:</p><ul style=\"list-style:none;padding:0;\">${rows}</ul>${link}</body></html>`
+
+    return renderOauthShell({
+        title: 'Select Business',
+        subtitle: 'Choose which Meta Business should be connected for this WABA profile.',
+        tone: 'info',
+        contentHtml: `<ul style="margin:0;padding:0;display:grid;gap:10px;">${rows}</ul>`,
+        returnUrl: payload.returnUrl
+    })
+}
+
+function renderPhoneNumberChoiceHtml(payload: {
+    phoneNumbers: Array<{
+        id: string
+        display_phone_number?: string
+        verified_name?: string
+        conflict_profile_id?: string | null
+    }>
+    state: string
+    businessId: string
+    wabaId: string
+    returnUrl?: string
+    subtitle?: string
+    alertMessage?: string
+}) {
+    const rows = payload.phoneNumbers
+        .map((phone) => {
+            const phoneId = typeof phone?.id === 'string' ? phone.id.trim() : ''
+            if (!phoneId) return ''
+
+            const displayPhone = typeof phone?.display_phone_number === 'string' && phone.display_phone_number.trim()
+                ? phone.display_phone_number.trim()
+                : 'No display number'
+            const verifiedName = typeof phone?.verified_name === 'string' && phone.verified_name.trim()
+                ? phone.verified_name.trim()
+                : null
+            const conflictProfileId = typeof phone?.conflict_profile_id === 'string' && phone.conflict_profile_id.trim()
+                ? phone.conflict_profile_id.trim()
+                : null
+            const verifiedLine = verifiedName
+                ? `Verified name: ${escapeHtml(verifiedName)}`
+                : 'Verified name not available'
+            const href = `/auth/waba/callback?state=${encodeURIComponent(payload.state)}&business_id=${encodeURIComponent(payload.businessId)}&waba_id=${encodeURIComponent(payload.wabaId)}&phone_number_id=${encodeURIComponent(phoneId)}`
+
+            if (conflictProfileId) {
+                return `<li style="list-style:none;">
+            <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:12px 14px;border-radius:14px;border:1px solid #f1c7ce;background:#fff6f7;">
+              <span style="display:block;min-width:0;">
+                <span style="display:block;font-size:14px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(displayPhone)}</span>
+                <span style="display:block;margin-top:4px;font-size:11px;color:#6a7e95;">${verifiedLine}</span>
+                <span style="display:block;margin-top:4px;font-size:11px;color:#6a7e95;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;">${escapeHtml(phoneId)}</span>
+              </span>
+              <span style="display:inline-flex;align-items:center;justify-content:center;padding:7px 10px;border-radius:10px;background:#f8d6dc;color:#8b1f2f;font-size:11px;white-space:nowrap;">Unavailable</span>
+            </div>
+            <p style="margin:6px 4px 0;font-size:12px;color:#8b1f2f;">Connected to profile ${escapeHtml(conflictProfileId)}. Disconnect it first.</p>
+          </li>`
+            }
+
+            return `<li style="list-style:none;">
+            <a href="${escapeHtml(href)}" style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 14px;border-radius:14px;border:1px solid #d9e5f3;background:#fff;color:#12253a;text-decoration:none;font-weight:700;">
+              <span style="display:block;min-width:0;">
+                <span style="display:block;font-size:14px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(displayPhone)}</span>
+                <span style="display:block;margin-top:4px;font-size:11px;color:#6a7e95;">${verifiedLine}</span>
+                <span style="display:block;margin-top:4px;font-size:11px;color:#6a7e95;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;">${escapeHtml(phoneId)}</span>
+              </span>
+              <span style="display:inline-flex;align-items:center;justify-content:center;padding:7px 10px;border-radius:10px;background:#111b21;color:#fff;font-size:11px;white-space:nowrap;">Select</span>
+            </a>
+          </li>`
+        })
+        .filter(Boolean)
+        .join('')
+
+    const alertHtml = payload.alertMessage
+        ? `<div style="margin:0 0 12px;padding:11px 12px;border:1px solid #f4cad1;background:#fff3f5;color:#8b1f2f;border-radius:12px;font-size:12px;line-height:1.5;">${escapeHtml(payload.alertMessage)}</div>`
+        : ''
+    const listHtml = rows || `<li style="list-style:none;padding:12px 14px;border-radius:14px;border:1px solid #d9e5f3;background:#fff;font-size:13px;color:#5b6f86;">No phone numbers available.</li>`
+
+    return renderOauthShell({
+        title: 'Select Phone Number',
+        subtitle: payload.subtitle || 'Choose which WhatsApp phone number should be connected for this profile.',
+        tone: 'info',
+        contentHtml: `${alertHtml}<ul style="margin:0;padding:0;display:grid;gap:10px;">${listHtml}</ul>`,
+        returnUrl: payload.returnUrl
+    })
 }
 
 app.get('/auth/waba/callback', async (req: any, res: any) => {
@@ -666,6 +934,16 @@ app.get('/auth/waba/callback', async (req: any, res: any) => {
             : typeof req.query?.businessId === 'string'
                 ? req.query.businessId
                 : null
+        const selectedWabaId = typeof req.query?.waba_id === 'string'
+            ? req.query.waba_id
+            : typeof req.query?.wabaId === 'string'
+                ? req.query.wabaId
+                : null
+        const selectedPhoneNumberId = typeof req.query?.phone_number_id === 'string'
+            ? req.query.phone_number_id
+            : typeof req.query?.phoneNumberId === 'string'
+                ? req.query.phoneNumberId
+                : null
         if (!state) {
             return res.status(400).send(renderOauthHtml('Invalid callback', 'Missing state.', resolveOauthReturnUrl(req)))
         }
@@ -682,11 +960,33 @@ app.get('/auth/waba/callback', async (req: any, res: any) => {
         }
 
         if (stateRow.used_at) {
-            return res.status(400).send(renderOauthHtml('State already used', 'Please restart the signup flow.', stateRow.redirect_url || resolveOauthReturnUrl(req)))
+            const usedAtIso = (() => {
+                try {
+                    return new Date(stateRow.used_at).toISOString()
+                } catch {
+                    return String(stateRow.used_at || '')
+                }
+            })()
+            return res.status(400).send(renderOauthHtml(
+                'State already used',
+                `This OAuth link was already used at ${usedAtIso}. Start "Connect WhatsApp Business" again to generate a fresh link.`,
+                stateRow.redirect_url || resolveOauthReturnUrl(req)
+            ))
         }
 
         if (stateRow.expires_at && new Date(stateRow.expires_at).getTime() < Date.now()) {
-            return res.status(400).send(renderOauthHtml('State expired', 'Please restart the signup flow.', stateRow.redirect_url || resolveOauthReturnUrl(req)))
+            const expiresAtIso = (() => {
+                try {
+                    return new Date(stateRow.expires_at).toISOString()
+                } catch {
+                    return String(stateRow.expires_at || '')
+                }
+            })()
+            return res.status(400).send(renderOauthHtml(
+                'State expired',
+                `This OAuth link expired at ${expiresAtIso}. Start "Connect WhatsApp Business" again. Each link is valid for 10 minutes.`,
+                stateRow.redirect_url || resolveOauthReturnUrl(req)
+            ))
         }
 
         const appId = process.env.WABA_APP_ID || process.env.APP_ID
@@ -804,7 +1104,24 @@ app.get('/auth/waba/callback', async (req: any, res: any) => {
         }
 
         const graphToken = businessIntegrationToken || accessToken
-        let wabaId = stateRow.requested_waba_id as string | null
+        const returnUrl = stateRow.redirect_url || resolveOauthReturnUrl(req)
+        const persistOauthSessionState = async () => {
+            const accessTokenExpiresAt = expiresIn
+                ? new Date(Date.now() + Number(expiresIn) * 1000).toISOString()
+                : null
+            const { error: persistError } = await supabase
+                .from('waba_oauth_states')
+                .update({
+                    access_token: encryptToken(accessToken),
+                    access_token_type: tokenType || null,
+                    access_token_expires_at: accessTokenExpiresAt,
+                    client_business_id: clientBusinessId
+                })
+                .eq('id', stateRow.id)
+            return persistError || null
+        }
+
+        let wabaId = selectedWabaId || (stateRow.requested_waba_id as string | null)
         let businessId = selectedBusinessId || (stateRow.requested_business_id as string | null)
         let preferredWabaIds = new Set<string>()
         let preferredBusinessIds = new Set<string>()
@@ -819,22 +1136,14 @@ app.get('/auth/waba/callback', async (req: any, res: any) => {
                 }
 
                 if (businesses.length > 1 && !selectedBusinessId) {
-                    const accessTokenExpiresAt = expiresIn
-                        ? new Date(Date.now() + Number(expiresIn) * 1000).toISOString()
-                        : null
-                    await supabase
-                        .from('waba_oauth_states')
-                        .update({
-                            access_token: encryptToken(accessToken),
-                            access_token_type: tokenType || null,
-                            access_token_expires_at: accessTokenExpiresAt,
-                            client_business_id: clientBusinessId
-                        })
-                        .eq('id', stateRow.id)
+                    const persistError = await persistOauthSessionState()
+                    if (persistError) {
+                        return res.status(500).send(renderOauthHtml('Storage failed', persistError.message, returnUrl))
+                    }
                     return res.status(200).send(renderBusinessChoiceHtml({
                         businesses,
                         state,
-                        returnUrl: stateRow.redirect_url || resolveOauthReturnUrl(req)
+                        returnUrl
                     }))
                 }
 
@@ -863,7 +1172,10 @@ app.get('/auth/waba/callback', async (req: any, res: any) => {
             }
         }
 
-        
+        if (!businessId) {
+            return res.status(400).send(renderOauthHtml('No businesses found', 'Could not determine which Meta Business to connect.', returnUrl))
+        }
+
         if (!wabaId) {
             const owned = await fetchOwnedWabaAccounts(businessId, graphToken, apiVersion)
             const candidates = owned.length ? owned : await fetchClientWabaAccounts(businessId, graphToken, apiVersion)
@@ -878,13 +1190,8 @@ app.get('/auth/waba/callback', async (req: any, res: any) => {
             }
         }
 
-        let phoneNumberId = stateRow.requested_phone_number_id as string | null
-        if (!phoneNumberId) {
-            const numbers = await fetchPhoneNumbers(wabaId, graphToken, apiVersion)
-            if (!numbers.length) {
-                return res.status(400).send(renderOauthHtml('No phone numbers found', 'No phone numbers were found for this WABA.'))
-            }
-            phoneNumberId = numbers[0].id
+        if (!wabaId) {
+            return res.status(400).send(renderOauthHtml('No WABA found', 'Could not determine which WABA to connect.', returnUrl))
         }
 
         const stateProfileId = typeof stateRow.profile_id === 'string' ? stateRow.profile_id.trim() : ''
@@ -892,12 +1199,121 @@ app.get('/auth/waba/callback', async (req: any, res: any) => {
             return res.status(400).send(renderOauthHtml('Invalid callback', 'Profile information is missing in OAuth state.'))
         }
 
-        const phoneConfigConflict = await findConflictingActivePhoneNumberConfig(phoneNumberId, stateProfileId)
-        if (phoneConfigConflict) {
+        let phoneNumberId = selectedPhoneNumberId || (stateRow.requested_phone_number_id as string | null)
+        let selectedPhoneDisplayNumber: string | null = null
+        let selectedPhoneVerifiedName: string | null = null
+        let availablePhoneNumbers: Array<{ id: string; display_phone_number?: string; verified_name?: string }> = await fetchPhoneNumbers(wabaId, graphToken, apiVersion)
+        if (!availablePhoneNumbers.length) {
+            return res.status(400).send(renderOauthHtml('No phone numbers found', 'No phone numbers were found for this WABA.'))
+        }
+
+        availablePhoneNumbers = availablePhoneNumbers
+            .map((entry) => {
+                const id = typeof entry?.id === 'string' ? entry.id.trim() : ''
+                if (!id) return null
+                return { ...entry, id }
+            })
+            .filter((entry): entry is { id: string; display_phone_number?: string; verified_name?: string } => Boolean(entry))
+
+        if (!availablePhoneNumbers.length) {
+            return res.status(400).send(renderOauthHtml('No phone numbers found', 'No valid phone number IDs were returned for this WABA.'))
+        }
+
+        const phoneNumbersById = new Map(availablePhoneNumbers.map((entry) => [entry.id, entry]))
+        let phoneConflictsById: Map<string, string | null> | null = null
+        const loadPhoneConflicts = async () => {
+            if (phoneConflictsById) return phoneConflictsById
+
+            const nextMap = new Map<string, string | null>()
+            for (const candidate of availablePhoneNumbers) {
+                const conflict = await findConflictingActivePhoneNumberConfig(candidate.id, stateProfileId)
+                if (!conflict) continue
+                const conflictingProfileId = typeof conflict?.profileId === 'string'
+                    ? conflict.profileId.trim()
+                    : typeof conflict?.profile_id === 'string'
+                        ? conflict.profile_id.trim()
+                        : ''
+                nextMap.set(candidate.id, conflictingProfileId || null)
+            }
+
+            phoneConflictsById = nextMap
+            return nextMap
+        }
+        const buildPhoneChoices = async () => {
+            const conflicts = await loadPhoneConflicts()
+            return availablePhoneNumbers.map((entry) => ({
+                id: entry.id,
+                display_phone_number: entry.display_phone_number,
+                verified_name: entry.verified_name,
+                conflict_profile_id: conflicts.get(entry.id) || null
+            }))
+        }
+
+        if (!phoneNumberId && availablePhoneNumbers.length > 1) {
+            const persistError = await persistOauthSessionState()
+            if (persistError) {
+                return res.status(500).send(renderOauthHtml('Storage failed', persistError.message, returnUrl))
+            }
+            return res.status(200).send(renderPhoneNumberChoiceHtml({
+                phoneNumbers: await buildPhoneChoices(),
+                state,
+                businessId,
+                wabaId,
+                returnUrl
+            }))
+        }
+
+        if (!phoneNumberId) {
+            phoneNumberId = availablePhoneNumbers[0].id
+        }
+
+        if (!phoneNumbersById.has(phoneNumberId)) {
+            const persistError = await persistOauthSessionState()
+            if (persistError) {
+                return res.status(500).send(renderOauthHtml('Storage failed', persistError.message, returnUrl))
+            }
+            return res.status(400).send(renderPhoneNumberChoiceHtml({
+                phoneNumbers: await buildPhoneChoices(),
+                state,
+                businessId,
+                wabaId,
+                returnUrl,
+                alertMessage: `phoneNumberId "${phoneNumberId}" is not available in this WABA. Select a different number.`
+            }))
+        }
+
+        const selectedPhone = phoneNumbersById.get(phoneNumberId)
+        if (selectedPhone) {
+            selectedPhoneDisplayNumber = typeof selectedPhone.display_phone_number === 'string'
+                ? selectedPhone.display_phone_number.trim() || null
+                : null
+            selectedPhoneVerifiedName = typeof selectedPhone.verified_name === 'string'
+                ? selectedPhone.verified_name.trim() || null
+                : null
+        }
+
+        const phoneConflicts = await loadPhoneConflicts()
+        const phoneConflictProfileId = phoneConflicts.get(phoneNumberId) || null
+        if (phoneConflictProfileId !== null) {
+            if (availablePhoneNumbers.length > 1) {
+                const persistError = await persistOauthSessionState()
+                if (persistError) {
+                    return res.status(500).send(renderOauthHtml('Storage failed', persistError.message, returnUrl))
+                }
+                return res.status(409).send(renderPhoneNumberChoiceHtml({
+                    phoneNumbers: await buildPhoneChoices(),
+                    state,
+                    businessId,
+                    wabaId,
+                    returnUrl,
+                    alertMessage: `phoneNumberId "${phoneNumberId}" is already connected to another profile. Disconnect it first or select a different number.`
+                }))
+            }
+
             return res.status(409).send(renderOauthHtml(
                 'Phone number already connected',
                 `phoneNumberId "${phoneNumberId}" is already connected to another profile. Disconnect it first.`,
-                stateRow.redirect_url || resolveOauthReturnUrl(req)
+                returnUrl
             ))
         }
 
@@ -979,10 +1395,18 @@ app.get('/auth/waba/callback', async (req: any, res: any) => {
 
         await wabaRegistry.refresh(true)
 
-        const returnUrl = stateRow.redirect_url || resolveOauthReturnUrl(req)
         if (returnUrl) {
             const redirect = new URL(returnUrl)
             redirect.searchParams.set('waba', 'connected')
+            if (phoneNumberId) {
+                redirect.searchParams.set('waba_phone_number_id', String(phoneNumberId))
+            }
+            if (selectedPhoneDisplayNumber) {
+                redirect.searchParams.set('waba_display_phone_number', selectedPhoneDisplayNumber)
+            }
+            if (selectedPhoneVerifiedName) {
+                redirect.searchParams.set('waba_verified_name', selectedPhoneVerifiedName)
+            }
             return res.redirect(302, redirect.toString())
         }
 
@@ -1167,26 +1591,429 @@ app.get('/api/waba/registration/config', async (req: any, res: any) => {
         if (!access) return
 
         const config = await wabaRegistry.getConfigByProfile(access.profileId)
-        if (!config) {
+        const { data: configRow, error: configRowError } = await supabase
+            .from('waba_configs')
+            .select('company_id, business_id, client_business_id, waba_id, business_account_id, phone_number_id, token_source, access_token_expires_at, api_version, enabled')
+            .eq('profile_id', access.profileId)
+            .maybeSingle()
+
+        if (configRowError) {
+            return res.status(500).json({ success: false, error: configRowError.message })
+        }
+
+        if (!config && !configRow) {
             return res.status(404).json({ success: false, error: 'WABA config not found for this profile.' })
         }
+
+        const connectedCompanyId = trimText(configRow?.company_id || config?.companyId)
+        const connectedWabaId = trimText(config?.wabaId || config?.businessAccountId || configRow?.waba_id || configRow?.business_account_id)
+        const connectedBusinessId = trimText(config?.businessId || configRow?.business_id)
+        const connectedClientBusinessId = trimText(config?.clientBusinessId || configRow?.client_business_id)
+        const connectedPhoneNumberId = trimText(config?.phoneNumberId || configRow?.phone_number_id)
+        const connectedTokenSource = trimText(config?.tokenSource || configRow?.token_source)
+        const connectedAccessTokenExpiresAt = trimText(config?.accessTokenExpiresAt || configRow?.access_token_expires_at)
+        const connectedApiVersion = trimText(config?.apiVersion || configRow?.api_version)
 
         res.json({
             success: true,
             data: {
                 profileId: access.profileId,
                 companyId: access.companyId,
-                businessId: config.businessId || null,
-                clientBusinessId: config.clientBusinessId || null,
-                wabaId: config.wabaId || config.businessAccountId || null,
-                phoneNumberId: config.phoneNumberId || null,
-                tokenSource: config.tokenSource || null,
-                accessTokenExpiresAt: config.accessTokenExpiresAt || null,
-                apiVersion: config.apiVersion
+                connectedCompanyId: connectedCompanyId || null,
+                connectedCompanyMismatch: Boolean(connectedCompanyId && connectedCompanyId !== access.companyId),
+                businessId: connectedBusinessId || null,
+                clientBusinessId: connectedClientBusinessId || null,
+                wabaId: connectedWabaId || null,
+                phoneNumberId: connectedPhoneNumberId || null,
+                tokenSource: connectedTokenSource || null,
+                accessTokenExpiresAt: connectedAccessTokenExpiresAt || null,
+                apiVersion: connectedApiVersion || null,
+                enabled: configRow?.enabled === true
             }
         })
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message })
+    }
+})
+
+app.post('/api/waba/registration/company-id', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const companyId = trimText(req.body?.companyId)
+        if (!companyId) {
+            return res.status(400).json({ success: false, error: 'companyId is required' })
+        }
+
+        const isSuperAdmin = isSuperAdminUser(access.user)
+        if (!isSuperAdmin && companyId !== access.companyId) {
+            return res.status(403).json({
+                success: false,
+                error: `Company ID must match your account company "${access.companyId}".`
+            })
+        }
+
+        const { data: existingConfig, error: existingConfigError } = await supabase
+            .from('waba_configs')
+            .select('profile_id')
+            .eq('profile_id', access.profileId)
+            .maybeSingle()
+
+        if (existingConfigError) {
+            return res.status(500).json({ success: false, error: existingConfigError.message })
+        }
+        if (!existingConfig?.profile_id) {
+            return res.status(404).json({ success: false, error: 'WABA config not found for this profile.' })
+        }
+
+        const { error: updateError } = await supabase
+            .from('waba_configs')
+            .update({ company_id: companyId })
+            .eq('profile_id', access.profileId)
+
+        if (updateError) {
+            return res.status(500).json({ success: false, error: updateError.message })
+        }
+
+        await wabaRegistry.refresh(true)
+
+        return res.json({
+            success: true,
+            data: {
+                profileId: access.profileId,
+                companyId
+            }
+        })
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message })
+    }
+})
+
+app.get('/api/waba/review/readiness', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const runtimeConfig = await wabaRegistry.getConfigByProfile(access.profileId)
+        let { data: configRow, error: configError } = await supabase
+            .from('waba_configs')
+            .select('enabled, phone_number_id, business_id, client_business_id, waba_id, business_account_id, token_source, access_token_expires_at, token_scopes, connected_at, updated_at')
+            .eq('profile_id', access.profileId)
+            .maybeSingle()
+
+        if (configError && isMissingWabaConfigsUpdatedAtError(configError)) {
+            const fallback = await supabase
+                .from('waba_configs')
+                .select('enabled, phone_number_id, business_id, client_business_id, waba_id, business_account_id, token_source, access_token_expires_at, token_scopes, connected_at')
+                .eq('profile_id', access.profileId)
+                .maybeSingle()
+            configRow = fallback.data as any
+            configError = fallback.error as any
+        }
+
+        if (configError) {
+            return res.status(500).json({ success: false, error: configError.message })
+        }
+
+        const oauthMode = resolveOauthMode(process.env.WABA_EMBEDDED_SIGNUP_CONFIG_ID || '')
+        const oauthRedirectUri = resolveOauthRedirectUri(req)
+        const oauthReturnUrl = resolveOauthReturnUrl(req)
+        const appId = readTrimmed(process.env.WABA_APP_ID || process.env.APP_ID)
+        const appSecret = readTrimmed(process.env.WABA_APP_SECRET || process.env.APP_SECRET)
+        const verifyToken = readTrimmed(process.env.WABA_VERIFY_TOKEN || process.env.VERIFY_TOKEN)
+        const encryptionKeyReady = Boolean(getTokenEncryptionKey())
+        const tokenScopes = parseTokenScopes(configRow?.token_scopes)
+        const profileWabaId = readTrimmed(runtimeConfig?.wabaId || runtimeConfig?.businessAccountId || configRow?.waba_id || configRow?.business_account_id)
+        const profileBusinessId = readTrimmed(runtimeConfig?.businessId || configRow?.business_id)
+        const profileClientBusinessId = readTrimmed(runtimeConfig?.clientBusinessId || configRow?.client_business_id)
+        const profilePhoneNumberId = readTrimmed(runtimeConfig?.phoneNumberId || configRow?.phone_number_id)
+        const tokenSource = readTrimmed(runtimeConfig?.tokenSource || configRow?.token_source)
+        const accessTokenExpiresAt = readTrimmed(runtimeConfig?.accessTokenExpiresAt || configRow?.access_token_expires_at)
+        const connectedAt = trimText(configRow?.connected_at)
+        const updatedAt = trimText(configRow?.updated_at)
+        const hasDbConfig = Boolean(configRow)
+        const enabled = configRow?.enabled === true
+
+        const prerequisites = [
+            {
+                key: 'app_id',
+                label: 'WABA_APP_ID',
+                ok: Boolean(appId),
+                detail: appId ? 'Configured' : 'Missing'
+            },
+            {
+                key: 'app_secret',
+                label: 'WABA_APP_SECRET',
+                ok: Boolean(appSecret),
+                detail: appSecret ? 'Configured' : 'Missing'
+            },
+            {
+                key: 'verify_token',
+                label: 'WABA_VERIFY_TOKEN',
+                ok: Boolean(verifyToken),
+                detail: verifyToken ? 'Configured' : 'Missing'
+            },
+            {
+                key: 'token_encryption',
+                label: 'WABA_TOKEN_ENCRYPTION_KEY',
+                ok: encryptionKeyReady,
+                detail: encryptionKeyReady ? 'Configured' : 'Missing'
+            },
+            {
+                key: 'oauth_redirect_uri',
+                label: 'OAuth Redirect URI',
+                ok: /^https:\/\//i.test(oauthRedirectUri),
+                detail: oauthRedirectUri
+            },
+            {
+                key: 'oauth_return_url',
+                label: 'OAuth Return URL',
+                ok: /^https:\/\//i.test(oauthReturnUrl),
+                detail: oauthReturnUrl
+            }
+        ]
+
+        res.json({
+            success: true,
+            data: {
+                profileId: access.profileId,
+                companyId: access.companyId,
+                oauth: {
+                    mode: oauthMode,
+                    configId: readTrimmed(process.env.WABA_EMBEDDED_SIGNUP_CONFIG_ID || '') || null,
+                    redirectUri: oauthRedirectUri,
+                    returnUrl: oauthReturnUrl
+                },
+                prerequisites,
+                connection: {
+                    connected: Boolean(runtimeConfig) && (!hasDbConfig || enabled),
+                    runtimeConfigLoaded: Boolean(runtimeConfig),
+                    enabled,
+                    phoneNumberId: profilePhoneNumberId || null,
+                    wabaId: profileWabaId || null,
+                    businessId: profileBusinessId || null,
+                    clientBusinessId: profileClientBusinessId || null,
+                    tokenSource: tokenSource || null,
+                    accessTokenExpiresAt: accessTokenExpiresAt || null,
+                    tokenScopes,
+                    connectedAt: connectedAt || null,
+                    updatedAt: updatedAt || null
+                }
+            }
+        })
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error?.message || 'Failed to load review readiness' })
+    }
+})
+
+app.get('/api/waba/review/businesses', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const config = await wabaRegistry.getConfigByProfile(access.profileId)
+        if (!config) {
+            return res.status(503).json({ success: false, error: 'WABA not configured for this profile.' })
+        }
+
+        const businesses = await fetchBusinesses(config.accessToken, config.apiVersion)
+        res.json({
+            success: true,
+            data: {
+                count: businesses.length,
+                items: businesses.slice(0, 50)
+            }
+        })
+    } catch (error: any) {
+        const normalized = toHttpErrorPayload(error, 'Failed to fetch businesses for this token')
+        res.status(normalized.status).json(normalized.payload)
+    }
+})
+
+app.post('/api/waba/review/send-test-message', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const client = await wabaRegistry.getClientByProfile(access.profileId)
+        if (!client) {
+            return res.status(503).json({ success: false, error: 'WABA not configured for this profile.' })
+        }
+
+        const rawRecipient = readTrimmed(req.body?.to || req.body?.recipient || req.body?.recipientPhone || req.body?.recipient_phone)
+        const normalizedRecipient = normalizePhoneNumber(rawRecipient)
+        if (!normalizedRecipient) {
+            return res.status(400).json({ success: false, error: 'Recipient phone number is required' })
+        }
+
+        const text = readTrimmed(req.body?.text || req.body?.message || req.body?.body) || 'Meta App Review test message from QMessage.'
+        if (text.length > 1024) {
+            return res.status(400).json({ success: false, error: 'Test message must be 1024 characters or less' })
+        }
+
+        const sentAtIso = new Date().toISOString()
+        let result: any = null
+        let messageId = ''
+        let tracked = false
+        let trackingNote = 'Message accepted by Graph API. Delivery webhook status is not tracked for this send.'
+
+        const resolvedCompanyId =
+            readTrimmed(access.companyId)
+            || readTrimmed(await getCompanyIdForProfile(access.profileId))
+
+        if (resolvedCompanyId) {
+            const user = await findOrCreateUser(resolvedCompanyId, normalizedRecipient)
+            if (user?.id) {
+                const sent = await sendWhatsAppMessage({
+                    client,
+                    userId: user.id,
+                    to: normalizedRecipient,
+                    type: 'text',
+                    content: { text }
+                })
+                result = sent?.response || null
+                messageId = readTrimmed(sent?.messageId || sent?.response?.messages?.[0]?.id)
+                if (messageId) {
+                    tracked = true
+                    trackingNote = 'Message accepted by Graph API. Delivery/read progression is tracked via webhook status events.'
+                }
+            }
+        }
+
+        if (!messageId) {
+            result = await client.sendText(normalizedRecipient, text)
+            messageId = readTrimmed(result?.messages?.[0]?.id || result?.message_id)
+        }
+
+        res.json({
+            success: true,
+            data: {
+                to: normalizedRecipient,
+                text,
+                messageId: messageId || null,
+                sentAt: sentAtIso,
+                tracked,
+                delivery: {
+                    status: 'accepted',
+                    timeline: buildReviewDeliveryTimeline('accepted'),
+                    note: trackingNote
+                },
+                response: result
+            }
+        })
+    } catch (error: any) {
+        const normalized = toHttpErrorPayload(error, 'Failed to send review test message')
+        res.status(normalized.status).json(normalized.payload)
+    }
+})
+
+app.get('/api/waba/review/message-status', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const messageId = readTrimmed(req.query?.messageId || req.query?.message_id)
+        if (!messageId) {
+            return res.status(400).json({ success: false, error: 'messageId is required' })
+        }
+
+        const { data: messageRow, error: messageError } = await supabase
+            .from('messages')
+            .select('id, user_id, created_at, content')
+            .eq('content->>message_id', messageId)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle()
+
+        if (messageError) {
+            return res.status(500).json({ success: false, error: messageError.message })
+        }
+
+        if (!messageRow) {
+            return res.json({
+                success: true,
+                data: {
+                    messageId,
+                    tracked: false,
+                    status: 'accepted',
+                    timeline: buildReviewDeliveryTimeline('accepted'),
+                    checkedAt: new Date().toISOString(),
+                    sentAt: null,
+                    lastEventAt: null,
+                    recipient: null,
+                    note: 'Message is accepted by Graph API, but no stored delivery status event is available yet.'
+                }
+            })
+        }
+
+        const resolvedCompanyId =
+            readTrimmed(access.companyId)
+            || readTrimmed(await getCompanyIdForProfile(access.profileId))
+
+        let userRow: any = null
+        if (messageRow.user_id) {
+            const { data: fetchedUser, error: userError } = await supabase
+                .from('users')
+                .select('id, company_id, phone_number')
+                .eq('id', messageRow.user_id)
+                .maybeSingle()
+
+            if (userError) {
+                return res.status(500).json({ success: false, error: userError.message })
+            }
+            userRow = fetchedUser || null
+        }
+
+        if (
+            resolvedCompanyId
+            && userRow?.company_id
+            && readTrimmed(userRow.company_id) !== resolvedCompanyId
+        ) {
+            return res.status(404).json({ success: false, error: 'Message not found for this company' })
+        }
+
+        const content = messageRow?.content && typeof messageRow.content === 'object' ? messageRow.content : {}
+        const lastStatusEvent =
+            content?.last_status_event && typeof content.last_status_event === 'object'
+                ? content.last_status_event
+                : null
+        const stage = normalizeReviewDeliveryStage(lastStatusEvent?.status || content?.status)
+        const recipientParticipantId = readTrimmed(
+            lastStatusEvent?.recipient_participant_id
+            || lastStatusEvent?.participant_recipient_id
+        )
+
+        res.json({
+            success: true,
+            data: {
+                messageId,
+                tracked: true,
+                status: stage,
+                timeline: buildReviewDeliveryTimeline(stage),
+                checkedAt: new Date().toISOString(),
+                sentAt: readTrimmed(content?.sent_at || messageRow?.created_at) || null,
+                lastEventAt: toMetaTimestampIso(lastStatusEvent?.timestamp),
+                recipient: readTrimmed(
+                    lastStatusEvent?.recipient_id
+                    || content?.to
+                    || userRow?.phone_number
+                ) || null,
+                lastStatusEvent: lastStatusEvent
+                    ? {
+                        status: readTrimmed(lastStatusEvent?.status) || null,
+                        timestamp: Number.isFinite(Number(lastStatusEvent?.timestamp)) ? Number(lastStatusEvent.timestamp) : null,
+                        timestampIso: toMetaTimestampIso(lastStatusEvent?.timestamp),
+                        recipientId: readTrimmed(lastStatusEvent?.recipient_id) || null,
+                        recipientType: readTrimmed(lastStatusEvent?.recipient_type) || null,
+                        recipientParticipantId: recipientParticipantId || null
+                    }
+                    : null
+            }
+        })
+    } catch (error: any) {
+        const normalized = toHttpErrorPayload(error, 'Failed to load review message status')
+        res.status(normalized.status).json(normalized.payload)
     }
 })
 
@@ -1221,7 +2048,11 @@ app.post('/api/waba/registration/request-code', async (req: any, res: any) => {
         const phoneNumberId = typeof req.body?.phoneNumberId === 'string' ? req.body.phoneNumberId : ''
         const rawMethod = typeof req.body?.codeMethod === 'string' ? req.body.codeMethod : ''
         const codeMethod = rawMethod.toUpperCase()
-        const locale = typeof req.body?.locale === 'string' ? req.body.locale : 'en_US'
+        const rawLanguage = trimText(req.body?.language ?? req.body?.locale).replace('-', '_')
+        let language = rawLanguage || 'en_US'
+        if (/^[a-z]{2}$/i.test(language)) {
+            language = `en_${language.toUpperCase()}`
+        }
 
         if (!phoneNumberId) {
             return res.status(400).json({ success: false, error: 'phoneNumberId is required' })
@@ -1229,11 +2060,18 @@ app.post('/api/waba/registration/request-code', async (req: any, res: any) => {
         if (codeMethod !== 'SMS' && codeMethod !== 'VOICE') {
             return res.status(400).json({ success: false, error: 'codeMethod must be SMS or VOICE' })
         }
+        if (!/^[a-z]{2}_[A-Z]{2}$/.test(language)) {
+            return res.status(400).json({
+                success: false,
+                error: 'language must be in format ll_CC (for example, en_US)'
+            })
+        }
 
-        const data = await client.requestVerificationCode(phoneNumberId, codeMethod as 'SMS' | 'VOICE', locale)
+        const data = await client.requestVerificationCode(phoneNumberId, codeMethod as 'SMS' | 'VOICE', language)
         res.json({ success: true, data })
     } catch (error: any) {
-        res.status(500).json({ success: false, error: error.message })
+        const normalized = toHttpErrorPayload(error, 'Failed to request verification code')
+        res.status(normalized.status).json(normalized.payload)
     }
 })
 
@@ -1273,6 +2111,12 @@ app.post('/api/waba/registration/register', async (req: any, res: any) => {
 
         const phoneNumberId = typeof req.body?.phoneNumberId === 'string' ? req.body.phoneNumberId : ''
         const pin = typeof req.body?.pin === 'string' ? req.body.pin.trim() : ''
+        const dataLocalizationRegion = parseDataLocalizationRegion(
+            req.body?.dataLocalizationRegion ?? req.body?.data_localization_region
+        )
+        const rawDataLocalizationRegion = trimText(
+            req.body?.dataLocalizationRegion ?? req.body?.data_localization_region
+        ).toUpperCase()
 
         if (!phoneNumberId || !pin) {
             return res.status(400).json({ success: false, error: 'phoneNumberId and pin are required' })
@@ -1280,8 +2124,38 @@ app.post('/api/waba/registration/register', async (req: any, res: any) => {
         if (!/^\d{6}$/.test(pin)) {
             return res.status(400).json({ success: false, error: 'pin must be 6 digits' })
         }
+        if (rawDataLocalizationRegion && !dataLocalizationRegion) {
+            return res.status(400).json({
+                success: false,
+                error: 'dataLocalizationRegion must be one of: AU, ID, IN, JP, SG, KR, DE, CH, GB, BR, BH, ZA, AE, CA'
+            })
+        }
 
-        const data = await client.registerPhoneNumber(phoneNumberId, pin)
+        const data = await client.registerPhoneNumber(phoneNumberId, pin, {
+            ...(dataLocalizationRegion ? { dataLocalizationRegion } : {})
+        })
+        res.json({ success: true, data })
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error.message })
+    }
+})
+
+app.post('/api/waba/registration/deregister', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const client = await wabaRegistry.getClientByProfile(access.profileId)
+        if (!client) {
+            return res.status(503).json({ success: false, error: 'WABA not configured for this profile.' })
+        }
+
+        const phoneNumberId = typeof req.body?.phoneNumberId === 'string' ? req.body.phoneNumberId.trim() : ''
+        if (!phoneNumberId) {
+            return res.status(400).json({ success: false, error: 'phoneNumberId is required' })
+        }
+
+        const data = await client.deregisterPhoneNumber(phoneNumberId)
         res.json({ success: true, data })
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message })

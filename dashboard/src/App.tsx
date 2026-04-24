@@ -418,6 +418,22 @@ type AppToast = {
     avatarLabel?: string;
 };
 
+type WabaConnectedConfettiPiece = {
+    id: number;
+    left: number;
+    hue: number;
+    delay: number;
+    duration: number;
+    size: number;
+    opacity: number;
+};
+
+type WabaConnectedSummary = {
+    phoneNumberId: string;
+    displayPhoneNumber: string;
+    verifiedName: string;
+};
+
 type OnboardingStepId = 'welcome' | 'waba_id' | 'phone_number_id' | 'access_token' | 'verify_token' | 'connect';
 
 type OnboardingFieldKey = 'wabaId' | 'phoneNumberId' | 'accessToken' | 'verifyToken';
@@ -1807,15 +1823,7 @@ export default function App() {
     const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'open' | 'close'>('connecting');
     const [allMessages, setAllMessages] = useState<Message[]>([]);
     const [contacts, setContacts] = useState<Record<string, ContactMeta>>({});
-    const [selectedChatId, setSelectedChatId] = useState<string | null>(() => {
-        if (typeof window === 'undefined') return null;
-        if (window.innerWidth < MOBILE_LAYOUT_BREAKPOINT) return null;
-        try {
-            return window.localStorage.getItem('lastChatId');
-        } catch {
-            return null;
-        }
-    });
+    const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
     const [chatOpenNonce, setChatOpenNonce] = useState(0);
     const [messageText, setMessageText] = useState('');
     const [composerMediaType, setComposerMediaType] = useState<'none' | 'image' | 'video' | 'document'>('none');
@@ -1927,6 +1935,8 @@ export default function App() {
         token: '',
         platform: ''
     });
+    const [showWabaConnectedSuccess, setShowWabaConnectedSuccess] = useState(false);
+    const [wabaConnectedSummary, setWabaConnectedSummary] = useState<WabaConnectedSummary | null>(null);
 
     const [activeView, setActiveView] = useState<'dashboard' | 'chatflow' | 'settings' | 'admin'>('dashboard');
     const [workspaceSection, setWorkspaceSection] = useState<
@@ -1991,6 +2001,7 @@ export default function App() {
     const socketAccessTokenRef = useRef('');
     const refreshSessionPromiseRef = useRef<Promise<string | null> | null>(null);
     const refreshAccessTokenRef = useRef<(() => Promise<string | null>) | null>(null);
+    const authRecoveryInFlightRef = useRef(false);
     const lastTestNotificationTriggerAtRef = useRef(0);
     const notificationAudioContextRef = useRef<AudioContext | null>(null);
     const notificationSoundEnabledRef = useRef(notificationSoundEnabled);
@@ -2025,6 +2036,19 @@ export default function App() {
         key: selectedChatId || 'all'
     });
     const debugOverlayEnabled = useMemo(() => shouldShowDebugOverlay(), []);
+    const wabaConnectedConfettiPieces = useMemo<WabaConnectedConfettiPiece[]>(
+        () => Array.from({ length: 42 }, (_unused, index) => {
+            const seed = index + 1;
+            const left = ((seed * 17.7) % 100);
+            const hue = Math.round((seed * 52.3) % 360);
+            const delay = Number(((seed % 8) * 0.16).toFixed(2));
+            const duration = Number((3.6 + ((seed * 7) % 9) * 0.38).toFixed(2));
+            const size = 7 + (seed % 6) * 2;
+            const opacity = Number((0.48 + (seed % 5) * 0.09).toFixed(2));
+            return { id: seed, left, hue, delay, duration, size, opacity };
+        }),
+        []
+    );
 
     const bumpDebugSocketEvent = useCallback((name: string, detail = '') => {
         if (!debugOverlayEnabled) return;
@@ -2079,16 +2103,12 @@ export default function App() {
         {
             group: 'Onboarding',
             items: [
-                { id: 'settings-connect', label: 'Connect WhatsApp' },
-                { id: 'settings-manual', label: 'Manual Setup' },
-                { id: 'settings-register', label: 'Register Number' }
+                { id: 'settings-connect', label: 'Connect WhatsApp' }
             ]
         },
         {
-            group: 'Connectivity',
+            group: 'Preferences',
             items: [
-                { id: 'settings-ads-shoot', label: 'Ads Shoot Mode' },
-                { id: 'settings-webhooks', label: 'Outgoing Webhooks' },
                 { id: 'settings-notifications', label: 'Notifications' },
                 ...(
                     hiddenUiFeatures.some((feature) => String(feature).trim().toLowerCase() === 'calls')
@@ -2108,6 +2128,7 @@ export default function App() {
         ...(isSuperAdmin ? [{
             group: 'Admin',
             items: [
+                { id: 'settings-promo-push', label: 'Promo Push' },
                 { id: 'settings-system-runtime', label: 'System Runtime' },
                 { id: 'settings-connected-clients', label: 'Connected Clients' },
                 { id: 'settings-connected-businesses', label: 'Connected Businesses' }
@@ -2243,6 +2264,17 @@ export default function App() {
             scrollToSettingsSection(id);
         }, 120);
     }, [scrollToSettingsSection]);
+
+    const handleContinueAfterWabaConnected = useCallback(() => {
+        setShowWabaConnectedSuccess(false);
+        setWabaConnectedSummary(null);
+    }, []);
+
+    const handleOpenWabaConnectedSettings = useCallback(() => {
+        setShowWabaConnectedSuccess(false);
+        setWabaConnectedSummary(null);
+        openSettingsSection('settings-connect');
+    }, [openSettingsSection]);
 
     const onboardingStorageKey = session?.user?.id
         ? `${ONBOARDING_TOUR_STORAGE_PREFIX}${ONBOARDING_TOUR_VERSION}:${session.user.id}`
@@ -2926,6 +2958,19 @@ export default function App() {
         return pendingRefresh;
     }, [updateSessionState]);
 
+    const forceSessionReauth = useCallback((message: string) => {
+        if (authRecoveryInFlightRef.current) return;
+        authRecoveryInFlightRef.current = true;
+        setHostAuthError(message);
+        refreshSessionPromiseRef.current = null;
+        void supabase.auth.signOut()
+            .catch(() => undefined)
+            .finally(() => {
+                updateSessionState(null);
+                authRecoveryInFlightRef.current = false;
+            });
+    }, [updateSessionState]);
+
 
     useEffect(() => {
         refreshAccessTokenRef.current = refreshAccessToken;
@@ -3002,6 +3047,7 @@ export default function App() {
 
             const currentToken = session?.access_token?.trim();
             if (!currentToken) {
+                forceSessionReauth('Invalid or expired session. Please sign in again.');
                 throw new Error('Invalid or expired session');
             }
 
@@ -3012,12 +3058,16 @@ export default function App() {
 
             const refreshedToken = await refreshAccessToken();
             if (!refreshedToken) {
+                forceSessionReauth('Invalid or expired session. Please sign in again.');
                 return response;
             }
             response = await runWithTimeoutRetry(refreshedToken);
+            if (response.status === 401) {
+                forceSessionReauth('Invalid or expired session. Please sign in again.');
+            }
             return response;
         },
-        [refreshAccessToken, session?.access_token]
+        [forceSessionReauth, refreshAccessToken, session?.access_token]
     );
 
     const syncWebPushSubscription = useCallback(async (force = false): Promise<boolean> => {
@@ -3856,7 +3906,13 @@ export default function App() {
             'contacts',
             'calls',
             'analytics',
-            'settings'
+            'settings',
+            'settings-review',
+            'settings-manual',
+            'settings-register',
+            'settings-webhooks',
+            'settings-ads-shoot',
+            'settings-promo-push'
         ]);
         const aliases: Record<string, string> = {
             'team_inbox': 'team-inbox',
@@ -3870,7 +3926,20 @@ export default function App() {
             'analytic': 'analytics',
             'setting': 'settings',
             'more': 'analytics',
-            'other': 'analytics'
+            'other': 'analytics',
+            'settingsreview': 'settings-review',
+            'review': 'settings-review',
+            'permission-verification-console': 'settings-review',
+            'settingsmanual': 'settings-manual',
+            'manual-waba-setup': 'settings-manual',
+            'settingsregister': 'settings-register',
+            'register-whatsapp-number': 'settings-register',
+            'settingswebhooks': 'settings-webhooks',
+            'outgoing-webhooks': 'settings-webhooks',
+            'settingsadsshoot': 'settings-ads-shoot',
+            'ads-shoot-mode': 'settings-ads-shoot',
+            'settingspromopush': 'settings-promo-push',
+            'promo-push': 'settings-promo-push'
         };
         const unique = new Set<string>();
         const push = (entry: unknown) => {
@@ -4124,19 +4193,6 @@ export default function App() {
         };
     }, [fetchUiControls, session?.access_token]);
 
-
-    useEffect(() => {
-        if (isMobile) return;
-        if (!activeProfileId) return;
-        try {
-            const stored = window.localStorage.getItem(`lastChatId:${activeProfileId}`);
-            if (stored && !selectedChatId) {
-                setSelectedChatId(stored);
-            }
-        } catch {
-            // ignore storage errors
-        }
-    }, [activeProfileId, isMobile, selectedChatId]);
 
     useEffect(() => {
         if (!isMobile) return;
@@ -4436,6 +4492,37 @@ export default function App() {
         updateSessionState(null);
     };
 
+    useEffect(() => {
+        if (typeof window === 'undefined') return;
+        let params: URLSearchParams;
+        try {
+            params = new URLSearchParams(window.location.search);
+        } catch {
+            return;
+        }
+        if (params.get('waba') !== 'connected') return;
+        const phoneNumberId = params.get('waba_phone_number_id') || '';
+        const displayPhoneNumber = params.get('waba_display_phone_number') || '';
+        const verifiedName = params.get('waba_verified_name') || '';
+        if (phoneNumberId || displayPhoneNumber || verifiedName) {
+            setWabaConnectedSummary({
+                phoneNumberId: phoneNumberId.trim(),
+                displayPhoneNumber: displayPhoneNumber.trim(),
+                verifiedName: verifiedName.trim()
+            });
+        } else {
+            setWabaConnectedSummary(null);
+        }
+        setShowWabaConnectedSuccess(true);
+        params.delete('waba');
+        params.delete('waba_phone_number_id');
+        params.delete('waba_display_phone_number');
+        params.delete('waba_verified_name');
+        const nextQuery = params.toString();
+        const nextUrl = `${window.location.pathname}${nextQuery ? `?${nextQuery}` : ''}${window.location.hash}`;
+        window.history.replaceState({}, '', nextUrl);
+    }, []);
+
     // Check Auth
     useEffect(() => {
         let cancelled = false;
@@ -4622,6 +4709,7 @@ export default function App() {
             setAllMessages([]);
             latestMessageTimestampRef.current = 0;
             setContacts({});
+            setSelectedChatId(null);
             return;
         }
 
@@ -5546,7 +5634,7 @@ export default function App() {
         }
     };
 
-    const { chatsMap, chatList, latestChatId } = useMemo(
+    const { chatsMap, chatList } = useMemo(
         () => buildChatListComputation(allMessages, contacts, searchQuery, chatListFilter, unreadMessagesByChat),
         [allMessages, contacts, searchQuery, chatListFilter, unreadMessagesByChat]
     );
@@ -5610,15 +5698,6 @@ export default function App() {
         () => buildContactsListComputation(contacts, allMessages, contactsSearchQuery),
         [contacts, allMessages, contactsSearchQuery]
     );
-
-    useEffect(() => {
-        if (isMobile) return;
-        if (activeView !== 'dashboard') return;
-        if (workspaceSection !== 'team-inbox') return;
-        if (!selectedChatId && latestChatId) {
-            setSelectedChatId(latestChatId);
-        }
-    }, [activeView, isMobile, latestChatId, selectedChatId, workspaceSection]);
 
     const tagAnalytics = useMemo(() => {
         const tagCounts = new Map<string, number>();
@@ -7422,6 +7501,42 @@ export default function App() {
             }
             : null
     };
+    const debugSnapshotText = JSON.stringify(debugSnapshot, null, 2);
+
+    const handleCopyMobileDebugSnapshot = async () => {
+        if (!debugSnapshotText) return;
+
+        try {
+            if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+                await navigator.clipboard.writeText(debugSnapshotText);
+                showToast('Mobile debug copied.', 'success');
+                return;
+            }
+        } catch {
+            // fallback below
+        }
+
+        try {
+            if (typeof document === 'undefined') throw new Error('Clipboard unavailable');
+            const textArea = document.createElement('textarea');
+            textArea.value = debugSnapshotText;
+            textArea.setAttribute('readonly', 'readonly');
+            textArea.style.position = 'fixed';
+            textArea.style.top = '-1000px';
+            textArea.style.opacity = '0';
+            document.body.appendChild(textArea);
+            textArea.focus();
+            textArea.select();
+            const copied = document.execCommand('copy');
+            document.body.removeChild(textArea);
+            if (!copied) {
+                throw new Error('Copy command failed');
+            }
+            showToast('Mobile debug copied.', 'success');
+        } catch {
+            showToast('Unable to copy debug. Please long-press and copy manually.', 'error');
+        }
+    };
 
     return (
         <>
@@ -7459,6 +7574,75 @@ export default function App() {
                         </div>
                     )}
                 </>
+            )}
+            {showWabaConnectedSuccess && (
+                <div className="fixed inset-0 z-[360] qm-waba-success-shell overflow-y-auto">
+                    <div className="qm-waba-success-confetti-layer" aria-hidden="true">
+                        {wabaConnectedConfettiPieces.map((piece) => (
+                            <span
+                                key={`waba-confetti-${piece.id}`}
+                                className="qm-waba-confetti-piece"
+                                style={{
+                                    left: `${piece.left}%`,
+                                    width: `${piece.size}px`,
+                                    height: `${Math.max(6, Math.round(piece.size * 0.58))}px`,
+                                    backgroundColor: `hsl(${piece.hue} 92% 58%)`,
+                                    animationDelay: `${piece.delay}s`,
+                                    animationDuration: `${piece.duration}s`,
+                                    opacity: piece.opacity
+                                }}
+                            />
+                        ))}
+                    </div>
+                    <div className="min-h-full px-4 py-7 md:px-8 md:py-12 flex items-start justify-center">
+                        <div className="qm-waba-success-card w-full max-w-xl relative">
+                            <div className="w-16 h-16 rounded-2xl mx-auto bg-[#dff7ee] border border-[#bfe9da] text-[#0f805f] flex items-center justify-center shadow-[0_14px_28px_rgba(15,128,95,0.2)]">
+                                <CheckCheck className="w-9 h-9" />
+                            </div>
+                            <div className="mt-5 text-center space-y-3">
+                                <p className="text-[11px] font-black tracking-[0.14em] uppercase text-[#0f805f]">Connected</p>
+                                <h2 className="text-2xl md:text-[2rem] leading-tight font-black text-[#12253a]">
+                                    WhatsApp Business is connected successfully
+                                </h2>
+                                <p className="text-sm md:text-[15px] text-[#586b82] leading-relaxed">
+                                    Embedded Signup completed and your WABA connection is active.
+                                    You can continue to the inbox now or review connection settings.
+                                </p>
+                                {wabaConnectedSummary && (
+                                    <div className="mx-auto mt-2 max-w-[460px] rounded-2xl border border-[#dbe8f6] bg-[#f8fbff] px-4 py-3 text-left">
+                                        <p className="text-[10px] font-black uppercase tracking-[0.12em] text-[#64748b]">Selected WhatsApp Number</p>
+                                        <p className="mt-1 text-[15px] font-extrabold text-[#12253a]">
+                                            {wabaConnectedSummary.displayPhoneNumber || wabaConnectedSummary.phoneNumberId || '-'}
+                                        </p>
+                                        {(wabaConnectedSummary.verifiedName || wabaConnectedSummary.phoneNumberId) && (
+                                            <p className="mt-1 text-[11px] text-[#586b82]">
+                                                {wabaConnectedSummary.verifiedName ? `Verified name: ${wabaConnectedSummary.verifiedName}` : ''}
+                                                {wabaConnectedSummary.verifiedName && wabaConnectedSummary.phoneNumberId ? ' · ' : ''}
+                                                {wabaConnectedSummary.phoneNumberId ? `Phone Number ID: ${wabaConnectedSummary.phoneNumberId}` : ''}
+                                            </p>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+                            <div className="mt-6 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                <button
+                                    type="button"
+                                    onClick={handleOpenWabaConnectedSettings}
+                                    className="qm-btn qm-btn-primary w-full"
+                                >
+                                    Open Settings
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={handleContinueAfterWabaConnected}
+                                    className="qm-btn qm-btn-secondary w-full"
+                                >
+                                    Continue to Inbox
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
             )}
             {!hideGlobalHeaderOnMobileInbox && (
             <header
@@ -7708,8 +7892,8 @@ export default function App() {
                                 <ShieldCheck className="w-10 h-10 text-[#00a884] mx-auto mb-4" />
                                 <p className="text-[#111b21] font-bold mb-2">WABA not configured for this profile</p>
                                 <p className="text-sm text-[#54656f] leading-relaxed">
-                                    Add your Meta Cloud API credentials in Supabase `waba_configs` and enable the config.
-                                    Once saved, refresh the page and the profile will show as connected.
+                                    Set up your Meta Cloud API in Settings.
+                                    Once configured, refresh the page and the profile will show as connected.
                                 </p>
                             </div>
                         </div>
@@ -7936,15 +8120,12 @@ export default function App() {
                     </header>
                     )}
 
-                    {showMobileWindowClosedBanner && (
-                        <div className="absolute top-[66px] left-1/2 -translate-x-1/2 z-20 pointer-events-none">
-                            <div className="px-3 py-1.5 rounded-full bg-[#fff3e0]/95 text-[#a16207] text-[11px] font-bold border border-[#fde68a] shadow-[0_8px_24px_rgba(0,0,0,0.12)] backdrop-blur-[2px] whitespace-nowrap">
+                    <div className={`flex-1 min-h-0 z-10 flex flex-col ${isMobile ? 'px-2 py-3' : 'px-16 py-6'}`}>
+                        {showMobileWindowClosedBanner && (
+                            <div className="mb-2 self-center px-3 py-1.5 rounded-full bg-[#fff3e0]/95 text-[#a16207] text-[11px] font-bold border border-[#fde68a] shadow-[0_8px_24px_rgba(0,0,0,0.12)] backdrop-blur-[2px] text-center">
                                 24h window closed. Use template message to reply.
                             </div>
-                        </div>
-                    )}
-
-                    <div className={`flex-1 min-h-0 z-10 flex flex-col ${isMobile ? (showMobileWindowClosedBanner ? 'px-2 pt-11 pb-3' : 'px-2 py-3') : 'px-16 py-6'}`}>
+                        )}
                         {lastProfileError && (
                             <div className="self-center sticky top-2 z-20 mb-2 flex items-center gap-3 bg-[#fff4e5] border border-[#ffd9b3] text-[#7a4b00] px-3 py-2 rounded-xl text-[11px] font-bold shadow-sm">
                                 <span className="flex-1">{lastProfileError}</span>
@@ -9183,6 +9364,11 @@ export default function App() {
                         onSaveQuickReplies={saveQuickReplies}
                         onRefreshUiControls={fetchUiControls}
                         showCallSettings={!isUiFeatureHidden('calls')}
+                        showPermissionVerificationConsole={!isUiFeatureHidden('settings-review')}
+                        showManualWabaSetup={!isUiFeatureHidden('settings-manual')}
+                        showRegisterWhatsAppNumber={!isUiFeatureHidden('settings-register')}
+                        showOutgoingWebhooks={!isUiFeatureHidden('settings-webhooks')}
+                        showAdsShootMode={!isUiFeatureHidden('settings-ads-shoot')}
                         notificationPermission={notificationPermissionState}
                         notificationSoundEnabled={notificationSoundEnabled}
                         onToggleNotificationSound={handleToggleNotificationSound}
@@ -9193,6 +9379,7 @@ export default function App() {
                             void handleTestNotificationSound();
                         }}
                         WebhookViewComponent={LazyWebhookView}
+                        isMobileView={isMobile}
                     />
                 )
             }
@@ -9633,6 +9820,7 @@ export default function App() {
                         sessionToken={session?.access_token || null}
                         BroadcastTemplateBuilder={LazyBroadcastTemplateBuilder}
                         BroadcastTemplatesList={LazyBroadcastTemplatesList}
+                        onToast={showToast}
                     />
                 </div>
             ) : workspaceSection === 'automations' ? (
@@ -9959,7 +10147,16 @@ export default function App() {
                         </button>
                         {debugPanelOpen && (
                             <div className="max-h-[42vh] overflow-y-auto custom-scrollbar px-3 py-2">
-                                <pre className="text-[11px] leading-5 text-[#1f2937] whitespace-pre-wrap break-all">{JSON.stringify(debugSnapshot, null, 2)}</pre>
+                                <div className="pb-2 flex items-center justify-end">
+                                    <button
+                                        type="button"
+                                        onClick={handleCopyMobileDebugSnapshot}
+                                        className="h-7 px-2.5 rounded-md border border-[#d1dbe5] bg-white text-[10px] font-extrabold uppercase tracking-[0.08em] text-[#334155] hover:bg-[#f8fbff] transition-colors"
+                                    >
+                                        Copy
+                                    </button>
+                                </div>
+                                <pre className="text-[11px] leading-5 text-[#1f2937] whitespace-pre-wrap break-all">{debugSnapshotText}</pre>
                             </div>
                         )}
                     </div>

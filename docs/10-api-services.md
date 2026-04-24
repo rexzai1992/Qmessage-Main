@@ -111,6 +111,9 @@ Some validation/migration cases also return `code` and `details`.
 | POST | `/api/waba/manual-config` | Save manual WABA config |
 | GET | `/auth/waba/callback` | OAuth callback handler |
 | GET | `/api/waba/registration/config` | Registration config |
+| GET | `/api/waba/review/readiness` | App Review readiness + connection snapshot |
+| GET | `/api/waba/review/businesses` | Business portfolio proof check (`business_management`) |
+| POST | `/api/waba/review/send-test-message` | Send reviewer test message (`whatsapp_business_messaging`) |
 | GET | `/api/waba/registration/phone-numbers` | Fetch phone numbers |
 | POST | `/api/waba/registration/request-code` | Request verification code |
 | POST | `/api/waba/registration/verify-code` | Verify code |

@@ -16,6 +16,37 @@ export function registerFlowRoutes(app: Express, ctx: any) {
         return raw.includes('schema cache') && raw.includes(`'${column.toLowerCase()}'`)
     }
 
+    const generateWorkflowId = (reservedIds: Set<string>): string => {
+        let nextId = ''
+        do {
+            nextId = `wf-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        } while (!nextId || reservedIds.has(nextId))
+        reservedIds.add(nextId)
+        return nextId
+    }
+
+    const remapWorkflowReferenceIds = (value: any, idRemap: Map<string, string>): any => {
+        if (!idRemap.size) return value
+        if (Array.isArray(value)) {
+            return value.map((entry) => remapWorkflowReferenceIds(entry, idRemap))
+        }
+        if (!value || typeof value !== 'object') return value
+
+        const next: Record<string, any> = {}
+        Object.entries(value).forEach(([key, raw]) => {
+            if (
+                typeof raw === 'string'
+                && (key === 'workflow_id' || key === 'targetWorkflowId')
+                && idRemap.has(raw.trim())
+            ) {
+                next[key] = idRemap.get(raw.trim())
+                return
+            }
+            next[key] = remapWorkflowReferenceIds(raw, idRemap)
+        })
+        return next
+    }
+
     app.get('/health', (_req: any, res: any) => {
         res.send('Dashboard Server Running')
     })
@@ -67,29 +98,83 @@ export function registerFlowRoutes(app: Express, ctx: any) {
                 return res.status(400).json({ success: false, error: 'workflows array required' })
             }
 
-            const toUpsert = payload.map((wf: any) => {
+            const reservedIds = new Set<string>()
+            const normalizedPayload = payload.map((wf: any) => {
+                const idRaw = typeof wf?.id === 'string' ? wf.id.trim() : ''
+                const id = idRaw || generateWorkflowId(reservedIds)
+                if (idRaw) reservedIds.add(idRaw)
+                return {
+                    ...wf,
+                    id
+                }
+            })
+
+            const incomingIds = Array.from(
+                new Set(
+                    normalizedPayload
+                        .map((wf: any) => (typeof wf?.id === 'string' ? wf.id.trim() : ''))
+                        .filter(Boolean)
+                )
+            )
+
+            const idRemap = new Map<string, string>()
+            if (incomingIds.length > 0) {
+                const { data: existingById, error: existingByIdError } = await supabase
+                    .from('workflows')
+                    .select('id, company_id')
+                    .in('id', incomingIds)
+
+                if (existingByIdError) {
+                    return res.status(500).json({ success: false, error: existingByIdError.message })
+                }
+
+                const existingRows: Array<{ id: string; company_id: string | null }> = Array.isArray(existingById)
+                    ? existingById
+                    : []
+                existingRows.forEach((row) => {
+                    if (!row?.id) return
+                    const rowCompanyId = typeof row.company_id === 'string' ? row.company_id.trim() : ''
+                    // Prevent cross-company reassignment when workflow IDs collide globally.
+                    if (rowCompanyId && rowCompanyId === access.companyId) return
+                    const replacementId = generateWorkflowId(reservedIds)
+                    idRemap.set(row.id, replacementId)
+                })
+            }
+
+            const toUpsert = normalizedPayload.map((wf: any) => {
+                const sourceId = typeof wf?.id === 'string' ? wf.id.trim() : ''
+                const nextWorkflowId = idRemap.get(sourceId) || sourceId || generateWorkflowId(reservedIds)
                 const workflowName = typeof wf?.name === 'string' ? wf.name.trim() : ''
                 const workflowEnabled = wf?.enabled !== false
                 const runOnNewChat = wf?.run_on_new_chat === true || wf?.runOnNewChat === true
+                const remappedActions = remapWorkflowReferenceIds(
+                    Array.isArray(wf?.actions) ? wf.actions : [],
+                    idRemap
+                )
+                const remappedBuilder = remapWorkflowReferenceIds(
+                    wf?.builder && typeof wf.builder === 'object' && !Array.isArray(wf.builder) ? wf.builder : null,
+                    idRemap
+                )
                 const nextBuilder =
-                    wf?.builder && typeof wf.builder === 'object' && !Array.isArray(wf.builder)
+                    remappedBuilder && typeof remappedBuilder === 'object' && !Array.isArray(remappedBuilder)
                         ? {
-                            ...wf.builder,
+                            ...remappedBuilder,
+                            id: nextWorkflowId,
                             meta: {
-                                ...(wf.builder.meta && typeof wf.builder.meta === 'object' ? wf.builder.meta : {}),
+                                ...(remappedBuilder.meta && typeof remappedBuilder.meta === 'object' ? remappedBuilder.meta : {}),
                                 name: workflowName,
                                 enabled: workflowEnabled
                             }
                         }
-                        : wf?.builder || null
+                        : remappedBuilder || null
 
                 return {
-                    id: wf.id,
+                    id: nextWorkflowId,
                     company_id: access.companyId,
                     name: workflowName,
                     trigger_keyword: wf.trigger_keyword || wf.triggerKeyword || '',
                     run_on_new_chat: runOnNewChat,
-                    actions: wf.actions || [],
+                    actions: remappedActions,
                     builder: nextBuilder,
                     enabled: workflowEnabled
                 }
@@ -116,7 +201,11 @@ export function registerFlowRoutes(app: Express, ctx: any) {
                 return res.status(500).json({ success: false, error: error.message })
             }
 
-            return res.json({ success: true })
+            const remappedIds = Object.fromEntries(Array.from(idRemap.entries()))
+            return res.json({
+                success: true,
+                remappedIds
+            })
         } catch (error: any) {
             return res.status(500).json({ success: false, error: error.message })
         }

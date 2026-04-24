@@ -417,6 +417,7 @@ io.on('connection', async (socket) => {
     socket.join(userId)
     socket.join(getCompanyRoom(companyId))
     socket.data.appVisibility = 'visible'
+    socket.data.appVisibilityUpdatedAt = Date.now()
 
     if (lastServerStats) {
         socket.emit('server.stats', lastServerStats)
@@ -772,6 +773,7 @@ io.on('connection', async (socket) => {
                 : ''
         const normalizedVisibility = rawVisibility.trim().toLowerCase()
         socket.data.appVisibility = normalizedVisibility === 'visible' ? 'visible' : 'hidden'
+        socket.data.appVisibilityUpdatedAt = Date.now()
     })
 
     socket.on('contact.update', async ({ profileId, jid, alias, name, tags }) => {

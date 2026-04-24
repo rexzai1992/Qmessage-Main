@@ -1,9 +1,23 @@
+import { Capacitor } from '@capacitor/core'
+
 const LOCAL_SOCKET_FALLBACK = 'http://localhost:3000'
 const ROOT_DOMAIN = '2fast.xyz'
 const RESERVED_SUBDOMAINS = new Set(['www', 'admin', 'myadmin'])
 
+const isNativeApp = (): boolean => {
+    try {
+        return Capacitor.isNativePlatform()
+    } catch {
+        return false
+    }
+}
+
 export const getSocketUrl = (): string => {
     const configured = (import.meta.env.VITE_SOCKET_URL || '').trim()
+    const nativeConfigured = (import.meta.env.VITE_NATIVE_SOCKET_URL || '').trim()
+    if (isNativeApp() && nativeConfigured) {
+        return nativeConfigured
+    }
     if (configured) {
         const isLocalConfigured = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(configured)
         const currentHost = typeof window !== 'undefined' ? (window.location.hostname || '').toLowerCase() : ''
@@ -14,6 +28,7 @@ export const getSocketUrl = (): string => {
         return configured
     }
     if (typeof window !== 'undefined' && window.location?.origin) return window.location.origin
+    if (nativeConfigured) return nativeConfigured
     return LOCAL_SOCKET_FALLBACK
 }
 

@@ -25,6 +25,7 @@ This documentation set describes the `Qmessage-Main` repository as implemented i
 19. [Create New App/Web From This Repo](./19-create-new-app-from-repo.md)
 20. [Capacitor Native Push Setup](./capacitor-native-push.md)
 21. [Native App Setup (RN Migration)](./native-app-setup.md)
+22. [Meta App Review Readiness](./22-meta-app-review-readiness.md)
 
 ## Quick Start
 

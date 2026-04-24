@@ -1094,12 +1094,15 @@ export async function getWorkflows(companyId: string): Promise<any[]> {
     })
 }
 
-export async function getWorkflowById(workflowId: string): Promise<any | null> {
-    const { data, error } = await supabase
+export async function getWorkflowById(workflowId: string, companyId?: string): Promise<any | null> {
+    let query = supabase
         .from('workflows')
         .select('*')
         .eq('id', workflowId)
-        .maybeSingle()
+    if (companyId) {
+        query = query.eq('company_id', companyId)
+    }
+    const { data, error } = await query.maybeSingle()
 
     if (error) {
         console.warn('[DB] Failed to load workflow:', error.message)

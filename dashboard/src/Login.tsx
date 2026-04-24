@@ -21,6 +21,40 @@ const OAUTH_PENDING_COMPANY_KEY = 'pendingOAuthCompanyId'
 const COMPANY_ID_REGEX = /^[a-z0-9-]{3,63}$/
 const RESERVED_COMPANY_IDS = new Set(['www', 'admin', 'myadmin'])
 const AUTH_REQUEST_TIMEOUT_MS = 12_000
+const AUTH_FLASH_MESSAGE_KEY = 'qmessage.auth.flash.message'
+
+const writeAuthFlashMessage = (value: string) => {
+    if (typeof window === 'undefined') return
+    const normalized = value.trim()
+    if (!normalized) return
+    try {
+        window.sessionStorage.setItem(AUTH_FLASH_MESSAGE_KEY, normalized)
+    } catch {
+        // ignore storage failures
+    }
+}
+
+const consumeAuthFlashMessage = (): string => {
+    if (typeof window === 'undefined') return ''
+    try {
+        const value = window.sessionStorage.getItem(AUTH_FLASH_MESSAGE_KEY) || ''
+        if (value) {
+            window.sessionStorage.removeItem(AUTH_FLASH_MESSAGE_KEY)
+        }
+        return value
+    } catch {
+        return ''
+    }
+}
+
+const clearAuthFlashMessage = () => {
+    if (typeof window === 'undefined') return
+    try {
+        window.sessionStorage.removeItem(AUTH_FLASH_MESSAGE_KEY)
+    } catch {
+        // ignore storage failures
+    }
+}
 
 const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> => {
     let timeoutId: number | null = null
@@ -160,10 +194,17 @@ export default function Login({
         setCompanyId(inferred)
     }, [])
 
+    useEffect(() => {
+        const flashMessage = consumeAuthFlashMessage()
+        if (!flashMessage) return
+        setMsg(flashMessage)
+    }, [])
+
     const handleAuth = async (e: React.FormEvent) => {
         e.preventDefault()
         setLoading(true)
         setMsg('')
+        clearAuthFlashMessage()
 
         try {
             const { trimmedCompany, normalizedCompany } = validateCompanyInput()
@@ -192,6 +233,7 @@ export default function Login({
             }
 
             const session = await signInAndValidate(trimmedEmail, password, trimmedCompany)
+            clearAuthFlashMessage()
             onLogin(session)
         } catch (error: any) {
             const rawMessage = typeof error?.message === 'string' ? error.message : 'Unable to sign in right now. Please retry.'
@@ -200,10 +242,11 @@ export default function Login({
                 || rawMessage.toLowerCase().includes('timed out')
                 || rawMessage.toLowerCase().includes('gateway timeout')
                 || rawMessage.toLowerCase().includes('service unavailable')
-            setMsg(networkLikeError
+            const displayMessage = networkLikeError
                 ? 'Auth server is busy or unreachable right now. Please retry in a few seconds.'
                 : rawMessage
-            )
+            setMsg(displayMessage)
+            writeAuthFlashMessage(displayMessage)
         } finally {
             setLoading(false)
         }
@@ -211,6 +254,7 @@ export default function Login({
 
     const handleGoogleAuth = async () => {
         setMsg('')
+        clearAuthFlashMessage()
         setGoogleLoading(true)
         try {
             if (mode === 'signup') {
@@ -233,7 +277,9 @@ export default function Login({
             if (typeof window !== 'undefined') {
                 window.localStorage.removeItem(OAUTH_PENDING_COMPANY_KEY)
             }
-            setMsg(error?.message || 'Google sign-in failed.')
+            const displayMessage = error?.message || 'Google sign-in failed.'
+            setMsg(displayMessage)
+            writeAuthFlashMessage(displayMessage)
             setGoogleLoading(false)
         }
     }
@@ -745,6 +791,8 @@ export default function Login({
                                 <a href="/support" className="font-semibold text-[var(--qm-text)] hover:underline">Support</a>
                                 {' | '}
                                 <a href="/privacy-policy" className="font-semibold text-[var(--qm-text)] hover:underline">Privacy Policy</a>
+                                {' | '}
+                                <a href="/data-deletion" className="font-semibold text-[var(--qm-text)] hover:underline">User Data Deletion</a>
                                 {' | '}
                                 <a href="/terms-and-conditions" className="font-semibold text-[var(--qm-text)] hover:underline">Terms and Conditions</a>
                             </p>

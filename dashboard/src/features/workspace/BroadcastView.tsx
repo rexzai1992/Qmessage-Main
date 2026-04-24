@@ -13,6 +13,7 @@ type BroadcastViewProps = {
     sessionToken: string | null;
     BroadcastTemplateBuilder: React.ComponentType<any>;
     BroadcastTemplatesList: React.ComponentType<any>;
+    onToast?: (message: string, tone?: 'success' | 'error') => void;
 };
 
 type ScheduledBroadcastRow = {
@@ -61,7 +62,8 @@ export default function BroadcastView({
     activeProfileId,
     sessionToken,
     BroadcastTemplateBuilder,
-    BroadcastTemplatesList
+    BroadcastTemplatesList,
+    onToast
 }: BroadcastViewProps) {
     const [scheduledRows, setScheduledRows] = useState<ScheduledBroadcastRow[]>([]);
     const [scheduledLoading, setScheduledLoading] = useState(false);
@@ -302,6 +304,8 @@ export default function BroadcastView({
                                 sessionToken={sessionToken}
                                 onClose={() => setBroadcastSection('my-templates')}
                                 embedded
+                                onToast={onToast}
+                                onSubmitted={() => setBroadcastSection('my-templates')}
                             />
                         </Suspense>
                     )}
