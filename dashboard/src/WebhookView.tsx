@@ -91,6 +91,7 @@ type AppReviewCheckState = {
     details: string[];
 };
 type ReviewMessageDeliveryStatus = 'accepted' | 'sent' | 'delivered' | 'read' | 'failed';
+type MetaPhoneNumberRemovalMode = 'deregister' | 'graph-delete' | 'legacy-delete';
 
 type AppReviewReadinessState = {
     profileId: string;
@@ -194,6 +195,14 @@ const normalizeCommandDescription = (value: unknown): string =>
 
 const readTrimmed = (value: unknown): string =>
     typeof value === 'string' ? value.trim() : '';
+
+const formatApiError = (data: any, fallback: string): string => {
+    const message = readTrimmed(data?.error) || fallback;
+    const details = Array.isArray(data?.details)
+        ? data.details.map((item: any) => readTrimmed(item)).filter(Boolean)
+        : [];
+    return details.length > 0 ? `${message} (${details.join('; ')})` : message;
+};
 
 const normalizeAppLogoMaxBytes = (value: unknown): number => {
     const parsed = Number(value);
@@ -471,6 +480,16 @@ export default function WebhookView({
   "vertical": "OTHER"
 }`);
     const [registrationBusy, setRegistrationBusy] = useState<null | 'request' | 'verify' | 'register' | 'profile'>(null);
+    const [metaRemoveForm, setMetaRemoveForm] = useState({
+        wabaId: '',
+        phoneNumberId: '',
+        accessToken: '',
+        apiVersion: '',
+        mode: 'deregister' as MetaPhoneNumberRemovalMode
+    });
+    const [metaRemoveLoading, setMetaRemoveLoading] = useState(false);
+    const [metaRemoveError, setMetaRemoveError] = useState<string | null>(null);
+    const [metaRemoveNotice, setMetaRemoveNotice] = useState<string | null>(null);
     const [appReviewReadiness, setAppReviewReadiness] = useState<AppReviewReadinessState | null>(null);
     const [appReviewReadinessLoading, setAppReviewReadinessLoading] = useState(Boolean(sessionToken));
     const [appReviewReadinessError, setAppReviewReadinessError] = useState<string | null>(null);
@@ -1032,6 +1051,12 @@ export default function WebhookView({
                     setRegistrationConfig(cfg);
                     setRegistrationWabaId(cfg.wabaId || '');
                     setRegistrationPhoneNumberId(cfg.phoneNumberId || '');
+                    setMetaRemoveForm(prev => ({
+                        ...prev,
+                        wabaId: prev.wabaId || cfg.wabaId || '',
+                        phoneNumberId: prev.phoneNumberId || cfg.phoneNumberId || '',
+                        apiVersion: prev.apiVersion || cfg.apiVersion || ''
+                    }));
                     setRegistrationError(null);
                 } else {
                     setRegistrationConfig(null);
@@ -1634,13 +1659,81 @@ export default function WebhookView({
         }
     };
 
+    const handleRemoveMetaPhoneNumber = async () => {
+        if (!sessionToken || !profileId) {
+            setMetaRemoveError('You must be logged in to remove a Meta phone number.');
+            return;
+        }
+        if (!isAdmin) {
+            setMetaRemoveError('Admin access required.');
+            return;
+        }
+
+        const phoneNumberId = readTrimmed(metaRemoveForm.phoneNumberId);
+        const wabaId = readTrimmed(metaRemoveForm.wabaId);
+        const apiVersion = readTrimmed(metaRemoveForm.apiVersion);
+        const mode = metaRemoveForm.mode;
+        if (!phoneNumberId) {
+            setMetaRemoveError('Phone Number ID is required.');
+            return;
+        }
+        if (mode !== 'deregister' && !wabaId) {
+            setMetaRemoveError('WABA ID is required for DELETE removal modes.');
+            return;
+        }
+
+        const actionLabel = mode === 'deregister'
+            ? 'deregister this phone number from Cloud API'
+            : mode === 'legacy-delete'
+                ? 'send DELETE to the whatsapp_business_accounts path'
+                : 'send DELETE to the WABA phone_numbers edge';
+        if (!confirm(`Remove phone number ${phoneNumberId} from Meta?\n\nThis will ${actionLabel}.`)) {
+            return;
+        }
+
+        setMetaRemoveLoading(true);
+        setMetaRemoveError(null);
+        setMetaRemoveNotice(null);
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/waba/registration/remove-phone-number`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    profileId,
+                    mode,
+                    wabaId,
+                    phoneNumberId,
+                    apiVersion: apiVersion || null,
+                    accessToken: readTrimmed(metaRemoveForm.accessToken) || null,
+                    disableLocal: true
+                })
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data?.success) {
+                throw new Error(formatApiError(data, 'Failed to remove phone number from Meta.'));
+            }
+
+            const path = readTrimmed(data?.data?.path);
+            setMetaRemoveNotice(path ? `Meta request completed: ${path}` : 'Meta request completed.');
+            setConnectError(null);
+            setDisconnectError(null);
+            fetchRegistrationConfig();
+            fetchAppReviewReadiness();
+            if (isSuperAdmin) {
+                fetchClientConnections();
+            }
+        } catch (error: any) {
+            setMetaRemoveError(error?.message || 'Failed to remove phone number from Meta.');
+        } finally {
+            setMetaRemoveLoading(false);
+        }
+    };
+
     const parseBusinessProfileError = (data: any, fallback: string): string => {
-        const message = readTrimmed(data?.error) || fallback;
-        const details = Array.isArray(data?.details)
-            ? data.details.map((item: any) => readTrimmed(item)).filter(Boolean)
-            : [];
-        if (!details.length) return message;
-        return `${message} (${details.join(', ')})`;
+        return formatApiError(data, fallback);
     };
 
     const applyBusinessProfilePayload = (payload: any) => {
@@ -4408,7 +4501,7 @@ export default function WebhookView({
                     </div>
                 </div>
 
-                {isSuperAdmin && (
+                {isAdmin && (
                     <div id="settings-promo-push" className={`${settingsSectionCardClass} lg:col-span-2`}>
                         <div className="flex items-center justify-between mb-6">
                             <div>

@@ -1644,6 +1644,39 @@ const parseTemplateComponentsInput = (templateComponents: string): { components?
     }
 };
 
+const extractTemplateBodyParameterValues = (components: any[] | undefined): string[] => {
+    if (!Array.isArray(components)) return [];
+    const bodyComponent = components.find((component: any) => {
+        const type = typeof component?.type === 'string' ? component.type.trim().toLowerCase() : '';
+        return type === 'body';
+    });
+    const parameters = Array.isArray(bodyComponent?.parameters) ? bodyComponent.parameters : [];
+    return parameters
+        .map((param: any) => {
+            if (typeof param?.text === 'string') return param.text.trim();
+            return '';
+        })
+        .filter(Boolean);
+};
+
+const renderTemplatePreviewText = (templateText: unknown, bodyValues: string[]): string => {
+    const baseText = typeof templateText === 'string' ? templateText.trim() : '';
+    const normalizedValues = bodyValues
+        .map((value) => (typeof value === 'string' ? value.trim() : ''))
+        .filter(Boolean);
+
+    if (baseText) {
+        let rendered = baseText;
+        normalizedValues.forEach((value, index) => {
+            const placeholderPattern = new RegExp(`{{\\s*${index + 1}\\s*}}`, 'g');
+            rendered = rendered.replace(placeholderPattern, value);
+        });
+        return rendered.trim();
+    }
+
+    return normalizedValues.join(' ').trim();
+};
+
 const buildTemplateHeaderComponent = (args: {
     selectedTemplateHeaderFormat: string;
     requiredTemplateHeaderAttributeCount: number;
@@ -2125,13 +2158,15 @@ export default function App() {
                 { id: 'settings-team-users', label: 'Team Users' }
             ]
         },
-        ...(isSuperAdmin ? [{
+        ...(isAdmin ? [{
             group: 'Admin',
             items: [
                 { id: 'settings-promo-push', label: 'Promo Push' },
-                { id: 'settings-system-runtime', label: 'System Runtime' },
-                { id: 'settings-connected-clients', label: 'Connected Clients' },
-                { id: 'settings-connected-businesses', label: 'Connected Businesses' }
+                ...(isSuperAdmin ? [
+                    { id: 'settings-system-runtime', label: 'System Runtime' },
+                    { id: 'settings-connected-clients', label: 'Connected Clients' },
+                    { id: 'settings-connected-businesses', label: 'Connected Businesses' }
+                ] : [])
             ]
         }] : [])
     ];
@@ -7050,6 +7085,7 @@ export default function App() {
 
         let components: any[] | undefined;
         let namedBodyAttributes: TemplateBodyAttributePayload[] = [];
+        let templatePreviewText = '';
         const parsedTemplateInput = parseTemplateComponentsInput(templateComponents);
         if (parsedTemplateInput.error) {
             alert(parsedTemplateInput.error);
@@ -7057,6 +7093,8 @@ export default function App() {
         }
         if (parsedTemplateInput.components) {
             components = parsedTemplateInput.components;
+            const previewBodyValues = extractTemplateBodyParameterValues(components);
+            templatePreviewText = renderTemplatePreviewText(selectedTemplateBody?.text, previewBodyValues);
         } else if (selectedTemplateOption) {
             const templateBuildResult = buildTemplateFromSelection({
                 selectedTemplateHeaderFormat,
@@ -7075,6 +7113,10 @@ export default function App() {
             }
             components = templateBuildResult.components;
             namedBodyAttributes = templateBuildResult.bodyAttributes;
+            templatePreviewText = renderTemplatePreviewText(
+                selectedTemplateBody?.text,
+                templateBuildResult.bodyAttributes.map((entry) => entry.value)
+            );
         }
 
         socket.emit('sendTemplate', {
@@ -7083,7 +7125,8 @@ export default function App() {
             name: templateName.trim(),
             language: templateLanguage.trim() || 'en_US',
             components,
-            bodyAttributes: namedBodyAttributes
+            bodyAttributes: namedBodyAttributes,
+            previewText: templatePreviewText
         });
         setShowTemplateComposer(false);
     };

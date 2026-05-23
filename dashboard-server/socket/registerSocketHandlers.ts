@@ -161,6 +161,19 @@ export function registerSocketHandlers(io: Server, ctx: any) {
         }
     }
 
+    const extractTemplatePreviewFromComponents = (components: any[] | undefined): string => {
+        if (!Array.isArray(components)) return ''
+        const bodyComponent = components.find((component: any) => {
+            const type = typeof component?.type === 'string' ? component.type.trim().toLowerCase() : ''
+            return type === 'body'
+        })
+        const parameters = Array.isArray(bodyComponent?.parameters) ? bodyComponent.parameters : []
+        const values = parameters
+            .map((param: any) => readTrimmed(param?.text))
+            .filter(Boolean)
+        return values.join(' ').trim()
+    }
+
     const parseBoundedLimit = (value: unknown, fallback: number, min: number, max: number): number => {
         const parsed = Number(value)
         if (!Number.isFinite(parsed)) return fallback
@@ -1284,7 +1297,7 @@ io.on('connection', async (socket) => {
     })
 
     socket.on('sendTemplate', async (data, ack) => {
-        let { profileId, jid, name, language, components, bodyAttributes } = data
+        let { profileId, jid, name, language, components, bodyAttributes, previewText } = data
         if (!jid || !name) return
         jid = toChatJid(jid)
         if (!jid) return
@@ -1323,7 +1336,8 @@ io.on('connection', async (socket) => {
                 jid,
                 messageId: sent?.messageId || `tpl-${Date.now()}`,
                 actor,
-                fallbackLabel: `Template: ${name}`
+                text: readTrimmed(previewText) || extractTemplatePreviewFromComponents(components),
+                fallbackLabel: readTrimmed(name) || 'Template sent'
             })
             // Template sends do not use optimistic local rendering in the UI,
             // so publish to all clients, including the sender socket.
