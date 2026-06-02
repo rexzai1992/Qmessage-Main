@@ -367,6 +367,7 @@ function buildContactPayload(user: any) {
     const displayName = alias || whatsappName || phone || user?.phone_number || ''
     return {
         id: jid,
+        profileId: typeof user?.profile_id === 'string' && user.profile_id.trim() ? user.profile_id.trim() : null,
         name: displayName,
         alias,
         whatsappName,
@@ -1072,7 +1073,7 @@ async function clearAdsShootSimulatedConversations(
     companyId: string,
     profileId: string
 ): Promise<{ candidate_users: number; deleted_messages: number; deleted_users: number }> {
-    const users = await getUsersForCompany(companyId)
+    const users = await getUsersForCompany(companyId, profileId)
     if (users.length === 0) {
         return { candidate_users: 0, deleted_messages: 0, deleted_users: 0 }
     }
@@ -1158,7 +1159,7 @@ async function runWindowReminders() {
             const client = await wabaRegistry.getClientByProfile(profileId)
             if (!client) continue
 
-            const users = await getUsersWithExpiringWindow(companyId, minutes)
+            const users = await getUsersWithExpiringWindow(companyId, minutes, profileId)
             for (const user of users) {
                 const lastInboundMs = user.last_inbound_at ? new Date(user.last_inbound_at).getTime() : null
                 if (!lastInboundMs || Number.isNaN(lastInboundMs)) continue
@@ -1174,6 +1175,7 @@ async function runWindowReminders() {
                     await sendWhatsAppMessage({
                         client,
                         userId: user.id,
+                        profileId,
                         to: user.phone_number,
                         type: 'text',
                         content: { text: message },
@@ -3650,6 +3652,9 @@ const WEB_PUSH_NOTIFICATION_BADGE = '/icons/icon-192.png'
 const NATIVE_PUSH_TOKENS_FILE = resolvePath('native_push_tokens.json')
 const NATIVE_PUSH_CHANNEL_ID = 'qmessage-chat-v4'
 const NATIVE_PUSH_SOUND = 'default'
+const INBOUND_PUSH_DEDUPE_TTL_MS = 2 * 60 * 1000
+const MAX_INBOUND_PUSH_DEDUPE_KEYS = 3000
+const recentInboundPushDispatchAt = new Map<string, number>()
 
 const pushSubscriptionStore = createPushSubscriptionStore(WEB_PUSH_SUBSCRIPTIONS_FILE)
 const nativePushTokenStore = createNativePushTokenStore(NATIVE_PUSH_TOKENS_FILE)
@@ -3834,6 +3839,40 @@ const selectBackgroundPushUserIds = (userIds: string[]): string[] => {
     ))
     if (uniqueUserIds.length === 0) return []
     return uniqueUserIds.filter((userId) => getPushPresenceForUserId(userId) !== 'active')
+}
+
+const shouldSkipInboundPushDispatch = (dedupeKey: string): boolean => {
+    const key = typeof dedupeKey === 'string' ? dedupeKey.trim() : ''
+    if (!key) return false
+
+    const now = Date.now()
+    const cutoff = now - INBOUND_PUSH_DEDUPE_TTL_MS
+    for (const [entryKey, timestamp] of recentInboundPushDispatchAt) {
+        if (timestamp >= cutoff) continue
+        recentInboundPushDispatchAt.delete(entryKey)
+    }
+
+    const previous = recentInboundPushDispatchAt.get(key) || 0
+    if (previous > 0 && (now - previous) <= INBOUND_PUSH_DEDUPE_TTL_MS) {
+        return true
+    }
+
+    recentInboundPushDispatchAt.set(key, now)
+
+    if (recentInboundPushDispatchAt.size > MAX_INBOUND_PUSH_DEDUPE_KEYS) {
+        let oldestKey: string | null = null
+        let oldestTimestamp = Number.POSITIVE_INFINITY
+        for (const [entryKey, timestamp] of recentInboundPushDispatchAt) {
+            if (timestamp >= oldestTimestamp) continue
+            oldestTimestamp = timestamp
+            oldestKey = entryKey
+        }
+        if (oldestKey) {
+            recentInboundPushDispatchAt.delete(oldestKey)
+        }
+    }
+
+    return false
 }
 
 const sendPushNotificationToUsers = async (input: SendPushNotificationInput): Promise<void> => {
@@ -4385,7 +4424,7 @@ app.post('/api/send-message', verifyApiKey, async (req: any, res: any) => {
         }
 
         const recipientId = normalizePhoneNumber(jid)
-        const user = await findOrCreateUser(companyId, recipientId)
+        const user = await findOrCreateUser(companyId, recipientId, profileId)
         if (!user) {
             return res.status(500).json({ success: false, error: 'Failed to resolve user' })
         }
@@ -4393,6 +4432,7 @@ app.post('/api/send-message', verifyApiKey, async (req: any, res: any) => {
         const { messageId } = await sendWhatsAppMessage({
             client,
             userId: user.id,
+            profileId,
             to: recipientId,
             type: 'text',
             content: {
@@ -4463,7 +4503,7 @@ app.post('/api/send-image', verifyApiKey, async (req: any, res: any) => {
         }
 
         const recipientId = normalizePhoneNumber(jid)
-        const user = await findOrCreateUser(companyId, recipientId)
+        const user = await findOrCreateUser(companyId, recipientId, profileId)
         if (!user) {
             return res.status(500).json({ success: false, error: 'Failed to resolve user' })
         }
@@ -4473,6 +4513,7 @@ app.post('/api/send-image', verifyApiKey, async (req: any, res: any) => {
 
         await insertMessage({
             userId: user.id,
+            profileId,
             direction: 'out',
             content: {
                 type: 'image',
@@ -4714,7 +4755,7 @@ app.post('/api/company/ads-shoot-mode/run', requireSupabaseUserMiddleware, async
 
 // WABA WEBHOOK (Meta Cloud API)
 // ============================================
-app.get('/webhook', async (req: any, res: any) => {
+const handleMetaWhatsappWebhookVerify = async (req: any, res: any) => {
     const mode = req.query['hub.mode']
     const token = Array.isArray(req.query['hub.verify_token']) ? req.query['hub.verify_token'][0] : req.query['hub.verify_token']
     const challenge = Array.isArray(req.query['hub.challenge']) ? req.query['hub.challenge'][0] : req.query['hub.challenge']
@@ -4723,19 +4764,33 @@ app.get('/webhook', async (req: any, res: any) => {
         return res.status(400).send('Invalid webhook verification request')
     }
 
-    const tokens = await wabaRegistry.getVerifyTokens()
+    const envVerifyToken = [
+        process.env.META_WEBHOOK_VERIFY_TOKEN,
+        process.env.WABA_VERIFY_TOKEN,
+        process.env.VERIFY_TOKEN
+    ]
+        .map((value) => (typeof value === 'string' ? value.trim() : ''))
+        .filter(Boolean)
+    const tokens = Array.from(new Set([...(await wabaRegistry.getVerifyTokens()), ...envVerifyToken]))
     if (tokens.includes(token)) {
         return res.status(200).send(challenge)
     }
 
     return res.status(403).send('Verification failed')
-})
+}
 
-app.post('/webhook', async (req: any, res: any) => {
+const handleMetaWhatsappWebhook = async (req: any, res: any) => {
     try {
         const rawBody: Buffer = (req as any).rawBody || Buffer.from(JSON.stringify(req.body || {}))
         const signature = req.headers['x-hub-signature-256'] as string | undefined
-        const appSecrets = await wabaRegistry.getAppSecrets()
+        const envSecrets = [
+            process.env.META_APP_SECRET,
+            process.env.WABA_APP_SECRET,
+            process.env.APP_SECRET
+        ]
+            .map((value) => (typeof value === 'string' ? value.trim() : ''))
+            .filter(Boolean)
+        const appSecrets = Array.from(new Set([...(await wabaRegistry.getAppSecrets()), ...envSecrets]))
 
         const valid = verifyWabaSignature(rawBody, signature, appSecrets)
         if (!valid) {
@@ -4795,7 +4850,13 @@ app.post('/webhook', async (req: any, res: any) => {
         console.error('WABA webhook error:', error)
         return res.sendStatus(500)
     }
-})
+}
+
+app.get('/webhook', handleMetaWhatsappWebhookVerify)
+app.get('/api/webhooks/meta/whatsapp', handleMetaWhatsappWebhookVerify)
+
+app.post('/webhook', handleMetaWhatsappWebhook)
+app.post('/api/webhooks/meta/whatsapp', handleMetaWhatsappWebhook)
 
 // Configure webhook
 app.post('/api/webhook', verifyApiKey, (req: any, res: any) => {
@@ -7349,6 +7410,7 @@ async function recordToSyntheticMessage(
     }
 
     return {
+        profileId: typeof record?.profile_id === 'string' && record.profile_id.trim() ? record.profile_id.trim() : null,
         key: {
             remoteJid,
             fromMe: record.direction === 'out',
@@ -7446,6 +7508,7 @@ async function maybeSendAutoAiReply(params: {
     await sendWhatsAppMessage({
         client: params.client,
         userId: params.user.id,
+        profileId: params.profileId,
         to: params.phoneNumber,
         type: 'text',
         content: {
@@ -7473,7 +7536,7 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
         return
     }
 
-    const baseUser = await findOrCreateUser(companyId, phoneNumber)
+    const baseUser = await findOrCreateUser(companyId, phoneNumber, profileId)
     const humanTakeoverActive = hasHumanTakeover(baseUser)
 
     const workflowResult = await workflowEngine.processInbound({
@@ -7491,7 +7554,7 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
         raw: toMinimalInboundRaw(inbound)
     })
 
-    const user = (await getUserByPhone(companyId, phoneNumber)) || baseUser
+    const user = (await getUserByPhone(companyId, phoneNumber, profileId)) || baseUser
     if (user && inbound.contactName && !isGroupMessage) {
         const trimmedName = inbound.contactName.trim()
         const nameDigits = trimmedName.replace(/\D/g, '')
@@ -7600,12 +7663,9 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
             ctaFreeWindowStartedAt: null,
             ctaFreeWindowExpiresAt: null
         }
-    const companyProfileIds = await getProfileIdsForCompany(companyId, profileId)
-    companyProfileIds.forEach((broadcastProfileId) => {
-        io.to(getCompanyRoom(companyId)).emit('contacts.update', {
-            profileId: broadcastProfileId,
-            contacts: [contact]
-        })
+    io.to(getCompanyRoom(companyId)).emit('contacts.update', {
+        profileId,
+        contacts: [contact]
     })
 
     const buttonReply = inbound.buttonReplyId
@@ -7645,49 +7705,57 @@ async function handleInboundMessage(config: WabaConfig, inbound: WabaInboundMess
         raw: INCLUDE_RAW_WEBHOOK_EVENT_PAYLOAD ? inbound.raw : null
     })
 
-    companyProfileIds.forEach((broadcastProfileId) => {
-        io.to(getCompanyRoom(companyId)).emit('messages.upsert', {
-            profileId: broadcastProfileId,
-            messages: [syntheticMsg],
-            type: 'notify'
-        })
+    io.to(getCompanyRoom(companyId)).emit('messages.upsert', {
+        profileId,
+        messages: [syntheticMsg],
+        type: 'notify'
     })
 
     const notificationRecipientUserIds = await getCompanyRecipientUserIdsForPush(companyId)
     const backgroundNotificationRecipientUserIds = selectBackgroundPushUserIds(notificationRecipientUserIds)
+    const notificationPreview = getInboundNotificationPreview(inbound, text)
+    const inboundDedupId = readTrimmed(inbound.id)
+        || `${remoteJid}:${readTrimmed(inbound.timestamp)}:${notificationPreview.slice(0, 48)}`
+    const inboundPushDedupKey = `${companyId}:${profileId}:${inboundDedupId}`
+    const skipPushDispatch = shouldSkipInboundPushDispatch(inboundPushDedupKey)
     const senderName =
         (contact && typeof contact.name === 'string' && contact.name.trim())
         || (typeof inbound.contactName === 'string' && inbound.contactName.trim())
         || (isGroupMessage ? `Group ${phoneNumber}` : phoneNumber)
         || 'New message'
 
-    void sendPushNotificationToUsers({
-        companyId,
-        userIds: notificationRecipientUserIds,
-        title: senderName,
-        body: getInboundNotificationPreview(inbound, text),
-        url: `/?chat=${encodeURIComponent(remoteJid)}`,
-        tag: `chat:${remoteJid}`,
-        data: {
-            profileId,
-            chat: remoteJid
-        },
-        ttlSeconds: 120
-    })
+    if (skipPushDispatch) {
+        console.log(`[push] Skipping duplicate inbound push for key=${inboundPushDedupKey}`)
+    } else {
+        void sendPushNotificationToUsers({
+            companyId,
+            userIds: notificationRecipientUserIds,
+            title: senderName,
+            body: notificationPreview,
+            url: `/?chat=${encodeURIComponent(remoteJid)}`,
+            tag: `chat:${remoteJid}`,
+            data: {
+                profileId,
+                chat: remoteJid
+            },
+            ttlSeconds: 120
+        })
 
-    void sendNativePushNotificationToUsers({
-        companyId,
-        userIds: backgroundNotificationRecipientUserIds,
-        title: senderName,
-        body: getInboundNotificationPreview(inbound, text),
-        url: `/?chat=${encodeURIComponent(remoteJid)}`,
-        tag: `chat:${remoteJid}`,
-        data: {
-            profileId,
-            chat: remoteJid
-        },
-        ttlSeconds: 120
-    })
+        void sendNativePushNotificationToUsers({
+            companyId,
+            userIds: backgroundNotificationRecipientUserIds,
+            title: senderName,
+            body: notificationPreview,
+            url: `/?chat=${encodeURIComponent(remoteJid)}`,
+            tag: `chat:${remoteJid}:${inboundDedupId}`,
+            data: {
+                profileId,
+                chat: remoteJid,
+                messageId: inboundDedupId
+            },
+            ttlSeconds: 120
+        })
+    }
 }
 
 async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
@@ -7712,7 +7780,7 @@ async function handleStatusUpdate(config: WabaConfig, status: WabaStatus) {
         participantRecipientId: status.participantRecipientId,
         conversation: status.conversation,
         pricing: status.pricing
-    })
+    }, profileId)
 
     if (statusName === 'delivered' && updatedMessage?.content?.cta_entry_candidate) {
         const deliveredAt = status.timestamp
@@ -7865,6 +7933,12 @@ if (fs.existsSync(frontendPath)) {
     app.use(express.static(frontendPath, {
         index: false,
         setHeaders: (res, filePath) => {
+            const baseName = path.basename(filePath || '').toLowerCase()
+            if (baseName === 'sw.js') {
+                res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate')
+                res.setHeader('Pragma', 'no-cache')
+                res.setHeader('Expires', '0')
+            }
             if (filePath.endsWith('.html')) {
                 res.setHeader('Cache-Control', 'no-cache')
             }

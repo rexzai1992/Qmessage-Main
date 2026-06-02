@@ -45,7 +45,7 @@ export function createAddonRouter(
             }
 
             const phoneNumber = jid.replace(/@s\\.whatsapp\\.net$/, '').replace(/\\D/g, '')
-            const user = await findOrCreateUser(companyId, phoneNumber)
+            const user = await findOrCreateUser(companyId, phoneNumber, profileId)
             if (!user) {
                 return res.status(500).json({ success: false, error: 'Failed to resolve user' })
             }
@@ -86,6 +86,7 @@ export function createAddonRouter(
                 const messageId = responseMsg?.messages?.[0]?.id
                 await insertMessage({
                     userId: user.id,
+                    profileId,
                     direction: 'out',
                     content: {
                         type,
@@ -103,6 +104,7 @@ export function createAddonRouter(
                 responseMsg = await sendWhatsAppMessage({
                     client,
                     userId: user.id,
+                    profileId,
                     to: phoneNumber,
                     type: 'text',
                     content: { text: message }
@@ -153,7 +155,7 @@ export function createAddonRouter(
                 return res.json({ success: true, data: [] })
             }
 
-            const users = await getUsersForCompany(companyId)
+            const users = await getUsersForCompany(companyId, profileId)
             let filteredUsers = users
 
             if (phone) {

@@ -3,7 +3,7 @@ import { decryptToken } from '../services/token-vault'
 import type { WabaConfig } from './types'
 import { WabaClient } from './client'
 
-const DEFAULT_API_VERSION = process.env.WABA_API_VERSION || 'v19.0'
+const DEFAULT_API_VERSION = process.env.META_GRAPH_VERSION || process.env.WABA_API_VERSION || 'v24.0'
 
 type WabaConfigRow = {
     profile_id?: string
@@ -30,9 +30,9 @@ type WabaConfigRow = {
 
 function rowToConfig(row: WabaConfigRow | null): WabaConfig | null {
     if (!row) return null
-    const verifyToken = row.verify_token || process.env.WABA_VERIFY_TOKEN
-    const appId = row.app_id || process.env.WABA_APP_ID
-    const appSecret = row.app_secret || process.env.WABA_APP_SECRET
+    const verifyToken = row.verify_token || process.env.META_WEBHOOK_VERIFY_TOKEN || process.env.WABA_VERIFY_TOKEN
+    const appId = row.app_id || process.env.META_APP_ID || process.env.WABA_APP_ID
+    const appSecret = row.app_secret || process.env.META_APP_SECRET || process.env.WABA_APP_SECRET
     const apiVersion = row.api_version || DEFAULT_API_VERSION
     const wabaId = row.waba_id || row.business_account_id || undefined
     const rawToken = row.system_user_token || row.access_token
@@ -75,20 +75,20 @@ function rowToConfig(row: WabaConfigRow | null): WabaConfig | null {
 function envToConfig(): WabaConfig | null {
     const phoneNumberId = process.env.WABA_PHONE_NUMBER_ID
     const accessToken = process.env.WABA_ACCESS_TOKEN || process.env.WABA_TOKEN
-    const verifyToken = process.env.WABA_VERIFY_TOKEN
+    const verifyToken = process.env.META_WEBHOOK_VERIFY_TOKEN || process.env.WABA_VERIFY_TOKEN
 
     if (!phoneNumberId || !accessToken || !verifyToken) return null
 
     return {
         profileId: process.env.WABA_PROFILE_ID || 'default',
         companyId: process.env.WABA_COMPANY_ID || process.env.WABA_PROFILE_ID || 'default',
-        appId: process.env.WABA_APP_ID,
+        appId: process.env.META_APP_ID || process.env.WABA_APP_ID,
         phoneNumberId,
         businessAccountId: process.env.WABA_BUSINESS_ACCOUNT_ID,
         accessToken,
         verifyToken,
-        appSecret: process.env.WABA_APP_SECRET,
-        apiVersion: process.env.WABA_API_VERSION || DEFAULT_API_VERSION
+        appSecret: process.env.META_APP_SECRET || process.env.WABA_APP_SECRET,
+        apiVersion: process.env.META_GRAPH_VERSION || process.env.WABA_API_VERSION || DEFAULT_API_VERSION
     }
 }
 

@@ -118,6 +118,8 @@ function toHttpErrorPayload(error: any, fallback = 'Unexpected error'): {
     if (graphType) details.push(`type=${graphType}`)
     if (graphCode !== undefined && graphCode !== null && String(graphCode).trim()) details.push(`code=${graphCode}`)
     if (graphSubcode !== undefined && graphSubcode !== null && String(graphSubcode).trim()) details.push(`subcode=${graphSubcode}`)
+    const appUserAdvice = buildMetaAppUserTokenAdvice(message || graphMessage)
+    if (appUserAdvice) details.push(appUserAdvice)
 
     return {
         status,
@@ -227,6 +229,65 @@ function parsePreverifiedIdsInput(value: any): string[] {
     return Array.from(out)
 }
 
+type EmbeddedSignupFeatureType = 'whatsapp_business_app_onboarding'
+
+function parseEmbeddedSignupFeatureType(value: any): EmbeddedSignupFeatureType | null {
+    const raw = trimText(value).toLowerCase()
+    if (!raw) return null
+    if (raw === 'whatsapp_business_app_onboarding') return 'whatsapp_business_app_onboarding'
+    if (raw === 'business_app_onboarding') return 'whatsapp_business_app_onboarding'
+    if (raw === 'coexistence') return 'whatsapp_business_app_onboarding'
+    return null
+}
+
+function parseEmbeddedSignupSessionInfoVersion(value: any): string | null {
+    const raw = trimText(value)
+    if (!raw) return null
+    if (!/^\d+$/.test(raw)) return null
+    return raw
+}
+
+function isTruthyFlag(value: any): boolean {
+    if (value === true) return true
+    const raw = trimText(value).toLowerCase()
+    return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on'
+}
+
+function buildEmbeddedSignupExtras(params: {
+    preverifiedIds: string[]
+    featureType?: EmbeddedSignupFeatureType | null
+    sessionInfoVersion?: string | null
+}): Record<string, any> | undefined {
+    const hasPreverified = Array.isArray(params.preverifiedIds) && params.preverifiedIds.length > 0
+    const featureType = params.featureType || null
+    const sessionInfoVersion = params.sessionInfoVersion || null
+    if (!hasPreverified && !featureType && !sessionInfoVersion) {
+        return undefined
+    }
+
+    const setup: Record<string, any> = {}
+    if (hasPreverified) {
+        setup.preVerifiedPhone = {
+            ids: params.preverifiedIds
+        }
+    }
+
+    const extras: Record<string, any> = {
+        feature: 'whatsapp_embedded_signup',
+        version: 2,
+        setup
+    }
+
+    if (featureType) {
+        extras.featureType = featureType
+    }
+    if (sessionInfoVersion) {
+        extras.sessionInfoVersion = sessionInfoVersion
+    }
+
+    return extras
+}
+
 function parseScheduledRecipientsInput(value: any): string[] {
     const deduped = new Set<string>()
 
@@ -298,6 +359,7 @@ function parseDataLocalizationRegion(value: any): string | null {
 }
 
 type ReviewDeliveryStage = 'accepted' | 'sent' | 'delivered' | 'read' | 'failed'
+type MetaPhoneNumberRemovalMode = 'deregister' | 'graph-delete' | 'legacy-delete'
 
 function normalizeReviewDeliveryStage(value: any): ReviewDeliveryStage {
     const raw = trimText(value).toLowerCase()
@@ -306,6 +368,95 @@ function normalizeReviewDeliveryStage(value: any): ReviewDeliveryStage {
     if (raw === 'read') return 'read'
     if (raw === 'failed') return 'failed'
     return 'accepted'
+}
+
+function normalizeGraphApiVersion(value: any, fallback = 'v19.0'): string {
+    const raw = trimText(value) || fallback
+    const normalized = raw.startsWith('v') ? raw : `v${raw}`
+    if (!/^v\d+(\.\d+)?$/i.test(normalized)) {
+        throw new Error('apiVersion must look like v19.0')
+    }
+    return normalized
+}
+
+function normalizeMetaNumericId(value: any, label: string): string {
+    const raw = trimText(value)
+    if (!raw) {
+        throw new Error(`${label} is required`)
+    }
+    if (!/^\d+$/.test(raw)) {
+        throw new Error(`${label} must contain digits only`)
+    }
+    return raw
+}
+
+function normalizeMetaPhoneRemovalMode(value: any): MetaPhoneNumberRemovalMode {
+    const raw = trimText(value).toLowerCase()
+    if (raw === 'graph-delete' || raw === 'legacy-delete') return raw
+    return 'deregister'
+}
+
+async function requestMetaPhoneNumberRemoval(params: {
+    mode: MetaPhoneNumberRemovalMode
+    apiVersion: string
+    accessToken: string
+    wabaId?: string
+    phoneNumberId: string
+}) {
+    const phoneNumberId = normalizeMetaNumericId(params.phoneNumberId, 'phoneNumberId')
+    let method = 'POST'
+    let path = `${phoneNumberId}/deregister`
+
+    if (params.mode === 'graph-delete' || params.mode === 'legacy-delete') {
+        method = 'DELETE'
+        const wabaId = normalizeMetaNumericId(params.wabaId, 'wabaId')
+        path = params.mode === 'legacy-delete'
+            ? `whatsapp_business_accounts/${wabaId}/phone_numbers/${phoneNumberId}`
+            : `${wabaId}/phone_numbers/${phoneNumberId}`
+    }
+
+    const url = `https://graph.facebook.com/${params.apiVersion}/${path}`
+    const response = await fetch(url, {
+        method,
+        headers: {
+            Authorization: `Bearer ${params.accessToken}`
+        }
+    })
+    const text = await response.text()
+    let data: any = null
+    try {
+        data = text ? JSON.parse(text) : null
+    } catch {
+        data = text || null
+    }
+
+    if (!response.ok || data?.error) {
+        const message = trimText(data?.error?.message) || response.statusText || 'Meta API request failed'
+        const error: any = new Error(`Meta API error ${response.status}: ${message}`)
+        error.status = response.status
+        error.response = data
+        throw error
+    }
+
+    return {
+        method,
+        path: `/${params.apiVersion}/${path}`,
+        data
+    }
+}
+
+function buildMetaAppUserTokenAdvice(message: string): string | null {
+    const match = /Cannot call API for app\s+(\d+)\s+on behalf of user\s+(\d+)/i.exec(message || '')
+    if (!match) return null
+    return `Meta rejected the Facebook user token for app ${match[1]} and user ${match[2]}. Put the Meta app in Live mode or add that Facebook user as an app Admin/Developer/Tester while testing. For production WABA operations, use a business integration or system user token with WhatsApp permissions and full access to the WABA/phone number.`
+}
+
+function formatMetaOperationError(error: any, fallback: string): string {
+    const normalized = toHttpErrorPayload(error, fallback)
+    const details = normalized.payload.details || []
+    return details.length > 0
+        ? `${normalized.payload.error} (${details.join('; ')})`
+        : normalized.payload.error
 }
 
 function toMetaTimestampIso(value: any): string | null {
@@ -336,6 +487,13 @@ function isMissingWabaConfigsUpdatedAtError(error: any): boolean {
     return message.includes('waba_configs.updated_at') || message.includes('updated_at')
 }
 
+function isMissingWhatsappConnectionsTableError(error: any): boolean {
+    const code = typeof error?.code === 'string' ? error.code : ''
+    const message = String(error?.message || '').toLowerCase()
+    if (code !== '42P01') return false
+    return message.includes('whatsapp_connections')
+}
+
 function formatScheduledBroadcastError(value: any): string {
     if (!value) return 'Unknown error'
     if (typeof value === 'string') return value
@@ -345,6 +503,118 @@ function formatScheduledBroadcastError(value: any): string {
     } catch {
         return String(value)
     }
+}
+
+function resolveMetaAppIdFromEnv(): string {
+    return trimText(process.env.META_APP_ID || process.env.WABA_APP_ID || process.env.APP_ID)
+}
+
+function resolveMetaAppSecretFromEnv(): string {
+    return trimText(process.env.META_APP_SECRET || process.env.WABA_APP_SECRET || process.env.APP_SECRET)
+}
+
+function resolveMetaVerifyTokenFromEnv(): string {
+    return trimText(process.env.META_WEBHOOK_VERIFY_TOKEN || process.env.WABA_VERIFY_TOKEN || process.env.VERIFY_TOKEN)
+}
+
+function resolveMetaGraphVersionFromEnv(fallback = 'v25.0'): string {
+    return normalizeGraphApiVersion(process.env.META_GRAPH_VERSION || process.env.WABA_API_VERSION || fallback, fallback)
+}
+
+function resolveMetaEmbeddedSignupV4ConfigIdFromEnv(): string {
+    return trimText(
+        process.env.META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID
+        || process.env.WABA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID
+        || process.env.WABA_EMBEDDED_SIGNUP_CONFIG_ID
+    )
+}
+
+function resolveMetaExistingAppConfigIdFromEnv(): string {
+    return trimText(
+        process.env.META_WA_EXISTING_APP_CONFIGURATION_ID
+        || process.env.WABA_EXISTING_APP_CONFIGURATION_ID
+        || process.env.WABA_EMBEDDED_SIGNUP_CONFIG_ID
+    )
+}
+
+function buildMetaGraphUrl(path: string, apiVersion: string, params?: Record<string, string>) {
+    const cleanPath = path.startsWith('/') ? path.slice(1) : path
+    const url = new URL(`https://graph.facebook.com/${apiVersion}/${cleanPath}`)
+    if (params) {
+        Object.entries(params).forEach(([key, value]) => {
+            if (value !== undefined && value !== null) url.searchParams.set(key, String(value))
+        })
+    }
+    return url.toString()
+}
+
+async function requestMetaGraph(path: string, options: {
+    accessToken?: string
+    apiVersion?: string
+    method?: string
+    params?: Record<string, string>
+    body?: any
+} = {}) {
+    const apiVersion = options.apiVersion || resolveMetaGraphVersionFromEnv()
+    const url = path.startsWith('http')
+        ? path
+        : buildMetaGraphUrl(path, apiVersion, options.params)
+
+    const headers: Record<string, string> = {}
+    if (options.accessToken) headers.Authorization = `Bearer ${options.accessToken}`
+    let body: string | undefined
+
+    if (options.body !== undefined) {
+        headers['Content-Type'] = 'application/json'
+        body = JSON.stringify(options.body)
+    }
+
+    const response = await fetch(url, {
+        method: options.method || 'GET',
+        headers,
+        body
+    })
+
+    const text = await response.text()
+    let data: any = null
+    try {
+        data = text ? JSON.parse(text) : null
+    } catch {
+        data = text || null
+    }
+
+    if (!response.ok || data?.error) {
+        const message = trimText(data?.error?.message) || response.statusText || 'Meta Graph API request failed'
+        const error: any = new Error(`Meta Graph API error ${response.status}: ${message}`)
+        error.status = response.status
+        error.response = data
+        throw error
+    }
+
+    return data
+}
+
+function isMetaAlreadyRegisteredError(error: any): boolean {
+    const message = trimText(error?.response?.error?.message || error?.message).toLowerCase()
+    return (
+        message.includes('already registered')
+        || message.includes('already connected')
+        || message.includes('is already active')
+    )
+}
+
+function isMetaAlreadySubscribedError(error: any): boolean {
+    const message = trimText(error?.response?.error?.message || error?.message).toLowerCase()
+    return message.includes('already subscribed') || message.includes('subscribed')
+}
+
+function isMetaPinRequiredError(error: any): boolean {
+    const message = trimText(error?.response?.error?.message || error?.message).toLowerCase()
+    return message.includes('pin') && (message.includes('required') || message.includes('missing'))
+}
+
+function normalizeConnectionDisplayName(phoneDetails: any): string | null {
+    return trimText(phoneDetails?.display_name || phoneDetails?.name || phoneDetails?.verified_name) || null
 }
 
 export function registerWabaRoutes(app: Express, ctx: any) {
@@ -397,6 +667,316 @@ export function registerWabaRoutes(app: Express, ctx: any) {
         wabaRegistry,
         WABA_OAUTH_SCOPES
     } = ctx
+
+    const shapeWhatsAppConnectionRow = (row: any) => ({
+        id: trimText(row?.id) || null,
+        company_id: trimText(row?.company_id) || null,
+        profile_id: trimText(row?.profile_id) || null,
+        user_id: trimText(row?.user_id) || null,
+        waba_id: trimText(row?.waba_id) || null,
+        phone_number_id: trimText(row?.phone_number_id) || null,
+        business_id: trimText(row?.business_id) || null,
+        phone_number: trimText(row?.phone_number) || null,
+        display_name: trimText(row?.display_name) || null,
+        verified_name: trimText(row?.verified_name) || null,
+        account_review_status: trimText(row?.account_review_status) || null,
+        business_verification_status: trimText(row?.business_verification_status) || null,
+        quality_rating: trimText(row?.quality_rating) || null,
+        platform_type: trimText(row?.platform_type) || null,
+        status: trimText(row?.status) || null,
+        flow_type: trimText(row?.flow_type) || null,
+        token_expires_at: trimText(row?.token_expires_at) || null,
+        last_synced_at: trimText(row?.last_synced_at) || null,
+        created_at: trimText(row?.created_at) || null,
+        updated_at: trimText(row?.updated_at) || null
+    })
+
+    const exchangeEmbeddedSignupCodeForToken = async (params: {
+        code: string
+        appId: string
+        appSecret: string
+        apiVersion: string
+        req?: any
+    }) => {
+        const baseUrl = buildMetaGraphUrl('oauth/access_token', params.apiVersion, {
+            client_id: params.appId,
+            client_secret: params.appSecret,
+            code: params.code
+        })
+
+        try {
+            return await requestMetaGraph(baseUrl, { method: 'GET' })
+        } catch (error) {
+            if (!params.req) throw error
+            const redirectUri = resolveOauthRedirectUri(params.req)
+            return exchangeCodeForToken({
+                appId: params.appId,
+                appSecret: params.appSecret,
+                redirectUri,
+                code: params.code,
+                apiVersion: params.apiVersion
+            })
+        }
+    }
+
+    const fetchWabaAndPhoneDetails = async (params: {
+        accessToken: string
+        apiVersion: string
+        wabaId: string
+        phoneNumberId: string
+    }) => {
+        const [wabaDetails, phoneDetails] = await Promise.all([
+            requestMetaGraph(params.wabaId, {
+                accessToken: params.accessToken,
+                apiVersion: params.apiVersion,
+                params: {
+                    fields: 'id,name,currency,timezone_id,account_review_status,business_verification_status,message_template_namespace'
+                }
+            }),
+            requestMetaGraph(params.phoneNumberId, {
+                accessToken: params.accessToken,
+                apiVersion: params.apiVersion,
+                params: {
+                    fields: 'id,display_phone_number,verified_name,quality_rating,code_verification_status,platform_type,status,name'
+                }
+            })
+        ])
+
+        return { wabaDetails, phoneDetails }
+    }
+
+    const persistRuntimeWabaConfig = async (params: {
+        profileId: string
+        companyId: string
+        appId: string
+        appSecret: string
+        verifyToken: string
+        apiVersion: string
+        accessToken: string
+        accessTokenType?: string | null
+        accessTokenExpiresAt?: string | null
+        businessId?: string | null
+        clientBusinessId?: string | null
+        wabaId: string
+        phoneNumberId: string
+        flowType: string
+    }) => {
+        const nowIso = new Date().toISOString()
+        const payload: any = {
+            profile_id: params.profileId,
+            company_id: params.companyId,
+            app_id: params.appId || null,
+            phone_number_id: params.phoneNumberId,
+            business_id: params.businessId || null,
+            client_business_id: params.clientBusinessId || null,
+            waba_id: params.wabaId,
+            business_account_id: params.wabaId,
+            access_token: encryptToken(params.accessToken),
+            access_token_type: params.accessTokenType || null,
+            access_token_expires_at: params.accessTokenExpiresAt || null,
+            token_scopes: Array.isArray(WABA_OAUTH_SCOPES) ? WABA_OAUTH_SCOPES : null,
+            token_source: params.flowType || 'embedded_signup_v4',
+            system_user_token: null,
+            system_user_token_expires_at: null,
+            token_last_refreshed_at: nowIso,
+            verify_token: params.verifyToken,
+            app_secret: params.appSecret || null,
+            api_version: params.apiVersion,
+            enabled: true,
+            connected_at: nowIso
+        }
+
+        const { error } = await supabase
+            .from('waba_configs')
+            .upsert(payload, { onConflict: 'profile_id' })
+
+        if (error) {
+            throw new Error(error.message)
+        }
+    }
+
+    const persistWhatsAppConnection = async (params: {
+        companyId: string
+        profileId: string
+        userId: string
+        wabaId: string
+        phoneNumberId: string
+        businessId?: string | null
+        accessToken: string
+        tokenExpiresAt?: string | null
+        flowType: string
+        phoneDetails?: any
+        wabaDetails?: any
+        status?: string | null
+    }) => {
+        const nowIso = new Date().toISOString()
+        const payload = {
+            company_id: params.companyId,
+            profile_id: params.profileId,
+            user_id: params.userId,
+            waba_id: params.wabaId,
+            phone_number_id: params.phoneNumberId,
+            business_id: params.businessId || trimText(params.wabaDetails?.business_id) || null,
+            phone_number: trimText(params.phoneDetails?.display_phone_number) || null,
+            display_name: normalizeConnectionDisplayName(params.phoneDetails),
+            verified_name: trimText(params.phoneDetails?.verified_name) || null,
+            access_token_encrypted: encryptToken(params.accessToken),
+            token_expires_at: params.tokenExpiresAt || null,
+            account_review_status: trimText(params.wabaDetails?.account_review_status) || null,
+            business_verification_status: trimText(params.wabaDetails?.business_verification_status) || null,
+            quality_rating: trimText(params.phoneDetails?.quality_rating) || null,
+            platform_type: trimText(params.phoneDetails?.platform_type) || null,
+            status: trimText(params.status || params.phoneDetails?.status) || null,
+            flow_type: params.flowType || 'embedded_signup_v4',
+            last_synced_at: nowIso,
+            updated_at: nowIso
+        }
+
+        const { data, error } = await supabase
+            .from('whatsapp_connections')
+            .upsert(payload, {
+                onConflict: 'company_id,waba_id,phone_number_id'
+            })
+            .select('*')
+            .maybeSingle()
+
+        if (error) {
+            if (isMissingWhatsappConnectionsTableError(error)) {
+                return payload as any
+            }
+            throw new Error(error.message)
+        }
+
+        return data
+    }
+
+    const getCompanyWhatsappConnections = async (companyId: string, profileId?: string) => {
+        let query = supabase
+            .from('whatsapp_connections')
+            .select('*')
+            .eq('company_id', companyId)
+            .order('updated_at', { ascending: false })
+
+        if (profileId) {
+            query = query.eq('profile_id', profileId)
+        }
+
+        const { data, error } = await query
+        if (error) {
+            if (isMissingWhatsappConnectionsTableError(error)) return []
+            throw new Error(error.message)
+        }
+        return Array.isArray(data) ? data : []
+    }
+
+    const syncWhatsAppConnection = async (params: {
+        profileId: string
+        companyId: string
+        userId: string
+        appId: string
+        appSecret: string
+        verifyToken: string
+        apiVersion: string
+        accessToken: string
+        accessTokenType?: string | null
+        accessTokenExpiresAt?: string | null
+        businessId?: string | null
+        clientBusinessId?: string | null
+        wabaId: string
+        phoneNumberId: string
+        flowType: string
+        pin?: string | null
+        skipPhoneRegistration?: boolean
+    }) => {
+        const phoneConfigConflict = await findConflictingActivePhoneNumberConfig(params.phoneNumberId, params.profileId)
+        if (phoneConfigConflict) {
+            const conflictProfileId = trimText(phoneConfigConflict.profileId || phoneConfigConflict.profile_id)
+            const error: any = new Error(`phoneNumberId "${params.phoneNumberId}" is already connected to profile "${conflictProfileId}". Disconnect it first.`)
+            error.status = 409
+            throw error
+        }
+
+        if (!params.skipPhoneRegistration) {
+            try {
+                const payload: Record<string, any> = {
+                    messaging_product: 'whatsapp'
+                }
+                const pin = trimText(params.pin)
+                if (pin) payload.pin = pin
+                await requestMetaGraph(`${params.phoneNumberId}/register`, {
+                    accessToken: params.accessToken,
+                    apiVersion: params.apiVersion,
+                    method: 'POST',
+                    body: payload
+                })
+            } catch (error: any) {
+                if (!trimText(params.pin) && isMetaPinRequiredError(error)) {
+                    error.status = 409
+                    error.needsPin = true
+                    error.message = 'Meta requires a 6-digit phone registration PIN for this number. Enter the PIN and try again.'
+                    throw error
+                }
+                if (!isMetaAlreadyRegisteredError(error)) {
+                    throw error
+                }
+            }
+        }
+
+        try {
+            await subscribeWabaApp(params.wabaId, params.accessToken, params.apiVersion)
+        } catch (error: any) {
+            if (!isMetaAlreadySubscribedError(error)) {
+                throw error
+            }
+        }
+
+        const { wabaDetails, phoneDetails } = await fetchWabaAndPhoneDetails({
+            accessToken: params.accessToken,
+            apiVersion: params.apiVersion,
+            wabaId: params.wabaId,
+            phoneNumberId: params.phoneNumberId
+        })
+
+        await persistRuntimeWabaConfig({
+            profileId: params.profileId,
+            companyId: params.companyId,
+            appId: params.appId,
+            appSecret: params.appSecret,
+            verifyToken: params.verifyToken,
+            apiVersion: params.apiVersion,
+            accessToken: params.accessToken,
+            accessTokenType: params.accessTokenType,
+            accessTokenExpiresAt: params.accessTokenExpiresAt,
+            businessId: params.businessId,
+            clientBusinessId: params.clientBusinessId,
+            wabaId: params.wabaId,
+            phoneNumberId: params.phoneNumberId,
+            flowType: params.flowType
+        })
+
+        const connectionRow = await persistWhatsAppConnection({
+            companyId: params.companyId,
+            profileId: params.profileId,
+            userId: params.userId,
+            wabaId: params.wabaId,
+            phoneNumberId: params.phoneNumberId,
+            businessId: params.businessId,
+            accessToken: params.accessToken,
+            tokenExpiresAt: params.accessTokenExpiresAt,
+            flowType: params.flowType,
+            phoneDetails,
+            wabaDetails,
+            status: trimText(phoneDetails?.status) || 'CONNECTED'
+        })
+
+        await wabaRegistry.refresh(true)
+
+        return {
+            connectionRow,
+            wabaDetails,
+            phoneDetails
+        }
+    }
 
 app.get('/api/waba/conversational-automation', async (req: any, res: any) => {
     try {
@@ -546,26 +1126,16 @@ app.get('/api/waba/embedded-signup/url', async (req: any, res: any) => {
             return res.status(403).json({ success: false, error: 'Profile does not belong to your company' })
         }
 
-        const appId = process.env.WABA_APP_ID || process.env.APP_ID
-        const appSecret = process.env.WABA_APP_SECRET || process.env.APP_SECRET
-        const verifyToken = process.env.WABA_VERIFY_TOKEN || process.env.VERIFY_TOKEN
+        const appId = resolveMetaAppIdFromEnv()
+        const appSecret = resolveMetaAppSecretFromEnv()
+        const verifyToken = resolveMetaVerifyTokenFromEnv()
         if (!appId || !appSecret || !verifyToken) {
-            return res.status(500).json({ success: false, error: 'Missing WABA_APP_ID, WABA_APP_SECRET, or WABA_VERIFY_TOKEN' })
+            return res.status(500).json({ success: false, error: 'Missing META_APP_ID/META_APP_SECRET/META_WEBHOOK_VERIFY_TOKEN or WABA equivalents' })
         }
 
         if (!getTokenEncryptionKey()) {
             return res.status(500).json({ success: false, error: 'Missing WABA_TOKEN_ENCRYPTION_KEY' })
         }
-
-        const redirectUri = resolveOauthRedirectUri(req)
-        const apiVersion = process.env.WABA_API_VERSION || 'v19.0'
-        const configId = process.env.WABA_EMBEDDED_SIGNUP_CONFIG_ID
-        const oauthMode = resolveOauthMode(configId)
-        const includeScopes = oauthMode === 'user'
-
-        const state = randomBytes(16).toString('hex')
-        const stateHash = hashOAuthState(state)
-        const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString()
 
         const requestedBusinessId = typeof req.query?.businessId === 'string' ? req.query.businessId : null
         const requestedWabaId = typeof req.query?.wabaId === 'string' ? req.query.wabaId : null
@@ -584,6 +1154,40 @@ app.get('/api/waba/embedded-signup/url', async (req: any, res: any) => {
             ...parsePreverifiedIdsInput(preverifiedIdsFromQuery)
         ]
         const uniquePreverifiedIds = Array.from(new Set(preverifiedIds))
+        const queryFeatureType = parseEmbeddedSignupFeatureType(
+            req.query?.featureType ||
+            req.query?.signupFeatureType ||
+            req.query?.embeddedSignupFeatureType ||
+            null
+        )
+        const envFeatureType = parseEmbeddedSignupFeatureType(process.env.WABA_EMBEDDED_SIGNUP_FEATURE_TYPE || '')
+        const featureType = queryFeatureType ||
+            (isTruthyFlag(req.query?.coexistence) ? 'whatsapp_business_app_onboarding' : null) ||
+            envFeatureType
+        const querySessionInfoVersion = parseEmbeddedSignupSessionInfoVersion(req.query?.sessionInfoVersion)
+        const envSessionInfoVersion = parseEmbeddedSignupSessionInfoVersion(process.env.WABA_EMBEDDED_SIGNUP_SESSION_INFO_VERSION || '')
+        const sessionInfoVersion = querySessionInfoVersion ||
+            (featureType === 'whatsapp_business_app_onboarding' ? '3' : null) ||
+            envSessionInfoVersion
+        const embeddedSignupExtras = buildEmbeddedSignupExtras({
+            preverifiedIds: uniquePreverifiedIds,
+            featureType,
+            sessionInfoVersion
+        })
+
+        const redirectUri = resolveOauthRedirectUri(req)
+        const apiVersion = resolveMetaGraphVersionFromEnv('v25.0')
+        const defaultConfigId = resolveMetaEmbeddedSignupV4ConfigIdFromEnv()
+        const coexistenceConfigId = resolveMetaExistingAppConfigIdFromEnv()
+        const configId = featureType === 'whatsapp_business_app_onboarding'
+            ? (coexistenceConfigId || defaultConfigId)
+            : defaultConfigId
+        const oauthMode = resolveOauthMode(configId)
+        const includeScopes = oauthMode === 'user'
+
+        const state = randomBytes(16).toString('hex')
+        const stateHash = hashOAuthState(state)
+        const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString()
 
         const requestedReturnUrl = sanitizeReturnUrl(req.query?.returnUrl)
         const redirectUrl = requestedReturnUrl || resolveOauthReturnUrl(req)
@@ -614,22 +1218,378 @@ app.get('/api/waba/embedded-signup/url', async (req: any, res: any) => {
             apiVersion,
             configId: configId || undefined,
             includeScopes,
-            extras: uniquePreverifiedIds.length > 0
-                ? {
-                    feature: 'whatsapp_embedded_signup',
-                    version: 2,
-                    setup: {
-                        preVerifiedPhone: {
-                            ids: uniquePreverifiedIds
-                        }
-                    }
-                }
-                : undefined
+            extras: embeddedSignupExtras
         })
 
         res.json({ success: true, url })
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message })
+    }
+})
+
+app.post('/api/whatsapp/embedded-signup/v4/complete', async (req: any, res: any) => {
+    try {
+        const user = await getSupabaseUserFromRequest(req, res)
+        if (!user) return
+
+        const requestedCompanyId = trimText(req.body?.company_id || req.body?.companyId)
+        const profileId = trimText(req.body?.profile_id || req.body?.profileId)
+        const code = trimText(req.body?.code)
+        const wabaId = trimText(req.body?.waba_id || req.body?.wabaId)
+        const phoneNumberId = trimText(req.body?.phone_number_id || req.body?.phoneNumberId)
+        const businessId = trimText(req.body?.business_id || req.body?.businessId) || null
+        const flowType = trimText(req.body?.flow_type || req.body?.flowType) || 'new_phone_onboarding'
+        const pin = trimText(req.body?.pin)
+
+        if (!requestedCompanyId) {
+            return res.status(400).json({ success: false, error: 'company_id is required' })
+        }
+        if (!profileId) {
+            return res.status(400).json({ success: false, error: 'profile_id is required' })
+        }
+        if (!code || !wabaId || !phoneNumberId) {
+            return res.status(400).json({ success: false, error: 'code, waba_id, and phone_number_id are required' })
+        }
+        if (pin && !/^\d{6}$/.test(pin)) {
+            return res.status(400).json({ success: false, error: 'pin must be 6 digits' })
+        }
+
+        const companyId = getUserCompanyId(user)
+        if (!companyId) {
+            return res.status(400).json({ success: false, error: 'Company ID missing in user metadata' })
+        }
+        if (requestedCompanyId !== companyId && !isSuperAdminUser(user)) {
+            return res.status(403).json({ success: false, error: 'company_id does not belong to your account' })
+        }
+
+        const ownsProfile = await assertProfileCompany(profileId, requestedCompanyId)
+        if (!ownsProfile) {
+            return res.status(403).json({ success: false, error: 'Profile does not belong to the requested company' })
+        }
+
+        const appId = resolveMetaAppIdFromEnv()
+        const appSecret = resolveMetaAppSecretFromEnv()
+        const verifyToken = resolveMetaVerifyTokenFromEnv()
+        const apiVersion = resolveMetaGraphVersionFromEnv('v24.0')
+        if (!appId || !appSecret) {
+            return res.status(500).json({ success: false, error: 'Missing META_APP_ID or META_APP_SECRET' })
+        }
+        if (!verifyToken) {
+            return res.status(500).json({ success: false, error: 'Missing META_WEBHOOK_VERIFY_TOKEN or WABA_VERIFY_TOKEN' })
+        }
+        if (!getTokenEncryptionKey()) {
+            return res.status(500).json({ success: false, error: 'Missing WABA_TOKEN_ENCRYPTION_KEY or ENCRYPTION_KEY' })
+        }
+
+        const tokenData = await exchangeEmbeddedSignupCodeForToken({
+            code,
+            appId,
+            appSecret,
+            apiVersion,
+            req
+        })
+
+        const accessToken = trimText(tokenData?.access_token)
+        const accessTokenType = trimText(tokenData?.token_type) || null
+        const expiresIn = Number(tokenData?.expires_in)
+        const accessTokenExpiresAt = Number.isFinite(expiresIn) && expiresIn > 0
+            ? new Date(Date.now() + expiresIn * 1000).toISOString()
+            : null
+
+        if (!accessToken) {
+            return res.status(502).json({ success: false, error: 'Token exchange failed: no access token returned by Meta' })
+        }
+
+        try {
+            const { connectionRow, phoneDetails } = await syncWhatsAppConnection({
+                profileId,
+                companyId: requestedCompanyId,
+                userId: user.id,
+                appId,
+                appSecret,
+                verifyToken,
+                apiVersion,
+                accessToken,
+                accessTokenType,
+                accessTokenExpiresAt,
+                businessId,
+                wabaId,
+                phoneNumberId,
+                flowType,
+                pin: pin || null
+            })
+
+            return res.json({
+                success: true,
+                connection: {
+                    id: trimText(connectionRow?.id) || null,
+                    waba_id: trimText(connectionRow?.waba_id) || wabaId,
+                    phone_number_id: trimText(connectionRow?.phone_number_id) || phoneNumberId,
+                    phone_number: trimText(connectionRow?.phone_number || phoneDetails?.display_phone_number) || null,
+                    display_name: trimText(connectionRow?.display_name || phoneDetails?.name || phoneDetails?.display_name) || null,
+                    verified_name: trimText(connectionRow?.verified_name || phoneDetails?.verified_name) || null,
+                    status: trimText(connectionRow?.status || phoneDetails?.status) || 'CONNECTED'
+                }
+            })
+        } catch (error: any) {
+            if (error?.needsPin) {
+                return res.status(409).json({
+                    success: false,
+                    error: error.message,
+                    needs_pin: true
+                })
+            }
+            const normalized = toHttpErrorPayload(error, 'Failed to complete Embedded Signup v4 onboarding')
+            return res.status(normalized.status).json(normalized.payload)
+        }
+    } catch (error: any) {
+        const normalized = toHttpErrorPayload(error, 'Failed to complete Embedded Signup v4 onboarding')
+        res.status(normalized.status).json(normalized.payload)
+    }
+})
+
+app.get('/api/whatsapp/status', async (req: any, res: any) => {
+    try {
+        const user = await getSupabaseUserFromRequest(req, res)
+        if (!user) return
+
+        const userCompanyId = getUserCompanyId(user)
+        if (!userCompanyId) {
+            return res.status(400).json({ success: false, error: 'Company ID missing in user metadata' })
+        }
+
+        const requestedCompanyId = trimText(req.query?.company_id || req.query?.companyId) || userCompanyId
+        const profileId = trimText(req.query?.profile_id || req.query?.profileId)
+        if (requestedCompanyId !== userCompanyId && !isSuperAdminUser(user)) {
+            return res.status(403).json({ success: false, error: 'company_id does not belong to your account' })
+        }
+        if (profileId) {
+            const ownsProfile = await assertProfileCompany(profileId, requestedCompanyId)
+            if (!ownsProfile) {
+                return res.status(403).json({ success: false, error: 'Profile does not belong to the requested company' })
+            }
+        }
+
+        const rows = await getCompanyWhatsappConnections(requestedCompanyId, profileId || undefined)
+        const activeConnection = profileId
+            ? rows.find((row: any) => trimText(row?.profile_id) === profileId) || null
+            : (rows[0] || null)
+
+        res.json({
+            success: true,
+            company_id: requestedCompanyId,
+            profile_id: profileId || null,
+            status: activeConnection ? (trimText(activeConnection?.status) || 'CONNECTED') : 'NOT_CONNECTED',
+            connected: Boolean(activeConnection),
+            connection: activeConnection ? shapeWhatsAppConnectionRow(activeConnection) : null,
+            connections: rows.map((row: any) => shapeWhatsAppConnectionRow(row))
+        })
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error?.message || 'Failed to load WhatsApp status' })
+    }
+})
+
+app.get('/api/whatsapp/phone-numbers', async (req: any, res: any) => {
+    try {
+        const user = await getSupabaseUserFromRequest(req, res)
+        if (!user) return
+
+        const userCompanyId = getUserCompanyId(user)
+        if (!userCompanyId) {
+            return res.status(400).json({ success: false, error: 'Company ID missing in user metadata' })
+        }
+
+        const requestedCompanyId = trimText(req.query?.company_id || req.query?.companyId) || userCompanyId
+        if (requestedCompanyId !== userCompanyId && !isSuperAdminUser(user)) {
+            return res.status(403).json({ success: false, error: 'company_id does not belong to your account' })
+        }
+
+        const rows = await getCompanyWhatsappConnections(requestedCompanyId)
+        res.json({
+            success: true,
+            company_id: requestedCompanyId,
+            phone_numbers: rows.map((row: any) => shapeWhatsAppConnectionRow(row))
+        })
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error?.message || 'Failed to load WhatsApp phone numbers' })
+    }
+})
+
+app.post('/api/whatsapp/refresh-status', async (req: any, res: any) => {
+    try {
+        const user = await getSupabaseUserFromRequest(req, res)
+        if (!user) return
+
+        const userCompanyId = getUserCompanyId(user)
+        if (!userCompanyId) {
+            return res.status(400).json({ success: false, error: 'Company ID missing in user metadata' })
+        }
+
+        const requestedCompanyId = trimText(req.body?.company_id || req.body?.companyId) || userCompanyId
+        const profileId = trimText(req.body?.profile_id || req.body?.profileId)
+        if (requestedCompanyId !== userCompanyId && !isSuperAdminUser(user)) {
+            return res.status(403).json({ success: false, error: 'company_id does not belong to your account' })
+        }
+        if (profileId) {
+            const ownsProfile = await assertProfileCompany(profileId, requestedCompanyId)
+            if (!ownsProfile) {
+                return res.status(403).json({ success: false, error: 'Profile does not belong to the requested company' })
+            }
+        }
+
+        const rows = await getCompanyWhatsappConnections(requestedCompanyId, profileId || undefined)
+        const refreshed: any[] = []
+        const failures: Array<{ phone_number_id: string | null; error: string }> = []
+
+        for (const row of rows) {
+            const accessTokenEncrypted = trimText(row?.access_token_encrypted)
+            if (!accessTokenEncrypted) {
+                failures.push({
+                    phone_number_id: trimText(row?.phone_number_id) || null,
+                    error: 'Missing encrypted access token'
+                })
+                continue
+            }
+
+            try {
+                const accessToken = decryptToken(accessTokenEncrypted)
+                const { data: configRow } = await supabase
+                    .from('waba_configs')
+                    .select('api_version')
+                    .eq('profile_id', trimText(row?.profile_id))
+                    .maybeSingle()
+
+                const apiVersion = trimText(configRow?.api_version) || resolveMetaGraphVersionFromEnv('v24.0')
+                const { wabaDetails, phoneDetails } = await fetchWabaAndPhoneDetails({
+                    accessToken,
+                    apiVersion,
+                    wabaId: trimText(row?.waba_id),
+                    phoneNumberId: trimText(row?.phone_number_id)
+                })
+
+                const updated = await persistWhatsAppConnection({
+                    companyId: trimText(row?.company_id),
+                    profileId: trimText(row?.profile_id),
+                    userId: trimText(row?.user_id) || user.id,
+                    wabaId: trimText(row?.waba_id),
+                    phoneNumberId: trimText(row?.phone_number_id),
+                    businessId: trimText(row?.business_id) || null,
+                    accessToken,
+                    tokenExpiresAt: trimText(row?.token_expires_at) || null,
+                    flowType: trimText(row?.flow_type) || 'refresh_status',
+                    phoneDetails,
+                    wabaDetails,
+                    status: trimText(phoneDetails?.status) || trimText(row?.status) || 'CONNECTED'
+                })
+                refreshed.push(shapeWhatsAppConnectionRow(updated))
+            } catch (error: any) {
+                failures.push({
+                    phone_number_id: trimText(row?.phone_number_id) || null,
+                    error: error?.message || 'Failed to refresh connection'
+                })
+            }
+        }
+
+        res.json({
+            success: failures.length === 0,
+            company_id: requestedCompanyId,
+            profile_id: profileId || null,
+            connections: refreshed,
+            failures
+        })
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error?.message || 'Failed to refresh WhatsApp status' })
+    }
+})
+
+app.post('/api/whatsapp/disconnect', async (req: any, res: any) => {
+    try {
+        const user = await getSupabaseUserFromRequest(req, res)
+        if (!user) return
+
+        const companyId = getUserCompanyId(user)
+        if (!companyId) {
+            return res.status(400).json({ success: false, error: 'Company ID missing in user metadata' })
+        }
+
+        const admin = await isAdminUser(user.id, companyId || undefined)
+        if (!admin) {
+            return res.status(403).json({ success: false, error: 'Admin access required' })
+        }
+
+        const requestedCompanyId = trimText(req.body?.company_id || req.body?.companyId) || companyId
+        const profileId = trimText(req.body?.profile_id || req.body?.profileId)
+        const revoke = req.body?.revoke === true
+
+        if (requestedCompanyId !== companyId && !isSuperAdminUser(user)) {
+            return res.status(403).json({ success: false, error: 'company_id does not belong to your account' })
+        }
+        if (!profileId) {
+            return res.status(400).json({ success: false, error: 'profile_id is required' })
+        }
+
+        const ownsProfile = await assertProfileCompany(profileId, requestedCompanyId)
+        if (!ownsProfile) {
+            return res.status(403).json({ success: false, error: 'Profile does not belong to the requested company' })
+        }
+
+        const { data: config, error: fetchError } = await supabase
+            .from('waba_configs')
+            .select('profile_id, company_id, app_id, phone_number_id, business_id, waba_id, business_account_id, access_token, system_user_token, api_version')
+            .eq('profile_id', profileId)
+            .maybeSingle()
+
+        if (fetchError || !config) {
+            return res.status(404).json({ success: false, error: fetchError?.message || 'WABA config not found' })
+        }
+
+        const wabaId = trimText(config.waba_id || config.business_account_id)
+        let unsubscribed = false
+        let unsubscribeError: string | null = null
+
+        if (revoke && wabaId) {
+            try {
+                const token = decryptToken(config.system_user_token || config.access_token)
+                await unsubscribeWabaApp(wabaId, token, config.api_version || resolveMetaGraphVersionFromEnv('v24.0'))
+                unsubscribed = true
+            } catch (error: any) {
+                unsubscribeError = error?.message || 'Failed to unsubscribe app'
+            }
+        }
+
+        const nowIso = new Date().toISOString()
+        const { error: configUpdateError } = await supabase
+            .from('waba_configs')
+            .update({ enabled: false })
+            .eq('profile_id', profileId)
+
+        if (configUpdateError) {
+            return res.status(500).json({ success: false, error: configUpdateError.message })
+        }
+
+        const { error: connectionUpdateError } = await supabase
+            .from('whatsapp_connections')
+            .update({
+                status: 'DISCONNECTED',
+                last_synced_at: nowIso,
+                updated_at: nowIso
+            })
+            .eq('company_id', requestedCompanyId)
+            .eq('profile_id', profileId)
+
+        if (connectionUpdateError && !isMissingWhatsappConnectionsTableError(connectionUpdateError)) {
+            return res.status(500).json({ success: false, error: connectionUpdateError.message })
+        }
+
+        await wabaRegistry.refresh(true)
+
+        if (unsubscribeError) {
+            return res.json({ success: false, error: unsubscribeError, disabled: true, unsubscribed })
+        }
+
+        return res.json({ success: true, disabled: true, unsubscribed })
+    } catch (error: any) {
+        res.status(500).json({ success: false, error: error?.message || 'Failed to disconnect WhatsApp' })
     }
 })
 
@@ -658,10 +1618,10 @@ app.post('/api/waba/manual-config', async (req: any, res: any) => {
         const phoneNumberId = typeof req.body?.phoneNumberId === 'string' ? req.body.phoneNumberId.trim() : ''
         const accessToken = typeof req.body?.accessToken === 'string' ? req.body.accessToken.trim() : ''
         const businessId = typeof req.body?.businessId === 'string' ? req.body.businessId.trim() : null
-        const verifyToken = (typeof req.body?.verifyToken === 'string' ? req.body.verifyToken.trim() : '') || (process.env.WABA_VERIFY_TOKEN || '')
-        const appId = (typeof req.body?.appId === 'string' ? req.body.appId.trim() : '') || (process.env.WABA_APP_ID || '')
-        const appSecret = (typeof req.body?.appSecret === 'string' ? req.body.appSecret.trim() : '') || (process.env.WABA_APP_SECRET || '')
-        const apiVersion = (typeof req.body?.apiVersion === 'string' ? req.body.apiVersion.trim() : '') || (process.env.WABA_API_VERSION || 'v19.0')
+        const verifyToken = (typeof req.body?.verifyToken === 'string' ? req.body.verifyToken.trim() : '') || resolveMetaVerifyTokenFromEnv()
+        const appId = (typeof req.body?.appId === 'string' ? req.body.appId.trim() : '') || resolveMetaAppIdFromEnv()
+        const appSecret = (typeof req.body?.appSecret === 'string' ? req.body.appSecret.trim() : '') || resolveMetaAppSecretFromEnv()
+        const apiVersion = (typeof req.body?.apiVersion === 'string' ? req.body.apiVersion.trim() : '') || resolveMetaGraphVersionFromEnv('v24.0')
 
         if (!wabaId || !phoneNumberId || !accessToken) {
             return res.status(400).json({ success: false, error: 'wabaId, phoneNumberId, and accessToken are required' })
@@ -676,11 +1636,11 @@ app.post('/api/waba/manual-config', async (req: any, res: any) => {
         }
 
         if (!verifyToken) {
-            return res.status(400).json({ success: false, error: 'verifyToken is required (or set WABA_VERIFY_TOKEN)' })
+            return res.status(400).json({ success: false, error: 'verifyToken is required (or set META_WEBHOOK_VERIFY_TOKEN / WABA_VERIFY_TOKEN)' })
         }
 
         if (!getTokenEncryptionKey()) {
-            return res.status(500).json({ success: false, error: 'Missing WABA_TOKEN_ENCRYPTION_KEY' })
+            return res.status(500).json({ success: false, error: 'Missing WABA_TOKEN_ENCRYPTION_KEY or ENCRYPTION_KEY' })
         }
 
         const nowIso = new Date().toISOString()
@@ -719,7 +1679,43 @@ app.post('/api/waba/manual-config', async (req: any, res: any) => {
         try {
             await subscribeWabaApp(wabaId, accessToken, apiVersion)
         } catch (err: any) {
-            subscribeError = err?.message || 'Failed to subscribe webhook'
+            subscribeError = formatMetaOperationError(err, 'Failed to subscribe webhook')
+        }
+
+        try {
+            const details = await fetchWabaAndPhoneDetails({
+                accessToken,
+                apiVersion,
+                wabaId,
+                phoneNumberId
+            })
+            await persistWhatsAppConnection({
+                companyId,
+                profileId,
+                userId: user.id,
+                wabaId,
+                phoneNumberId,
+                businessId,
+                accessToken,
+                tokenExpiresAt: null,
+                flowType: 'manual_config',
+                phoneDetails: details.phoneDetails,
+                wabaDetails: details.wabaDetails,
+                status: subscribeError ? 'PENDING' : (trimText(details.phoneDetails?.status) || 'CONNECTED')
+            })
+        } catch (err: any) {
+            await persistWhatsAppConnection({
+                companyId,
+                profileId,
+                userId: user.id,
+                wabaId,
+                phoneNumberId,
+                businessId,
+                accessToken,
+                tokenExpiresAt: null,
+                flowType: 'manual_config',
+                status: subscribeError ? 'PENDING' : 'CONNECTED'
+            })
         }
 
         await wabaRegistry.refresh(true)
@@ -1320,7 +2316,7 @@ app.get('/auth/waba/callback', async (req: any, res: any) => {
         try {
             await subscribeWabaApp(wabaId, graphToken, apiVersion)
         } catch (err: any) {
-            return res.status(500).send(renderOauthHtml('Subscription failed', err?.message || 'Failed to subscribe app.'))
+            return res.status(500).send(renderOauthHtml('Subscription failed', formatMetaOperationError(err, 'Failed to subscribe app.')))
         }
 
         let systemUserToken: string | null = null
@@ -1381,6 +2377,47 @@ app.get('/auth/waba/callback', async (req: any, res: any) => {
 
         if (upsertError) {
             return res.status(500).send(renderOauthHtml('Storage failed', upsertError.message))
+        }
+
+        try {
+            const details = await fetchWabaAndPhoneDetails({
+                accessToken: graphToken,
+                apiVersion,
+                wabaId,
+                phoneNumberId
+            })
+            await persistWhatsAppConnection({
+                companyId: trimText(stateRow.company_id),
+                profileId: stateProfileId,
+                userId: trimText(stateRow.user_id) || stateRow.user_id,
+                wabaId,
+                phoneNumberId,
+                businessId,
+                accessToken: graphToken,
+                tokenExpiresAt: accessTokenExpiresAt,
+                flowType: useBusinessIntegration ? 'business_integration' : (systemUserToken ? 'system_user' : 'legacy_embedded_signup'),
+                phoneDetails: details.phoneDetails,
+                wabaDetails: details.wabaDetails,
+                status: trimText(details.phoneDetails?.status) || 'CONNECTED'
+            })
+        } catch (err: any) {
+            await persistWhatsAppConnection({
+                companyId: trimText(stateRow.company_id),
+                profileId: stateProfileId,
+                userId: trimText(stateRow.user_id) || stateRow.user_id,
+                wabaId,
+                phoneNumberId,
+                businessId,
+                accessToken: graphToken,
+                tokenExpiresAt: accessTokenExpiresAt,
+                flowType: useBusinessIntegration ? 'business_integration' : (systemUserToken ? 'system_user' : 'legacy_embedded_signup'),
+                phoneDetails: {
+                    display_phone_number: selectedPhoneDisplayNumber,
+                    verified_name: selectedPhoneVerifiedName,
+                    status: 'CONNECTED'
+                },
+                status: 'CONNECTED'
+            })
         }
 
         await supabase
@@ -1596,9 +2633,20 @@ app.get('/api/waba/registration/config', async (req: any, res: any) => {
             .select('company_id, business_id, client_business_id, waba_id, business_account_id, phone_number_id, token_source, access_token_expires_at, api_version, enabled')
             .eq('profile_id', access.profileId)
             .maybeSingle()
+        const { data: connectionRow, error: connectionRowError } = await supabase
+            .from('whatsapp_connections')
+            .select('*')
+            .eq('company_id', access.companyId)
+            .eq('profile_id', access.profileId)
+            .order('updated_at', { ascending: false })
+            .limit(1)
+            .maybeSingle()
 
         if (configRowError) {
             return res.status(500).json({ success: false, error: configRowError.message })
+        }
+        if (connectionRowError && !isMissingWhatsappConnectionsTableError(connectionRowError)) {
+            return res.status(500).json({ success: false, error: connectionRowError.message })
         }
 
         if (!config && !configRow) {
@@ -1625,6 +2673,12 @@ app.get('/api/waba/registration/config', async (req: any, res: any) => {
                 clientBusinessId: connectedClientBusinessId || null,
                 wabaId: connectedWabaId || null,
                 phoneNumberId: connectedPhoneNumberId || null,
+                phoneNumber: trimText(connectionRow?.phone_number) || null,
+                displayName: trimText(connectionRow?.display_name) || null,
+                verifiedName: trimText(connectionRow?.verified_name) || null,
+                platformType: trimText(connectionRow?.platform_type) || null,
+                status: trimText(connectionRow?.status) || null,
+                qualityRating: trimText(connectionRow?.quality_rating) || null,
                 tokenSource: connectedTokenSource || null,
                 accessTokenExpiresAt: connectedAccessTokenExpiresAt || null,
                 apiVersion: connectedApiVersion || null,
@@ -1863,11 +2917,12 @@ app.post('/api/waba/review/send-test-message', async (req: any, res: any) => {
             || readTrimmed(await getCompanyIdForProfile(access.profileId))
 
         if (resolvedCompanyId) {
-            const user = await findOrCreateUser(resolvedCompanyId, normalizedRecipient)
+            const user = await findOrCreateUser(resolvedCompanyId, normalizedRecipient, access.profileId)
             if (user?.id) {
                 const sent = await sendWhatsAppMessage({
                     client,
                     userId: user.id,
+                    profileId: access.profileId,
                     to: normalizedRecipient,
                     type: 'text',
                     content: { text }
@@ -2136,7 +3191,8 @@ app.post('/api/waba/registration/register', async (req: any, res: any) => {
         })
         res.json({ success: true, data })
     } catch (error: any) {
-        res.status(500).json({ success: false, error: error.message })
+        const normalized = toHttpErrorPayload(error, 'Failed to register phone number')
+        res.status(normalized.status).json(normalized.payload)
     }
 })
 
@@ -2158,7 +3214,92 @@ app.post('/api/waba/registration/deregister', async (req: any, res: any) => {
         const data = await client.deregisterPhoneNumber(phoneNumberId)
         res.json({ success: true, data })
     } catch (error: any) {
-        res.status(500).json({ success: false, error: error.message })
+        const normalized = toHttpErrorPayload(error, 'Failed to deregister phone number')
+        res.status(normalized.status).json(normalized.payload)
+    }
+})
+
+app.post('/api/waba/registration/remove-phone-number', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const admin = await isAdminUser(access.user.id, access.companyId)
+        if (!admin) {
+            return res.status(403).json({ success: false, error: 'Admin access required' })
+        }
+
+        const mode = normalizeMetaPhoneRemovalMode(req.body?.mode)
+        const suppliedPhoneNumberId = trimText(req.body?.phoneNumberId || req.body?.phone_number_id)
+        const suppliedWabaId = trimText(req.body?.wabaId || req.body?.waba_id)
+        const suppliedToken = trimText(req.body?.accessToken || req.body?.access_token)
+        const suppliedApiVersion = trimText(req.body?.apiVersion || req.body?.api_version)
+        const shouldDisableLocal = req.body?.disableLocal !== false
+
+        const config = await wabaRegistry.getConfigByProfile(access.profileId)
+        const phoneNumberId = suppliedPhoneNumberId || trimText(config?.phoneNumberId)
+        const wabaId = suppliedWabaId || trimText(config?.wabaId || config?.businessAccountId)
+        const accessToken = suppliedToken || trimText(config?.accessToken)
+        const apiVersion = normalizeGraphApiVersion(
+            suppliedApiVersion || config?.apiVersion,
+            process.env.WABA_API_VERSION || 'v19.0'
+        )
+
+        if (!phoneNumberId) {
+            return res.status(400).json({ success: false, error: 'phoneNumberId is required' })
+        }
+        if ((mode === 'graph-delete' || mode === 'legacy-delete') && !wabaId) {
+            return res.status(400).json({ success: false, error: 'wabaId is required for DELETE removal modes' })
+        }
+        if (!accessToken) {
+            return res.status(400).json({ success: false, error: 'A saved WABA token or accessToken override is required' })
+        }
+
+        const result = await requestMetaPhoneNumberRemoval({
+            mode,
+            apiVersion,
+            accessToken,
+            wabaId,
+            phoneNumberId
+        })
+
+        let localDisabled = false
+        if (shouldDisableLocal && config?.phoneNumberId === phoneNumberId) {
+            const { error: updateError } = await supabase
+                .from('waba_configs')
+                .update({ enabled: false })
+                .eq('profile_id', access.profileId)
+
+            if (updateError) {
+                return res.status(500).json({
+                    success: false,
+                    error: updateError.message,
+                    meta: {
+                        mode,
+                        method: result.method,
+                        path: result.path,
+                        data: result.data
+                    }
+                })
+            }
+
+            localDisabled = true
+            await wabaRegistry.refresh(true)
+        }
+
+        res.json({
+            success: true,
+            data: {
+                mode,
+                method: result.method,
+                path: result.path,
+                localDisabled,
+                response: result.data
+            }
+        })
+    } catch (error: any) {
+        const normalized = toHttpErrorPayload(error, 'Failed to remove phone number from Meta')
+        res.status(normalized.status).json(normalized.payload)
     }
 })
 
@@ -2787,7 +3928,7 @@ app.post('/api/waba/templates/authentication/send', async (req: any, res: any) =
             return res.status(400).json({ success: false, error: codeError })
         }
 
-        const user = await findOrCreateUser(access.companyId, phoneNumber)
+        const user = await findOrCreateUser(access.companyId, phoneNumber, access.profileId)
         if (!user) {
             return res.status(500).json({ success: false, error: 'Failed to resolve user' })
         }
@@ -2800,6 +3941,7 @@ app.post('/api/waba/templates/authentication/send', async (req: any, res: any) =
 
         await insertMessage({
             userId: user.id,
+            profileId: access.profileId,
             direction: 'out',
             content: {
                 type: 'template',
@@ -2854,7 +3996,7 @@ app.post('/api/waba/templates/send', async (req: any, res: any) => {
             return res.status(400).json({ success: false, error: 'to/phone is required' })
         }
 
-        const user = await findOrCreateUser(access.companyId, phoneNumber)
+        const user = await findOrCreateUser(access.companyId, phoneNumber, access.profileId)
         if (!user) {
             return res.status(500).json({ success: false, error: 'Failed to resolve user' })
         }
@@ -2894,6 +4036,7 @@ app.post('/api/waba/templates/send', async (req: any, res: any) => {
         const { messageId } = await sendWhatsAppMessage({
             client,
             userId: user.id,
+            profileId: access.profileId,
             to: phoneNumber,
             type: 'template',
             content: {
@@ -2949,7 +4092,7 @@ app.post('/api/waba/marketing-messages/send', async (req: any, res: any) => {
             return res.status(400).json({ success: false, error: 'Invalid marketing message payload', details: errors })
         }
 
-        const user = await findOrCreateUser(access.companyId, phoneNumber)
+        const user = await findOrCreateUser(access.companyId, phoneNumber, access.profileId)
         if (!user) {
             return res.status(500).json({ success: false, error: 'Failed to resolve user' })
         }
@@ -2962,6 +4105,7 @@ app.post('/api/waba/marketing-messages/send', async (req: any, res: any) => {
 
         await insertMessage({
             userId: user.id,
+            profileId: access.profileId,
             direction: 'out',
             content: {
                 type: 'template',
@@ -3126,7 +4270,7 @@ async function runScheduledBroadcastTick() {
                         } else {
                             for (const phoneNumber of recipients) {
                                 try {
-                                    const user = await findOrCreateUser(companyId, phoneNumber)
+                                    const user = await findOrCreateUser(companyId, phoneNumber, profileId)
                                     if (!user?.id) {
                                         failedCount += 1
                                         if (!firstError) firstError = `Failed to resolve user for ${phoneNumber}`
@@ -3136,6 +4280,7 @@ async function runScheduledBroadcastTick() {
                                     await sendWhatsAppMessage({
                                         client,
                                         userId: user.id,
+                                        profileId,
                                         to: phoneNumber,
                                         type: 'template',
                                         content: {
@@ -3442,6 +4587,17 @@ app.post('/api/waba/clients/disconnect', async (req: any, res: any) => {
         if (updateError) {
             return res.status(500).json({ success: false, error: updateError.message })
         }
+
+        const nowIso = new Date().toISOString()
+        await supabase
+            .from('whatsapp_connections')
+            .update({
+                status: 'DISCONNECTED',
+                last_synced_at: nowIso,
+                updated_at: nowIso
+            })
+            .eq('company_id', companyId)
+            .eq('profile_id', profileId)
 
         await wabaRegistry.refresh(true)
 

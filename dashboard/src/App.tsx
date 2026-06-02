@@ -104,7 +104,7 @@ import {
 
 
 const SOCKET_URL = getSocketUrl();
-const SINGLE_PROFILE_MODE = true;
+const SINGLE_PROFILE_MODE = false;
 const OAUTH_PENDING_COMPANY_KEY = 'pendingOAuthCompanyId';
 const MOBILE_LAYOUT_BREAKPOINT = 1024;
 const MOBILE_BOTTOM_TAB_SECTIONS = ['team-inbox', 'automations', 'contacts', 'more'] as const;
@@ -192,6 +192,7 @@ const isSameSessionIdentity = (left: Session | null, right: Session | null): boo
 };
 
 interface Message {
+    profileId?: string | null;
     key: {
         id: string;
         remoteJid: string;
@@ -455,6 +456,7 @@ type OnboardingStepConfig = {
 };
 
 type ContactMeta = {
+    profileId?: string | null;
     name?: string;
     alias?: string | null;
     whatsappName?: string | null;
@@ -7811,14 +7813,26 @@ export default function App() {
                                     className="w-9 h-9 rounded-lg object-cover"
                                 />
                             ) : (
-                                <button
-                                    type="button"
-                                    onClick={() => setShowNewChatModal(true)}
-                                    className="w-8 h-8 rounded-lg bg-[#00a884]/12 border border-[#00a884]/25 text-[#00a884] flex items-center justify-center hover:bg-[#00a884]/18 transition-all"
-                                    title="Start new chat"
-                                >
-                                    <Plus className="w-4 h-4" />
-                                </button>
+                                <>
+                                    <button
+                                        type="button"
+                                        onClick={() => setShowNewChatModal(true)}
+                                        className="w-8 h-8 rounded-lg bg-[#00a884]/12 border border-[#00a884]/25 text-[#00a884] flex items-center justify-center hover:bg-[#00a884]/18 transition-all"
+                                        title="Start new chat"
+                                    >
+                                        <Plus className="w-4 h-4" />
+                                    </button>
+                                    {!SINGLE_PROFILE_MODE && (
+                                        <button
+                                            type="button"
+                                            onClick={handleAddProfile}
+                                            className="w-8 h-8 rounded-lg bg-[#f4f8ff] border border-[var(--qm-border)] text-[#54656f] flex items-center justify-center hover:bg-white hover:border-[#cdd8e0] transition-all"
+                                            title="Add profile"
+                                        >
+                                            <Users className="w-4 h-4" />
+                                        </button>
+                                    )}
+                                </>
                             )}
                         </div>
                         <div className="flex-1 bg-[#f4f8ff] border border-transparent rounded-xl flex items-center px-4 py-2 focus-within:bg-white focus-within:border-[var(--qm-border)] focus-within:ring-1 focus-within:ring-[#00a884]/20 transition-all">

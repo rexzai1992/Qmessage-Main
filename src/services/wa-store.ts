@@ -11,6 +11,7 @@ export type Company = {
 export type User = {
     id: string
     company_id: string
+    profile_id?: string | null
     phone_number: string
     name?: string | null
     alias?: string | null
@@ -50,6 +51,7 @@ export type TemplateAttributeInput = {
 export type MessageRecord = {
     id: string
     user_id: string
+    profile_id?: string | null
     direction: 'in' | 'out'
     content: any
     workflow_state: any | null
@@ -102,6 +104,16 @@ export function normalizePhoneNumber(input: string | null | undefined): string {
 
     const withoutDevice = localPart.includes(':') ? (localPart.split(':')[0] || '') : localPart
     return withoutDevice.replace(/\D/g, '')
+}
+
+function normalizeOptionalProfileId(input: string | null | undefined): string | null {
+    if (typeof input !== 'string') return null
+    const trimmed = input.trim()
+    return trimmed ? trimmed : null
+}
+
+function isMissingColumnError(error: any): boolean {
+    return error?.code === '42703' || String(error?.message || '').toLowerCase().includes('does not exist')
 }
 
 function sanitizeTemplateAttributeText(value: any, maxLength: number): string {
@@ -218,8 +230,9 @@ export async function updateCompanyFallbackSettings(
     return true
 }
 
-export async function findOrCreateUser(companyId: string, phoneNumber: string): Promise<User | null> {
+export async function findOrCreateUser(companyId: string, phoneNumber: string, profileId?: string | null): Promise<User | null> {
     const normalized = normalizePhoneNumber(phoneNumber)
+    const normalizedProfileId = normalizeOptionalProfileId(profileId)
     if (!normalized) {
         console.warn('[DB] Invalid phone number for user lookup:', phoneNumber)
         return null
@@ -235,12 +248,64 @@ export async function findOrCreateUser(companyId: string, phoneNumber: string): 
         )
     )
 
-    const { data: existing, error: fetchError } = await supabase
-        .from('users')
-        .select('*')
-        .eq('company_id', companyId)
-        .in('phone_number', candidates)
-        .limit(2)
+    let existing: any[] | null = null
+    let fetchError: any = null
+
+    if (normalizedProfileId) {
+        const exactResult = await supabase
+            .from('users')
+            .select('*')
+            .eq('company_id', companyId)
+            .eq('profile_id', normalizedProfileId)
+            .in('phone_number', candidates)
+            .limit(2)
+
+        if (exactResult.error && isMissingColumnError(exactResult.error)) {
+            console.warn('[DB] users.profile_id is missing; falling back to company-scoped contact lookup.')
+            const fallbackResult = await supabase
+                .from('users')
+                .select('*')
+                .eq('company_id', companyId)
+                .in('phone_number', candidates)
+                .limit(2)
+            existing = fallbackResult.data || null
+            fetchError = fallbackResult.error
+        } else if (exactResult.data && exactResult.data.length > 0) {
+            existing = exactResult.data
+            fetchError = exactResult.error
+        } else {
+            const legacyResult = await supabase
+                .from('users')
+                .select('*')
+                .eq('company_id', companyId)
+                .is('profile_id', null)
+                .in('phone_number', candidates)
+                .limit(2)
+
+            if (legacyResult.error && isMissingColumnError(legacyResult.error)) {
+                const fallbackResult = await supabase
+                    .from('users')
+                    .select('*')
+                    .eq('company_id', companyId)
+                    .in('phone_number', candidates)
+                    .limit(2)
+                existing = fallbackResult.data || null
+                fetchError = fallbackResult.error
+            } else {
+                existing = legacyResult.data || null
+                fetchError = legacyResult.error
+            }
+        }
+    } else {
+        const companyResult = await supabase
+            .from('users')
+            .select('*')
+            .eq('company_id', companyId)
+            .in('phone_number', candidates)
+            .limit(2)
+        existing = companyResult.data || null
+        fetchError = companyResult.error
+    }
 
     if (fetchError) {
         console.warn('[DB] Failed to fetch user:', fetchError.message)
@@ -248,25 +313,57 @@ export async function findOrCreateUser(companyId: string, phoneNumber: string): 
 
     if (existing && existing.length > 0) {
         const exact = existing.find((row: any) => row.phone_number === normalized) || existing[0]
-        if (exact && exact.phone_number !== normalized) {
-            const { error: updateError } = await supabase
-                .from('users')
-                .update({ phone_number: normalized })
-                .eq('id', exact.id)
-            if (updateError) {
-                console.warn('[DB] Failed to normalize user phone_number:', updateError.message)
-            } else {
-                exact.phone_number = normalized
+        if (exact) {
+            const updates: Record<string, any> = {}
+            if (exact.phone_number !== normalized) updates.phone_number = normalized
+            if (normalizedProfileId && !normalizeOptionalProfileId(exact.profile_id)) {
+                updates.profile_id = normalizedProfileId
+            }
+            if (Object.keys(updates).length > 0) {
+                const { error: updateError } = await supabase
+                    .from('users')
+                    .update(updates)
+                    .eq('id', exact.id)
+                if (updateError && !isMissingColumnError(updateError)) {
+                    console.warn('[DB] Failed to normalize user row:', updateError.message)
+                } else {
+                    Object.assign(exact, updates)
+                }
             }
         }
         return exact as User
     }
 
-    const { data: created, error: createError } = await supabase
-        .from('users')
-        .insert({ company_id: companyId, phone_number: normalized, tags: [] })
-        .select('*')
-        .single()
+    let created: any = null
+    let createError: any = null
+
+    if (normalizedProfileId) {
+        const profileInsert = await supabase
+            .from('users')
+            .insert({ company_id: companyId, profile_id: normalizedProfileId, phone_number: normalized, tags: [] })
+            .select('*')
+            .single()
+        created = profileInsert.data
+        createError = profileInsert.error
+
+        if (createError && isMissingColumnError(createError)) {
+            const fallbackInsert = await supabase
+                .from('users')
+                .insert({ company_id: companyId, phone_number: normalized, tags: [] })
+                .select('*')
+                .single()
+            created = fallbackInsert.data
+            createError = fallbackInsert.error
+        }
+    } else {
+        const companyInsert = await supabase
+            .from('users')
+            .insert({ company_id: companyId, phone_number: normalized, tags: [] })
+            .select('*')
+            .single()
+        created = companyInsert.data
+        createError = companyInsert.error
+    }
 
     if (createError) {
         console.warn('[DB] Failed to create user:', createError.message)
@@ -276,8 +373,9 @@ export async function findOrCreateUser(companyId: string, phoneNumber: string): 
     return created as User
 }
 
-export async function getUserByPhone(companyId: string, phoneNumber: string): Promise<User | null> {
+export async function getUserByPhone(companyId: string, phoneNumber: string, profileId?: string | null): Promise<User | null> {
     const normalized = normalizePhoneNumber(phoneNumber)
+    const normalizedProfileId = normalizeOptionalProfileId(profileId)
     if (!normalized) return null
     const groupJid = `${normalized}@g.us`
     const individualJid = `${normalized}@s.whatsapp.net`
@@ -289,12 +387,55 @@ export async function getUserByPhone(companyId: string, phoneNumber: string): Pr
         )
     )
 
-    const { data, error } = await supabase
-        .from('users')
-        .select('*')
-        .eq('company_id', companyId)
-        .in('phone_number', candidates)
-        .limit(2)
+    let data: any[] | null = null
+    let error: any = null
+
+    if (normalizedProfileId) {
+        const exactResult = await supabase
+            .from('users')
+            .select('*')
+            .eq('company_id', companyId)
+            .eq('profile_id', normalizedProfileId)
+            .in('phone_number', candidates)
+            .limit(2)
+        if (exactResult.error && isMissingColumnError(exactResult.error)) {
+            const fallbackResult = await supabase
+                .from('users')
+                .select('*')
+                .eq('company_id', companyId)
+                .in('phone_number', candidates)
+                .limit(2)
+            data = fallbackResult.data || null
+            error = fallbackResult.error
+        } else if (exactResult.data && exactResult.data.length > 0) {
+            data = exactResult.data
+            error = exactResult.error
+        } else {
+            const legacyResult = await supabase
+                .from('users')
+                .select('*')
+                .eq('company_id', companyId)
+                .is('profile_id', null)
+                .in('phone_number', candidates)
+                .limit(2)
+            if (legacyResult.error && isMissingColumnError(legacyResult.error)) {
+                data = []
+                error = null
+            } else {
+                data = legacyResult.data || null
+                error = legacyResult.error
+            }
+        }
+    } else {
+        const companyResult = await supabase
+            .from('users')
+            .select('*')
+            .eq('company_id', companyId)
+            .in('phone_number', candidates)
+            .limit(2)
+        data = companyResult.data || null
+        error = companyResult.error
+    }
 
     if (error) {
         console.warn('[DB] Failed to fetch user by phone:', error.message)
@@ -730,26 +871,46 @@ export async function setUserTemplateAttributes(
 
 export async function insertMessage(record: {
     userId: string
+    profileId?: string | null
     direction: 'in' | 'out'
     content: any
     workflowState?: any | null
     createdAt?: string | null
 }): Promise<MessageRecord | null> {
+    const normalizedProfileId = normalizeOptionalProfileId(record.profileId)
     const payload: any = {
         user_id: record.userId,
         direction: record.direction,
         content: record.content,
-        workflow_state: record.workflowState ?? null
+        workflow_state: record.workflowState ?? null,
+        ...(normalizedProfileId ? { profile_id: normalizedProfileId } : {})
     }
     if (record.createdAt) {
         payload.created_at = record.createdAt
     }
 
-    const { data, error } = await supabase
+    let data: any = null
+    let error: any = null
+
+    const insertResult = await supabase
         .from('messages')
         .insert(payload)
         .select('*')
         .single()
+    data = insertResult.data
+    error = insertResult.error
+
+    if (error && normalizedProfileId && isMissingColumnError(error)) {
+        const fallbackPayload = { ...payload }
+        delete fallbackPayload.profile_id
+        const fallbackResult = await supabase
+            .from('messages')
+            .insert(fallbackPayload)
+            .select('*')
+            .single()
+        data = fallbackResult.data
+        error = fallbackResult.error
+    }
 
     if (error) {
         console.warn('[DB] Failed to insert message:', error.message)
@@ -926,17 +1087,43 @@ type StatusUpdateMeta = {
 export async function updateMessageStatusByMessageId(
     messageId: string,
     status: string,
-    meta: StatusUpdateMeta = {}
+    meta: StatusUpdateMeta = {},
+    profileId?: string | null
 ): Promise<MessageRecord | null> {
     if (!messageId) return null
 
-    const { data: existing, error: fetchError } = await supabase
+    const normalizedProfileId = normalizeOptionalProfileId(profileId)
+
+    let existing: any = null
+    let fetchError: any = null
+
+    let lookupQuery = supabase
         .from('messages')
         .select('id, content')
         .eq('content->>message_id', messageId)
         .order('created_at', { ascending: false })
         .limit(1)
-        .maybeSingle()
+
+    if (normalizedProfileId) {
+        const scopedLookup = await lookupQuery.eq('profile_id', normalizedProfileId).maybeSingle()
+        existing = scopedLookup.data
+        fetchError = scopedLookup.error
+        if (fetchError && isMissingColumnError(fetchError)) {
+            const fallbackLookup = await supabase
+                .from('messages')
+                .select('id, content')
+                .eq('content->>message_id', messageId)
+                .order('created_at', { ascending: false })
+                .limit(1)
+                .maybeSingle()
+            existing = fallbackLookup.data
+            fetchError = fallbackLookup.error
+        }
+    } else {
+        const unscopedLookup = await lookupQuery.maybeSingle()
+        existing = unscopedLookup.data
+        fetchError = unscopedLookup.error
+    }
 
     if (fetchError) {
         console.warn('[DB] Failed to lookup message by message_id:', fetchError.message)
@@ -1026,17 +1213,41 @@ export async function updateMessageWorkflowState(messageId: string, workflowStat
 
 const WINDOW_MS = 24 * 60 * 60 * 1000
 
-export async function getUsersWithExpiringWindow(companyId: string, minutes: number): Promise<User[]> {
+export async function getUsersWithExpiringWindow(companyId: string, minutes: number, profileId?: string | null): Promise<User[]> {
     if (!minutes || minutes <= 0) return []
     const thresholdMs = minutes * 60 * 1000
     const earliestInbound = new Date(Date.now() - WINDOW_MS).toISOString()
+    const normalizedProfileId = normalizeOptionalProfileId(profileId)
 
-    const { data, error } = await supabase
+    let data: any[] | null = null
+    let error: any = null
+
+    let query = supabase
         .from('users')
         .select('*')
         .eq('company_id', companyId)
         .not('last_inbound_at', 'is', null)
         .gte('last_inbound_at', earliestInbound)
+
+    if (normalizedProfileId) {
+        const scopedResult = await query.eq('profile_id', normalizedProfileId)
+        data = scopedResult.data || null
+        error = scopedResult.error
+        if (error && isMissingColumnError(error)) {
+            const fallbackResult = await supabase
+                .from('users')
+                .select('*')
+                .eq('company_id', companyId)
+                .not('last_inbound_at', 'is', null)
+                .gte('last_inbound_at', earliestInbound)
+            data = fallbackResult.data || null
+            error = fallbackResult.error
+        }
+    } else {
+        const unscopedResult = await query
+        data = unscopedResult.data || null
+        error = unscopedResult.error
+    }
 
     if (error) {
         console.warn('[DB] Failed to load users for window reminder:', error.message)
@@ -1112,18 +1323,25 @@ export async function getWorkflowById(workflowId: string, companyId?: string): P
     return data
 }
 
-export async function getUsersForCompany(companyId: string): Promise<User[]> {
-    const primarySelect = 'id, company_id, phone_number, name, alias, tags, last_inbound_at, last_window_reminder_at, assigned_to_user_id, assigned_to_name, assigned_to_color, assigned_at, cta_referral_at, cta_referral_source, cta_free_window_started_at, cta_free_window_expires_at, template_attributes'
+export async function getUsersForCompany(companyId: string, profileId?: string | null): Promise<User[]> {
+    const normalizedProfileId = normalizeOptionalProfileId(profileId)
+    const primarySelect = 'id, company_id, profile_id, phone_number, name, alias, tags, last_inbound_at, last_window_reminder_at, assigned_to_user_id, assigned_to_name, assigned_to_color, assigned_at, cta_referral_at, cta_referral_source, cta_free_window_started_at, cta_free_window_expires_at, template_attributes'
     const fallbackSelectWithAlias = 'id, company_id, phone_number, name, alias, tags, last_inbound_at, last_window_reminder_at, assigned_to_user_id, assigned_to_name, assigned_to_color, assigned_at'
     const fallbackSelectLegacy = 'id, company_id, phone_number, name, tags, last_inbound_at, last_window_reminder_at, assigned_to_user_id, assigned_to_name, assigned_to_color, assigned_at'
-    const isMissingColumnError = (error: any): boolean => (
-        error?.code === '42703' || String(error?.message || '').toLowerCase().includes('does not exist')
-    )
 
-    const { data, error } = await supabase
+    let data: any[] | null = null
+    let error: any = null
+
+    let primaryQuery = supabase
         .from('users')
         .select(primarySelect)
         .eq('company_id', companyId)
+    if (normalizedProfileId) {
+        primaryQuery = primaryQuery.eq('profile_id', normalizedProfileId)
+    }
+    const primaryResult = await primaryQuery
+    data = primaryResult.data || null
+    error = primaryResult.error
 
     if (error && isMissingColumnError(error)) {
         console.warn('[DB] users schema is missing newer columns, using fallback user projection.')
@@ -1154,13 +1372,14 @@ export async function getUsersForCompany(companyId: string): Promise<User[]> {
         return (fallbackData || []).map((row: any) => {
             const alias = typeof row?.alias === 'string' ? row.alias : null
             return {
-            ...row,
-            alias,
-            cta_referral_at: null,
-            cta_referral_source: null,
-            cta_free_window_started_at: null,
-            cta_free_window_expires_at: null,
-            template_attributes: []
+                ...row,
+                alias,
+                profile_id: normalizeOptionalProfileId(row?.profile_id),
+                cta_referral_at: null,
+                cta_referral_source: null,
+                cta_free_window_started_at: null,
+                cta_free_window_expires_at: null,
+                template_attributes: []
             }
         }) as User[]
     }

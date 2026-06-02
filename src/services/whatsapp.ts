@@ -6,6 +6,7 @@ const WINDOW_MS = 24 * 60 * 60 * 1000
 export type SendMessageInput = {
     client: WabaClient
     userId: string
+    profileId?: string | null
     to: string
     type: 'text' | 'buttons' | 'list' | 'cta_url' | 'template'
     content: any
@@ -83,7 +84,7 @@ export async function canReplyFreely(userId: string): Promise<boolean> {
 }
 
 export async function sendWhatsAppMessage(input: SendMessageInput) {
-    const { client, userId, to, type, workflowState, actor } = input
+    const { client, userId, profileId, to, type, workflowState, actor } = input
     let { content } = input
     const messageActor =
         actor ||
@@ -200,6 +201,7 @@ export async function sendWhatsAppMessage(input: SendMessageInput) {
     }
     await insertMessage({
         userId,
+        profileId,
         direction: 'out',
         content: persistedContent,
         workflowState: workflowState ?? null

@@ -6,6 +6,88 @@ import { supabase } from './supabase';
 import { uploadFileToCompanyStorage } from './features/media/uploadToCompanyStorage';
 
 const SOCKET_URL = getSocketUrl();
+const META_ALLOWED_EMBEDDED_SIGNUP_ORIGINS = new Set([
+    'https://www.facebook.com',
+    'https://web.facebook.com'
+]);
+const META_SDK_SCRIPT_ID = 'meta-facebook-jssdk';
+const META_APP_ID = typeof import.meta.env.VITE_META_APP_ID === 'string' ? import.meta.env.VITE_META_APP_ID.trim() : '';
+const META_GRAPH_VERSION = typeof import.meta.env.VITE_META_GRAPH_VERSION === 'string' && import.meta.env.VITE_META_GRAPH_VERSION.trim()
+    ? import.meta.env.VITE_META_GRAPH_VERSION.trim()
+    : 'v24.0';
+const META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID =
+    typeof import.meta.env.VITE_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID === 'string'
+        ? import.meta.env.VITE_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID.trim()
+        : '';
+const META_WA_EXISTING_APP_CONFIGURATION_ID =
+    typeof import.meta.env.VITE_META_WA_EXISTING_APP_CONFIGURATION_ID === 'string'
+        ? import.meta.env.VITE_META_WA_EXISTING_APP_CONFIGURATION_ID.trim()
+        : '';
+
+let metaSdkPromise: Promise<any> | null = null;
+let metaSdkInitKey = '';
+
+const initializeMetaSdk = (appId: string, version: string) => {
+    if (!window.FB || typeof window.FB.init !== 'function') {
+        throw new Error('Facebook SDK is not available.');
+    }
+    const initKey = `${appId}:${version}`;
+    if (metaSdkInitKey === initKey) return window.FB;
+    window.FB.init({
+        appId,
+        cookie: true,
+        xfbml: false,
+        version
+    });
+    metaSdkInitKey = initKey;
+    return window.FB;
+};
+
+const loadMetaSdk = async (appId: string, version: string) => {
+    if (!appId) {
+        throw new Error('Missing VITE_META_APP_ID.');
+    }
+    if (window.FB && typeof window.FB.login === 'function') {
+        return initializeMetaSdk(appId, version);
+    }
+    if (!metaSdkPromise) {
+        metaSdkPromise = new Promise((resolve, reject) => {
+            const existingScript = document.getElementById(META_SDK_SCRIPT_ID) as HTMLScriptElement | null;
+            const handleReady = () => {
+                try {
+                    resolve(initializeMetaSdk(appId, version));
+                } catch (error) {
+                    reject(error);
+                }
+            };
+
+            window.fbAsyncInit = handleReady;
+
+            if (existingScript) {
+                if (window.FB && typeof window.FB.login === 'function') {
+                    handleReady();
+                }
+                return;
+            }
+
+            const script = document.createElement('script');
+            script.id = META_SDK_SCRIPT_ID;
+            script.async = true;
+            script.defer = true;
+            script.src = 'https://connect.facebook.net/en_US/sdk.js';
+            script.onerror = () => {
+                reject(new Error('Failed to load Facebook SDK.'));
+            };
+            document.head.appendChild(script);
+        }).catch((error) => {
+            metaSdkPromise = null;
+            throw error;
+        });
+    }
+
+    const sdk = await metaSdkPromise;
+    return initializeMetaSdk(appId, version) || sdk;
+};
 
 type QuickReply = {
     id?: string;
@@ -83,6 +165,7 @@ type AppReviewCheckKey =
     | 'whatsapp_business_management'
     | 'business_management'
     | 'whatsapp_business_messaging';
+type EmbeddedSignupConnectMode = 'default' | 'coexistence';
 
 type AppReviewCheckState = {
     status: AppReviewCheckStatus;
@@ -122,6 +205,38 @@ type AppReviewReadinessState = {
         connectedAt: string | null;
         updatedAt: string | null;
     };
+};
+
+type WhatsAppConnectionRecord = {
+    id: string | null;
+    company_id: string | null;
+    profile_id: string | null;
+    user_id: string | null;
+    waba_id: string | null;
+    phone_number_id: string | null;
+    business_id: string | null;
+    phone_number: string | null;
+    display_name: string | null;
+    verified_name: string | null;
+    account_review_status: string | null;
+    business_verification_status: string | null;
+    quality_rating: string | null;
+    platform_type: string | null;
+    status: string | null;
+    flow_type: string | null;
+    token_expires_at: string | null;
+    last_synced_at: string | null;
+    created_at: string | null;
+    updated_at: string | null;
+};
+
+type WhatsAppStatusState = {
+    company_id: string | null;
+    profile_id: string | null;
+    status: string;
+    connected: boolean;
+    connection: WhatsAppConnectionRecord | null;
+    connections: WhatsAppConnectionRecord[];
 };
 
 type BusinessProfileFormState = {
@@ -456,6 +571,10 @@ export default function WebhookView({
     const [registrationConfig, setRegistrationConfig] = useState<any | null>(null);
     const [registrationLoading, setRegistrationLoading] = useState(false);
     const [registrationError, setRegistrationError] = useState<string | null>(null);
+    const [whatsappStatus, setWhatsappStatus] = useState<WhatsAppStatusState | null>(null);
+    const [whatsappStatusLoading, setWhatsappStatusLoading] = useState(Boolean(sessionToken));
+    const [whatsappStatusError, setWhatsappStatusError] = useState<string | null>(null);
+    const [embeddedSignupPin, setEmbeddedSignupPin] = useState('');
     const [registrationNumbers, setRegistrationNumbers] = useState<any[]>([]);
     const [registrationNumbersLoading, setRegistrationNumbersLoading] = useState(false);
     const [registrationNumbersError, setRegistrationNumbersError] = useState<string | null>(null);
@@ -546,6 +665,7 @@ export default function WebhookView({
         }
         if (sessionToken) {
             fetchRegistrationConfig();
+            fetchWhatsappStatus();
             fetchTeamUsers();
             if (showCallSettings) {
                 fetchCallSettings();
@@ -875,7 +995,153 @@ export default function WebhookView({
         }
     };
 
-    const handleConnectWhatsapp = async () => {
+    const handleConnectNewWhatsappNumber = async () => {
+        if (!sessionToken) {
+            setConnectError('You must be logged in to connect WhatsApp.');
+            return;
+        }
+        if (!profileId) {
+            setConnectError('Profile ID is missing.');
+            return;
+        }
+        if (!META_APP_ID) {
+            setConnectError('Missing VITE_META_APP_ID.');
+            return;
+        }
+        if (!META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID) {
+            setConnectError('Missing VITE_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID.');
+            return;
+        }
+
+        const activeCompanyId = readTrimmed(
+            whatsappStatus?.company_id
+            || registrationConfig?.companyId
+            || registrationConfig?.connectedCompanyId
+        );
+        if (!activeCompanyId) {
+            setConnectError('Company mapping is not ready yet. Refresh status and try again.');
+            return;
+        }
+
+        setConnectLoading(true);
+        setConnectError(null);
+        setDisconnectError(null);
+        setDisconnectNotice(null);
+        try {
+            const FB = await loadMetaSdk(META_APP_ID, META_GRAPH_VERSION);
+            let cleanupSignupListener = () => {};
+
+            const signupPromise = new Promise<{ wabaId: string; phoneNumberId: string; businessId: string | null }>((resolve, reject) => {
+                const timeoutId = window.setTimeout(() => {
+                    cleanup();
+                    reject(new Error('Embedded Signup timed out before completion.'));
+                }, 10 * 60 * 1000);
+
+                const cleanup = () => {
+                    window.clearTimeout(timeoutId);
+                    window.removeEventListener('message', handleMessage);
+                };
+                cleanupSignupListener = cleanup;
+
+                const handleMessage = (event: MessageEvent) => {
+                    if (!META_ALLOWED_EMBEDDED_SIGNUP_ORIGINS.has(event.origin)) return;
+
+                    let payload: any = event.data;
+                    if (typeof payload === 'string') {
+                        try {
+                            payload = JSON.parse(payload);
+                        } catch {
+                            return;
+                        }
+                    }
+                    if (!payload || payload.type !== 'WA_EMBEDDED_SIGNUP') return;
+
+                    const eventName = readTrimmed(payload.event).toUpperCase();
+                    const data = payload.data && typeof payload.data === 'object' ? payload.data : {};
+
+                    if (eventName === 'FINISH') {
+                        const wabaId = readTrimmed(data.waba_id);
+                        const phoneNumberId = readTrimmed(data.phone_number_id);
+                        const businessId = readTrimmed(data.business_id) || null;
+                        if (!wabaId || !phoneNumberId) {
+                            cleanup();
+                            reject(new Error('Meta did not return waba_id or phone_number_id.'));
+                            return;
+                        }
+                        cleanup();
+                        resolve({ wabaId, phoneNumberId, businessId });
+                        return;
+                    }
+
+                    if (eventName === 'CANCEL' || eventName === 'ERROR') {
+                        const message = readTrimmed(data.error_message)
+                            || readTrimmed(data.current_step)
+                            || 'Embedded Signup was cancelled before completion.';
+                        cleanup();
+                        reject(new Error(message));
+                    }
+                };
+
+                window.addEventListener('message', handleMessage);
+            });
+
+            const loginResponse = await new Promise<any>((resolve) => {
+                FB.login((response: any) => resolve(response), {
+                    config_id: META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID,
+                    response_type: 'code',
+                    override_default_response_type: true,
+                    extras: {
+                        setup: {},
+                        sessionInfoVersion: '3'
+                    }
+                });
+            });
+
+            const code = readTrimmed(loginResponse?.authResponse?.code);
+            if (!code) {
+                cleanupSignupListener();
+                throw new Error('Facebook Login was cancelled or no authorization code was returned.');
+            }
+
+            const sessionInfo = await signupPromise;
+            const completeRes = await fetch(`${SOCKET_URL}/api/whatsapp/embedded-signup/v4/complete`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    code,
+                    waba_id: sessionInfo.wabaId,
+                    phone_number_id: sessionInfo.phoneNumberId,
+                    business_id: sessionInfo.businessId,
+                    company_id: activeCompanyId,
+                    profile_id: profileId,
+                    flow_type: 'new_phone_onboarding',
+                    pin: readTrimmed(embeddedSignupPin) || undefined
+                })
+            });
+            const completeData = await completeRes.json().catch(() => null);
+            if (!completeRes.ok || !completeData?.success) {
+                throw new Error(formatApiError(completeData, 'Failed to complete new WhatsApp API number onboarding.'));
+            }
+
+            setDisconnectNotice('New WhatsApp API number connected successfully.');
+            setEmbeddedSignupPin('');
+            fetchRegistrationConfig();
+            fetchWhatsappStatus();
+            fetchAppReviewReadiness();
+            if (isSuperAdmin) {
+                fetchClientConnections();
+            }
+        } catch (err: any) {
+            setConnectError(err?.message || 'Failed to connect new WhatsApp API number.');
+        } finally {
+            setConnectLoading(false);
+        }
+    };
+
+    const handleConnectWhatsapp = async (mode: EmbeddedSignupConnectMode = 'default') => {
         if (!sessionToken) {
             setConnectError('You must be logged in to connect WhatsApp.');
             return;
@@ -888,6 +1154,11 @@ export default function WebhookView({
             const params = new URLSearchParams();
             params.set('profileId', profileId);
             params.set('returnUrl', `${window.location.origin}${window.location.pathname}`);
+            if (mode === 'coexistence') {
+                params.set('featureType', 'whatsapp_business_app_onboarding');
+                params.set('sessionInfoVersion', '3');
+                params.set('coexistence', '1');
+            }
             const res = await fetch(`${SOCKET_URL}/api/waba/embedded-signup/url?${params.toString()}`, {
                 headers: {
                     Authorization: `Bearer ${sessionToken}`
@@ -923,13 +1194,22 @@ export default function WebhookView({
         setDisconnectError(null);
         setDisconnectNotice(null);
         try {
-            const res = await fetch(`${SOCKET_URL}/api/waba/clients/disconnect`, {
+            const activeCompanyId = readTrimmed(
+                whatsappStatus?.company_id
+                || registrationConfig?.companyId
+                || registrationConfig?.connectedCompanyId
+            );
+            const res = await fetch(`${SOCKET_URL}/api/whatsapp/disconnect`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                     Authorization: `Bearer ${sessionToken}`
                 },
-                body: JSON.stringify({ profileId, revoke })
+                body: JSON.stringify({
+                    profile_id: profileId,
+                    company_id: activeCompanyId || undefined,
+                    revoke
+                })
             });
             const data = await res.json().catch(() => null);
             if (!res.ok) {
@@ -951,6 +1231,7 @@ export default function WebhookView({
             setConnectError(null);
             setRegistrationConfig(null);
             fetchRegistrationConfig();
+            fetchWhatsappStatus();
             fetchAppReviewReadiness();
             if (isSuperAdmin) {
                 fetchClientConnections();
@@ -998,6 +1279,7 @@ export default function WebhookView({
             setDisconnectError(null);
             setDisconnectNotice(null);
             fetchRegistrationConfig();
+            fetchWhatsappStatus();
             fetchAppReviewReadiness();
             if (isSuperAdmin) {
                 fetchClientConnections();
@@ -1006,6 +1288,40 @@ export default function WebhookView({
             setManualError(err?.message || 'Manual config failed');
         } finally {
             setManualLoading(false);
+        }
+    };
+
+    const handleRefreshWhatsappStatus = async () => {
+        if (!sessionToken || !profileId) return;
+        setWhatsappStatusLoading(true);
+        setWhatsappStatusError(null);
+        try {
+            const activeCompanyId = readTrimmed(
+                whatsappStatus?.company_id
+                || registrationConfig?.companyId
+                || registrationConfig?.connectedCompanyId
+            );
+            const res = await fetch(`${SOCKET_URL}/api/whatsapp/refresh-status`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    company_id: activeCompanyId || undefined,
+                    profile_id: profileId
+                })
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data) {
+                throw new Error(formatApiError(data, 'Failed to refresh WhatsApp status.'));
+            }
+            fetchRegistrationConfig();
+            await fetchWhatsappStatus();
+        } catch (error: any) {
+            setWhatsappStatusError(error?.message || 'Failed to refresh WhatsApp status.');
+        } finally {
+            setWhatsappStatusLoading(false);
         }
     };
 
@@ -1069,6 +1385,48 @@ export default function WebhookView({
                 }
             })
             .finally(() => setRegistrationLoading(false));
+    };
+
+    const fetchWhatsappStatus = async () => {
+        if (!sessionToken || !profileId) {
+            setWhatsappStatus(null);
+            setWhatsappStatusLoading(false);
+            setWhatsappStatusError(null);
+            return;
+        }
+
+        setWhatsappStatusLoading(true);
+        setWhatsappStatusError(null);
+        try {
+            const params = new URLSearchParams();
+            params.set('profile_id', profileId);
+            const activeCompanyId = readTrimmed(registrationConfig?.companyId || registrationConfig?.connectedCompanyId);
+            if (activeCompanyId) {
+                params.set('company_id', activeCompanyId);
+            }
+            const res = await fetch(`${SOCKET_URL}/api/whatsapp/status?${params.toString()}`, {
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`
+                }
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data?.success) {
+                throw new Error(formatApiError(data, 'Failed to load WhatsApp connection status.'));
+            }
+            setWhatsappStatus({
+                company_id: readTrimmed(data?.company_id) || null,
+                profile_id: readTrimmed(data?.profile_id) || null,
+                status: readTrimmed(data?.status) || 'NOT_CONNECTED',
+                connected: data?.connected === true,
+                connection: data?.connection || null,
+                connections: Array.isArray(data?.connections) ? data.connections : []
+            });
+        } catch (error: any) {
+            setWhatsappStatus(null);
+            setWhatsappStatusError(error?.message || 'Failed to load WhatsApp connection status.');
+        } finally {
+            setWhatsappStatusLoading(false);
+        }
     };
 
     const parseAppReviewError = (data: any, fallback: string): { message: string; details: string[] } => {
@@ -2885,14 +3243,30 @@ export default function WebhookView({
             : notificationPermission === 'denied'
                 ? 'text-rose-700 bg-rose-50 border-rose-200'
                 : 'text-[#54656f] bg-[#f0f2f5] border-[#eceff1]';
+    const activeWhatsappConnection = whatsappStatus?.connection || null;
     const hasActiveWabaConnection = Boolean(
-        registrationConfig?.enabled === true
-        && (
-            registrationConfig?.phoneNumberId
-            || registrationConfig?.wabaId
-            || registrationConfig?.businessId
+        activeWhatsappConnection
+        || (
+            registrationConfig?.enabled === true
+            && (
+                registrationConfig?.phoneNumberId
+                || registrationConfig?.wabaId
+                || registrationConfig?.businessId
+            )
         )
     );
+    const newPhoneSignupConfigured = Boolean(META_APP_ID && META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID);
+    const existingAppSignupConfigured = Boolean(META_WA_EXISTING_APP_CONFIGURATION_ID);
+    const whatsappConnectionStatusLabel =
+        connectLoading
+            ? 'Connecting...'
+            : whatsappStatusLoading || registrationLoading
+                ? 'Checking...'
+                : activeWhatsappConnection
+                    ? (readTrimmed(activeWhatsappConnection.status) || 'Connected')
+                    : hasActiveWabaConnection
+                        ? 'Connected'
+                        : 'Not connected';
     const appReviewPrerequisites = Array.isArray(appReviewReadiness?.prerequisites) ? appReviewReadiness.prerequisites : [];
     const appReviewReadyCount = appReviewPrerequisites.filter((item) => item?.ok).length;
     const appReviewChecksList: Array<{ key: AppReviewCheckKey; label: string; description: string }> = [
@@ -3159,25 +3533,25 @@ export default function WebhookView({
                         <h3 className="text-xl text-[#111b21] font-bold">Connect WhatsApp Business</h3>
                     </div>
                     <p className="text-sm text-[#54656f] mb-6 font-medium">
-                        Link a client’s WhatsApp Business account using Meta Embedded Signup. You’ll be redirected to Facebook Login.
+                        Link a client's WhatsApp Business account using Meta Embedded Signup. New number onboarding stays in the popup flow, while existing app coexistence keeps the legacy redirect path.
                     </p>
                     <div className="mb-4 flex items-center justify-between gap-3 rounded-xl border border-[#eceff1] bg-[#f8fafc] px-4 py-2.5">
                         <span className="text-[11px] font-bold uppercase tracking-widest text-[#54656f]">Connection status</span>
                         <span className={`text-[10px] px-3 py-1 rounded-full border font-bold uppercase tracking-widest ${hasActiveWabaConnection ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-[#dbe3ea] bg-white text-[#64748b]'}`}>
-                            {registrationLoading ? 'Checking...' : hasActiveWabaConnection ? 'Connected' : 'Not connected'}
+                            {whatsappConnectionStatusLabel}
                         </span>
                     </div>
                     <div className="mb-4 rounded-xl border border-[#eceff1] bg-[#f8fafc] px-4 py-3">
                         <div className="flex flex-wrap items-center justify-between gap-2">
                             <span className="text-[11px] font-bold uppercase tracking-widest text-[#54656f]">Company ID</span>
                             <span className="text-[11px] font-mono text-[#334155]">
-                                Active: {readTrimmed(registrationConfig?.companyId) || '-'}
+                                Active: {readTrimmed(whatsappStatus?.company_id || registrationConfig?.companyId) || '-'}
                             </span>
                         </div>
                         <div className="mt-2 rounded-xl border border-[#dbe3ea] bg-white px-3 py-2.5">
                             <div className="text-[10px] font-black uppercase tracking-widest text-[#64748b]">Connected Mapping</div>
                             <div className="mt-1 text-xs font-mono text-[#111b21] break-all">
-                                {readTrimmed(registrationConfig?.connectedCompanyId) || readTrimmed(registrationConfig?.companyId) || '-'}
+                                {readTrimmed(whatsappStatus?.company_id || registrationConfig?.connectedCompanyId || registrationConfig?.companyId) || '-'}
                             </div>
                             <p className="mt-1 text-[10px] text-[#64748b]">
                                 Reference only. Company ID can’t be edited here.
@@ -3189,13 +3563,89 @@ export default function WebhookView({
                             </p>
                         )}
                     </div>
+                    <div className="mb-4 rounded-xl border border-[#eceff1] bg-white px-4 py-3">
+                        <div className="text-[10px] font-black uppercase tracking-widest text-[#64748b]">Connected WhatsApp Details</div>
+                        <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3 text-[11px]">
+                            <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">WABA ID</div>
+                                <div className="mt-1 font-mono text-[#111b21] break-all">{readTrimmed(activeWhatsappConnection?.waba_id || registrationConfig?.wabaId) || '-'}</div>
+                            </div>
+                            <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">Phone Number ID</div>
+                                <div className="mt-1 font-mono text-[#111b21] break-all">{readTrimmed(activeWhatsappConnection?.phone_number_id || registrationConfig?.phoneNumberId) || '-'}</div>
+                            </div>
+                            <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">Phone Number</div>
+                                <div className="mt-1 text-[#111b21] break-all">{readTrimmed(activeWhatsappConnection?.phone_number || registrationConfig?.phoneNumber) || '-'}</div>
+                            </div>
+                            <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">Display Name</div>
+                                <div className="mt-1 text-[#111b21] break-all">{readTrimmed(activeWhatsappConnection?.display_name || registrationConfig?.displayName) || '-'}</div>
+                            </div>
+                            <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">Verified Name</div>
+                                <div className="mt-1 text-[#111b21] break-all">{readTrimmed(activeWhatsappConnection?.verified_name || registrationConfig?.verifiedName) || '-'}</div>
+                            </div>
+                            <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">Status</div>
+                                <div className="mt-1 text-[#111b21] break-all">{readTrimmed(activeWhatsappConnection?.status || registrationConfig?.status) || whatsappConnectionStatusLabel}</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div className="mb-4 rounded-xl border border-[#eceff1] bg-[#f8fafc] px-4 py-3">
+                        <div className="text-[10px] font-black uppercase tracking-widest text-[#64748b]">Optional Registration PIN</div>
+                        <p className="mt-1 text-[11px] text-[#54656f]">
+                            Only enter this if Meta asks for a 6-digit phone registration PIN during new number onboarding.
+                        </p>
+                        <input
+                            className="mt-3 w-full bg-white border border-[#dbe3ea] rounded-2xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-[#00a884]/20 focus:border-[#00a884] text-[#111b21] font-bold placeholder-[#aebac1]"
+                            placeholder="6-digit PIN (optional)"
+                            inputMode="numeric"
+                            maxLength={6}
+                            value={embeddedSignupPin}
+                            onChange={e => setEmbeddedSignupPin(e.target.value.replace(/\D+/g, '').slice(0, 6))}
+                        />
+                    </div>
                     <button
-                        onClick={handleConnectWhatsapp}
+                        onClick={handleConnectNewWhatsappNumber}
                         disabled={connectLoading || disconnectLoading || !sessionToken}
                         className="w-full bg-[#111b21] hover:bg-[#202c33] text-white font-black py-4 rounded-2xl transition-all flex items-center justify-center gap-3 shadow-[0_8px_20px_rgba(17,27,33,0.18)] disabled:opacity-50 active:scale-95"
                     >
                         {connectLoading ? <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" /> : <Globe className="w-5 h-5" />}
-                        Connect WhatsApp Business
+                        Connect New WhatsApp API Number
+                    </button>
+                    <p className="mt-2 text-[11px] text-[#54656f]">
+                        Use this if the customer wants to add and verify a new WhatsApp Business API number using Meta Embedded Signup.
+                    </p>
+                    {!newPhoneSignupConfigured && (
+                        <p className="mt-2 text-[11px] text-amber-700 font-semibold">
+                            Frontend Meta SDK env is incomplete. Set VITE_META_APP_ID and VITE_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID.
+                        </p>
+                    )}
+                    <button
+                        type="button"
+                        onClick={() => handleConnectWhatsapp('coexistence')}
+                        disabled={connectLoading || disconnectLoading || !sessionToken}
+                        className="mt-3 w-full bg-[#e6f7f3] hover:bg-[#d3f0e8] text-[#0f766e] border border-[#9fdccf] font-bold py-3 rounded-2xl transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+                    >
+                        {connectLoading ? <div className="w-4 h-4 border-2 border-[#0f766e] border-t-transparent rounded-full animate-spin" /> : <Globe className="w-4 h-4" />}
+                        Connect Existing Business App Number
+                    </button>
+                    <p className="mt-2 text-[11px] text-[#54656f]">
+                        Use this only if the customer already has an existing WhatsApp Business App number or existing Meta WhatsApp asset.
+                    </p>
+                    {!existingAppSignupConfigured && (
+                        <p className="mt-2 text-[11px] text-amber-700 font-semibold">
+                            Existing-app configuration ID is missing on the frontend. The backend fallback may still work if it is configured server-side.
+                        </p>
+                    )}
+                    <button
+                        type="button"
+                        onClick={handleRefreshWhatsappStatus}
+                        disabled={connectLoading || disconnectLoading || !sessionToken}
+                        className="mt-3 w-full bg-white hover:bg-[#f8fafc] text-[#334155] border border-[#dce4ee] font-bold py-3 rounded-2xl transition-all disabled:opacity-50"
+                    >
+                        Refresh Status
                     </button>
                     <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
                         <button
@@ -3217,6 +3667,9 @@ export default function WebhookView({
                             Disconnect + Revoke
                         </button>
                     </div>
+                    {whatsappStatusError && (
+                        <p className="text-sm text-rose-600 mt-4 font-semibold">{whatsappStatusError}</p>
+                    )}
                     {connectError && (
                         <p className="text-sm text-rose-600 mt-4 font-semibold">{connectError}</p>
                     )}

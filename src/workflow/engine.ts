@@ -599,7 +599,7 @@ function evaluateCondition(action: any, state: WorkflowState, user: User, ctx: I
 
 export class WorkflowEngine {
     public async processInbound(ctx: InboundContext): Promise<WorkflowProcessResult> {
-        const user = await findOrCreateUser(ctx.companyId, ctx.phoneNumber)
+        const user = await findOrCreateUser(ctx.companyId, ctx.phoneNumber, ctx.profileId)
         if (!user) return { handled: false, replied: false }
         const isSimulatedInbound = Boolean(ctx.raw?.simulated)
         if (isSimulatedInbound) {
@@ -692,6 +692,7 @@ export class WorkflowEngine {
 
         const inboundRecord = await insertMessage({
             userId: user.id,
+            profileId: ctx.profileId,
             direction: 'in',
             content: inboundContent,
             workflowState: currentState,
@@ -789,6 +790,7 @@ export class WorkflowEngine {
                         await sendWhatsAppMessage({
                             client: ctx.client,
                             userId: user.id,
+                            profileId: ctx.profileId,
                             to: ctx.phoneNumber,
                             type: 'text',
                             content: { text: receiptText },
@@ -841,6 +843,7 @@ export class WorkflowEngine {
                         await sendWhatsAppMessage({
                             client: ctx.client,
                             userId: user.id,
+                            profileId: ctx.profileId,
                             to: ctx.phoneNumber,
                             type: 'text',
                             content: { text: expiredMessage },
@@ -872,6 +875,7 @@ export class WorkflowEngine {
                     await sendWhatsAppMessage({
                         client: ctx.client,
                         userId: user.id,
+                        profileId: ctx.profileId,
                         to: ctx.phoneNumber,
                         type: 'buttons',
                         content: {
@@ -890,6 +894,7 @@ export class WorkflowEngine {
                         await sendWhatsAppMessage({
                             client: ctx.client,
                             userId: user.id,
+                            profileId: ctx.profileId,
                             to: ctx.phoneNumber,
                             type: 'text',
                             content: {
@@ -944,6 +949,7 @@ export class WorkflowEngine {
                     await sendWhatsAppMessage({
                         client: ctx.client,
                         userId: user.id,
+                        profileId: ctx.profileId,
                         to: ctx.phoneNumber,
                         type: 'text',
                         content: { text: renderDynamicText(trimmedFallback, state, user, ctx) },
@@ -988,6 +994,7 @@ export class WorkflowEngine {
                         await sendWhatsAppMessage({
                             client: ctx.client,
                             userId: user.id,
+                            profileId: ctx.profileId,
                             to: ctx.phoneNumber,
                             type: 'text',
                             content: { text: confirmationPrompt },
@@ -1034,6 +1041,7 @@ export class WorkflowEngine {
                         await sendWhatsAppMessage({
                             client: ctx.client,
                             userId: user.id,
+                            profileId: ctx.profileId,
                             to: ctx.phoneNumber,
                             type: 'text',
                             content: { text: renderDynamicText(fallbackMessage, state, user, ctx) },
@@ -1070,6 +1078,7 @@ export class WorkflowEngine {
                             await sendWhatsAppMessage({
                                 client: ctx.client,
                                 userId: user.id,
+                                profileId: ctx.profileId,
                                 to: ctx.phoneNumber,
                                 type: 'text',
                                 content: {
@@ -1094,6 +1103,7 @@ export class WorkflowEngine {
                             await sendWhatsAppMessage({
                                 client: ctx.client,
                                 userId: user.id,
+                                profileId: ctx.profileId,
                                 to: ctx.phoneNumber,
                                 type: 'text',
                                 content: {
@@ -1132,6 +1142,7 @@ export class WorkflowEngine {
                         await sendWhatsAppMessage({
                             client: ctx.client,
                             userId: user.id,
+                            profileId: ctx.profileId,
                             to: ctx.phoneNumber,
                             type: 'text',
                             content: { text: editPrompt },
@@ -1196,6 +1207,7 @@ export class WorkflowEngine {
                     await sendWhatsAppMessage({
                         client: ctx.client,
                         userId: user.id,
+                        profileId: ctx.profileId,
                         to: ctx.phoneNumber,
                         type: 'text',
                         content: { text: trimmedFallback },
@@ -1257,7 +1269,7 @@ export class WorkflowEngine {
     }
 
     public async startWorkflow(ctx: InboundContext, workflowId: string): Promise<WorkflowProcessResult> {
-        const user = await findOrCreateUser(ctx.companyId, ctx.phoneNumber)
+        const user = await findOrCreateUser(ctx.companyId, ctx.phoneNumber, ctx.profileId)
         if (!user) return { handled: false, replied: false }
 
         const workflow = await getWorkflowById(workflowId, ctx.companyId)
@@ -1390,6 +1402,7 @@ export class WorkflowEngine {
                     await sendWhatsAppMessage({
                         client: ctx.client,
                         userId: user.id,
+                        profileId: ctx.profileId,
                         to: ctx.phoneNumber,
                         type: 'text',
                         content: {
@@ -1442,6 +1455,7 @@ export class WorkflowEngine {
                     await sendWhatsAppMessage({
                         client: ctx.client,
                         userId: user.id,
+                        profileId: ctx.profileId,
                         to: ctx.phoneNumber,
                         type: 'text',
                         content: { text: prompt },
@@ -1479,6 +1493,7 @@ export class WorkflowEngine {
                     await sendWhatsAppMessage({
                         client: ctx.client,
                         userId: user.id,
+                        profileId: ctx.profileId,
                         to: ctx.phoneNumber,
                         type: 'text',
                         content: {
@@ -1506,6 +1521,7 @@ export class WorkflowEngine {
                     await sendWhatsAppMessage({
                         client: ctx.client,
                         userId: user.id,
+                        profileId: ctx.profileId,
                         to: ctx.phoneNumber,
                         type: 'template',
                         content: {
@@ -1620,6 +1636,7 @@ export class WorkflowEngine {
                     await sendWhatsAppMessage({
                         client: ctx.client,
                         userId: user.id,
+                        profileId: ctx.profileId,
                         to: ctx.phoneNumber,
                         type: 'buttons',
                         content: {
@@ -1701,6 +1718,7 @@ export class WorkflowEngine {
                     await sendWhatsAppMessage({
                         client: ctx.client,
                         userId: user.id,
+                        profileId: ctx.profileId,
                         to: ctx.phoneNumber,
                         type: 'list',
                         content: {
@@ -1733,6 +1751,7 @@ export class WorkflowEngine {
                     await sendWhatsAppMessage({
                         client: ctx.client,
                         userId: user.id,
+                        profileId: ctx.profileId,
                         to: ctx.phoneNumber,
                         type: 'cta_url',
                         content: {
@@ -1808,6 +1827,7 @@ export class WorkflowEngine {
                     await sendWhatsAppMessage({
                         client: ctx.client,
                         userId: user.id,
+                        profileId: ctx.profileId,
                         to: ctx.phoneNumber,
                         type: 'buttons',
                         content: {
@@ -1854,3 +1874,5 @@ export class WorkflowEngine {
         return result
     }
 }
+
+

@@ -19,14 +19,17 @@ function deriveKey(raw: string): Buffer {
 }
 
 export function getTokenEncryptionKey(): Buffer | null {
-    const raw = process.env.WABA_TOKEN_ENCRYPTION_KEY || process.env.TOKEN_ENCRYPTION_KEY
+    const raw =
+        process.env.WABA_TOKEN_ENCRYPTION_KEY
+        || process.env.TOKEN_ENCRYPTION_KEY
+        || process.env.ENCRYPTION_KEY
     if (!raw) return null
     return deriveKey(raw)
 }
 
 export function encryptToken(plaintext: string): string {
     const key = getTokenEncryptionKey()
-    if (!key) throw new Error('Missing WABA_TOKEN_ENCRYPTION_KEY')
+    if (!key) throw new Error('Missing WABA_TOKEN_ENCRYPTION_KEY or ENCRYPTION_KEY')
 
     const iv = randomBytes(12)
     const cipher = createCipheriv('aes-256-gcm', key, iv)
@@ -42,7 +45,7 @@ export function decryptToken(value: string): string {
     if (!value.startsWith(TOKEN_PREFIX)) return value
 
     const key = getTokenEncryptionKey()
-    if (!key) throw new Error('Missing WABA_TOKEN_ENCRYPTION_KEY')
+    if (!key) throw new Error('Missing WABA_TOKEN_ENCRYPTION_KEY or ENCRYPTION_KEY')
 
     const raw = value.slice(TOKEN_PREFIX.length)
     const parts = raw.split(':')

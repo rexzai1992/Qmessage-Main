@@ -183,6 +183,7 @@ export function registerSocketHandlers(io: Server, ctx: any) {
     const FULL_HISTORY_LIMIT = parseBoundedLimit(process.env.SOCKET_FULL_HISTORY_LIMIT, 60, 20, 500)
     const DELTA_HISTORY_LIMIT = parseBoundedLimit(process.env.SOCKET_DELTA_HISTORY_LIMIT, 40, 10, 500)
     const CONTACT_CACHE_TTL_MS = 15_000
+    const getSyncCacheKey = (companyId: string, profileId: string) => `${companyId}::${profileId}`
     const companySyncCache = new Map<string, {
         loadedAt: number
         userIds: string[]
@@ -190,9 +191,17 @@ export function registerSocketHandlers(io: Server, ctx: any) {
         userMap: Map<string, { phone: string; name: string | null }>
     }>()
 
-    const invalidateCompanySyncCache = (companyId: string | null | undefined) => {
+    const invalidateCompanySyncCache = (companyId: string | null | undefined, profileId?: string | null) => {
         if (!companyId) return
-        companySyncCache.delete(companyId)
+        if (profileId) {
+            companySyncCache.delete(getSyncCacheKey(companyId, profileId))
+            return
+        }
+        for (const key of Array.from(companySyncCache.keys())) {
+            if (key.startsWith(`${companyId}::`)) {
+                companySyncCache.delete(key)
+            }
+        }
     }
 
     const normalizeRefreshRequest = (value: any): {
@@ -220,15 +229,17 @@ export function registerSocketHandlers(io: Server, ctx: any) {
         }
     }
 
-    const getCompanySyncContext = async (
+    const getProfileSyncContext = async (
         companyId: string,
+        profileId: string,
         force = false
     ): Promise<{
         userIds: string[]
         contacts: any[]
         userMap: Map<string, { phone: string; name: string | null }>
     }> => {
-        const cached = companySyncCache.get(companyId)
+        const cacheKey = getSyncCacheKey(companyId, profileId)
+        const cached = companySyncCache.get(cacheKey)
         if (!force && cached && (Date.now() - cached.loadedAt) < CONTACT_CACHE_TTL_MS) {
             return {
                 userIds: cached.userIds,
@@ -237,7 +248,7 @@ export function registerSocketHandlers(io: Server, ctx: any) {
             }
         }
 
-        const users = await getUsersForCompany(companyId)
+        const users = await getUsersForCompany(companyId, profileId)
         const contacts = users.map((u: any) => buildContactPayload(u))
         const userIds = users.map((u: any) => u.id).filter(Boolean)
         const userMap = new Map(
@@ -250,7 +261,7 @@ export function registerSocketHandlers(io: Server, ctx: any) {
             ])
         )
 
-        companySyncCache.set(companyId, {
+        companySyncCache.set(cacheKey, {
             loadedAt: Date.now(),
             userIds,
             contacts,
@@ -281,7 +292,7 @@ export function registerSocketHandlers(io: Server, ctx: any) {
             ? Math.max(1, Math.min(500, Math.floor(options.historyLimit || FULL_HISTORY_LIMIT)))
             : FULL_HISTORY_LIMIT
 
-        const { userIds, contacts, userMap } = await getCompanySyncContext(companyId, forceContactsReload)
+        const { userIds, contacts, userMap } = await getProfileSyncContext(companyId, profileId, forceContactsReload)
 
         if (includeContacts) {
             socket.emit('contacts.update', { profileId, contacts })
@@ -319,7 +330,7 @@ export function registerSocketHandlers(io: Server, ctx: any) {
             ? Math.max(1, Math.min(500, Math.floor(options.limit || DELTA_HISTORY_LIMIT)))
             : DELTA_HISTORY_LIMIT
 
-        const { userIds, contacts, userMap } = await getCompanySyncContext(companyId, forceContactsReload)
+        const { userIds, contacts, userMap } = await getProfileSyncContext(companyId, profileId, forceContactsReload)
 
         if (includeContacts) {
             socket.emit('contacts.update', { profileId, contacts })
@@ -530,38 +541,19 @@ io.on('connection', async (socket) => {
                 ? requestedProfileId.trim()
                 : ''
 
-        if (requested) {
-            const requestedClient = await wabaRegistry.getClientByProfile(requested)
-            if (requestedClient) {
-                const requestedConfig = await wabaRegistry.getConfigByProfile(requested)
-                const requestedCompanyId = await resolveCompanyId(requestedConfig?.companyId || requested)
-                if (requestedCompanyId && requestedCompanyId === companyId) {
-                    return {
-                        profileId: requested,
-                        companyId: requestedCompanyId,
-                        client: requestedClient
-                    }
-                }
-            }
+        if (!requested) return null
+
+        const requestedCompanyId = await getCompanyIdForProfile(requested)
+        if (!requestedCompanyId || requestedCompanyId !== companyId) return null
+
+        const requestedClient = await wabaRegistry.getClientByProfile(requested)
+        if (!requestedClient) return null
+
+        return {
+            profileId: requested,
+            companyId: requestedCompanyId,
+            client: requestedClient
         }
-
-        const activeProfiles = await wabaRegistry.getProfileIds()
-        for (const candidateProfileId of activeProfiles) {
-            const candidateConfig = await wabaRegistry.getConfigByProfile(candidateProfileId)
-            const candidateCompanyId = await resolveCompanyId(candidateConfig?.companyId || candidateProfileId)
-            if (!candidateCompanyId || candidateCompanyId !== companyId) continue
-
-            const candidateClient = await wabaRegistry.getClientByProfile(candidateProfileId)
-            if (!candidateClient) continue
-
-            return {
-                profileId: candidateProfileId,
-                companyId: candidateCompanyId,
-                client: candidateClient
-            }
-        }
-
-        return null
     }
 
     async function enrichProfilesWithConnectionStatus(items: any[]) {
@@ -804,7 +796,7 @@ io.on('connection', async (socket) => {
             }
 
             const phoneNumber = normalizePhoneNumber(jid)
-            const user = await findOrCreateUser(companyId, phoneNumber)
+            const user = await findOrCreateUser(companyId, phoneNumber, profileId)
             if (!user) {
                 socket.emit('profile.error', { message: 'Failed to resolve user.' })
                 return
@@ -821,9 +813,9 @@ io.on('connection', async (socket) => {
             if (Array.isArray(tags)) {
                 await setUserTags(user.id, tags)
             }
-            invalidateCompanySyncCache(companyId)
+            invalidateCompanySyncCache(companyId, profileId)
 
-            const updated = await getUserByPhone(companyId, phoneNumber)
+            const updated = await getUserByPhone(companyId, phoneNumber, profileId)
             if (updated) {
                 io.to(getCompanyRoom(companyId)).emit('contacts.update', {
                     profileId,
@@ -866,7 +858,7 @@ io.on('connection', async (socket) => {
                 return
             }
 
-            const user = await findOrCreateUser(companyId, phoneNumber)
+            const user = await findOrCreateUser(companyId, phoneNumber, profileId)
             if (!user) {
                 const error = 'Failed to resolve contact.'
                 if (typeof ack === 'function') ack({ success: false, error })
@@ -881,7 +873,7 @@ io.on('connection', async (socket) => {
             }
 
             const contactPayload = { ...buildContactPayload(updated), id: `${phoneNumber}@s.whatsapp.net` }
-            invalidateCompanySyncCache(companyId)
+            invalidateCompanySyncCache(companyId, profileId)
             io.to(getCompanyRoom(companyId)).emit('contacts.update', {
                 profileId,
                 contacts: [contactPayload]
@@ -946,7 +938,7 @@ io.on('connection', async (socket) => {
                 return
             }
 
-            const user = await findOrCreateUser(companyId, phoneNumber)
+            const user = await findOrCreateUser(companyId, phoneNumber, profileId)
             if (!user) {
                 const error = 'Failed to resolve contact.'
                 if (typeof ack === 'function') ack({ success: false, error })
@@ -997,7 +989,7 @@ io.on('connection', async (socket) => {
             }
 
             const contactPayload = { ...buildContactPayload(updated), id: `${phoneNumber}@s.whatsapp.net` }
-            invalidateCompanySyncCache(companyId)
+            invalidateCompanySyncCache(companyId, profileId)
             io.to(getCompanyRoom(companyId)).emit('contacts.update', {
                 profileId,
                 contacts: [contactPayload]
@@ -1038,11 +1030,11 @@ io.on('connection', async (socket) => {
                 return
             }
 
-            const user = await getUserByPhone(companyId, phoneNumber)
+            const user = await getUserByPhone(companyId, phoneNumber, profileId)
             if (user) {
                 await deleteMessagesForUser(user.id)
                 await deleteUserById(user.id)
-                invalidateCompanySyncCache(companyId)
+                invalidateCompanySyncCache(companyId, profileId)
             }
 
             io.to(getCompanyRoom(companyId)).emit('messages.cleared', { profileId, jid })
@@ -1152,7 +1144,7 @@ io.on('connection', async (socket) => {
             const resolvedCompanyId = resolvedProfile.companyId
             const recipientId = normalizePhoneNumber(jid)
             const isGroup = jid.endsWith('@g.us')
-            const user = await findOrCreateUser(resolvedCompanyId, recipientId)
+            const user = await findOrCreateUser(resolvedCompanyId, recipientId, profileId)
             if (!user) {
                 socket.emit('profile.error', { message: 'Failed to resolve user.' })
                 if (typeof ack === 'function') ack({ success: false, error: 'Failed to resolve user.' })
@@ -1194,6 +1186,7 @@ io.on('connection', async (socket) => {
             const sent = await sendWhatsAppMessage({
                 client,
                 userId: user.id,
+                profileId,
                 to: recipientId,
                 type: 'text',
                 content: {
@@ -1241,7 +1234,7 @@ io.on('connection', async (socket) => {
                 color: actor.color
             })
             if (assigned) {
-                invalidateCompanySyncCache(resolvedCompanyId)
+                invalidateCompanySyncCache(resolvedCompanyId, profileId)
                 io.to(getCompanyRoom(resolvedCompanyId)).emit('contacts.update', {
                     profileId,
                     contacts: [{ ...buildContactPayload(assigned), id: isGroup ? `${recipientId}@g.us` : `${recipientId}@s.whatsapp.net` }]
@@ -1313,7 +1306,7 @@ io.on('connection', async (socket) => {
             const resolvedCompanyId = resolvedProfile.companyId
             const recipientId = normalizePhoneNumber(jid)
             const isGroup = jid.endsWith('@g.us')
-            const user = await findOrCreateUser(resolvedCompanyId, recipientId)
+            const user = await findOrCreateUser(resolvedCompanyId, recipientId, profileId)
             if (!user) {
                 socket.emit('profile.error', { message: 'Failed to resolve user.' })
                 return
@@ -1323,6 +1316,7 @@ io.on('connection', async (socket) => {
             const sent = await sendWhatsAppMessage({
                 client,
                 userId: user.id,
+                profileId,
                 to: recipientId,
                 type: 'template',
                 content: {
@@ -1360,7 +1354,7 @@ io.on('connection', async (socket) => {
                 color: actor.color
             })
             if (assigned) {
-                invalidateCompanySyncCache(resolvedCompanyId)
+                invalidateCompanySyncCache(resolvedCompanyId, profileId)
                 io.to(getCompanyRoom(resolvedCompanyId)).emit('contacts.update', {
                     profileId,
                     contacts: [{ ...buildContactPayload(assigned), id: isGroup ? `${recipientId}@g.us` : `${recipientId}@s.whatsapp.net` }]
