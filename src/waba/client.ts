@@ -650,6 +650,38 @@ export class WabaClient {
         })
     }
 
+    public async sendCallPermissionRequest(userWaId: string, bodyText: string, phoneNumberId?: string) {
+        const targetPhoneNumberId = phoneNumberId || this.config.phoneNumberId
+        if (!targetPhoneNumberId) {
+            throw new Error('phoneNumberId is required')
+        }
+        const normalizedWaId = this.normalizeUserWaId(userWaId)
+        if (!normalizedWaId) {
+            throw new Error('user_wa_id is required')
+        }
+
+        const payload = {
+            messaging_product: 'whatsapp',
+            recipient_type: 'individual',
+            to: normalizedWaId,
+            type: 'interactive',
+            interactive: {
+                type: 'call_permission_request',
+                action: {
+                    name: 'call_permission_request'
+                },
+                body: {
+                    text: bodyText || 'We would like to call you to help support your request.'
+                }
+            }
+        }
+
+        return this.request(`${targetPhoneNumberId}/messages`, {
+            method: 'POST',
+            json: payload
+        })
+    }
+
     public async manageCall(payload: {
         action: 'connect' | 'pre_accept' | 'accept' | 'reject' | 'terminate'
         to?: string

@@ -41,6 +41,16 @@ export type WabaInboundMessage = {
         type?: string
         button_reply?: { id?: string; title?: string }
         list_reply?: { id?: string; title?: string; description?: string }
+        call_permission_reply?: {
+            response?: string
+            is_permanent?: boolean
+            expiration_timestamp?: string | number
+            response_source?: string
+        }
+    }
+    context?: {
+        id?: string
+        from?: string
     }
     image?: WabaMedia
     document?: WabaMedia
@@ -63,6 +73,16 @@ export type WabaInboundMessage = {
     buttonReplyId?: string
     buttonReplyTitle?: string
     buttonReplyDescription?: string
+    webhookField?: string
+    eventCategory?: 'message' | 'coexistence_history' | 'call_permission_reply'
+    callPermissionReply?: {
+        response?: string
+        isPermanent?: boolean
+        expirationTimestamp?: number | null
+        responseSource?: string
+        contextId?: string | null
+        contextFrom?: string | null
+    } | null
     raw: any
 }
 
@@ -77,6 +97,7 @@ export type WabaStatus = {
     participantRecipientId?: string
     conversation?: any
     pricing?: any
+    webhookField?: string
     raw: any
 }
 
@@ -101,6 +122,7 @@ export type WabaCallUpdate = {
     }
     contactName?: string
     errors?: any[]
+    webhookField?: string
     raw: any
 }
 

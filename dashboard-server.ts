@@ -38,6 +38,18 @@ import { createNativePushTokenStore } from './dashboard-server/services/nativePu
 import { createNativeFcmPushSender } from './dashboard-server/services/fcmNativePush'
 import { createSystemRuntimeStatusStore } from './dashboard-server/services/systemRuntimeStatusStore'
 import { registerSocketHandlers } from './dashboard-server/socket/registerSocketHandlers'
+import {
+    buildWebhookDedupeKey,
+    deriveStoredCallStatus,
+    normalizeStoredCallPermissionStatus,
+    persistRawWebhookEvent,
+    touchWhatsappConnectionWebhook,
+    upsertWhatsappCall,
+    upsertWhatsappCallPermission,
+    upsertWhatsappImportedHistoryMessage,
+    updateWhatsappCallPermissionRequestByMessageId,
+    type MetaWebhookEventType
+} from './src/services/meta-whatsapp-store'
 import { errorHandler } from './dashboard-server/middleware/error'
 import { requireSupabaseUser } from './dashboard-server/middleware/auth'
 
@@ -4320,6 +4332,222 @@ function toMinimalCallRaw(call: WabaCallUpdate): any | null {
     }
 }
 
+function classifyWebhookChange(change: any): MetaWebhookEventType {
+    const field = readTrimmed(change?.field).toLowerCase()
+    const value = change?.value && typeof change.value === 'object' ? change.value : {}
+    const messages = Array.isArray(value?.messages) ? value.messages : []
+    const statuses = Array.isArray(value?.statuses) ? value.statuses : []
+    const calls = Array.isArray(value?.calls) ? value.calls : []
+    const hasPermissionReply = messages.some((msg: any) => {
+        const interactiveType = readTrimmed(msg?.interactive?.type).toLowerCase()
+        return interactiveType === 'call_permission_reply'
+    })
+
+    if (hasPermissionReply) return 'call_permission_reply'
+    if (calls.length > 0) return 'call'
+    if (statuses.length > 0) return 'status'
+    if (field.includes('smb_') || field.includes('history') || field.includes('state_sync')) {
+        return 'coexistence_history'
+    }
+    if (messages.length > 0) return 'message'
+    return 'unknown'
+}
+
+function extractWebhookObjectId(change: any): string {
+    const value = change?.value && typeof change.value === 'object' ? change.value : {}
+    const messages = Array.isArray(value?.messages) ? value.messages : []
+    const statuses = Array.isArray(value?.statuses) ? value.statuses : []
+    const calls = Array.isArray(value?.calls) ? value.calls : []
+    return readTrimmed(messages[0]?.id || statuses[0]?.id || calls[0]?.id)
+}
+
+function extractWebhookOccurredAt(change: any): string | null {
+    const value = change?.value && typeof change.value === 'object' ? change.value : {}
+    const messages = Array.isArray(value?.messages) ? value.messages : []
+    const statuses = Array.isArray(value?.statuses) ? value.statuses : []
+    const calls = Array.isArray(value?.calls) ? value.calls : []
+    const rawTimestamp =
+        messages[0]?.timestamp ??
+        statuses[0]?.timestamp ??
+        calls[0]?.timestamp ??
+        null
+    if (rawTimestamp === null || rawTimestamp === undefined || rawTimestamp === '') return null
+    const numeric = Number(rawTimestamp)
+    if (Number.isFinite(numeric) && numeric > 0) {
+        const milliseconds = numeric > 10_000_000_000 ? numeric : numeric * 1000
+        const date = new Date(milliseconds)
+        if (!Number.isNaN(date.getTime())) return date.toISOString()
+    }
+    const text = readTrimmed(rawTimestamp)
+    if (!text) return null
+    const date = new Date(text)
+    return Number.isNaN(date.getTime()) ? null : date.toISOString()
+}
+
+async function resolveWebhookConfigContext(phoneNumberId: string) {
+    const normalized = readTrimmed(phoneNumberId)
+    if (!normalized) {
+        return {
+            config: null,
+            profileId: '',
+            companyId: '',
+            wabaId: ''
+        }
+    }
+
+    const config = await wabaRegistry.getConfigByPhoneNumberId(normalized)
+    const profileId = readTrimmed(config?.profileId)
+    const companyId = readTrimmed(config?.companyId) || (profileId ? (await getCompanyIdForProfile(profileId)) || '' : '')
+    const wabaId = readTrimmed(config?.wabaId || config?.businessAccountId)
+    return { config, profileId, companyId, wabaId }
+}
+
+async function persistRawWebhookChanges(payload: any) {
+    const entries = Array.isArray(payload?.entry) ? payload.entry : []
+    for (const entry of entries) {
+        const entryId = readTrimmed(entry?.id)
+        const changes = Array.isArray(entry?.changes) ? entry.changes : []
+        for (const change of changes) {
+            try {
+                const value = change?.value && typeof change.value === 'object' ? change.value : {}
+                const phoneNumberId = readTrimmed(value?.metadata?.phone_number_id)
+                const eventType = classifyWebhookChange(change)
+                const objectId = extractWebhookObjectId(change)
+                const occurredAt = extractWebhookOccurredAt(change)
+                const { profileId, companyId, wabaId } = await resolveWebhookConfigContext(phoneNumberId)
+                const dedupeKey = buildWebhookDedupeKey({
+                    entryId,
+                    changeField: readTrimmed(change?.field),
+                    phoneNumberId,
+                    objectId,
+                    timestamp: occurredAt || objectId,
+                    eventType,
+                    raw: change
+                })
+
+                await persistRawWebhookEvent(supabase, {
+                    companyId: companyId || null,
+                    profileId: profileId || null,
+                    phoneNumberId: phoneNumberId || null,
+                    wabaId: wabaId || entryId || null,
+                    webhookField: readTrimmed(change?.field) || null,
+                    eventType,
+                    objectId: objectId || null,
+                    dedupeKey,
+                    occurredAt,
+                    payload: change
+                })
+
+                if (eventType !== 'unknown' && (companyId || profileId || phoneNumberId || wabaId || entryId)) {
+                    await touchWhatsappConnectionWebhook(supabase, {
+                        companyId: companyId || null,
+                        profileId: profileId || null,
+                        phoneNumberId: phoneNumberId || null,
+                        wabaId: wabaId || entryId || null,
+                        lastWebhookAt: occurredAt || new Date().toISOString()
+                    })
+                }
+            } catch (error) {
+                console.warn('[WABA] Failed to persist raw webhook change:', error)
+            }
+        }
+    }
+}
+
+async function persistSpecialWebhookMessages(messages: WabaInboundMessage[]) {
+    for (const inbound of messages) {
+        const category = inbound.eventCategory
+        if (category !== 'call_permission_reply' && category !== 'coexistence_history') continue
+
+        try {
+            const { profileId, companyId, wabaId } = await resolveWebhookConfigContext(inbound.phoneNumberId)
+            if (category === 'call_permission_reply' && inbound.callPermissionReply) {
+                const permissionStatus = normalizeStoredCallPermissionStatus({
+                    response: inbound.callPermissionReply.response,
+                    isPermanent: inbound.callPermissionReply.isPermanent,
+                    expirationTimestamp: inbound.callPermissionReply.expirationTimestamp
+                })
+                await upsertWhatsappCallPermission(supabase, {
+                    companyId: companyId || null,
+                    profileId: profileId || null,
+                    phoneNumberId: inbound.phoneNumberId,
+                    customerWaId: inbound.from,
+                    customerPhoneNumber: normalizePhoneNumber(inbound.from) || null,
+                    permissionStatus,
+                    isPermanent: inbound.callPermissionReply.isPermanent === true,
+                    expirationTimestamp:
+                        inbound.callPermissionReply.expirationTimestamp
+                            ? new Date(inbound.callPermissionReply.expirationTimestamp * 1000).toISOString()
+                            : null,
+                    responseSource: inbound.callPermissionReply.responseSource || null,
+                    contextId: inbound.callPermissionReply.contextId || null,
+                    contextFrom: inbound.callPermissionReply.contextFrom || null,
+                    lastRequestMessageId: inbound.callPermissionReply.contextId || null,
+                    rawPayload: inbound.raw
+                })
+
+                if (inbound.callPermissionReply.contextId) {
+                    await updateWhatsappCallPermissionRequestByMessageId(supabase, {
+                        requestMessageId: inbound.callPermissionReply.contextId,
+                        status: permissionStatus,
+                        metaResponse: inbound.raw
+                    })
+                }
+
+                if (companyId || profileId || inbound.phoneNumberId || wabaId) {
+                    await touchWhatsappConnectionWebhook(supabase, {
+                        companyId: companyId || null,
+                        profileId: profileId || null,
+                        phoneNumberId: inbound.phoneNumberId,
+                        wabaId: wabaId || null,
+                        lastWebhookAt: inbound.timestamp ? new Date(inbound.timestamp * 1000).toISOString() : new Date().toISOString()
+                    })
+                }
+                continue
+            }
+
+            if (category === 'coexistence_history') {
+                const dedupeKey = buildWebhookDedupeKey({
+                    entryId: wabaId || profileId || inbound.phoneNumberId,
+                    changeField: inbound.webhookField,
+                    phoneNumberId: inbound.phoneNumberId,
+                    objectId: inbound.id,
+                    timestamp: inbound.timestamp,
+                    eventType: category,
+                    raw: inbound.raw
+                })
+
+                await upsertWhatsappImportedHistoryMessage(supabase, {
+                    companyId: companyId || null,
+                    profileId: profileId || null,
+                    phoneNumberId: inbound.phoneNumberId,
+                    wabaId: wabaId || null,
+                    dedupeKey,
+                    source: 'coexistence_history',
+                    messageId: inbound.id,
+                    customerWaId: inbound.from,
+                    direction: 'in',
+                    messageType: inbound.type,
+                    messageTimestamp: inbound.timestamp ? new Date(inbound.timestamp * 1000).toISOString() : null,
+                    payload: inbound.raw
+                })
+
+                if (companyId || profileId || inbound.phoneNumberId || wabaId) {
+                    await touchWhatsappConnectionWebhook(supabase, {
+                        companyId: companyId || null,
+                        profileId: profileId || null,
+                        phoneNumberId: inbound.phoneNumberId,
+                        wabaId: wabaId || null,
+                        lastWebhookAt: inbound.timestamp ? new Date(inbound.timestamp * 1000).toISOString() : new Date().toISOString()
+                    })
+                }
+            }
+        } catch (error) {
+            console.warn('[WABA] Failed to persist special webhook message:', error)
+        }
+    }
+}
+
 async function processWebhookQueue() {
     try {
         while (queuedWebhookEvents.length > 0) {
@@ -4801,7 +5029,10 @@ const handleMetaWhatsappWebhook = async (req: any, res: any) => {
             return res.status(401).send('Invalid signature')
         }
 
+        await persistRawWebhookChanges(req.body || {})
+
         const { messages, statuses, calls } = parseWabaWebhook(req.body || {})
+        await persistSpecialWebhookMessages(messages)
         const uniquePhoneNumberIds = Array.from(
             new Set(
                 [...messages, ...statuses, ...calls]
@@ -4815,6 +5046,9 @@ const handleMetaWhatsappWebhook = async (req: any, res: any) => {
         const queueItems: QueuedWebhookEvent[] = []
 
         messages.forEach((msg) => {
+            if (msg.eventCategory === 'call_permission_reply' || msg.eventCategory === 'coexistence_history') {
+                return
+            }
             queueItems.push({
                 kind: 'message',
                 event: {
@@ -7837,10 +8071,58 @@ async function handleCallUpdate(config: WabaConfig, call: WabaCallUpdate) {
 
     const room = getCompanyRoom(companyId)
     const eventName = readTrimmed(call.event).toLowerCase()
+    const normalizedStatus = deriveStoredCallStatus({
+        event: eventName,
+        status: Array.isArray(call.status) ? call.status : [],
+        hasErrors: Array.isArray(call.errors) && call.errors.length > 0,
+        timestamp: call.timestamp
+    })
+
+    const callRow = await upsertWhatsappCall(supabase, {
+        companyId,
+        profileId,
+        phoneNumberId: call.phoneNumberId,
+        wabaId: readTrimmed(config.wabaId || config.businessAccountId) || null,
+        callId: call.id,
+        customerWaId: call.from || null,
+        customerName: call.contactName || null,
+        businessWaId: call.to || null,
+        direction: call.direction || null,
+        event: eventName || call.event || 'unknown',
+        status: normalizedStatus,
+        historyEntry: {
+            source: 'webhook',
+            event: eventName || call.event || 'unknown',
+            status: normalizedStatus,
+            timestamp: call.timestamp || 0,
+            recorded_at: new Date().toISOString()
+        },
+        sessionSdpType: call.session?.sdp_type || null,
+        sessionSdp: call.session?.sdp || null,
+        startTime: call.startTime ? new Date(call.startTime * 1000).toISOString() : null,
+        endTime: call.endTime ? new Date(call.endTime * 1000).toISOString() : null,
+        durationSeconds: call.duration ?? null,
+        deeplinkPayload: call.deeplinkPayload || null,
+        ctaPayload: call.ctaPayload || null,
+        bizOpaqueCallbackData: call.bizOpaqueCallbackData || null,
+        rawPayload: call.raw,
+        metaError: Array.isArray(call.errors) && call.errors.length > 0 ? call.errors : undefined,
+        lastEventAt: call.timestamp ? new Date(call.timestamp * 1000).toISOString() : new Date().toISOString()
+    })
+
+    await touchWhatsappConnectionWebhook(supabase, {
+        companyId,
+        profileId,
+        phoneNumberId: call.phoneNumberId,
+        wabaId: readTrimmed(config.wabaId || config.businessAccountId) || null,
+        lastWebhookAt: call.timestamp ? new Date(call.timestamp * 1000).toISOString() : new Date().toISOString()
+    })
+
     const payload = {
         profileId,
         callId: call.id,
         event: eventName || call.event || 'unknown',
+        normalizedStatus,
         phoneNumberId: call.phoneNumberId,
         from: call.from || null,
         to: call.to || null,
@@ -7856,6 +8138,7 @@ async function handleCallUpdate(config: WabaConfig, call: WabaCallUpdate) {
         session: call.session || null,
         contactName: call.contactName || null,
         errors: Array.isArray(call.errors) ? call.errors : [],
+        persistedCall: callRow || null,
         raw: INCLUDE_RAW_WEBHOOK_EVENT_PAYLOAD ? call.raw : null
     }
 

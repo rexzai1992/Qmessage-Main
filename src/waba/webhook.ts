@@ -35,6 +35,12 @@ export function parseWabaWebhook(payload: any): WabaWebhookParseResult {
     for (const entry of entries) {
         const changes = entry?.changes || []
         for (const change of changes) {
+            const webhookField = typeof change?.field === 'string' ? change.field : ''
+            const normalizedField = webhookField.trim().toLowerCase()
+            const isCoexistenceField =
+                normalizedField.includes('smb_') ||
+                normalizedField.includes('history') ||
+                normalizedField.includes('state_sync')
             const value = change?.value || {}
             const metadata = value?.metadata || {}
             const phoneNumberId = metadata?.phone_number_id
@@ -64,6 +70,33 @@ export function parseWabaWebhook(payload: any): WabaWebhookParseResult {
                     msg?.interactive?.list_reply?.title
                 const buttonReplyDescription =
                     msg?.interactive?.list_reply?.description
+                const interactiveType =
+                    typeof msg?.interactive?.type === 'string'
+                        ? msg.interactive.type.trim().toLowerCase()
+                        : ''
+                const callPermissionReply =
+                    interactiveType === 'call_permission_reply' && msg?.interactive?.call_permission_reply
+                        ? {
+                            response: typeof msg.interactive.call_permission_reply.response === 'string'
+                                ? msg.interactive.call_permission_reply.response
+                                : undefined,
+                            isPermanent: msg.interactive.call_permission_reply.is_permanent === true,
+                            expirationTimestamp:
+                                msg.interactive.call_permission_reply.expiration_timestamp !== undefined
+                                    ? Number(msg.interactive.call_permission_reply.expiration_timestamp || 0)
+                                    : null,
+                            responseSource: typeof msg.interactive.call_permission_reply.response_source === 'string'
+                                ? msg.interactive.call_permission_reply.response_source
+                                : undefined,
+                            contextId: typeof msg?.context?.id === 'string' ? msg.context.id : null,
+                            contextFrom: typeof msg?.context?.from === 'string' ? msg.context.from : null
+                        }
+                        : null
+                const eventCategory = callPermissionReply
+                    ? 'call_permission_reply'
+                    : isCoexistenceField
+                        ? 'coexistence_history'
+                        : 'message'
                 messages.push({
                     phoneNumberId,
                     from: msg.from,
@@ -74,6 +107,12 @@ export function parseWabaWebhook(payload: any): WabaWebhookParseResult {
                     text: msg.text,
                     button: msg.button,
                     interactive: msg.interactive,
+                    context: msg?.context && typeof msg.context === 'object'
+                        ? {
+                            id: typeof msg.context.id === 'string' ? msg.context.id : undefined,
+                            from: typeof msg.context.from === 'string' ? msg.context.from : undefined
+                        }
+                        : undefined,
                     image: msg.image,
                     document: msg.document,
                     audio: msg.audio,
@@ -83,6 +122,9 @@ export function parseWabaWebhook(payload: any): WabaWebhookParseResult {
                     buttonReplyId,
                     buttonReplyTitle,
                     buttonReplyDescription,
+                    webhookField,
+                    eventCategory,
+                    callPermissionReply,
                     raw: msg
                 })
             }
@@ -113,6 +155,7 @@ export function parseWabaWebhook(payload: any): WabaWebhookParseResult {
                         (status?.conversation && typeof status.conversation === 'object'
                             ? status.conversation.pricing
                             : undefined),
+                    webhookField,
                     raw: status
                 })
             }
@@ -152,6 +195,7 @@ export function parseWabaWebhook(payload: any): WabaWebhookParseResult {
                         : undefined,
                     contactName: callFrom ? contactMap.get(callFrom) : undefined,
                     errors: callErrors,
+                    webhookField,
                     raw: call
                 })
             }

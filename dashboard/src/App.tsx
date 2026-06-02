@@ -307,6 +307,29 @@ type OutgoingMessagePayload = {
     media?: SendMediaPayload;
 };
 
+type CallPermissionUiState = {
+    permissionStatus: string;
+    canStartCall: boolean;
+    canRequestPermission: boolean;
+    expirationTime: string | null;
+    storedPermissionStatus: string | null;
+    storedUpdatedAt: string | null;
+};
+
+type IncomingCallState = {
+    callId: string;
+    profileId: string;
+    phoneNumberId: string;
+    from: string | null;
+    to: string | null;
+    direction: string | null;
+    contactName: string | null;
+    normalizedStatus: string;
+    timestamp: number;
+    event: string;
+    loadingAction: 'reject' | 'terminate' | null;
+};
+
 type TemplateBodyAttributePayload = {
     scope: 'body';
     index: number;
@@ -1531,24 +1554,39 @@ const buildCopiedWorkflowRecord = (
     };
 };
 
-const extractCallPermissionSummary = (payload: any): { permissionStatus: string; canStartCall: boolean } => {
+const extractCallPermissionSummary = (payload: any): CallPermissionUiState => {
     const permissionStatus = String(payload?.data?.permission?.status || '').toLowerCase();
+    const expirationTime = typeof payload?.data?.permission?.expiration_time === 'string'
+        ? payload.data.permission.expiration_time
+        : null;
     const actions = Array.isArray(payload?.data?.actions) ? payload.data.actions : [];
     const startAction = actions.find((entry: any) => String(entry?.action_name || '').toLowerCase() === 'start_call');
-    const canStartCall = startAction?.can_perform_action === true;
-    return { permissionStatus, canStartCall };
+    const requestAction = actions.find((entry: any) => String(entry?.action_name || '').toLowerCase() === 'send_call_permission_request');
+    return {
+        permissionStatus,
+        canStartCall: startAction?.can_perform_action === true,
+        canRequestPermission: requestAction?.can_perform_action === true,
+        expirationTime,
+        storedPermissionStatus: typeof payload?.stored_permission?.permission_status === 'string'
+            ? payload.stored_permission.permission_status.toLowerCase()
+            : null,
+        storedUpdatedAt: typeof payload?.stored_permission?.updated_at === 'string'
+            ? payload.stored_permission.updated_at
+            : null
+    };
 };
 
 const getCallPermissionFeedback = (
     kind: 'voice' | 'video',
     permissionStatus: string,
     canStartCall: boolean,
+    canRequestPermission: boolean,
     userWaId: string
 ): { message: string; tone: 'success' | 'error'; logMessage?: string } => {
     const callTypeLabel = kind === 'video' ? 'Video call' : 'Voice call';
-    if (permissionStatus === 'granted' && canStartCall) {
+    if ((permissionStatus === 'granted' || permissionStatus === 'temporary' || permissionStatus === 'permanent') && canStartCall) {
         return {
-            message: `${callTypeLabel} is permitted. Dialer UI not enabled yet.`,
+            message: `${callTypeLabel} is permitted. Live call pickup is not configured yet.`,
             tone: 'success',
             logMessage: `[Calls] ${callTypeLabel} permitted for ${userWaId}.`
         };
@@ -1556,13 +1594,28 @@ const getCallPermissionFeedback = (
     if (permissionStatus === 'pending') {
         return { message: 'Call permission is pending approval from this user.', tone: 'error' };
     }
-    if (permissionStatus === 'denied') {
+    if (permissionStatus === 'denied' || permissionStatus === 'rejected') {
         return { message: 'Call permission was denied by this user.', tone: 'error' };
     }
     if (permissionStatus === 'expired') {
         return { message: 'Call permission has expired. Request permission again.', tone: 'error' };
     }
+    if (canRequestPermission) {
+        return { message: 'This contact can be sent a call permission request from the chat header.', tone: 'error' };
+    }
     return { message: 'Call permission is not available for this contact.', tone: 'error' };
+};
+
+const getCallPermissionBadgeLabel = (state: CallPermissionUiState | null): string => {
+    if (!state) return 'Call: unavailable';
+    if ((state.permissionStatus === 'temporary' || state.permissionStatus === 'permanent' || state.permissionStatus === 'granted') && state.canStartCall) {
+        return state.permissionStatus === 'permanent' ? 'Call: permanent' : 'Call: approved';
+    }
+    if (state.permissionStatus === 'pending') return 'Call: pending';
+    if (state.permissionStatus === 'expired') return 'Call: expired';
+    if (state.permissionStatus === 'rejected' || state.permissionStatus === 'denied') return 'Call: rejected';
+    if (state.canRequestPermission) return 'Call: request needed';
+    return 'Call: unavailable';
 };
 
 const isCallingApiNotEnabledError = (errorMessage: string): boolean => (
@@ -1928,6 +1981,10 @@ export default function App() {
     const [assigningContactId, setAssigningContactId] = useState<string | null>(null);
     const [humanTakeoverSaving, setHumanTakeoverSaving] = useState(false);
     const [callActionLoading, setCallActionLoading] = useState<'voice' | 'video' | null>(null);
+    const [selectedCallPermission, setSelectedCallPermission] = useState<CallPermissionUiState | null>(null);
+    const [callPermissionLoading, setCallPermissionLoading] = useState(false);
+    const [callPermissionRequestLoading, setCallPermissionRequestLoading] = useState(false);
+    const [incomingCalls, setIncomingCalls] = useState<IncomingCallState[]>([]);
     const [mediaCache, setMediaCache] = useState<Record<string, MediaData>>({});
     const [mediaDownloadProgress, setMediaDownloadProgress] = useState<Record<string, MediaDownloadProgressState>>({});
     const [unreadMessagesByChat, setUnreadMessagesByChat] = useState<Record<string, number>>({});
@@ -4308,6 +4365,10 @@ export default function App() {
     }, [selectedChatId, markChatAsRead]);
 
     useEffect(() => {
+        setIncomingCalls([]);
+    }, [activeProfileId]);
+
+    useEffect(() => {
         if (!selectedChatId) return;
         markChatAsRead(selectedChatId);
     }, [selectedChatId, allMessages.length, markChatAsRead]);
@@ -5157,14 +5218,50 @@ export default function App() {
             const callId = typeof data?.callId === 'string' ? data.callId.trim() : '';
             const from = typeof data?.from === 'string' ? data.from.trim() : '';
             const to = typeof data?.to === 'string' ? data.to.trim() : '';
+            const normalizedStatus = typeof data?.normalizedStatus === 'string' ? data.normalizedStatus.trim().toLowerCase() : '';
+            const isRinging = normalizedStatus === 'ringing' || eventName === 'connect';
 
-            if (eventName === 'connect') {
+            if (callId) {
+                setIncomingCalls((prev) => {
+                    const existing = prev.find((entry) => entry.callId === callId);
+                    const nextEntry: IncomingCallState = {
+                        callId,
+                        profileId: typeof data?.profileId === 'string' ? data.profileId : activeProfileIdRef.current || '',
+                        phoneNumberId: typeof data?.phoneNumberId === 'string' ? data.phoneNumberId : '',
+                        from: from || null,
+                        to: to || null,
+                        direction: typeof data?.direction === 'string' ? data.direction : null,
+                        contactName: typeof data?.contactName === 'string' ? data.contactName : null,
+                        normalizedStatus: normalizedStatus || 'unknown',
+                        timestamp: Number(data?.timestamp || Date.now() / 1000),
+                        event: eventName || 'unknown',
+                        loadingAction: existing?.loadingAction || null
+                    };
+
+                    if (isRinging) {
+                        if (existing) {
+                            return prev.map((entry) => entry.callId === callId ? nextEntry : entry);
+                        }
+                        return [nextEntry, ...prev].slice(0, 5);
+                    }
+
+                    if (normalizedStatus === 'terminated' || normalizedStatus === 'rejected' || normalizedStatus === 'missed' || normalizedStatus === 'failed' || eventName === 'terminate' || eventName === 'reject') {
+                        return prev.filter((entry) => entry.callId !== callId);
+                    }
+
+                    return existing
+                        ? prev.map((entry) => entry.callId === callId ? nextEntry : entry)
+                        : prev;
+                });
+            }
+
+            if (isRinging) {
                 pushLog(`[Calls] Incoming call ${callId || '-'} from ${from || 'unknown'} to ${to || '-'}.`, 'info');
                 showToast('Incoming WhatsApp call received.', 'success');
                 return;
             }
 
-            if (eventName === 'terminate') {
+            if (normalizedStatus === 'terminated' || eventName === 'terminate') {
                 pushLog(`[Calls] Call ${callId || '-'} ended.`, 'info');
                 return;
             }
@@ -6762,28 +6859,31 @@ export default function App() {
         }
     }, [activeProfileId, selectedChatId, selectedHumanTakeover, socket]);
 
-    const handleCallAction = useCallback(async (kind: 'voice' | 'video') => {
+    const fetchSelectedCallPermission = useCallback(async (options?: { silent?: boolean }): Promise<CallPermissionUiState | null> => {
         if (!session?.access_token) {
-            showToast('Please login again before checking call permission.', 'error');
-            return;
+            if (!options?.silent) showToast('Please login again before checking call permission.', 'error');
+            return null;
         }
         if (!activeProfileId) {
-            showToast('No active profile selected.', 'error');
-            return;
+            if (!options?.silent) showToast('No active profile selected.', 'error');
+            return null;
         }
-        if (!selectedChatId) return;
+        if (!selectedChatId) return null;
         if (selectedChatId.endsWith('@g.us')) {
-            showToast('Calls are not supported for groups yet.', 'error');
-            return;
+            setSelectedCallPermission(null);
+            if (!options?.silent) showToast('Calls are not supported for groups yet.', 'error');
+            return null;
         }
 
         const userWaId = getCleanId(selectedChatId).replace(/\D/g, '');
         if (!userWaId) {
-            showToast('This contact has no valid WhatsApp ID for calling.', 'error');
-            return;
+            if (!options?.silent) showToast('This contact has no valid WhatsApp ID for calling.', 'error');
+            return null;
         }
 
-        setCallActionLoading(kind);
+        if (!options?.silent) {
+            setCallPermissionLoading(true);
+        }
         try {
             const params = new URLSearchParams({
                 profileId: activeProfileId,
@@ -6800,23 +6900,138 @@ export default function App() {
                 throw new Error(payload?.error || `Failed with status ${response.status}`);
             }
 
-            const { permissionStatus, canStartCall } = extractCallPermissionSummary(payload);
-            const feedback = getCallPermissionFeedback(kind, permissionStatus, canStartCall, userWaId);
+            const summary = extractCallPermissionSummary(payload);
+            setSelectedCallPermission(summary);
+            return summary;
+        } catch (error: any) {
+            if (!options?.silent) {
+                const rawMessage = String(error?.message || '').toLowerCase();
+                if (isCallingApiNotEnabledError(rawMessage)) {
+                    showToast('Meta Calling API is not enabled for this phone number yet. Enable WhatsApp Cloud Calling for this number first.', 'error');
+                } else {
+                    showToast(error?.message || 'Failed to check call permission.', 'error');
+                }
+            }
+            return null;
+        } finally {
+            if (!options?.silent) {
+                setCallPermissionLoading(false);
+            }
+        }
+    }, [activeProfileId, selectedChatId, session?.access_token, showToast]);
+
+    const handleRequestCallPermission = useCallback(async () => {
+        if (!session?.access_token) {
+            showToast('Please login again before requesting call permission.', 'error');
+            return;
+        }
+        if (!activeProfileId || !selectedChatId) return;
+        if (selectedChatId.endsWith('@g.us')) {
+            showToast('Calls are not supported for groups yet.', 'error');
+            return;
+        }
+
+        const userWaId = getCleanId(selectedChatId).replace(/\D/g, '');
+        if (!userWaId) {
+            showToast('This contact has no valid WhatsApp ID for calling.', 'error');
+            return;
+        }
+
+        setCallPermissionRequestLoading(true);
+        try {
+            const response = await fetch(`${SOCKET_URL}/api/whatsapp/calling/request-permission`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${session.access_token}`
+                },
+                body: JSON.stringify({
+                    profileId: activeProfileId,
+                    user_wa_id: userWaId,
+                    body_text: `We would like to call you to help support your request.`
+                })
+            });
+            const payload = await response.json().catch(() => null);
+            if (!response.ok || payload?.success === false) {
+                throw new Error(payload?.error || `Failed with status ${response.status}`);
+            }
+
+            showToast('Call permission request sent.', 'success');
+            pushLog(`[Calls] Permission request sent to ${userWaId}.`, 'info');
+            setSelectedCallPermission((current) => current ? { ...current, canRequestPermission: false, permissionStatus: current.permissionStatus || 'pending' } : {
+                permissionStatus: 'pending',
+                canStartCall: false,
+                canRequestPermission: false,
+                expirationTime: null,
+                storedPermissionStatus: null,
+                storedUpdatedAt: null
+            });
+            void fetchSelectedCallPermission({ silent: true });
+        } catch (error: any) {
+            showToast(error?.message || 'Failed to send call permission request.', 'error');
+        } finally {
+            setCallPermissionRequestLoading(false);
+        }
+    }, [activeProfileId, selectedChatId, session?.access_token, showToast, pushLog, fetchSelectedCallPermission]);
+
+    const handleIncomingCallAction = useCallback(async (callId: string, action: 'reject' | 'terminate') => {
+        if (!session?.access_token) {
+            showToast('Please login again before managing calls.', 'error');
+            return;
+        }
+        if (!activeProfileId) {
+            showToast('No active profile selected.', 'error');
+            return;
+        }
+
+        setIncomingCalls((prev) => prev.map((entry) => entry.callId === callId ? { ...entry, loadingAction: action } : entry));
+        try {
+            const response = await fetch(`${SOCKET_URL}/api/meta/whatsapp/calling/${encodeURIComponent(callId)}/${action}`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${session.access_token}`
+                },
+                body: JSON.stringify({
+                    profileId: activeProfileId
+                })
+            });
+            const payload = await response.json().catch(() => null);
+            if (!response.ok || payload?.success === false) {
+                throw new Error(payload?.error || `Failed with status ${response.status}`);
+            }
+
+            showToast(action === 'reject' ? 'Incoming call rejected.' : 'Call terminated.', 'success');
+            setIncomingCalls((prev) => prev.filter((entry) => entry.callId !== callId));
+        } catch (error: any) {
+            showToast(error?.message || `Failed to ${action} call.`, 'error');
+            setIncomingCalls((prev) => prev.map((entry) => entry.callId === callId ? { ...entry, loadingAction: null } : entry));
+        }
+    }, [activeProfileId, session?.access_token, showToast]);
+
+    const handleCallAction = useCallback(async (kind: 'voice' | 'video') => {
+        const userWaId = selectedChatId ? getCleanId(selectedChatId).replace(/\D/g, '') : '';
+        setCallActionLoading(kind);
+        try {
+            const summary = await fetchSelectedCallPermission();
+            if (!summary) return;
+            const feedback = getCallPermissionFeedback(kind, summary.permissionStatus, summary.canStartCall, summary.canRequestPermission, userWaId);
             showToast(feedback.message, feedback.tone);
             if (feedback.logMessage) {
                 pushLog(feedback.logMessage, 'info');
             }
-        } catch (error: any) {
-            const rawMessage = String(error?.message || '').toLowerCase();
-            if (isCallingApiNotEnabledError(rawMessage)) {
-                showToast('Meta Calling API is not enabled for this phone number yet. Enable WhatsApp Cloud Calling for this number first.', 'error');
-            } else {
-                showToast(error?.message || 'Failed to check call permission.', 'error');
-            }
         } finally {
             setCallActionLoading(null);
         }
-    }, [activeProfileId, selectedChatId, session?.access_token, showToast, pushLog]);
+    }, [selectedChatId, fetchSelectedCallPermission, showToast, pushLog]);
+
+    useEffect(() => {
+        if (!activeProfileId || !selectedChatId || selectedChatId.endsWith('@g.us')) {
+            setSelectedCallPermission(null);
+            return;
+        }
+        void fetchSelectedCallPermission({ silent: true });
+    }, [activeProfileId, selectedChatId, fetchSelectedCallPermission]);
 
     const handleStartWorkflow = () => {
         if (!socket || !selectedChatId || !activeProfileId || !startWorkflowId) return;
@@ -8140,6 +8355,9 @@ export default function App() {
                                                     <span>{selectedHumanTakeover ? 'Human' : 'Bot'}</span>
                                                 </button>
                                             </span>
+                                            <span className="ml-2 inline-flex items-center rounded-full border border-[#d8e6df] bg-white px-2 py-0.5 text-[10px] font-bold text-[#46625b]">
+                                                {callPermissionLoading ? 'Call: loading' : getCallPermissionBadgeLabel(selectedCallPermission)}
+                                            </span>
                                         </>
                                     )}
                                 </p>
@@ -8148,6 +8366,15 @@ export default function App() {
                         <div className="flex items-center gap-6 text-[#54656f]">
                             {!isUiFeatureHidden('calls') && (
                                 <>
+                                    <button
+                                        type="button"
+                                        onClick={() => void handleRequestCallPermission()}
+                                        disabled={!isAdmin || callPermissionRequestLoading || !selectedChatId || selectedChatId.endsWith('@g.us')}
+                                        title="Request call permission"
+                                        className="text-[#54656f] hover:text-[#111b21] transition-colors disabled:opacity-50"
+                                    >
+                                        <Bell className="w-5 h-5" />
+                                    </button>
                                     <button
                                         type="button"
                                         onClick={() => void handleCallAction('video')}
@@ -10144,6 +10371,66 @@ export default function App() {
                             )}
                         </div>
                     </div>
+                </div>
+            )}
+            {incomingCalls.length > 0 && (
+                <div
+                    className="fixed top-4 left-4 z-[275] flex max-w-[420px] flex-col gap-3"
+                    style={{
+                        top: 'max(calc(env(safe-area-inset-top) + 0.5rem), 1rem)',
+                        left: 'max(calc(env(safe-area-inset-left) + 0.5rem), 1rem)',
+                        right: isMobile ? 'max(calc(env(safe-area-inset-right) + 0.5rem), 0.75rem)' : undefined
+                    }}
+                >
+                    {incomingCalls.map((call) => (
+                        <div
+                            key={call.callId}
+                            className="rounded-2xl border border-[#cde7dd] bg-white/98 px-4 py-3 shadow-[0_14px_34px_rgba(0,0,0,0.16)] backdrop-blur-sm"
+                        >
+                            <div className="flex items-start gap-3">
+                                <div className="flex h-11 w-11 items-center justify-center rounded-full bg-[#dcfce7] text-[#047857]">
+                                    <Phone className="h-5 w-5" />
+                                </div>
+                                <div className="min-w-0 flex-1">
+                                    <div className="flex items-center gap-2">
+                                        <p className="truncate text-[13px] font-bold text-[#111b21]">
+                                            {call.contactName || formatPhoneNumber(call.from || '') || call.from || 'Unknown caller'}
+                                        </p>
+                                        <span className="rounded-full bg-[#ecfdf5] px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-[#047857]">
+                                            {call.normalizedStatus || 'ringing'}
+                                        </span>
+                                    </div>
+                                    <p className="mt-0.5 text-[12px] text-[#54656f]">
+                                        {call.from || 'Unknown'} {call.to ? `to ${call.to}` : ''}
+                                    </p>
+                                    <p className="mt-0.5 text-[11px] font-medium text-[#7a8b97]">
+                                        {new Date((call.timestamp || Date.now() / 1000) * 1000).toLocaleTimeString()}
+                                    </p>
+                                    <div className="mt-3 flex items-center gap-2">
+                                        <button
+                                            type="button"
+                                            onClick={() => void handleIncomingCallAction(call.callId, 'reject')}
+                                            disabled={!isAdmin || call.loadingAction !== null}
+                                            className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-1.5 text-[12px] font-bold text-rose-700 transition-all hover:bg-rose-100 disabled:opacity-60"
+                                        >
+                                            Reject
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => void handleIncomingCallAction(call.callId, 'terminate')}
+                                            disabled={!isAdmin || call.loadingAction !== null}
+                                            className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-[12px] font-bold text-slate-700 transition-all hover:bg-slate-100 disabled:opacity-60"
+                                        >
+                                            Terminate
+                                        </button>
+                                        <span className="text-[10px] font-semibold uppercase tracking-wide text-[#8b9aa5]">
+                                            Accept unavailable
+                                        </span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    ))}
                 </div>
             )}
             {appToast && (
