@@ -37,6 +37,7 @@ dev.out.log
 
 # Local binaries
 cloudflared.exe
+.tools/
 
 # Local scratch files
 Could

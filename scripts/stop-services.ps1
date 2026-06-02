@@ -25,7 +25,7 @@ function Stop-FromPidFile {
 
     if ($parsed) {
         try {
-            Stop-Process -Id $processId -Force -ErrorAction Stop
+            & taskkill.exe /PID $processId /T /F | Out-Null
             Write-Output "Stopped $Name PID: $processId"
         } catch {
             Write-Output "$Name PID $processId already stopped."

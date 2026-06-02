@@ -2,6 +2,7 @@
 param(
     [string]$CloudflaredPath = "",
     [string]$CloudflaredConfig = "cloudflared-2fast.yml",
+    [string]$NodeDir = "",
     [switch]$ForceRestart,
     [switch]$IncludeFrontend
 )
@@ -14,6 +15,71 @@ $pidDir = Join-Path $runtimeDir "pids"
 
 New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
 New-Item -ItemType Directory -Force -Path $pidDir | Out-Null
+
+function Resolve-NodeDirectory {
+    param(
+        [string]$RequestedNodeDir
+    )
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+
+    if (-not [string]::IsNullOrWhiteSpace($RequestedNodeDir)) {
+        if ([System.IO.Path]::IsPathRooted($RequestedNodeDir)) {
+            $candidates.Add($RequestedNodeDir)
+        } else {
+            $candidates.Add((Join-Path $repoRoot $RequestedNodeDir))
+        }
+    }
+
+    $toolsDir = Join-Path $repoRoot ".tools"
+    if (Test-Path $toolsDir) {
+        Get-ChildItem -Path $toolsDir -Directory -Filter "node-v*-win-x64" -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            ForEach-Object { $candidates.Add($_.FullName) }
+    }
+
+    $pathNode = Get-Command node.exe -ErrorAction SilentlyContinue
+    if ($null -ne $pathNode -and -not [string]::IsNullOrWhiteSpace($pathNode.Source)) {
+        $candidates.Add((Split-Path -Parent $pathNode.Source))
+    }
+
+    $seen = @{}
+    foreach ($candidate in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) {
+            continue
+        }
+
+        $resolvedCandidate = $candidate
+        try {
+            if (Test-Path $candidate) {
+                $resolvedCandidate = (Resolve-Path $candidate).Path
+            }
+        } catch {
+            $resolvedCandidate = $candidate
+        }
+
+        $key = $resolvedCandidate.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) {
+            continue
+        }
+        $seen[$key] = $true
+
+        if ((Test-Path (Join-Path $resolvedCandidate "node.exe")) -and (Test-Path (Join-Path $resolvedCandidate "npm.cmd"))) {
+            return $resolvedCandidate
+        }
+    }
+
+    return $null
+}
+
+$resolvedNodeDir = Resolve-NodeDirectory -RequestedNodeDir $NodeDir
+if ($null -ne $resolvedNodeDir) {
+    $env:Path = "$resolvedNodeDir;$env:Path"
+    $env:npm_config_cache = Join-Path $repoRoot ".tools\npm-cache"
+    Write-Output "Using Node runtime: $resolvedNodeDir"
+} else {
+    Write-Output "No bundled Node runtime found; using node/npm from system PATH."
+}
 
 function Get-RunningProcessFromPidFile {
     param(
@@ -50,12 +116,37 @@ function Stop-ExistingByPidFile {
 
     $proc = Get-RunningProcessFromPidFile -PidFile $PidFile
     if ($null -ne $proc) {
-        Stop-Process -Id $proc.Id -Force
+        & taskkill.exe /PID $proc.Id /T /F | Out-Null
         Start-Sleep -Milliseconds 400
     }
 
     if (Test-Path $PidFile) {
         Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Stop-RepoListenerOnPort {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Port
+    )
+
+    $listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    foreach ($listener in $listeners) {
+        $processId = [int]$listener.OwningProcess
+        if ($processId -le 0) {
+            continue
+        }
+
+        $procInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
+        if ($null -eq $procInfo -or [string]::IsNullOrWhiteSpace($procInfo.CommandLine)) {
+            continue
+        }
+
+        if ($procInfo.CommandLine -like "*$repoRoot*") {
+            & taskkill.exe /PID $processId /T /F | Out-Null
+            Start-Sleep -Milliseconds 400
+        }
     }
 }
 
@@ -67,6 +158,8 @@ if ($ForceRestart) {
     Stop-ExistingByPidFile -PidFile $backendPidFile
     Stop-ExistingByPidFile -PidFile $frontendPidFile
     Stop-ExistingByPidFile -PidFile $cloudflaredPidFile
+    Stop-RepoListenerOnPort -Port 3000
+    Stop-RepoListenerOnPort -Port 5173
 }
 
 $backendOut = Join-Path $runtimeDir "dev.out.log"
@@ -106,6 +199,7 @@ function Start-ManagedProcess {
         -WorkingDirectory $WorkingDirectory `
         -RedirectStandardOutput $StdOutLog `
         -RedirectStandardError $StdErrLog `
+        -WindowStyle Hidden `
         -PassThru
 
     Start-Sleep -Milliseconds 700
@@ -195,6 +289,7 @@ if ($null -eq $cloudProc) {
         -WorkingDirectory $repoRoot `
         -RedirectStandardOutput $tunnelOut `
         -RedirectStandardError $tunnelErr `
+        -WindowStyle Hidden `
         -PassThru
 
     Start-Sleep -Milliseconds 700

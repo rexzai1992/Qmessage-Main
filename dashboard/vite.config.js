@@ -2,8 +2,14 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 
+const buildId = process.env.QMESSAGE_BUILD_ID
+    || new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14)
+
 // https://vitejs.dev/config/
 export default defineConfig({
+    define: {
+        __QMESSAGE_BUILD_ID__: JSON.stringify(buildId),
+    },
     plugins: [
         react(),
         tailwindcss(),
@@ -11,7 +17,7 @@ export default defineConfig({
     server: {
         host: true,
         port: 5173,
-        strictPort: false,
+        strictPort: true,
         allowedHosts: ['2fast.xyz', '.2fast.xyz', 'localhost', '127.0.0.1'],
         proxy: {
             '/api': {

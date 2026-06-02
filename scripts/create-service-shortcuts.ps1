@@ -2,7 +2,8 @@
 param(
     [string]$ShortcutName = "Qmessage Main Services",
     [string]$CloudflaredPath = "",
-    [string]$CloudflaredConfig = "cloudflared-2fast.yml"
+    [string]$CloudflaredConfig = "cloudflared-2fast.yml",
+    [bool]$IncludeFrontend = $true
 )
 
 $ErrorActionPreference = "Stop"
@@ -42,7 +43,8 @@ if (-not (Test-Path $resolvedConfig)) {
 }
 
 $powerShellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-$arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$startScriptPath`" -CloudflaredPath `"$resolvedCloudflaredPath`" -CloudflaredConfig `"$resolvedConfig`""
+$includeFrontendArg = if ($IncludeFrontend) { " -IncludeFrontend" } else { "" }
+$arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$startScriptPath`" -CloudflaredPath `"$resolvedCloudflaredPath`" -CloudflaredConfig `"$resolvedConfig`"$includeFrontendArg"
 
 $startupFolder = [Environment]::GetFolderPath("Startup")
 $desktopFolder = [Environment]::GetFolderPath("Desktop")

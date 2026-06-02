@@ -6,6 +6,7 @@ import './index.css'
 
 const PWA_UPDATE_AVAILABLE_EVENT = 'qmessage:pwa-update-available';
 const CHUNK_ERROR_RELOAD_KEY = 'qmessage:chunk-error-reload:v1';
+const SERVICE_WORKER_URL = `/sw.js?build=${encodeURIComponent(__QMESSAGE_BUILD_ID__)}`;
 
 const isChunkLoadError = (value: unknown): boolean => {
     const text = String(value ?? '').toLowerCase();
@@ -50,7 +51,7 @@ const dispatchPwaUpdateAvailable = (registration: ServiceWorkerRegistration) => 
 
 if ('serviceWorker' in navigator && import.meta.env.PROD && !Capacitor.isNativePlatform()) {
     window.addEventListener('load', () => {
-        navigator.serviceWorker.register('/sw.js')
+        navigator.serviceWorker.register(SERVICE_WORKER_URL)
             .then((registration) => {
                 dispatchPwaUpdateAvailable(registration);
 

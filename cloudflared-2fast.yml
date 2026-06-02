@@ -1,8 +1,50 @@
 tunnel: 0bcd5d57-0dc6-4353-b5c8-f81c3ac80180
-credentials-file: C:/Users/Admin/.cloudflared/0bcd5d57-0dc6-4353-b5c8-f81c3ac80180.json
+credentials-file: C:/Users/Admin/user/.cloudflared/0bcd5d57-0dc6-4353-b5c8-f81c3ac80180.json
 
 ingress:
   - hostname: 2fast.xyz
+    path: /api/*
+    service: http://localhost:3000
+  - hostname: 2fast.xyz
+    path: /socket.io/*
+    service: http://localhost:3000
+  - hostname: 2fast.xyz
+    path: /addon*
+    service: http://localhost:3000
+  - hostname: 2fast.xyz
+    path: /webhook*
+    service: http://localhost:3000
+  - hostname: 2fast.xyz
+    path: /health
+    service: http://localhost:3000
+  - hostname: 2fast.xyz
+    path: /auth/*
+    service: http://localhost:3000
+  - hostname: 2fast.xyz
+    path: /my*
+    service: http://localhost:3000
+  - hostname: 2fast.xyz
+    path: /support
+    service: http://localhost:3000
+  - hostname: 2fast.xyz
+    path: /simulated-payment*
+    service: http://localhost:3000
+  - hostname: 2fast.xyz
+    path: /customixie*
+    service: http://localhost:3000
+  - hostname: 2fast.xyz
+    service: http://localhost:3000
+  - hostname: '*.2fast.xyz'
+    path: /api/*
+    service: http://localhost:3000
+  - hostname: '*.2fast.xyz'
+    path: /socket.io/*
+    service: http://localhost:3000
+  - hostname: '*.2fast.xyz'
+    path: /addon*
+    service: http://localhost:3000
+  - hostname: '*.2fast.xyz'
+    path: /webhook*
     service: http://localhost:3000
   - hostname: '*.2fast.xyz'
     service: http://localhost:3000
