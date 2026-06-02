@@ -11,15 +11,15 @@ const META_ALLOWED_EMBEDDED_SIGNUP_ORIGINS = new Set([
     'https://web.facebook.com'
 ]);
 const META_SDK_SCRIPT_ID = 'meta-facebook-jssdk';
-const META_APP_ID = typeof import.meta.env.VITE_META_APP_ID === 'string' ? import.meta.env.VITE_META_APP_ID.trim() : '';
-const META_GRAPH_VERSION = typeof import.meta.env.VITE_META_GRAPH_VERSION === 'string' && import.meta.env.VITE_META_GRAPH_VERSION.trim()
+const DEFAULT_META_APP_ID = typeof import.meta.env.VITE_META_APP_ID === 'string' ? import.meta.env.VITE_META_APP_ID.trim() : '';
+const DEFAULT_META_GRAPH_VERSION = typeof import.meta.env.VITE_META_GRAPH_VERSION === 'string' && import.meta.env.VITE_META_GRAPH_VERSION.trim()
     ? import.meta.env.VITE_META_GRAPH_VERSION.trim()
     : 'v24.0';
-const META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID =
+const DEFAULT_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID =
     typeof import.meta.env.VITE_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID === 'string'
         ? import.meta.env.VITE_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID.trim()
         : '';
-const META_WA_EXISTING_APP_CONFIGURATION_ID =
+const DEFAULT_META_WA_EXISTING_APP_CONFIGURATION_ID =
     typeof import.meta.env.VITE_META_WA_EXISTING_APP_CONFIGURATION_ID === 'string'
         ? import.meta.env.VITE_META_WA_EXISTING_APP_CONFIGURATION_ID.trim()
         : '';
@@ -45,7 +45,7 @@ const initializeMetaSdk = (appId: string, version: string) => {
 
 const loadMetaSdk = async (appId: string, version: string) => {
     if (!appId) {
-        throw new Error('Missing VITE_META_APP_ID.');
+        throw new Error('Missing Meta App ID.');
     }
     if (window.FB && typeof window.FB.login === 'function') {
         return initializeMetaSdk(appId, version);
@@ -1004,12 +1004,12 @@ export default function WebhookView({
             setConnectError('Profile ID is missing.');
             return;
         }
-        if (!META_APP_ID) {
-            setConnectError('Missing VITE_META_APP_ID.');
+        if (!resolvedMetaAppId) {
+            setConnectError('Missing Meta App ID. Set META_APP_ID or VITE_META_APP_ID.');
             return;
         }
-        if (!META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID) {
-            setConnectError('Missing VITE_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID.');
+        if (!resolvedEmbeddedSignupV4ConfigId) {
+            setConnectError('Missing Embedded Signup v4 configuration ID. Set META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID or VITE_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID.');
             return;
         }
 
@@ -1028,7 +1028,7 @@ export default function WebhookView({
         setDisconnectError(null);
         setDisconnectNotice(null);
         try {
-            const FB = await loadMetaSdk(META_APP_ID, META_GRAPH_VERSION);
+            const FB = await loadMetaSdk(resolvedMetaAppId, resolvedMetaGraphVersion);
             let cleanupSignupListener = () => {};
 
             const signupPromise = new Promise<{ wabaId: string; phoneNumberId: string; businessId: string | null }>((resolve, reject) => {
@@ -1087,7 +1087,7 @@ export default function WebhookView({
 
             const loginResponse = await new Promise<any>((resolve) => {
                 FB.login((response: any) => resolve(response), {
-                    config_id: META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID,
+                    config_id: resolvedEmbeddedSignupV4ConfigId,
                     response_type: 'code',
                     override_default_response_type: true,
                     extras: {
@@ -3244,6 +3244,14 @@ export default function WebhookView({
                 ? 'text-rose-700 bg-rose-50 border-rose-200'
                 : 'text-[#54656f] bg-[#f0f2f5] border-[#eceff1]';
     const activeWhatsappConnection = whatsappStatus?.connection || null;
+    const resolvedMetaAppId = readTrimmed(registrationConfig?.metaAppId) || DEFAULT_META_APP_ID;
+    const resolvedMetaGraphVersion = readTrimmed(registrationConfig?.metaGraphVersion) || DEFAULT_META_GRAPH_VERSION;
+    const resolvedEmbeddedSignupV4ConfigId =
+        readTrimmed(registrationConfig?.embeddedSignupV4ConfigId) || DEFAULT_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID;
+    const resolvedExistingAppConfigId =
+        readTrimmed(registrationConfig?.existingAppConfigId)
+        || DEFAULT_META_WA_EXISTING_APP_CONFIGURATION_ID
+        || resolvedEmbeddedSignupV4ConfigId;
     const hasActiveWabaConnection = Boolean(
         activeWhatsappConnection
         || (
@@ -3255,8 +3263,8 @@ export default function WebhookView({
             )
         )
     );
-    const newPhoneSignupConfigured = Boolean(META_APP_ID && META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID);
-    const existingAppSignupConfigured = Boolean(META_WA_EXISTING_APP_CONFIGURATION_ID);
+    const newPhoneSignupConfigured = Boolean(resolvedMetaAppId && resolvedEmbeddedSignupV4ConfigId);
+    const existingAppSignupConfigured = Boolean(resolvedExistingAppConfigId);
     const whatsappConnectionStatusLabel =
         connectLoading
             ? 'Connecting...'
@@ -3619,7 +3627,7 @@ export default function WebhookView({
                     </p>
                     {!newPhoneSignupConfigured && (
                         <p className="mt-2 text-[11px] text-amber-700 font-semibold">
-                            Frontend Meta SDK env is incomplete. Set VITE_META_APP_ID and VITE_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID.
+                            Meta signup config is incomplete. Set META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID in .env, or VITE_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID if you want it baked into the frontend build.
                         </p>
                     )}
                     <button
@@ -3636,7 +3644,7 @@ export default function WebhookView({
                     </p>
                     {!existingAppSignupConfigured && (
                         <p className="mt-2 text-[11px] text-amber-700 font-semibold">
-                            Existing-app configuration ID is missing on the frontend. The backend fallback may still work if it is configured server-side.
+                            Existing-app configuration ID is still missing. Set META_WA_EXISTING_APP_CONFIGURATION_ID in .env, or VITE_META_WA_EXISTING_APP_CONFIGURATION_ID if you want it baked into the frontend build.
                         </p>
                     )}
                     <button

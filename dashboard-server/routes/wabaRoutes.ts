@@ -2649,10 +2649,6 @@ app.get('/api/waba/registration/config', async (req: any, res: any) => {
             return res.status(500).json({ success: false, error: connectionRowError.message })
         }
 
-        if (!config && !configRow) {
-            return res.status(404).json({ success: false, error: 'WABA config not found for this profile.' })
-        }
-
         const connectedCompanyId = trimText(configRow?.company_id || config?.companyId)
         const connectedWabaId = trimText(config?.wabaId || config?.businessAccountId || configRow?.waba_id || configRow?.business_account_id)
         const connectedBusinessId = trimText(config?.businessId || configRow?.business_id)
@@ -2667,6 +2663,10 @@ app.get('/api/waba/registration/config', async (req: any, res: any) => {
             data: {
                 profileId: access.profileId,
                 companyId: access.companyId,
+                metaAppId: resolveMetaAppIdFromEnv() || null,
+                metaGraphVersion: resolveMetaGraphVersionFromEnv('v24.0'),
+                embeddedSignupV4ConfigId: resolveMetaEmbeddedSignupV4ConfigIdFromEnv() || null,
+                existingAppConfigId: resolveMetaExistingAppConfigIdFromEnv() || null,
                 connectedCompanyId: connectedCompanyId || null,
                 connectedCompanyMismatch: Boolean(connectedCompanyId && connectedCompanyId !== access.companyId),
                 businessId: connectedBusinessId || null,
