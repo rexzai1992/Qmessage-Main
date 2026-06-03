@@ -1368,6 +1368,30 @@ const getLatestTimestampFromMessages = (messages: Message[]): number => {
 
 const trimString = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
 
+const normalizeWebRtcSdp = (value: unknown): string => {
+    if (typeof value !== 'string') return '';
+    const normalized = value
+        .replace(/^\uFEFF/, '')
+        .replace(/\u0000/g, '')
+        .replace(/\r\n|\r|\n/g, '\r\n')
+        .replace(/^(?:\r\n)+/, '')
+        .replace(/(?:\r\n)+$/, '');
+    return normalized ? `${normalized}\r\n` : '';
+};
+
+const normalizeCallSessionPayload = (value: unknown): CallSessionPayload | null => {
+    if (!value || typeof value !== 'object') return null;
+    const raw = value as { sdp_type?: unknown; sdpType?: unknown; sdp?: unknown };
+    const sdpType = trimString(raw.sdp_type || raw.sdpType).toLowerCase();
+    if (sdpType !== 'offer' && sdpType !== 'answer') return null;
+    const sdp = normalizeWebRtcSdp(raw.sdp);
+    if (!sdp) return null;
+    return {
+        sdp_type: sdpType,
+        sdp
+    };
+};
+
 const createClientTempMessageId = (): string => `tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
 const createSendMediaPayload = (
@@ -5586,12 +5610,7 @@ export default function App() {
             const acceptedByName = typeof data?.acceptedByName === 'string' ? data.acceptedByName.trim() : '';
             const acceptedAt = typeof data?.acceptedAt === 'string' ? data.acceptedAt.trim() : '';
             const claimExpiresAt = typeof data?.claimExpiresAt === 'string' ? data.claimExpiresAt.trim() : '';
-            const sessionPayload = data?.session && typeof data.session === 'object' && typeof data.session.sdp === 'string' && typeof data.session.sdp_type === 'string'
-                ? {
-                    sdp_type: data.session.sdp_type.trim().toLowerCase() as 'offer' | 'answer',
-                    sdp: data.session.sdp
-                }
-                : null;
+            const sessionPayload = normalizeCallSessionPayload(data?.session);
             const isRinging = normalizedStatus === 'ringing';
             const normalizedPartyId = getCleanId(from || to).replace(/\D/g, '');
             const browserSession = browserVoiceCallSessionRef.current;
@@ -5629,8 +5648,9 @@ export default function App() {
                         && !browserSession.remoteDescriptionApplied
                     ) {
                         browserSession.remoteDescriptionApplied = true;
+                        const remoteAnswerSdp = normalizeWebRtcSdp(sessionPayload.sdp);
                         void browserSession.peerConnection
-                            .setRemoteDescription({ type: 'answer', sdp: sessionPayload.sdp })
+                            .setRemoteDescription({ type: 'answer', sdp: remoteAnswerSdp })
                             .then(() => {
                                 setActiveVoiceCall((current) => current ? { ...current, status: 'connecting' } : current);
                             })
@@ -7469,7 +7489,7 @@ export default function App() {
         setIncomingCalls((prev) => prev.map((entry) => entry.callId === callId ? { ...entry, loadingAction: 'accept' } : entry));
 
         try {
-            let sessionPayload = fallbackCall.session;
+            let sessionPayload = normalizeCallSessionPayload(fallbackCall.session);
             let phoneNumberId = fallbackCall.phoneNumberId;
             let fromWaId = fallbackCall.from;
             let remoteLabel = fallbackCall.contactName || formatPhoneNumber(fallbackCall.from || '') || fallbackCall.from || 'Unknown caller';
@@ -7481,11 +7501,9 @@ export default function App() {
             const storedClaimExpiresAt = trimString(storedCall?.claim_expires_at);
 
             if (storedCall) {
-                if (storedCall?.session?.sdp && storedCall?.session?.sdp_type === 'offer') {
-                    sessionPayload = {
-                        sdp: storedCall.session.sdp,
-                        sdp_type: 'offer'
-                    };
+                const storedSessionPayload = normalizeCallSessionPayload(storedCall?.session);
+                if (storedSessionPayload?.sdp_type === 'offer') {
+                    sessionPayload = storedSessionPayload;
                 }
                 phoneNumberId = trimString(storedCall.phone_number_id) || phoneNumberId;
                 fromWaId = trimString(storedCall.customer_id) || fromWaId;
@@ -7497,11 +7515,8 @@ export default function App() {
                     from: trimString(storedCall.customer_id) || entry.from,
                     contactName: trimString(storedCall.customer_name) || entry.contactName,
                     normalizedStatus: storedStatus || entry.normalizedStatus,
-                    session: storedCall?.session?.sdp && storedCall?.session?.sdp_type === 'offer'
-                        ? {
-                            sdp: storedCall.session.sdp,
-                            sdp_type: 'offer'
-                        }
+                    session: storedSessionPayload?.sdp_type === 'offer'
+                        ? storedSessionPayload
                         : entry.session,
                     acceptedByUserId: storedAcceptedByUserId || null,
                     acceptedByName: storedAcceptedByName || null,
@@ -7560,9 +7575,10 @@ export default function App() {
                 callId
             });
 
+            const remoteOfferSdp = normalizeWebRtcSdp(sessionPayload.sdp);
             await browserSession.peerConnection.setRemoteDescription({
                 type: 'offer',
-                sdp: sessionPayload.sdp
+                sdp: remoteOfferSdp
             });
             browserSession.remoteDescriptionApplied = true;
 
@@ -7570,7 +7586,7 @@ export default function App() {
             await browserSession.peerConnection.setLocalDescription(answer);
             await waitForIceGatheringComplete(browserSession.peerConnection);
 
-            const finalSdp = trimString(browserSession.peerConnection.localDescription?.sdp);
+            const finalSdp = normalizeWebRtcSdp(browserSession.peerConnection.localDescription?.sdp);
             if (!finalSdp) {
                 throw new Error('Failed to generate a local audio answer.');
             }
@@ -7730,7 +7746,7 @@ export default function App() {
             await browserSession.peerConnection.setLocalDescription(offer);
             await waitForIceGatheringComplete(browserSession.peerConnection);
 
-            const finalSdp = trimString(browserSession.peerConnection.localDescription?.sdp);
+            const finalSdp = normalizeWebRtcSdp(browserSession.peerConnection.localDescription?.sdp);
             if (!finalSdp) {
                 throw new Error('Failed to generate a local call offer.');
             }

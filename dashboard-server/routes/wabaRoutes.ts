@@ -47,6 +47,29 @@ function trimText(value: any): string {
     return typeof value === 'string' ? value.trim() : ''
 }
 
+function normalizeWebRtcSdp(value: any): string {
+    if (typeof value !== 'string') return ''
+    const normalized = value
+        .replace(/^\uFEFF/, '')
+        .replace(/\u0000/g, '')
+        .replace(/\r\n|\r|\n/g, '\r\n')
+        .replace(/^(?:\r\n)+/, '')
+        .replace(/(?:\r\n)+$/, '')
+    return normalized ? `${normalized}\r\n` : ''
+}
+
+function buildCallSessionPayload(rawSession: any): { sdp_type: 'offer' | 'answer'; sdp: string } | undefined {
+    const sessionSdpType = trimText(rawSession?.sdp_type || rawSession?.sdpType).toLowerCase()
+    const sessionSdp = normalizeWebRtcSdp(rawSession?.sdp)
+    if ((sessionSdpType === 'offer' || sessionSdpType === 'answer') && sessionSdp) {
+        return {
+            sdp_type: sessionSdpType,
+            sdp: sessionSdp
+        }
+    }
+    return undefined
+}
+
 function sanitizeCommandName(value: any): string {
     return trimText(value).replace(/^\/+/, '').toLowerCase()
 }
@@ -286,11 +309,7 @@ function buildEmbeddedSignupExtras(params: {
         }
     }
 
-    const extras: Record<string, any> = {
-        feature: 'whatsapp_embedded_signup',
-        version: 2,
-        setup
-    }
+    const extras: Record<string, any> = { setup }
 
     if (featureType) {
         extras.featureType = featureType
@@ -549,6 +568,7 @@ function resolveMetaCoexistenceConfigIdFromEnv(): string {
         || process.env.WABA_COEXISTENCE_CONFIGURATION_ID
         || process.env.META_WA_EXISTING_APP_CONFIGURATION_ID
         || process.env.WABA_EXISTING_APP_CONFIGURATION_ID
+        || resolveMetaEmbeddedSignupV4ConfigIdFromEnv()
     )
 }
 
@@ -966,7 +986,7 @@ export function registerWabaRoutes(app: Express, ctx: any) {
         const appId = resolveMetaAppIdFromEnv()
         const appSecret = resolveMetaAppSecretFromEnv()
         const verifyToken = resolveMetaVerifyTokenFromEnv()
-        const apiVersion = resolveMetaGraphVersionFromEnv('v24.0')
+        const apiVersion = resolveMetaGraphVersionFromEnv('v25.0')
         if (!appId || !appSecret) {
             const error: any = new Error('Missing META_APP_ID or META_APP_SECRET')
             error.status = 500
@@ -1542,7 +1562,7 @@ export function registerWabaRoutes(app: Express, ctx: any) {
                     .eq('profile_id', trimText(row?.profile_id))
                     .maybeSingle()
 
-                const apiVersion = trimText(configRow?.api_version) || resolveMetaGraphVersionFromEnv('v24.0')
+                const apiVersion = trimText(configRow?.api_version) || resolveMetaGraphVersionFromEnv('v25.0')
                 const { wabaDetails, phoneDetails } = await fetchWabaAndPhoneDetails({
                     accessToken,
                     apiVersion,
@@ -1600,7 +1620,7 @@ export function registerWabaRoutes(app: Express, ctx: any) {
         if (params.revoke && wabaId) {
             try {
                 const token = decryptToken(config.system_user_token || config.access_token)
-                await unsubscribeWabaApp(wabaId, token, config.api_version || resolveMetaGraphVersionFromEnv('v24.0'))
+                await unsubscribeWabaApp(wabaId, token, config.api_version || resolveMetaGraphVersionFromEnv('v25.0'))
                 unsubscribed = true
             } catch (error: any) {
                 unsubscribeError = error?.message || 'Failed to unsubscribe app'
@@ -1689,7 +1709,7 @@ export function registerWabaRoutes(app: Express, ctx: any) {
 
         const configId = resolveMetaCoexistenceConfigIdFromEnv()
         if (!configId) {
-            const error: any = new Error('Missing META_WA_COEXISTENCE_CONFIGURATION_ID or META_WA_EXISTING_APP_CONFIGURATION_ID')
+            const error: any = new Error('Missing META_WA_COEXISTENCE_CONFIGURATION_ID, META_WA_EXISTING_APP_CONFIGURATION_ID, or META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID')
             error.status = 500
             throw error
         }
@@ -2334,7 +2354,7 @@ app.get('/api/waba/embedded-signup/url', async (req: any, res: any) => {
         if (featureType === 'whatsapp_business_app_onboarding' && !configId) {
             return res.status(500).json({
                 success: false,
-                error: 'Missing META_WA_COEXISTENCE_CONFIGURATION_ID or META_WA_EXISTING_APP_CONFIGURATION_ID'
+                error: 'Missing META_WA_COEXISTENCE_CONFIGURATION_ID, META_WA_EXISTING_APP_CONFIGURATION_ID, or META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID'
             })
         }
         const oauthMode = resolveOauthMode(configId)
@@ -2426,7 +2446,7 @@ app.post('/api/whatsapp/embedded-signup/v4/complete', async (req: any, res: any)
         const appId = resolveMetaAppIdFromEnv()
         const appSecret = resolveMetaAppSecretFromEnv()
         const verifyToken = resolveMetaVerifyTokenFromEnv()
-        const apiVersion = resolveMetaGraphVersionFromEnv('v24.0')
+        const apiVersion = resolveMetaGraphVersionFromEnv('v25.0')
         if (!appId || !appSecret) {
             return res.status(500).json({ success: false, error: 'Missing META_APP_ID or META_APP_SECRET' })
         }
@@ -2635,7 +2655,7 @@ app.post('/api/whatsapp/refresh-status', async (req: any, res: any) => {
                     .eq('profile_id', trimText(row?.profile_id))
                     .maybeSingle()
 
-                const apiVersion = trimText(configRow?.api_version) || resolveMetaGraphVersionFromEnv('v24.0')
+                const apiVersion = trimText(configRow?.api_version) || resolveMetaGraphVersionFromEnv('v25.0')
                 const { wabaDetails, phoneDetails } = await fetchWabaAndPhoneDetails({
                     accessToken,
                     apiVersion,
@@ -2727,7 +2747,7 @@ app.post('/api/whatsapp/disconnect', async (req: any, res: any) => {
         if (revoke && wabaId) {
             try {
                 const token = decryptToken(config.system_user_token || config.access_token)
-                await unsubscribeWabaApp(wabaId, token, config.api_version || resolveMetaGraphVersionFromEnv('v24.0'))
+                await unsubscribeWabaApp(wabaId, token, config.api_version || resolveMetaGraphVersionFromEnv('v25.0'))
                 unsubscribed = true
             } catch (error: any) {
                 unsubscribeError = error?.message || 'Failed to unsubscribe app'
@@ -2798,7 +2818,7 @@ app.post('/api/waba/manual-config', async (req: any, res: any) => {
         const verifyToken = (typeof req.body?.verifyToken === 'string' ? req.body.verifyToken.trim() : '') || resolveMetaVerifyTokenFromEnv()
         const appId = (typeof req.body?.appId === 'string' ? req.body.appId.trim() : '') || resolveMetaAppIdFromEnv()
         const appSecret = (typeof req.body?.appSecret === 'string' ? req.body.appSecret.trim() : '') || resolveMetaAppSecretFromEnv()
-        const apiVersion = (typeof req.body?.apiVersion === 'string' ? req.body.apiVersion.trim() : '') || resolveMetaGraphVersionFromEnv('v24.0')
+        const apiVersion = (typeof req.body?.apiVersion === 'string' ? req.body.apiVersion.trim() : '') || resolveMetaGraphVersionFromEnv('v25.0')
 
         if (!wabaId || !phoneNumberId || !accessToken) {
             return res.status(400).json({ success: false, error: 'wabaId, phoneNumberId, and accessToken are required' })
@@ -3841,7 +3861,7 @@ app.get('/api/waba/registration/config', async (req: any, res: any) => {
                 profileId: access.profileId,
                 companyId: access.companyId,
                 metaAppId: resolveMetaAppIdFromEnv() || null,
-                metaGraphVersion: resolveMetaGraphVersionFromEnv('v24.0'),
+                metaGraphVersion: resolveMetaGraphVersionFromEnv('v25.0'),
                 embeddedSignupV4ConfigId: resolveMetaEmbeddedSignupV4ConfigIdFromEnv() || null,
                 coexistenceConfigId: resolveMetaCoexistenceConfigIdFromEnv() || null,
                 existingAppConfigId: resolveMetaExistingAppConfigIdFromEnv() || null,
@@ -6832,7 +6852,7 @@ app.post('/api/whatsapp/connect/complete', async (req: any, res: any) => {
         const appId = resolveMetaAppIdFromEnv()
         const appSecret = resolveMetaAppSecretFromEnv()
         const verifyToken = resolveMetaVerifyTokenFromEnv()
-        const apiVersion = resolveMetaGraphVersionFromEnv('v24.0')
+        const apiVersion = resolveMetaGraphVersionFromEnv('v25.0')
         if (!appId || !appSecret) {
             return res.status(500).json(buildVersionedApiError(req, 'META_SIGNUP_CONFIG_MISSING', 'Missing META_APP_ID or META_APP_SECRET'))
         }
@@ -7250,15 +7270,7 @@ app.post('/api/whatsapp/calls/connect', async (req: any, res: any) => {
         if (!access) return
         if (!(await requireAdminAccess(access, res))) return
 
-        const rawSession = req.body?.session
-        const sessionSdpType = readTrimmed(rawSession?.sdp_type || rawSession?.sdpType).toLowerCase()
-        const sessionSdp = readTrimmed(rawSession?.sdp)
-        const session = sessionSdpType && sessionSdp
-            ? {
-                sdp_type: sessionSdpType as 'offer' | 'answer',
-                sdp: sessionSdp
-            }
-            : undefined
+        const session = buildCallSessionPayload(req.body?.session)
 
         if (!session || session.sdp_type !== 'offer') {
             return res.status(400).json(buildVersionedApiError(
@@ -7290,15 +7302,7 @@ app.post('/api/whatsapp/calls/:callId/pre-accept', async (req: any, res: any) =>
         const access = await resolveProfileAccess(req, res)
         if (!access) return
 
-        const rawSession = req.body?.session
-        const sessionSdpType = readTrimmed(rawSession?.sdp_type || rawSession?.sdpType).toLowerCase()
-        const sessionSdp = readTrimmed(rawSession?.sdp)
-        const session = sessionSdpType && sessionSdp
-            ? {
-                sdp_type: sessionSdpType as 'offer' | 'answer',
-                sdp: sessionSdp
-            }
-            : undefined
+        const session = buildCallSessionPayload(req.body?.session)
 
         if (!session || session.sdp_type !== 'answer') {
             return res.status(400).json(buildVersionedApiError(
@@ -7330,15 +7334,7 @@ app.post('/api/whatsapp/calls/:callId/accept', async (req: any, res: any) => {
         const access = await resolveProfileAccess(req, res)
         if (!access) return
 
-        const rawSession = req.body?.session
-        const sessionSdpType = readTrimmed(rawSession?.sdp_type || rawSession?.sdpType).toLowerCase()
-        const sessionSdp = readTrimmed(rawSession?.sdp)
-        const session = sessionSdpType && sessionSdp
-            ? {
-                sdp_type: sessionSdpType as 'offer' | 'answer',
-                sdp: sessionSdp
-            }
-            : undefined
+        const session = buildCallSessionPayload(req.body?.session)
 
         if (!session || session.sdp_type !== 'answer') {
             return res.status(400).json(buildVersionedApiError(
@@ -7586,15 +7582,7 @@ app.post('/api/meta/whatsapp/calling/connect', async (req: any, res: any) => {
         if (!access) return
         if (!(await requireAdminAccess(access, res))) return
 
-        const rawSession = req.body?.session
-        const sessionSdpType = readTrimmed(rawSession?.sdp_type || rawSession?.sdpType).toLowerCase()
-        const sessionSdp = readTrimmed(rawSession?.sdp)
-        const session = sessionSdpType && sessionSdp
-            ? {
-                sdp_type: sessionSdpType as 'offer' | 'answer',
-                sdp: sessionSdp
-            }
-            : undefined
+        const session = buildCallSessionPayload(req.body?.session)
 
         if (!session || session.sdp_type !== 'offer') {
             return res.status(400).json({
@@ -7627,15 +7615,7 @@ app.post('/api/meta/whatsapp/calling/:callId/pre-accept', async (req: any, res: 
         const access = await resolveProfileAccess(req, res)
         if (!access) return
 
-        const rawSession = req.body?.session
-        const sessionSdpType = readTrimmed(rawSession?.sdp_type || rawSession?.sdpType).toLowerCase()
-        const sessionSdp = readTrimmed(rawSession?.sdp)
-        const session = sessionSdpType && sessionSdp
-            ? {
-                sdp_type: sessionSdpType as 'offer' | 'answer',
-                sdp: sessionSdp
-            }
-            : undefined
+        const session = buildCallSessionPayload(req.body?.session)
 
         if (!session || session.sdp_type !== 'answer') {
             return res.status(400).json({
@@ -7678,15 +7658,7 @@ app.post('/api/meta/whatsapp/calling/:callId/accept', async (req: any, res: any)
         const access = await resolveProfileAccess(req, res)
         if (!access) return
 
-        const rawSession = req.body?.session
-        const sessionSdpType = readTrimmed(rawSession?.sdp_type || rawSession?.sdpType).toLowerCase()
-        const sessionSdp = readTrimmed(rawSession?.sdp)
-        const session = sessionSdpType && sessionSdp
-            ? {
-                sdp_type: sessionSdpType as 'offer' | 'answer',
-                sdp: sessionSdp
-            }
-            : undefined
+        const session = buildCallSessionPayload(req.body?.session)
 
         if (!session || session.sdp_type !== 'answer') {
             return res.status(400).json({
@@ -7810,15 +7782,7 @@ app.post('/api/waba/calls', async (req: any, res: any) => {
             return res.status(400).json({ success: false, error: 'biz_opaque_callback_data max length is 512 characters' })
         }
 
-        const rawSession = req.body?.session
-        const sessionSdpType = readTrimmed(rawSession?.sdp_type || rawSession?.sdpType).toLowerCase()
-        const sessionSdp = readTrimmed(rawSession?.sdp)
-        const session = sessionSdpType && sessionSdp
-            ? {
-                sdp_type: sessionSdpType as 'offer' | 'answer',
-                sdp: sessionSdp
-            }
-            : undefined
+        const session = buildCallSessionPayload(req.body?.session)
 
         if ((action === 'pre_accept' || action === 'accept') && (!session || session.sdp_type !== 'answer')) {
             return res.status(400).json({

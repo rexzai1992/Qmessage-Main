@@ -14,7 +14,7 @@ const META_SDK_SCRIPT_ID = 'meta-facebook-jssdk';
 const DEFAULT_META_APP_ID = typeof import.meta.env.VITE_META_APP_ID === 'string' ? import.meta.env.VITE_META_APP_ID.trim() : '';
 const DEFAULT_META_GRAPH_VERSION = typeof import.meta.env.VITE_META_GRAPH_VERSION === 'string' && import.meta.env.VITE_META_GRAPH_VERSION.trim()
     ? import.meta.env.VITE_META_GRAPH_VERSION.trim()
-    : 'v24.0';
+    : 'v25.0';
 const DEFAULT_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID =
     typeof import.meta.env.VITE_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID === 'string'
         ? import.meta.env.VITE_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID.trim()
@@ -1132,8 +1132,6 @@ export default function WebhookView({
                     response_type: 'code',
                     override_default_response_type: true,
                     extras: {
-                        feature: 'whatsapp_embedded_signup',
-                        version: 2,
                         setup: {},
                         sessionInfoVersion: '3'
                     }
@@ -1198,7 +1196,7 @@ export default function WebhookView({
             return;
         }
         if (!resolvedCoexistenceConfigId) {
-            setConnectError('Missing coexistence configuration ID. Set META_WA_COEXISTENCE_CONFIGURATION_ID or VITE_META_WA_COEXISTENCE_CONFIGURATION_ID.');
+            setConnectError('Missing WhatsApp Embedded Signup configuration ID. Set META_WA_COEXISTENCE_CONFIGURATION_ID or reuse META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID.');
             return;
         }
         const activeCompanyId = readTrimmed(
@@ -1225,8 +1223,6 @@ export default function WebhookView({
                     response_type: 'code',
                     override_default_response_type: true,
                     extras: {
-                        feature: 'whatsapp_embedded_signup',
-                        version: 2,
                         setup: {},
                         featureType: 'whatsapp_business_app_onboarding',
                         sessionInfoVersion: '3'
