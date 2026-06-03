@@ -1132,6 +1132,8 @@ export default function WebhookView({
                     response_type: 'code',
                     override_default_response_type: true,
                     extras: {
+                        feature: 'whatsapp_embedded_signup',
+                        version: 2,
                         setup: {},
                         sessionInfoVersion: '3'
                     }
@@ -1223,6 +1225,8 @@ export default function WebhookView({
                     response_type: 'code',
                     override_default_response_type: true,
                     extras: {
+                        feature: 'whatsapp_embedded_signup',
+                        version: 2,
                         setup: {},
                         featureType: 'whatsapp_business_app_onboarding',
                         sessionInfoVersion: '3'
@@ -3361,7 +3365,8 @@ export default function WebhookView({
         readTrimmed(registrationConfig?.coexistenceConfigId)
         || DEFAULT_META_WA_COEXISTENCE_CONFIGURATION_ID
         || readTrimmed(registrationConfig?.existingAppConfigId)
-        || DEFAULT_META_WA_EXISTING_APP_CONFIGURATION_ID;
+        || DEFAULT_META_WA_EXISTING_APP_CONFIGURATION_ID
+        || resolvedEmbeddedSignupV4ConfigId;
     const hasActiveWabaConnection = Boolean(
         activeWhatsappConnection
         || (
@@ -3777,7 +3782,7 @@ export default function WebhookView({
                     <button
                         type="button"
                         onClick={launchCoexistenceSignup}
-                        disabled={connectLoading || disconnectLoading || !sessionToken}
+                        disabled={connectLoading || disconnectLoading || !sessionToken || !existingAppSignupConfigured}
                         className="mt-3 w-full bg-[#e6f7f3] hover:bg-[#d3f0e8] text-[#0f766e] border border-[#9fdccf] font-bold py-3 rounded-2xl transition-all flex items-center justify-center gap-2 disabled:opacity-50"
                     >
                         {connectLoading ? <div className="w-4 h-4 border-2 border-[#0f766e] border-t-transparent rounded-full animate-spin" /> : <Globe className="w-4 h-4" />}
@@ -3788,7 +3793,7 @@ export default function WebhookView({
                     </p>
                     {!existingAppSignupConfigured && (
                         <p className="mt-2 text-[11px] text-amber-700 font-semibold">
-                            Coexistence configuration ID is still missing. Set META_WA_COEXISTENCE_CONFIGURATION_ID in .env, or VITE_META_WA_COEXISTENCE_CONFIGURATION_ID if you want it baked into the frontend build.
+                            Coexistence configuration ID is still missing. Set META_WA_COEXISTENCE_CONFIGURATION_ID in .env, or VITE_META_WA_COEXISTENCE_CONFIGURATION_ID if you want it baked into the frontend build. If Meta uses the same Embedded Signup config for coexistence in your app, the dashboard can also reuse the standard Embedded Signup configuration.
                         </p>
                     )}
                     <button

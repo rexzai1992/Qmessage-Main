@@ -1732,10 +1732,11 @@ export function registerWabaRoutes(app: Express, ctx: any) {
             apiVersion,
             configId,
             includeScopes: resolveOauthMode(configId) === 'user',
-            extras: {
+            extras: buildEmbeddedSignupExtras({
+                preverifiedIds: [],
                 featureType: 'whatsapp_business_app_onboarding',
                 sessionInfoVersion: '3'
-            }
+            })
         })
 
         return {
@@ -7468,10 +7469,11 @@ app.post('/api/meta/whatsapp/coexistence/start', async (req: any, res: any) => {
             apiVersion,
             configId,
             includeScopes: resolveOauthMode(configId) === 'user',
-            extras: {
+            extras: buildEmbeddedSignupExtras({
+                preverifiedIds: [],
                 featureType: 'whatsapp_business_app_onboarding',
                 sessionInfoVersion: '3'
-            }
+            })
         })
 
         res.json({
