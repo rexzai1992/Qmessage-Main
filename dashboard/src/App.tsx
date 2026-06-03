@@ -7420,42 +7420,53 @@ export default function App() {
         }
     }, [activeProfileId, selectedChatId, session?.access_token, showToast]);
 
-    const handleRequestCallPermission = useCallback(async () => {
+    const requestCallPermissionForContact = useCallback(async (options?: {
+        userWaId?: string;
+        successMessage?: string;
+        refreshAfterSend?: boolean;
+    }): Promise<boolean> => {
         if (!session?.access_token) {
             showToast('Please login again before requesting call permission.', 'error');
-            return;
+            return false;
         }
-        if (!activeProfileId || !selectedChatId) return;
+        if (!activeProfileId || !selectedChatId) return false;
         if (selectedChatId.endsWith('@g.us')) {
             showToast('Calls are not supported for groups yet.', 'error');
-            return;
+            return false;
         }
 
-        const userWaId = getCleanId(selectedChatId).replace(/\D/g, '');
+        const userWaId = trimString(options?.userWaId) || getCleanId(selectedChatId).replace(/\D/g, '');
         if (!userWaId) {
             showToast('This contact has no valid WhatsApp ID for calling.', 'error');
-            return;
+            return false;
         }
 
         setCallPermissionRequestLoading(true);
         try {
-            const response = await fetch(`${SOCKET_URL}/api/whatsapp/calling/request-permission`, {
+            const response = await fetch(`${SOCKET_URL}/api/whatsapp/calls/request-permission`, {
                 method: 'POST',
                 headers: createAuthHeaders(session.access_token, {
                     'Content-Type': 'application/json'
                 }),
                 body: JSON.stringify({
                     profileId: activeProfileId,
+                    customer_id: userWaId,
                     user_wa_id: userWaId,
                     body_text: `We would like to call you to help support your request.`
                 })
             });
             const payload = await response.json().catch(() => null);
             if (!response.ok || payload?.success === false) {
-                throw new Error(payload?.error || `Failed with status ${response.status}`);
+                const errorMessage =
+                    typeof payload?.error === 'string'
+                        ? payload.error
+                        : typeof payload?.error?.message === 'string'
+                            ? payload.error.message
+                            : `Failed with status ${response.status}`;
+                throw new Error(errorMessage);
             }
 
-            showToast('Call permission request sent.', 'success');
+            showToast(options?.successMessage || 'Call permission request sent.', 'success');
             pushLog(`[Calls] Permission request sent to ${userWaId}.`, 'info');
             setSelectedCallPermission((current) => current ? { ...current, canRequestPermission: false, permissionStatus: current.permissionStatus || 'pending' } : {
                 permissionStatus: 'pending',
@@ -7465,13 +7476,21 @@ export default function App() {
                 storedPermissionStatus: null,
                 storedUpdatedAt: null
             });
-            void fetchSelectedCallPermission({ silent: true });
+            if (options?.refreshAfterSend !== false) {
+                void fetchSelectedCallPermission({ silent: true });
+            }
+            return true;
         } catch (error: any) {
             showToast(error?.message || 'Failed to send call permission request.', 'error');
+            return false;
         } finally {
             setCallPermissionRequestLoading(false);
         }
     }, [activeProfileId, selectedChatId, session?.access_token, showToast, pushLog, fetchSelectedCallPermission]);
+
+    const handleRequestCallPermission = useCallback(async () => {
+        await requestCallPermissionForContact();
+    }, [requestCallPermissionForContact]);
 
     const fetchStoredCallDetails = useCallback(async (callId: string) => {
         if (!activeProfileId) return null;
@@ -7904,6 +7923,14 @@ export default function App() {
                 return;
             }
 
+            if (summary.canRequestPermission) {
+                await requestCallPermissionForContact({
+                    userWaId,
+                    successMessage: 'Call permission request sent. Ask the user to approve it, then press call again.'
+                });
+                return;
+            }
+
             const feedback = getCallPermissionFeedback(kind, summary.permissionStatus, summary.canStartCall, summary.canRequestPermission, userWaId);
             showToast(feedback.message, feedback.tone);
             if (feedback.logMessage) {
@@ -7912,7 +7939,7 @@ export default function App() {
         } finally {
             setCallActionLoading(null);
         }
-    }, [contacts, fetchSelectedCallPermission, pushLog, selectedChatId, showToast, startOutboundVoiceCall]);
+    }, [contacts, fetchSelectedCallPermission, pushLog, requestCallPermissionForContact, selectedChatId, showToast, startOutboundVoiceCall]);
 
     useEffect(() => {
         if (!activeProfileId || !selectedChatId || selectedChatId.endsWith('@g.us')) {
@@ -9282,7 +9309,7 @@ export default function App() {
                                         type="button"
                                         onClick={() => void handleCallAction('voice')}
                                         disabled={callActionLoading !== null}
-                                        title="Check voice call permission"
+                                        title="Start voice call or request permission"
                                         className="text-[#54656f] hover:text-[#111b21] transition-colors disabled:opacity-50"
                                     >
                                         <Phone className="w-5 h-5" />
