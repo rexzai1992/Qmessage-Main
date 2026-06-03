@@ -573,7 +573,10 @@ function resolveMetaCoexistenceConfigIdFromEnv(): string {
 }
 
 function resolveMetaExistingAppConfigIdFromEnv(): string {
-    return resolveMetaCoexistenceConfigIdFromEnv()
+    return trimText(
+        process.env.META_WA_EXISTING_APP_CONFIGURATION_ID
+        || process.env.WABA_EXISTING_APP_CONFIGURATION_ID
+    )
 }
 
 function buildMetaGraphUrl(path: string, apiVersion: string, params?: Record<string, string>) {
@@ -1670,6 +1673,8 @@ export function registerWabaRoutes(app: Express, ctx: any) {
         const appSecret = resolveMetaAppSecretFromEnv()
         const verifyToken = resolveMetaVerifyTokenFromEnv()
         const embeddedConfigId = resolveMetaEmbeddedSignupV4ConfigIdFromEnv()
+        const coexistenceConfigId = resolveMetaCoexistenceConfigIdFromEnv()
+        const coexistenceConfigMatchesEmbedded = Boolean(coexistenceConfigId && embeddedConfigId && coexistenceConfigId === embeddedConfigId)
         const tokenEncryptionReady = Boolean(getTokenEncryptionKey())
         const permissionsReady =
             Array.isArray(WABA_OAUTH_SCOPES)
@@ -1682,6 +1687,7 @@ export function registerWabaRoutes(app: Express, ctx: any) {
         if (!appSecret) issues.push('META_APP_SECRET is missing.')
         if (!verifyToken) issues.push('META_WEBHOOK_VERIFY_TOKEN is missing.')
         if (!embeddedConfigId) issues.push('META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID is missing.')
+        if (!coexistenceConfigId) issues.push('WhatsApp Embedded Signup configuration ID is missing.')
         if (!tokenEncryptionReady) issues.push('ENCRYPTION_KEY is missing.')
 
         return {
@@ -1689,6 +1695,9 @@ export function registerWabaRoutes(app: Express, ctx: any) {
             provider: 'meta_whatsapp_cloud_api',
             tech_provider_ready: Boolean(appId && appSecret && verifyToken && tokenEncryptionReady),
             embedded_signup_config_found: Boolean(embeddedConfigId),
+            coexistence_config_found: Boolean(coexistenceConfigId),
+            coexistence_configuration_separate: Boolean(coexistenceConfigId && !coexistenceConfigMatchesEmbedded),
+            coexistence_configuration_matches_embedded: coexistenceConfigMatchesEmbedded,
             permissions_ready: permissionsReady,
             webhook_configured: Boolean(verifyToken),
             customers_connected: connections.length,
@@ -1707,9 +1716,10 @@ export function registerWabaRoutes(app: Express, ctx: any) {
             throw error
         }
 
+        const embeddedConfigId = resolveMetaEmbeddedSignupV4ConfigIdFromEnv()
         const configId = resolveMetaCoexistenceConfigIdFromEnv()
         if (!configId) {
-            const error: any = new Error('Missing META_WA_COEXISTENCE_CONFIGURATION_ID, META_WA_EXISTING_APP_CONFIGURATION_ID, or META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID')
+            const error: any = new Error('Missing WhatsApp Embedded Signup configuration ID. Configure META_WA_COEXISTENCE_CONFIGURATION_ID, META_WA_EXISTING_APP_CONFIGURATION_ID, or META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID.')
             error.status = 500
             throw error
         }
@@ -1764,6 +1774,10 @@ export function registerWabaRoutes(app: Express, ctx: any) {
             onboarding_type: 'coexistence',
             start_url: url,
             configuration_id: configId,
+            configuration_id_matches_embedded: Boolean(embeddedConfigId && configId === embeddedConfigId),
+            configuration_warning: embeddedConfigId && configId === embeddedConfigId
+                ? 'Coexistence is using the same WhatsApp Embedded Signup configuration ID as normal onboarding. This may be valid because Meta selects WhatsApp Business App onboarding using featureType.'
+                : null,
             feature_type: 'whatsapp_business_app_onboarding',
             session_info_version: '3'
         }
@@ -2354,7 +2368,7 @@ app.get('/api/waba/embedded-signup/url', async (req: any, res: any) => {
         if (featureType === 'whatsapp_business_app_onboarding' && !configId) {
             return res.status(500).json({
                 success: false,
-                error: 'Missing META_WA_COEXISTENCE_CONFIGURATION_ID, META_WA_EXISTING_APP_CONFIGURATION_ID, or META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID'
+                error: 'Missing WhatsApp Embedded Signup configuration ID. Configure META_WA_COEXISTENCE_CONFIGURATION_ID, META_WA_EXISTING_APP_CONFIGURATION_ID, or META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID.'
             })
         }
         const oauthMode = resolveOauthMode(configId)
@@ -3854,6 +3868,14 @@ app.get('/api/waba/registration/config', async (req: any, res: any) => {
         const connectedTokenSource = trimText(config?.tokenSource || configRow?.token_source)
         const connectedAccessTokenExpiresAt = trimText(config?.accessTokenExpiresAt || configRow?.access_token_expires_at)
         const connectedApiVersion = trimText(config?.apiVersion || configRow?.api_version)
+        const embeddedSignupV4ConfigId = resolveMetaEmbeddedSignupV4ConfigIdFromEnv()
+        const coexistenceConfigId = resolveMetaCoexistenceConfigIdFromEnv()
+        const existingAppConfigId = resolveMetaExistingAppConfigIdFromEnv()
+        const coexistenceConfigMatchesEmbedded = Boolean(
+            coexistenceConfigId
+            && embeddedSignupV4ConfigId
+            && coexistenceConfigId === embeddedSignupV4ConfigId
+        )
 
         res.json({
             success: true,
@@ -3862,9 +3884,13 @@ app.get('/api/waba/registration/config', async (req: any, res: any) => {
                 companyId: access.companyId,
                 metaAppId: resolveMetaAppIdFromEnv() || null,
                 metaGraphVersion: resolveMetaGraphVersionFromEnv('v25.0'),
-                embeddedSignupV4ConfigId: resolveMetaEmbeddedSignupV4ConfigIdFromEnv() || null,
-                coexistenceConfigId: resolveMetaCoexistenceConfigIdFromEnv() || null,
-                existingAppConfigId: resolveMetaExistingAppConfigIdFromEnv() || null,
+                embeddedSignupV4ConfigId: embeddedSignupV4ConfigId || null,
+                coexistenceConfigId: coexistenceConfigId || null,
+                existingAppConfigId: existingAppConfigId || null,
+                embeddedSignupConfigFound: Boolean(embeddedSignupV4ConfigId),
+                coexistenceConfigFound: Boolean(coexistenceConfigId),
+                coexistenceConfigMatchesEmbedded,
+                coexistenceConfigSeparate: Boolean(coexistenceConfigId && !coexistenceConfigMatchesEmbedded),
                 officialMetaOnly: isOfficialMetaOnlyMode(),
                 apiBasePath: getApiBasePath(),
                 connectedCompanyId: connectedCompanyId || null,
@@ -7424,9 +7450,10 @@ app.post('/api/meta/whatsapp/coexistence/start', async (req: any, res: any) => {
             return res.status(500).json({ success: false, error: 'Missing META_APP_ID/META_APP_SECRET/META_WEBHOOK_VERIFY_TOKEN or WABA equivalents' })
         }
 
-        const configId = resolveMetaExistingAppConfigIdFromEnv() || resolveMetaEmbeddedSignupV4ConfigIdFromEnv()
+        const embeddedConfigId = resolveMetaEmbeddedSignupV4ConfigIdFromEnv()
+        const configId = resolveMetaCoexistenceConfigIdFromEnv()
         if (!configId) {
-            return res.status(500).json({ success: false, error: 'Missing META_WA_EXISTING_APP_CONFIGURATION_ID or META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID' })
+            return res.status(500).json({ success: false, error: 'Missing WhatsApp Embedded Signup configuration ID. Configure META_WA_COEXISTENCE_CONFIGURATION_ID, META_WA_EXISTING_APP_CONFIGURATION_ID, or META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID.' })
         }
 
         const requestedBusinessId = readTrimmed(req.body?.businessId || req.query?.businessId) || null
@@ -7475,7 +7502,13 @@ app.post('/api/meta/whatsapp/coexistence/start', async (req: any, res: any) => {
         res.json({
             success: true,
             url,
+            start_url: url,
+            onboarding_type: 'coexistence',
             configuration_id: configId,
+            configuration_id_matches_embedded: Boolean(embeddedConfigId && configId === embeddedConfigId),
+            configuration_warning: embeddedConfigId && configId === embeddedConfigId
+                ? 'Coexistence is using the same WhatsApp Embedded Signup configuration ID as normal onboarding. This may be valid because Meta selects WhatsApp Business App onboarding using featureType.'
+                : null,
             feature_type: 'whatsapp_business_app_onboarding',
             session_info_version: '3'
         })

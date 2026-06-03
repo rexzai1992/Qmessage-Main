@@ -337,11 +337,27 @@ const readTrimmed = (value: unknown): string =>
     typeof value === 'string' ? value.trim() : '';
 
 const formatApiError = (data: any, fallback: string): string => {
-    const message = readTrimmed(data?.error) || fallback;
-    const details = Array.isArray(data?.details)
-        ? data.details.map((item: any) => readTrimmed(item)).filter(Boolean)
-        : [];
+    const rawError = data?.error;
+    const message =
+        readTrimmed(rawError)
+        || readTrimmed(rawError?.message)
+        || readTrimmed(data?.message)
+        || fallback;
+    const detailsSource = Array.isArray(rawError?.details)
+        ? rawError.details
+        : Array.isArray(data?.details)
+            ? data.details
+            : [];
+    const details = detailsSource
+        .map((item: any) => readTrimmed(item))
+        .filter(Boolean);
     return details.length > 0 ? `${message} (${details.join('; ')})` : message;
+};
+
+const logCoexistenceDebug = (message: string, details?: Record<string, unknown>) => {
+    if (typeof console !== 'undefined' && typeof console.info === 'function') {
+        console.info(`[WhatsApp Coexistence] ${message}`, details || {});
+    }
 };
 
 const normalizeAppLogoMaxBytes = (value: unknown): number => {
@@ -1043,10 +1059,19 @@ export default function WebhookView({
                 if (!payload || payload.type !== 'WA_EMBEDDED_SIGNUP') return;
 
                 const eventName = readTrimmed(payload.event).toUpperCase();
+                if (flowMode === 'coexistence') {
+                    logCoexistenceDebug('Meta Embedded Signup event received', { event_name: eventName || 'UNKNOWN' });
+                }
                 const data = payload.data && typeof payload.data === 'object' ? payload.data : {};
                 const isCoexistenceFinish =
                     eventName === 'FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING'
                     || (eventName === 'FINISH' && data?.is_wa_login_user === true);
+
+                if (flowMode === 'coexistence' && eventName === 'FINISH' && data?.is_wa_login_user !== true) {
+                    cleanup();
+                    reject(new Error('Meta returned normal FINISH without is_wa_login_user. Meta may have opened normal onboarding instead of WhatsApp Business App onboarding.'));
+                    return;
+                }
 
                 if (
                     (flowMode === 'new_phone_onboarding' && eventName === 'FINISH')
@@ -1183,6 +1208,10 @@ export default function WebhookView({
     };
 
     const launchCoexistenceSignup = async () => {
+        logCoexistenceDebug('Coexistence button clicked', {
+            profile_id_present: Boolean(profileId),
+            session_present: Boolean(sessionToken)
+        });
         if (!sessionToken) {
             setConnectError('You must be logged in to connect WhatsApp.');
             return;
@@ -1193,10 +1222,6 @@ export default function WebhookView({
         }
         if (!resolvedMetaAppId) {
             setConnectError('Missing Meta App ID. Set META_APP_ID or VITE_META_APP_ID.');
-            return;
-        }
-        if (!resolvedCoexistenceConfigId) {
-            setConnectError('Missing WhatsApp Embedded Signup configuration ID. Set META_WA_COEXISTENCE_CONFIGURATION_ID or reuse META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID.');
             return;
         }
         const activeCompanyId = readTrimmed(
@@ -1214,20 +1239,78 @@ export default function WebhookView({
         setDisconnectError(null);
         setDisconnectNotice(null);
         try {
+            const coexistenceStartEndpoint = `${SOCKET_URL}/api/v1/whatsapp/coexistence/start`;
+            logCoexistenceDebug('/api/v1/whatsapp/coexistence/start called', {
+                route: '/api/v1/whatsapp/coexistence/start'
+            });
+            const startRes = await fetch(coexistenceStartEndpoint, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    company_id: activeCompanyId,
+                    profile_id: profileId
+                })
+            });
+            const startData = await startRes.json().catch(() => null);
+            if (!startRes.ok || !startData?.success) {
+                throw new Error(formatApiError(startData, 'Failed to start coexistence onboarding.'));
+            }
+
+            const startPayload = startData?.data || {};
+            const onboardingType = readTrimmed(startPayload?.onboarding_type || startPayload?.onboardingType).toLowerCase();
+            const backendCoexistenceConfigId = readTrimmed(startPayload?.configuration_id || startPayload?.configurationId);
+            const backendStartUrl = readTrimmed(startPayload?.start_url || startPayload?.startUrl || startPayload?.url);
+
+            logCoexistenceDebug('Coexistence start returned', {
+                onboarding_type: onboardingType || 'missing',
+                configuration_id_exists: Boolean(backendCoexistenceConfigId),
+                configuration_id_matches_embedded: Boolean(resolvedEmbeddedSignupV4ConfigId && backendCoexistenceConfigId === resolvedEmbeddedSignupV4ConfigId),
+                start_url_exists: Boolean(backendStartUrl),
+                launch_strategy: 'fb_login_with_backend_configuration_id'
+            });
+
+            if (onboardingType !== 'coexistence') {
+                throw new Error(`Coexistence start returned onboarding_type "${onboardingType || 'missing'}". Please check the backend coexistence route.`);
+            }
+            if (!backendCoexistenceConfigId) {
+                throw new Error('Coexistence configuration ID is missing. Please configure a WhatsApp Business App Coexistence-enabled configuration.');
+            }
+            const usingSameEmbeddedSignupConfig = Boolean(
+                resolvedEmbeddedSignupV4ConfigId
+                && backendCoexistenceConfigId === resolvedEmbeddedSignupV4ConfigId
+            );
+            if (usingSameEmbeddedSignupConfig) {
+                logCoexistenceDebug('Same Embedded Signup configuration ID warning', {
+                    warning: 'Coexistence is using the same WhatsApp Embedded Signup configuration ID as normal onboarding. This may be valid because Meta selects WhatsApp Business App onboarding using featureType.'
+                });
+            }
+
             const FB = await loadMetaSdk(resolvedMetaAppId, resolvedMetaGraphVersion);
             const { promise: signupPromise, cleanup: cleanupSignupListener } = startEmbeddedSignupSession('coexistence');
+            const fbLoginOptions = {
+                config_id: backendCoexistenceConfigId,
+                response_type: 'code',
+                override_default_response_type: true,
+                extras: {
+                    setup: {},
+                    featureType: 'whatsapp_business_app_onboarding',
+                    sessionInfoVersion: '3'
+                }
+            };
+
+            logCoexistenceDebug('FB.login options prepared', {
+                config_id_exists: Boolean(fbLoginOptions.config_id),
+                response_type: fbLoginOptions.response_type,
+                override_default_response_type: fbLoginOptions.override_default_response_type,
+                extras_featureType: fbLoginOptions.extras.featureType,
+                extras_sessionInfoVersion: fbLoginOptions.extras.sessionInfoVersion
+            });
 
             const loginResponse = await new Promise<any>((resolve) => {
-                FB.login((response: any) => resolve(response), {
-                    config_id: resolvedCoexistenceConfigId,
-                    response_type: 'code',
-                    override_default_response_type: true,
-                    extras: {
-                        setup: {},
-                        featureType: 'whatsapp_business_app_onboarding',
-                        sessionInfoVersion: '3'
-                    }
-                });
+                FB.login((response: any) => resolve(response), fbLoginOptions);
             });
 
             const code = readTrimmed(loginResponse?.authResponse?.code);
@@ -1237,21 +1320,26 @@ export default function WebhookView({
             }
 
             const sessionInfo = await signupPromise;
-            const completeRes = await fetch(`${SOCKET_URL}/api/whatsapp/coexistence/complete`, {
+            const completePayload = {
+                code,
+                waba_id: sessionInfo.wabaId,
+                phone_number_id: sessionInfo.phoneNumberId || undefined,
+                business_id: sessionInfo.businessId || undefined,
+                company_id: activeCompanyId,
+                profile_id: profileId,
+                flow_type: 'coexistence'
+            };
+            logCoexistenceDebug('/api/v1/whatsapp/coexistence/complete called', {
+                route: '/api/v1/whatsapp/coexistence/complete',
+                payload_keys: Object.keys(completePayload).sort()
+            });
+            const completeRes = await fetch(`${SOCKET_URL}/api/v1/whatsapp/coexistence/complete`, {
                 method: 'POST',
                 headers: {
                     Authorization: `Bearer ${sessionToken}`,
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify({
-                    code,
-                    waba_id: sessionInfo.wabaId,
-                    phone_number_id: sessionInfo.phoneNumberId || undefined,
-                    business_id: sessionInfo.businessId || undefined,
-                    company_id: activeCompanyId,
-                    profile_id: profileId,
-                    flow_type: 'coexistence'
-                })
+                body: JSON.stringify(completePayload)
             });
             const completeData = await completeRes.json().catch(() => null);
             if (!completeRes.ok || !completeData?.success) {
@@ -3363,6 +3451,14 @@ export default function WebhookView({
         || readTrimmed(registrationConfig?.existingAppConfigId)
         || DEFAULT_META_WA_EXISTING_APP_CONFIGURATION_ID
         || resolvedEmbeddedSignupV4ConfigId;
+    const coexistenceConfigFound = registrationConfig?.coexistenceConfigFound === true
+        || registrationConfig?.coexistence_config_found === true
+        || Boolean(resolvedCoexistenceConfigId);
+    const coexistenceConfigMatchesEmbedded = Boolean(
+        resolvedCoexistenceConfigId
+        && resolvedEmbeddedSignupV4ConfigId
+        && resolvedCoexistenceConfigId === resolvedEmbeddedSignupV4ConfigId
+    );
     const hasActiveWabaConnection = Boolean(
         activeWhatsappConnection
         || (
@@ -3683,6 +3779,33 @@ export default function WebhookView({
                         )}
                     </div>
                     <div className="mb-4 rounded-xl border border-[#eceff1] bg-white px-4 py-3">
+                        <div className="text-[10px] font-black uppercase tracking-widest text-[#64748b]">Meta Signup Configuration</div>
+                        <div className="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-3 text-[11px]">
+                            <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">Embedded Config</div>
+                                <div className="mt-1 font-bold text-[#111b21]">{resolvedEmbeddedSignupV4ConfigId ? 'Found' : 'Missing'}</div>
+                            </div>
+                            <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">coexistence_config_found</div>
+                                <div className="mt-1 font-bold text-[#111b21]">{coexistenceConfigFound ? 'true' : 'false'}</div>
+                            </div>
+                            <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">Config Mode</div>
+                                <div className="mt-1 font-bold text-[#111b21]">{coexistenceConfigMatchesEmbedded ? 'Same ID' : existingAppSignupConfigured ? 'Dedicated ID' : 'Missing'}</div>
+                            </div>
+                        </div>
+                        {!coexistenceConfigFound && (
+                            <p className="mt-2 text-[11px] text-amber-700 font-semibold">
+                                Coexistence configuration ID is missing. Please configure a WhatsApp Business App Coexistence-enabled configuration.
+                            </p>
+                        )}
+                        {coexistenceConfigMatchesEmbedded && (
+                            <p className="mt-2 text-[11px] text-amber-700 font-semibold">
+                                Coexistence is using the same WhatsApp Embedded Signup configuration ID as normal onboarding. This may be valid because Meta selects WhatsApp Business App onboarding using featureType.
+                            </p>
+                        )}
+                    </div>
+                    <div className="mb-4 rounded-xl border border-[#eceff1] bg-white px-4 py-3">
                         <div className="text-[10px] font-black uppercase tracking-widest text-[#64748b]">Connected WhatsApp Details</div>
                         <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3 text-[11px]">
                             <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
@@ -3778,7 +3901,7 @@ export default function WebhookView({
                     <button
                         type="button"
                         onClick={launchCoexistenceSignup}
-                        disabled={connectLoading || disconnectLoading || !sessionToken || !existingAppSignupConfigured}
+                        disabled={connectLoading || disconnectLoading || !sessionToken}
                         className="mt-3 w-full bg-[#e6f7f3] hover:bg-[#d3f0e8] text-[#0f766e] border border-[#9fdccf] font-bold py-3 rounded-2xl transition-all flex items-center justify-center gap-2 disabled:opacity-50"
                     >
                         {connectLoading ? <div className="w-4 h-4 border-2 border-[#0f766e] border-t-transparent rounded-full animate-spin" /> : <Globe className="w-4 h-4" />}
@@ -3789,7 +3912,7 @@ export default function WebhookView({
                     </p>
                     {!existingAppSignupConfigured && (
                         <p className="mt-2 text-[11px] text-amber-700 font-semibold">
-                            Coexistence configuration ID is still missing. Set META_WA_COEXISTENCE_CONFIGURATION_ID in .env, or VITE_META_WA_COEXISTENCE_CONFIGURATION_ID if you want it baked into the frontend build. If Meta uses the same Embedded Signup config for coexistence in your app, the dashboard can also reuse the standard Embedded Signup configuration.
+                            Coexistence configuration ID is missing. Set META_WA_COEXISTENCE_CONFIGURATION_ID, META_WA_EXISTING_APP_CONFIGURATION_ID, or reuse META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID if Meta only provides one WhatsApp Embedded Signup configuration.
                         </p>
                     )}
                     <button
