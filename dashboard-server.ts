@@ -1756,9 +1756,13 @@ async function resolveProfileAccess(req: any, res: any) {
 
     const profileId = typeof req.query?.profileId === 'string'
         ? req.query.profileId
-        : typeof req.body?.profileId === 'string'
-            ? req.body.profileId
-            : undefined
+        : typeof req.query?.profile_id === 'string'
+            ? req.query.profile_id
+            : typeof req.body?.profileId === 'string'
+                ? req.body.profileId
+                : typeof req.body?.profile_id === 'string'
+                    ? req.body.profile_id
+                    : undefined
 
     if (!profileId) {
         res.status(400).json({ success: false, error: 'profileId is required' })

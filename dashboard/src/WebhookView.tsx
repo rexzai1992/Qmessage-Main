@@ -1251,6 +1251,7 @@ export default function WebhookView({
                 },
                 body: JSON.stringify({
                     company_id: activeCompanyId,
+                    profileId,
                     profile_id: profileId
                 })
             });
@@ -1326,6 +1327,7 @@ export default function WebhookView({
                 phone_number_id: sessionInfo.phoneNumberId || undefined,
                 business_id: sessionInfo.businessId || undefined,
                 company_id: activeCompanyId,
+                profileId,
                 profile_id: profileId,
                 flow_type: 'coexistence'
             };

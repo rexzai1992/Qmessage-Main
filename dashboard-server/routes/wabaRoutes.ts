@@ -2294,7 +2294,11 @@ app.get('/api/waba/embedded-signup/url', async (req: any, res: any) => {
         const user = await getSupabaseUserFromRequest(req, res)
         if (!user) return
 
-        const profileId = typeof req.query?.profileId === 'string' ? req.query.profileId : undefined
+        const profileId = typeof req.query?.profileId === 'string'
+            ? req.query.profileId
+            : typeof req.query?.profile_id === 'string'
+                ? req.query.profile_id
+                : undefined
         if (!profileId) {
             return res.status(400).json({ success: false, error: 'profileId is required' })
         }
