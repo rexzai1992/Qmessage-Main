@@ -90,6 +90,24 @@ export function getWebhookUrl(): string | null {
     return appBaseUrl ? `${appBaseUrl}/webhook` : null
 }
 
+function getTenantRootDomain(): string {
+    const explicit = trimText(process.env.TENANT_ROOT_DOMAIN).toLowerCase()
+    if (explicit) return explicit
+
+    const appBaseUrl = getAppBaseUrl()
+    if (!appBaseUrl) return ''
+
+    try {
+        const hostname = new URL(appBaseUrl).hostname.trim().toLowerCase()
+        if (!hostname || hostname === 'localhost' || /^[0-9.]+$/.test(hostname)) {
+            return ''
+        }
+        return hostname.replace(/^www\./, '')
+    } catch {
+        return ''
+    }
+}
+
 function buildDefaultCorsOrigins(): string[] {
     const defaults = new Set<string>([
         'http://localhost:3000',
@@ -101,7 +119,7 @@ function buildDefaultCorsOrigins(): string[] {
     const appBaseUrl = getAppBaseUrl()
     if (appBaseUrl) defaults.add(appBaseUrl)
 
-    const tenantRootDomain = trimText(process.env.TENANT_ROOT_DOMAIN).toLowerCase()
+    const tenantRootDomain = getTenantRootDomain()
     if (tenantRootDomain) {
         defaults.add(`https://${tenantRootDomain}`)
         defaults.add(`https://*.${tenantRootDomain}`)

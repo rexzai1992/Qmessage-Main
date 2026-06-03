@@ -5250,6 +5250,7 @@ registerWabaRoutes(app, {
     fetchPhoneNumbers,
     findConflictingActivePhoneNumberConfig,
     findOrCreateUser,
+    getCompanyRoom,
     getCompanyIdForProfile,
     getMessagesForUsers,
     getMessagesForUsersSince,
@@ -5272,6 +5273,7 @@ registerWabaRoutes(app, {
     resolveProfileAccess,
     sendWhatsAppMessage,
     setUserTemplateAttributes,
+    io,
     subscribeWabaApp,
     supabase,
     unsubscribeWabaApp,
@@ -8555,6 +8557,7 @@ async function handleCallUpdate(config: WabaConfig, call: WabaCallUpdate) {
         metaError: Array.isArray(call.errors) && call.errors.length > 0 ? call.errors : undefined,
         lastEventAt: call.timestamp ? new Date(call.timestamp * 1000).toISOString() : new Date().toISOString()
     })
+    const effectiveNormalizedStatus = readTrimmed(callRow?.status).toLowerCase() || normalizedStatus
 
     await touchWhatsappConnectionWebhook(supabase, {
         companyId,
@@ -8568,7 +8571,7 @@ async function handleCallUpdate(config: WabaConfig, call: WabaCallUpdate) {
         profileId,
         callId: call.id,
         event: eventName || call.event || 'unknown',
-        normalizedStatus,
+        normalizedStatus: effectiveNormalizedStatus,
         phoneNumberId: call.phoneNumberId,
         from: call.from || null,
         to: call.to || null,
@@ -8584,6 +8587,10 @@ async function handleCallUpdate(config: WabaConfig, call: WabaCallUpdate) {
         session: call.session || null,
         contactName: call.contactName || null,
         errors: Array.isArray(call.errors) ? call.errors : [],
+        acceptedByUserId: readTrimmed(callRow?.accepted_by_user_id) || null,
+        acceptedByName: readTrimmed(callRow?.accepted_by_name) || null,
+        acceptedAt: readTrimmed(callRow?.accepted_at) || null,
+        claimExpiresAt: readTrimmed(callRow?.claim_expires_at) || null,
         persistedCall: callRow || null,
         raw: INCLUDE_RAW_WEBHOOK_EVENT_PAYLOAD ? call.raw : null
     }

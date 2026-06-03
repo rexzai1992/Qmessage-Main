@@ -6,6 +6,7 @@ interface ImportMetaEnv {
     readonly VITE_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID?: string;
     readonly VITE_META_WA_COEXISTENCE_CONFIGURATION_ID?: string;
     readonly VITE_META_WA_EXISTING_APP_CONFIGURATION_ID?: string;
+    readonly VITE_WEBRTC_ICE_SERVERS?: string;
 }
 
 interface ImportMeta {

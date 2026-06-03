@@ -24,7 +24,7 @@ function renderInlineMarkdown(input: string): string {
 
     output = output.replace(/`([^`]+)`/g, (_match, code) => {
         const token = `__INLINE_CODE_${tokens.length}__`
-        tokens.push(`<code>${escapeHtml(code)}</code>`)
+        tokens.push(`<code style="font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace; font-size: 0.92em; background: rgba(42, 110, 244, 0.08); color: var(--qm-text); border: 1px solid var(--qm-border); border-radius: 8px; padding: 0.1em 0.4em;">${escapeHtml(code)}</code>`)
         return token
     })
 
@@ -33,7 +33,7 @@ function renderInlineMarkdown(input: string): string {
         const safeHref = escapeHtml(String(href).trim())
         const safeLabel = escapeHtml(String(label).trim())
         const external = /^https?:\/\//i.test(String(href).trim())
-        tokens.push(`<a href="${safeHref}"${external ? ' target="_blank" rel="noreferrer"' : ''}>${safeLabel}</a>`)
+        tokens.push(`<a href="${safeHref}"${external ? ' target="_blank" rel="noreferrer"' : ''} style="color: var(--qm-accent); font-weight: 700; text-decoration: none;">${safeLabel}</a>`)
         return token
     })
 
@@ -91,7 +91,7 @@ function renderMarkdownToHtml(markdown: string): { bodyHtml: string; tocHtml: st
             }
             if (index < lines.length) index += 1
             blocks.push(
-                `<pre><code${language ? ` class="language-${escapeHtml(language)}"` : ''}>${escapeHtml(codeLines.join('\n'))}</code></pre>`
+                `<pre class="qm-card" style="margin: 18px 0 24px; padding: 18px; overflow: auto; background: #12253a; color: #f8fbff; border-color: rgba(255, 255, 255, 0.06);"><code${language ? ` class="language-${escapeHtml(language)}"` : ''} style="background: transparent; color: inherit; border: 0; padding: 0; font-size: 0.9rem; line-height: 1.65; font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace; display: block;">${escapeHtml(codeLines.join('\n'))}</code></pre>`
             )
             continue
         }
@@ -118,12 +118,12 @@ function renderMarkdownToHtml(markdown: string): { bodyHtml: string; tocHtml: st
                 index += 1
             }
 
-            const headerHtml = headerCells.map((cell) => `<th>${renderInlineMarkdown(cell)}</th>`).join('')
+            const headerHtml = headerCells.map((cell) => `<th style="padding: 12px 14px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--qm-border); background: rgba(14, 164, 122, 0.06); color: var(--qm-text-soft); font-size: 0.72rem; letter-spacing: 0.12em; text-transform: uppercase;">${renderInlineMarkdown(cell)}</th>`).join('')
             const bodyHtml = rowLines
-                .map((cells) => `<tr>${cells.map((cell) => `<td>${renderInlineMarkdown(cell)}</td>`).join('')}</tr>`)
+                .map((cells) => `<tr>${cells.map((cell) => `<td style="padding: 12px 14px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--qm-border); color: var(--qm-text);">${renderInlineMarkdown(cell)}</td>`).join('')}</tr>`)
                 .join('')
 
-            blocks.push(`<div class="table-wrap"><table><thead><tr>${headerHtml}</tr></thead><tbody>${bodyHtml}</tbody></table></div>`)
+            blocks.push(`<div class="qm-card-soft" style="overflow-x: auto; margin: 18px 0 24px;"><table style="width: 100%; border-collapse: collapse;"><thead><tr>${headerHtml}</tr></thead><tbody>${bodyHtml}</tbody></table></div>`)
             continue
         }
 
@@ -180,7 +180,12 @@ function renderMarkdownToHtml(markdown: string): { bodyHtml: string; tocHtml: st
 
     const tocHtml = tocEntries
         .filter((entry) => entry.level <= 3)
-        .map((entry) => `<a class="toc-link level-${entry.level}" href="#${entry.slug}">${escapeHtml(entry.text)}</a>`)
+        .map((entry) => {
+            const paddingLeft = entry.level === 1 ? 14 : entry.level === 2 ? 24 : 34
+            const fontSize = entry.level === 1 ? '0.84rem' : entry.level === 2 ? '0.8rem' : '0.76rem'
+            const textColor = entry.level === 1 ? 'var(--qm-text)' : 'var(--qm-text-muted)'
+            return `<a class="qm-card-soft" href="#${entry.slug}" style="display: block; padding: 10px 14px 10px ${paddingLeft}px; text-decoration: none; font-size: ${fontSize}; font-weight: 700; color: ${textColor};">${escapeHtml(entry.text)}</a>`
+        })
         .join('')
 
     return {
@@ -189,297 +194,70 @@ function renderMarkdownToHtml(markdown: string): { bodyHtml: string; tocHtml: st
     }
 }
 
+function resolveDashboardStylesheetHref(): string | null {
+    const dashboardIndexPath = path.join(process.cwd(), 'dashboard', 'dist', 'index.html')
+    if (!fs.existsSync(dashboardIndexPath)) {
+        return null
+    }
+
+    try {
+        const dashboardIndexHtml = fs.readFileSync(dashboardIndexPath, 'utf-8')
+        const stylesheetMatch = dashboardIndexHtml.match(/<link\s+rel="stylesheet"[^>]*href="([^"]+)"/i)
+        return stylesheetMatch?.[1] ?? null
+    } catch {
+        return null
+    }
+}
+
 function renderApiDocsPage(markdown: string, updatedAt: string): string {
     const { bodyHtml, tocHtml } = renderMarkdownToHtml(markdown)
+    const dashboardStylesheetHref = resolveDashboardStylesheetHref()
+    const dashboardStylesheetTag = dashboardStylesheetHref
+        ? `\n  <link rel="stylesheet" crossorigin href="${escapeHtml(dashboardStylesheetHref)}" />`
+        : ''
 
     return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>API Reference · 2fast</title>
-  <style>
-    :root {
-      --bg: #eef4f2;
-      --surface: #ffffff;
-      --surface-soft: #f7fbfa;
-      --line: #d8e6e1;
-      --text: #102a24;
-      --muted: #52706a;
-      --brand: #0f8f72;
-      --brand-deep: #0b6f59;
-      --code: #0f172a;
-      --code-bg: #f3f7fb;
-    }
-    * { box-sizing: border-box; }
-    html { scroll-behavior: smooth; }
-    body {
-      margin: 0;
-      font-family: Georgia, "Times New Roman", serif;
-      background:
-        radial-gradient(circle at top left, rgba(15, 143, 114, 0.12), transparent 34%),
-        linear-gradient(180deg, #f4faf8 0%, var(--bg) 100%);
-      color: var(--text);
-    }
-    a { color: var(--brand-deep); text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    .hero {
-      max-width: 1200px;
-      margin: 0 auto;
-      padding: 40px 20px 18px;
-    }
-    .eyebrow {
-      display: inline-block;
-      padding: 6px 12px;
-      border: 1px solid #c8dfd7;
-      border-radius: 999px;
-      background: rgba(255,255,255,0.72);
-      color: var(--brand-deep);
-      font: 700 11px/1.2 Arial, sans-serif;
-      letter-spacing: .12em;
-      text-transform: uppercase;
-    }
-    .hero-grid {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) 280px;
-      gap: 20px;
-      align-items: end;
-      margin-top: 14px;
-    }
-    .hero h1 {
-      margin: 0;
-      font-size: clamp(34px, 5vw, 58px);
-      line-height: 0.96;
-      letter-spacing: -0.04em;
-    }
-    .hero p {
-      margin: 12px 0 0;
-      max-width: 780px;
-      font: 15px/1.7 Arial, sans-serif;
-      color: var(--muted);
-    }
-    .meta-card {
-      padding: 16px 18px;
-      border: 1px solid var(--line);
-      border-radius: 18px;
-      background: rgba(255,255,255,0.84);
-      backdrop-filter: blur(8px);
-      box-shadow: 0 20px 50px rgba(16, 42, 36, 0.08);
-      font: 13px/1.6 Arial, sans-serif;
-      color: var(--muted);
-    }
-    .meta-card strong {
-      display: block;
-      color: var(--text);
-      font-size: 13px;
-      text-transform: uppercase;
-      letter-spacing: .08em;
-      margin-bottom: 6px;
-    }
-    .layout {
-      max-width: 1200px;
-      margin: 0 auto;
-      padding: 0 20px 40px;
-      display: grid;
-      grid-template-columns: 280px minmax(0, 1fr);
-      gap: 20px;
-    }
-    .toc,
-    .content {
-      border: 1px solid var(--line);
-      border-radius: 22px;
-      background: rgba(255,255,255,0.9);
-      box-shadow: 0 20px 50px rgba(16, 42, 36, 0.08);
-    }
-    .toc {
-      position: sticky;
-      top: 20px;
-      align-self: start;
-      padding: 18px;
-      font-family: Arial, sans-serif;
-    }
-    .toc-title {
-      margin: 0 0 12px;
-      font-size: 12px;
-      letter-spacing: .12em;
-      text-transform: uppercase;
-      color: var(--muted);
-      font-weight: 800;
-    }
-    .toc-links {
-      display: grid;
-      gap: 8px;
-    }
-    .toc-link {
-      display: block;
-      color: var(--text);
-      border-radius: 10px;
-      padding: 8px 10px;
-      background: transparent;
-      font-size: 13px;
-      line-height: 1.4;
-    }
-    .toc-link:hover {
-      background: var(--surface-soft);
-      text-decoration: none;
-    }
-    .toc-link.level-2 { margin-left: 10px; color: var(--muted); }
-    .toc-link.level-3 { margin-left: 20px; color: var(--muted); font-size: 12px; }
-    .content {
-      padding: 28px;
-      overflow: hidden;
-    }
-    .content h1,
-    .content h2,
-    .content h3,
-    .content h4,
-    .content h5,
-    .content h6 {
-      scroll-margin-top: 90px;
-      margin-top: 34px;
-      margin-bottom: 14px;
-      line-height: 1.1;
-      letter-spacing: -0.03em;
-    }
-    .content h1:first-child,
-    .content h2:first-child {
-      margin-top: 0;
-    }
-    .content h1 { font-size: 40px; }
-    .content h2 {
-      padding-top: 20px;
-      border-top: 1px solid #e7efec;
-      font-size: 30px;
-    }
-    .content h3 { font-size: 24px; }
-    .content h4 { font-size: 19px; }
-    .content p,
-    .content li {
-      font: 15px/1.72 Arial, sans-serif;
-      color: #17332d;
-    }
-    .content p { margin: 0 0 14px; }
-    .content ul,
-    .content ol {
-      margin: 0 0 18px 20px;
-      padding: 0;
-    }
-    .content li + li { margin-top: 6px; }
-    .content code {
-      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-      font-size: 0.92em;
-      background: var(--code-bg);
-      color: var(--code);
-      border: 1px solid #dbe6f2;
-      border-radius: 6px;
-      padding: 0.1em 0.4em;
-    }
-    .content pre {
-      margin: 16px 0 22px;
-      background: #0f172a;
-      color: #e2e8f0;
-      border-radius: 16px;
-      padding: 18px;
-      overflow: auto;
-      border: 1px solid #1e293b;
-    }
-    .content pre code {
-      background: transparent;
-      color: inherit;
-      border: 0;
-      padding: 0;
-      font-size: 13px;
-      line-height: 1.6;
-      display: block;
-    }
-    .table-wrap {
-      overflow-x: auto;
-      margin: 16px 0 24px;
-      border: 1px solid var(--line);
-      border-radius: 16px;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font: 13px/1.5 Arial, sans-serif;
-      background: white;
-    }
-    th, td {
-      text-align: left;
-      vertical-align: top;
-      padding: 12px 14px;
-      border-bottom: 1px solid #e6efec;
-    }
-    th {
-      background: #f6fbf9;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: .08em;
-      font-size: 11px;
-    }
-    tr:last-child td { border-bottom: 0; }
-    .footer-nav {
-      margin-top: 28px;
-      padding-top: 18px;
-      border-top: 1px solid #e7efec;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      font: 12px/1.4 Arial, sans-serif;
-    }
-    .footer-link {
-      display: inline-flex;
-      align-items: center;
-      border-radius: 999px;
-      border: 1px solid #d6e5e0;
-      background: #f3faf7;
-      padding: 8px 12px;
-      color: var(--brand-deep);
-      font-weight: 700;
-    }
-    @media (max-width: 960px) {
-      .hero-grid,
-      .layout {
-        grid-template-columns: 1fr;
-      }
-      .toc {
-        position: static;
-      }
-    }
-  </style>
+  <title>QMessage API Reference</title>${dashboardStylesheetTag}
 </head>
-<body>
-  <header class="hero">
-    <span class="eyebrow">Official Meta API</span>
-    <div class="hero-grid">
-      <div>
-        <h1>Q Message Runtime API Reference</h1>
-        <p>Public reference for the live Express backend. This page covers authentication, route parameters, payloads, examples, and the current signaling-first limitations for Meta WhatsApp calling.</p>
-      </div>
-      <aside class="meta-card">
-        <strong>Endpoint</strong>
-        Available online at <code>/docs/api/</code>
-        <br /><br />
-        <strong>Last Updated</strong>
-        ${escapeHtml(updatedAt)}
-      </aside>
+<body class="qm-app-gradient">
+  <div style="min-height: 100vh; padding: 24px 20px 40px;">
+    <div style="max-width: 1280px; margin: 0 auto; display: grid; gap: 20px;">
+      <header class="qm-shell" style="padding: 28px;">
+        <div style="display: flex; gap: 18px; flex-wrap: wrap; align-items: end; justify-content: space-between;">
+          <div style="display: grid; gap: 12px; flex: 1 1 620px; min-width: 0;">
+            <span class="qm-eyebrow">Backend-Owned API</span>
+            <div class="qm-title" style="max-width: 860px;">QMessage Runtime API Reference</div>
+            <p class="qm-subtitle" style="margin: 0; max-width: 860px;">Public reference for the live Express backend. This page uses the same web styling as the dashboard and covers authentication, route parameters, payloads, examples, and the current signaling-first limitations for Meta WhatsApp calling.</p>
+          </div>
+          <aside class="qm-card-soft" style="padding: 18px; flex: 0 1 320px; min-width: min(100%, 260px);">
+            <div class="qm-label" style="margin-bottom: 10px;">Endpoint</div>
+            <div style="font-weight: 700; color: var(--qm-text); word-break: break-word;">Available online at <code style="font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace; background: rgba(42, 110, 244, 0.08); padding: 2px 6px; border-radius: 8px; border: 1px solid var(--qm-border);">/docs/api/</code></div>
+            <div class="qm-label" style="margin: 18px 0 10px;">Last Updated</div>
+            <div style="color: var(--qm-text-muted); font-weight: 600;">${escapeHtml(updatedAt)}</div>
+          </aside>
+        </div>
+      </header>
+      <main style="display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start;">
+        <nav class="qm-card" aria-label="Table of contents" style="position: sticky; top: 20px; padding: 18px; flex: 0 1 300px; width: min(100%, 300px);">
+          <div class="qm-label" style="margin-bottom: 14px;">On This Page</div>
+          <div style="display: grid; gap: 8px;">${tocHtml}</div>
+        </nav>
+        <article class="qm-shell" style="padding: 28px; overflow: hidden; flex: 1 1 760px; min-width: 0;">
+          <div style="display: grid; gap: 12px; color: var(--qm-text); line-height: 1.72;">${bodyHtml}</div>
+          <div style="margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--qm-border); display: flex; flex-wrap: wrap; gap: 10px;">
+            <a class="qm-btn qm-btn-secondary" href="/api/public/config">Public Config JSON</a>
+            <a class="qm-btn qm-btn-secondary" href="/api/v1/public/config">Versioned Config JSON</a>
+            <a class="qm-btn qm-btn-secondary" href="/support">Support</a>
+            <a class="qm-btn qm-btn-secondary" href="/">Back to Login</a>
+          </div>
+        </article>
+      </main>
     </div>
-  </header>
-  <main class="layout">
-    <nav class="toc" aria-label="Table of contents">
-      <div class="toc-title">On This Page</div>
-      <div class="toc-links">${tocHtml}</div>
-    </nav>
-    <article class="content">
-      ${bodyHtml}
-      <div class="footer-nav">
-        <a class="footer-link" href="/api/public/config">Public Config JSON</a>
-        <a class="footer-link" href="/api/v1/public/config">Versioned Config JSON</a>
-        <a class="footer-link" href="/support">Support</a>
-        <a class="footer-link" href="/">Back to Login</a>
-      </div>
-    </article>
-  </main>
+  </div>
 </body>
 </html>`
 }

@@ -44,15 +44,9 @@ Common error shape:
 }
 ```
 
-Some Meta and signaling endpoints also return:
+Live WhatsApp voice calling now uses browser WebRTC for the media path, while your backend continues to handle Meta signaling and persistence.
 
-```json
-{
-  "success": false,
-  "error": "CALL_MEDIA_BACKEND_NOT_CONFIGURED",
-  "details": ["Live call media is not configured yet."]
-}
-```
+For call setup routes, send the required SDP payloads exactly as documented below.
 
 ## Authentication Modes
 
@@ -808,7 +802,8 @@ Authentication:
 Current behavior:
 
 - validates permission first
-- then returns `CALL_MEDIA_BACKEND_NOT_CONFIGURED` until real WebRTC/SIP is implemented
+- forwards the SDP offer to Meta signaling
+- stores the resulting call state for the dashboard and follow-up actions
 
 Request body:
 
@@ -835,7 +830,9 @@ Path parameters:
 
 Current behavior:
 
-- always returns `CALL_MEDIA_BACKEND_NOT_CONFIGURED`
+- accepts a browser-generated SDP answer
+- forwards `pre_accept` / `accept` to Meta signaling
+- updates the stored call row used by the dashboard
 
 ### POST `/api/v1/whatsapp/calls/:callId/reject`
 
@@ -940,7 +937,6 @@ X-Barley-Event: <event_name>
 |---|---|
 | `Invalid API key` | API key was missing or not found |
 | `Invalid admin password` | Legacy admin password mismatch |
-| `CALL_MEDIA_BACKEND_NOT_CONFIGURED` | Signaling endpoint reached, but live call media backend is not implemented |
 | `CALL_PERMISSION_REQUIRED` | Customer has not granted permission for WhatsApp calling |
 | `WABA not configured for this profile` | Profile exists but has no active Meta connection |
 | `Company not found` | Profile/company mapping could not be resolved |

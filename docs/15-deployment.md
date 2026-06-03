@@ -36,8 +36,9 @@ Files:
 ### Compose behavior
 
 - Service name: `wsbarly`
-- Host mapping: `3001:3001` (verify app `PORT` value to avoid mismatch)
+- Host mapping: `3000:3000`
 - Mounts persistent local volume `./app_data:/app/data`
+- Uses `.env` plus `NODE_ENV=production` and `PORT=3000`
 
 ## 3) Tunnel-based External Access
 
@@ -47,6 +48,8 @@ Ingress routes:
 
 - `2fast.xyz` -> `http://localhost:3000`
 - `*.2fast.xyz` -> `http://localhost:3000`
+
+`cloudflared` is not part of `docker-compose.yml` in this repo. Run it separately on the host so it can forward public traffic into the local Docker-mapped backend on port `3000`.
 
 ## 4) Wonderpark Runtime
 

@@ -107,8 +107,8 @@ docker compose up --build
 Notes:
 
 - Multi-stage Dockerfile builds frontend then runs backend via `tsx`.
-- `docker-compose.yml` maps host `3001` -> container `3001` currently, while server default is `3000` unless `PORT` is set.
-- Align `PORT` and compose mappings before production use.
+- `docker-compose.yml` now maps host `3000` -> container `3000` and sets `PORT=3000`.
+- The compose stack runs the app container only. `cloudflared` remains a separate host-managed process and should keep pointing to `http://localhost:3000`.
 
 ## 7) Optional: Wonderpark Runtime
 

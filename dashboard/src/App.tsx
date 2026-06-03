@@ -114,6 +114,34 @@ const AUTH_CHECK_TIMEOUT_MS = 4_000;
 const PROFILE_SYNC_TIMEOUT_MS = 20_000;
 const CHAT_SYNC_TIMEOUT_MS = 24_000;
 const SOCKET_STALE_REFRESH_INTERVAL_MS = 90_000;
+const BROWSER_VOICE_CALL_DISCONNECT_GRACE_MS = 8_000;
+const DEFAULT_WEBRTC_ICE_SERVERS: RTCIceServer[] = [
+    {
+        urls: [
+            'stun:stun.l.google.com:19302',
+            'stun:stun1.l.google.com:19302'
+        ]
+    }
+];
+
+const parseWebrtcIceServers = (): RTCIceServer[] => {
+    const raw = typeof import.meta.env.VITE_WEBRTC_ICE_SERVERS === 'string'
+        ? import.meta.env.VITE_WEBRTC_ICE_SERVERS.trim()
+        : '';
+    if (!raw) {
+        return DEFAULT_WEBRTC_ICE_SERVERS;
+    }
+
+    try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed) || parsed.length === 0) {
+            return DEFAULT_WEBRTC_ICE_SERVERS;
+        }
+        return parsed.filter((entry) => entry && typeof entry === 'object' && entry.urls) as RTCIceServer[];
+    } catch {
+        return DEFAULT_WEBRTC_ICE_SERVERS;
+    }
+};
 const QUICK_REPLIES_PREFETCH_DELAY_MS = 220;
 const NOTIFICATION_SOUND_PREF_KEY = 'qmessage.notification.sound.enabled.v1';
 const ANDROID_HEADS_UP_PROMPT_KEY = 'qmessage.native.android.headsup.prompted.v1';
@@ -316,6 +344,11 @@ type CallPermissionUiState = {
     storedUpdatedAt: string | null;
 };
 
+type CallSessionPayload = {
+    sdp_type: 'offer' | 'answer';
+    sdp: string;
+};
+
 type IncomingCallState = {
     callId: string;
     profileId: string;
@@ -327,7 +360,41 @@ type IncomingCallState = {
     normalizedStatus: string;
     timestamp: number;
     event: string;
-    loadingAction: 'reject' | 'terminate' | null;
+    session: CallSessionPayload | null;
+    bizOpaqueCallbackData: string | null;
+    acceptedByUserId: string | null;
+    acceptedByName: string | null;
+    acceptedAt: string | null;
+    claimExpiresAt: string | null;
+    loadingAction: 'accept' | 'reject' | 'terminate' | null;
+};
+
+type ActiveVoiceCallState = {
+    callId: string | null;
+    customerWaId: string | null;
+    remoteLabel: string;
+    direction: 'inbound' | 'outbound';
+    status: 'preparing' | 'connecting' | 'connected' | 'ending' | 'failed';
+    muted: boolean;
+    startedAt: number;
+    profileId: string;
+    lastError: string | null;
+};
+
+type BrowserVoiceCallSession = {
+    peerConnection: RTCPeerConnection;
+    localStream: MediaStream;
+    remoteStream: MediaStream;
+    callId: string | null;
+    customerWaId: string | null;
+    direction: 'inbound' | 'outbound';
+    profileId: string;
+    remoteLabel: string;
+    remoteDescriptionApplied: boolean;
+    preAcceptSent: boolean;
+    acceptSent: boolean;
+    acceptLockToken: string | null;
+    disconnectTimeoutId: number | null;
 };
 
 type TemplateBodyAttributePayload = {
@@ -1618,6 +1685,105 @@ const getCallPermissionBadgeLabel = (state: CallPermissionUiState | null): strin
     return 'Call: unavailable';
 };
 
+const getVoiceCallStatusLabel = (status: ActiveVoiceCallState['status']): string => {
+    switch (status) {
+        case 'preparing':
+            return 'Preparing audio';
+        case 'connecting':
+            return 'Connecting';
+        case 'connected':
+            return 'Live';
+        case 'ending':
+            return 'Ending';
+        case 'failed':
+            return 'Failed';
+        default:
+            return status;
+    }
+};
+
+type CallApiErrorResult = {
+    code: string | null;
+    message: string;
+    details: any;
+};
+
+const getIncomingCallStatusLabel = (status: string): string => {
+    switch (status.trim().toLowerCase()) {
+        case 'ringing':
+            return 'Ringing';
+        case 'accepting':
+            return 'Answering';
+        case 'accepted':
+            return 'Accepted';
+        case 'answered':
+            return 'Answered';
+        case 'rejected':
+            return 'Rejected';
+        case 'terminated':
+            return 'Ended';
+        case 'missed':
+            return 'Missed';
+        case 'failed':
+            return 'Failed';
+        default:
+            return status || 'Unknown';
+    }
+};
+
+const parseCallApiError = (payload: any, responseStatus: number, fallbackMessage: string): CallApiErrorResult => {
+    const nestedError = payload?.error && typeof payload.error === 'object' ? payload.error : null;
+    const code = typeof nestedError?.code === 'string'
+        ? nestedError.code.trim()
+        : (typeof payload?.code === 'string' ? payload.code.trim() : '');
+    const message =
+        (typeof nestedError?.message === 'string' ? nestedError.message.trim() : '')
+        || (typeof payload?.error === 'string' ? payload.error.trim() : '')
+        || (typeof payload?.message === 'string' ? payload.message.trim() : '')
+        || fallbackMessage
+        || `Failed with status ${responseStatus}`;
+    const details = nestedError?.details ?? payload?.details ?? null;
+    return {
+        code: code || null,
+        message,
+        details
+    };
+};
+
+const formatCallApiErrorMessage = (error: CallApiErrorResult): string => {
+    if (error.code === 'CALL_ALREADY_ANSWERED') {
+        const answeredBy = typeof error.details?.answered_by === 'string' ? error.details.answered_by.trim() : '';
+        return answeredBy
+            ? `Someone already answered this call. ${answeredBy} is handling it.`
+            : 'Someone already answered this call.';
+    }
+    if (error.code === 'CALL_MEDIA_BACKEND_NOT_CONFIGURED') {
+        return 'Call media backend is not configured yet. Check the WebRTC calling setup before answering.';
+    }
+    if (error.code === 'CALL_ACCEPT_LOCK_REQUIRED') {
+        return 'This call answer session expired. Please try answering again.';
+    }
+    return error.message;
+};
+
+const formatMicrophoneCallErrorMessage = (error: any): string | null => {
+    const errorName = typeof error?.name === 'string' ? error.name.trim() : '';
+    if (errorName === 'NotAllowedError' || errorName === 'SecurityError') {
+        return 'Microphone access is blocked. Allow mic permission for this site, then try again.';
+    }
+    if (errorName === 'NotFoundError') {
+        return 'No microphone was found for this browser. Connect a mic and try again.';
+    }
+    if (errorName === 'NotReadableError' || errorName === 'AbortError') {
+        return 'The microphone is busy or unavailable. Close other apps using the mic and try again.';
+    }
+    return null;
+};
+
+const isIncomingCallClaimed = (call: IncomingCallState): boolean => (
+    ['accepting', 'accepted', 'answered'].includes(call.normalizedStatus.trim().toLowerCase())
+);
+
 const isCallingApiNotEnabledError = (errorMessage: string): boolean => (
     errorMessage.includes('calling api not enabled') || errorMessage.includes('code=138000')
 );
@@ -1985,6 +2151,7 @@ export default function App() {
     const [callPermissionLoading, setCallPermissionLoading] = useState(false);
     const [callPermissionRequestLoading, setCallPermissionRequestLoading] = useState(false);
     const [incomingCalls, setIncomingCalls] = useState<IncomingCallState[]>([]);
+    const [activeVoiceCall, setActiveVoiceCall] = useState<ActiveVoiceCallState | null>(null);
     const [mediaCache, setMediaCache] = useState<Record<string, MediaData>>({});
     const [mediaDownloadProgress, setMediaDownloadProgress] = useState<Record<string, MediaDownloadProgressState>>({});
     const [unreadMessagesByChat, setUnreadMessagesByChat] = useState<Record<string, number>>({});
@@ -2073,6 +2240,9 @@ export default function App() {
     const messageInputRef = useRef<HTMLTextAreaElement>(null);
     const composerFileInputRef = useRef<HTMLInputElement>(null);
     const activeProfileIdRef = useRef<string | null>(null);
+    const activeVoiceCallRef = useRef<ActiveVoiceCallState | null>(null);
+    const browserVoiceCallSessionRef = useRef<BrowserVoiceCallSession | null>(null);
+    const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
     const profilesRef = useRef<any[]>([]);
     const selectedChatIdRef = useRef<string | null>(null);
     const chatReadCursorByChatRef = useRef<Record<string, number>>({});
@@ -2128,6 +2298,7 @@ export default function App() {
         key: selectedChatId || 'all'
     });
     const debugOverlayEnabled = useMemo(() => shouldShowDebugOverlay(), []);
+    const webrtcIceServers = useMemo(() => parseWebrtcIceServers(), []);
     const wabaConnectedConfettiPieces = useMemo<WabaConnectedConfettiPiece[]>(
         () => Array.from({ length: 42 }, (_unused, index) => {
             const seed = index + 1;
@@ -2141,6 +2312,189 @@ export default function App() {
         }),
         []
     );
+
+    const attachRemoteAudioStream = useCallback((stream: MediaStream | null) => {
+        const element = remoteAudioRef.current;
+        if (!element) return;
+        const nextStream = stream || null;
+        if ((element.srcObject || null) !== nextStream) {
+            element.srcObject = nextStream;
+        }
+        if (nextStream) {
+            void element.play().catch(() => undefined);
+        }
+    }, []);
+
+    const destroyBrowserVoiceCallSession = useCallback((options?: {
+        preserveUiState?: boolean;
+        nextUiState?: Partial<ActiveVoiceCallState> | null;
+    }) => {
+        const session = browserVoiceCallSessionRef.current;
+        browserVoiceCallSessionRef.current = null;
+
+        if (session) {
+            if (session.disconnectTimeoutId !== null) {
+                window.clearTimeout(session.disconnectTimeoutId);
+                session.disconnectTimeoutId = null;
+            }
+            try {
+                session.peerConnection.ontrack = null;
+                session.peerConnection.onconnectionstatechange = null;
+                session.peerConnection.oniceconnectionstatechange = null;
+                session.peerConnection.onicegatheringstatechange = null;
+                session.peerConnection.close();
+            } catch {
+                // ignore peer connection cleanup failures
+            }
+            session.localStream.getTracks().forEach((track) => {
+                try {
+                    track.stop();
+                } catch {
+                    // ignore track cleanup failures
+                }
+            });
+            session.remoteStream.getTracks().forEach((track) => {
+                try {
+                    track.stop();
+                } catch {
+                    // ignore track cleanup failures
+                }
+            });
+        }
+
+        attachRemoteAudioStream(null);
+        if (!options?.preserveUiState) {
+            setActiveVoiceCall(options?.nextUiState ? ((current) => current ? { ...current, ...options.nextUiState } : null) : null);
+        }
+    }, [attachRemoteAudioStream]);
+
+    const waitForIceGatheringComplete = useCallback(async (peerConnection: RTCPeerConnection, timeoutMs = 4_000) => {
+        if (peerConnection.iceGatheringState === 'complete') return;
+        await new Promise<void>((resolve) => {
+            let settled = false;
+            const finish = () => {
+                if (settled) return;
+                settled = true;
+                peerConnection.removeEventListener('icegatheringstatechange', onStateChange);
+                window.clearTimeout(timeoutId);
+                resolve();
+            };
+            const onStateChange = () => {
+                if (peerConnection.iceGatheringState === 'complete') {
+                    finish();
+                }
+            };
+            const timeoutId = window.setTimeout(finish, timeoutMs);
+            peerConnection.addEventListener('icegatheringstatechange', onStateChange);
+        });
+    }, []);
+
+    const createBrowserVoiceCallSession = useCallback(async (params: {
+        direction: 'inbound' | 'outbound';
+        profileId: string;
+        customerWaId: string | null;
+        remoteLabel: string;
+        callId?: string | null;
+    }) => {
+        if (!window.RTCPeerConnection) {
+            throw new Error('WebRTC is not supported in this browser.')
+        }
+        if (!navigator.mediaDevices?.getUserMedia) {
+            throw new Error('Microphone access is not available in this browser.')
+        }
+        if (browserVoiceCallSessionRef.current) {
+            throw new Error('Finish the current call before starting a new one.')
+        }
+
+        const localStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true
+            },
+            video: false
+        });
+        const remoteStream = new MediaStream();
+        const peerConnection = new RTCPeerConnection({ iceServers: webrtcIceServers });
+        const session: BrowserVoiceCallSession = {
+            peerConnection,
+            localStream,
+            remoteStream,
+            callId: params.callId || null,
+            customerWaId: params.customerWaId,
+            direction: params.direction,
+            profileId: params.profileId,
+            remoteLabel: params.remoteLabel,
+            remoteDescriptionApplied: false,
+            preAcceptSent: false,
+            acceptSent: false,
+            acceptLockToken: null,
+            disconnectTimeoutId: null
+        };
+        localStream.getTracks().forEach((track) => {
+            peerConnection.addTrack(track, localStream);
+        });
+        peerConnection.ontrack = (event) => {
+            event.streams.forEach((stream) => {
+                stream.getTracks().forEach((track) => {
+                    if (!remoteStream.getTracks().some((existing) => existing.id === track.id)) {
+                        remoteStream.addTrack(track);
+                    }
+                });
+            });
+            attachRemoteAudioStream(remoteStream);
+            setActiveVoiceCall((current) => current ? { ...current, status: 'connected' } : current);
+        };
+        peerConnection.onconnectionstatechange = () => {
+            const state = peerConnection.connectionState;
+            if (state === 'connected') {
+                if (session.disconnectTimeoutId !== null) {
+                    window.clearTimeout(session.disconnectTimeoutId);
+                    session.disconnectTimeoutId = null;
+                }
+                setActiveVoiceCall((current) => current ? { ...current, status: 'connected' } : current);
+                return;
+            }
+            if (state === 'connecting' || state === 'new') {
+                if (session.disconnectTimeoutId !== null) {
+                    window.clearTimeout(session.disconnectTimeoutId);
+                    session.disconnectTimeoutId = null;
+                }
+                return;
+            }
+            if (state === 'disconnected') {
+                if (session.disconnectTimeoutId !== null) {
+                    return;
+                }
+                session.disconnectTimeoutId = window.setTimeout(() => {
+                    session.disconnectTimeoutId = null;
+                    if (browserVoiceCallSessionRef.current !== session) {
+                        return;
+                    }
+                    if (session.peerConnection.connectionState === 'connected' || session.peerConnection.connectionState === 'connecting') {
+                        return;
+                    }
+                    destroyBrowserVoiceCallSession();
+                }, BROWSER_VOICE_CALL_DISCONNECT_GRACE_MS);
+                return;
+            }
+            if (state === 'failed' || state === 'closed') {
+                destroyBrowserVoiceCallSession();
+            }
+        };
+        browserVoiceCallSessionRef.current = session;
+        setActiveVoiceCall({
+            callId: session.callId,
+            customerWaId: session.customerWaId,
+            remoteLabel: params.remoteLabel,
+            direction: params.direction,
+            status: 'preparing',
+            muted: false,
+            startedAt: Date.now(),
+            profileId: params.profileId,
+            lastError: null
+        });
+        return session;
+    }, [attachRemoteAudioStream, destroyBrowserVoiceCallSession, webrtcIceServers]);
 
     const bumpDebugSocketEvent = useCallback((name: string, detail = '') => {
         if (!debugOverlayEnabled) return;
@@ -4138,6 +4492,10 @@ export default function App() {
     }, [activeProfileId, bumpDebugSocketEvent]);
 
     useEffect(() => {
+        activeVoiceCallRef.current = activeVoiceCall;
+    }, [activeVoiceCall]);
+
+    useEffect(() => {
         profilesRef.current = Array.isArray(profiles) ? profiles : [];
         if (!debugOverlayEnabled) return;
         const summary = profilesRef.current
@@ -4150,6 +4508,10 @@ export default function App() {
     useEffect(() => {
         selectedChatIdRef.current = selectedChatId;
     }, [selectedChatId]);
+
+    useEffect(() => () => {
+        destroyBrowserVoiceCallSession();
+    }, [destroyBrowserVoiceCallSession]);
 
     useEffect(() => {
         chatReadCursorByChatRef.current = chatReadCursorByChat;
@@ -5214,12 +5576,81 @@ export default function App() {
 
         newSocket.on('calls.update', (data) => {
             if (data?.profileId !== activeProfileIdRef.current) return;
+            const currentUserId = typeof session?.user?.id === 'string' ? session.user.id.trim() : '';
             const eventName = typeof data?.event === 'string' ? data.event.trim().toLowerCase() : '';
             const callId = typeof data?.callId === 'string' ? data.callId.trim() : '';
             const from = typeof data?.from === 'string' ? data.from.trim() : '';
             const to = typeof data?.to === 'string' ? data.to.trim() : '';
             const normalizedStatus = typeof data?.normalizedStatus === 'string' ? data.normalizedStatus.trim().toLowerCase() : '';
-            const isRinging = normalizedStatus === 'ringing' || eventName === 'connect';
+            const acceptedByUserId = typeof data?.acceptedByUserId === 'string' ? data.acceptedByUserId.trim() : '';
+            const acceptedByName = typeof data?.acceptedByName === 'string' ? data.acceptedByName.trim() : '';
+            const acceptedAt = typeof data?.acceptedAt === 'string' ? data.acceptedAt.trim() : '';
+            const claimExpiresAt = typeof data?.claimExpiresAt === 'string' ? data.claimExpiresAt.trim() : '';
+            const sessionPayload = data?.session && typeof data.session === 'object' && typeof data.session.sdp === 'string' && typeof data.session.sdp_type === 'string'
+                ? {
+                    sdp_type: data.session.sdp_type.trim().toLowerCase() as 'offer' | 'answer',
+                    sdp: data.session.sdp
+                }
+                : null;
+            const isRinging = normalizedStatus === 'ringing';
+            const normalizedPartyId = getCleanId(from || to).replace(/\D/g, '');
+            const browserSession = browserVoiceCallSessionRef.current;
+            const claimedByAnotherUser =
+                Boolean(acceptedByUserId)
+                && acceptedByUserId !== currentUserId
+                && ['accepting', 'accepted', 'answered'].includes(normalizedStatus);
+
+            if (browserSession) {
+                const sameCallId = Boolean(callId && browserSession.callId && browserSession.callId === callId);
+                const sameCustomer = Boolean(normalizedPartyId && browserSession.customerWaId && browserSession.customerWaId === normalizedPartyId);
+                const isMatchingBrowserSession = sameCallId || (!browserSession.callId && sameCustomer);
+
+                if (isMatchingBrowserSession) {
+                    if (claimedByAnotherUser) {
+                        showToast(
+                            acceptedByName
+                                ? `Someone already answered this call. ${acceptedByName} is handling it.`
+                                : 'Someone already answered this call.',
+                            'error'
+                        );
+                        destroyBrowserVoiceCallSession();
+                        return;
+                    }
+
+                    if (callId && browserSession.callId !== callId) {
+                        browserSession.callId = callId;
+                        setActiveVoiceCall((current) => current ? { ...current, callId } : current);
+                    }
+
+                    if (
+                        browserSession.direction === 'outbound'
+                        && sessionPayload?.sdp_type === 'answer'
+                        && sessionPayload.sdp
+                        && !browserSession.remoteDescriptionApplied
+                    ) {
+                        browserSession.remoteDescriptionApplied = true;
+                        void browserSession.peerConnection
+                            .setRemoteDescription({ type: 'answer', sdp: sessionPayload.sdp })
+                            .then(() => {
+                                setActiveVoiceCall((current) => current ? { ...current, status: 'connecting' } : current);
+                            })
+                            .catch((error: any) => {
+                                browserSession.remoteDescriptionApplied = false;
+                                pushLog(`[Calls] Failed to apply outbound answer SDP: ${error?.message || 'unknown error'}`, 'error');
+                                showToast(error?.message || 'Failed to connect call audio.', 'error');
+                                destroyBrowserVoiceCallSession();
+                            });
+                    }
+
+                    if (normalizedStatus === 'terminated' || normalizedStatus === 'rejected' || normalizedStatus === 'missed' || normalizedStatus === 'failed' || eventName === 'terminate' || eventName === 'reject') {
+                        destroyBrowserVoiceCallSession();
+                    } else if (eventName === 'accept' || normalizedStatus === 'answered') {
+                        setActiveVoiceCall((current) => current ? { ...current, status: 'connected' } : current);
+                    } else {
+                        setActiveVoiceCall((current) => current ? { ...current, status: current.status === 'connected' ? current.status : 'connecting' } : current);
+                    }
+                }
+            }
 
             if (callId) {
                 setIncomingCalls((prev) => {
@@ -5235,10 +5666,16 @@ export default function App() {
                         normalizedStatus: normalizedStatus || 'unknown',
                         timestamp: Number(data?.timestamp || Date.now() / 1000),
                         event: eventName || 'unknown',
+                        session: sessionPayload,
+                        bizOpaqueCallbackData: typeof data?.bizOpaqueCallbackData === 'string' ? data.bizOpaqueCallbackData : null,
+                        acceptedByUserId: acceptedByUserId || null,
+                        acceptedByName: acceptedByName || null,
+                        acceptedAt: acceptedAt || null,
+                        claimExpiresAt: claimExpiresAt || null,
                         loadingAction: existing?.loadingAction || null
                     };
 
-                    if (isRinging) {
+                    if (isRinging || isIncomingCallClaimed(nextEntry)) {
                         if (existing) {
                             return prev.map((entry) => entry.callId === callId ? nextEntry : entry);
                         }
@@ -6974,7 +7411,259 @@ export default function App() {
         }
     }, [activeProfileId, selectedChatId, session?.access_token, showToast, pushLog, fetchSelectedCallPermission]);
 
-    const handleIncomingCallAction = useCallback(async (callId: string, action: 'reject' | 'terminate') => {
+    const fetchStoredCallDetails = useCallback(async (callId: string) => {
+        if (!activeProfileId) return null;
+        const params = new URLSearchParams({
+            profileId: activeProfileId
+        });
+        const response = await fetchWithSessionAuth(
+            `${SOCKET_URL}/api/whatsapp/calls/${encodeURIComponent(callId)}?${params.toString()}`,
+            { method: 'GET' }
+        );
+        const payload = await response.json().catch(() => null);
+        if (!response.ok || payload?.success === false) {
+            const apiError = parseCallApiError(payload, response.status, `Failed with status ${response.status}`);
+            const error: any = new Error(formatCallApiErrorMessage(apiError));
+            error.callApiError = apiError;
+            throw error;
+        }
+        return payload?.data?.call || null;
+    }, [activeProfileId, fetchWithSessionAuth]);
+
+    const handleAcceptIncomingCall = useCallback(async (callId: string) => {
+        if (!session?.access_token) {
+            showToast('Please login again before accepting calls.', 'error');
+            return;
+        }
+        if (!activeProfileId) {
+            showToast('No active profile selected.', 'error');
+            return;
+        }
+        if (browserVoiceCallSessionRef.current || activeVoiceCallRef.current) {
+            showToast('Finish the current call before answering another one.', 'error');
+            return;
+        }
+
+        const currentUserId = trimString(session?.user?.id);
+        const existingCall = incomingCalls.find((entry) => entry.callId === callId) || null;
+        const fallbackCall = existingCall || {
+            callId,
+            profileId: activeProfileId,
+            phoneNumberId: '',
+            from: null,
+            to: null,
+            direction: 'inbound',
+            contactName: null,
+            normalizedStatus: 'ringing',
+            timestamp: Math.floor(Date.now() / 1000),
+            event: 'connect',
+            session: null,
+            bizOpaqueCallbackData: null,
+            acceptedByUserId: null,
+            acceptedByName: null,
+            acceptedAt: null,
+            claimExpiresAt: null,
+            loadingAction: null
+        };
+
+        setIncomingCalls((prev) => prev.map((entry) => entry.callId === callId ? { ...entry, loadingAction: 'accept' } : entry));
+
+        try {
+            let sessionPayload = fallbackCall.session;
+            let phoneNumberId = fallbackCall.phoneNumberId;
+            let fromWaId = fallbackCall.from;
+            let remoteLabel = fallbackCall.contactName || formatPhoneNumber(fallbackCall.from || '') || fallbackCall.from || 'Unknown caller';
+            const storedCall = await fetchStoredCallDetails(callId);
+            const storedStatus = trimString(storedCall?.status).toLowerCase();
+            const storedAcceptedByUserId = trimString(storedCall?.accepted_by_user_id);
+            const storedAcceptedByName = trimString(storedCall?.accepted_by_name);
+            const storedAcceptedAt = trimString(storedCall?.accepted_at);
+            const storedClaimExpiresAt = trimString(storedCall?.claim_expires_at);
+
+            if (storedCall) {
+                if (storedCall?.session?.sdp && storedCall?.session?.sdp_type === 'offer') {
+                    sessionPayload = {
+                        sdp: storedCall.session.sdp,
+                        sdp_type: 'offer'
+                    };
+                }
+                phoneNumberId = trimString(storedCall.phone_number_id) || phoneNumberId;
+                fromWaId = trimString(storedCall.customer_id) || fromWaId;
+                remoteLabel = trimString(storedCall.customer_name) || remoteLabel;
+
+                setIncomingCalls((prev) => prev.map((entry) => entry.callId === callId ? {
+                    ...entry,
+                    phoneNumberId: trimString(storedCall.phone_number_id) || entry.phoneNumberId,
+                    from: trimString(storedCall.customer_id) || entry.from,
+                    contactName: trimString(storedCall.customer_name) || entry.contactName,
+                    normalizedStatus: storedStatus || entry.normalizedStatus,
+                    session: storedCall?.session?.sdp && storedCall?.session?.sdp_type === 'offer'
+                        ? {
+                            sdp: storedCall.session.sdp,
+                            sdp_type: 'offer'
+                        }
+                        : entry.session,
+                    acceptedByUserId: storedAcceptedByUserId || null,
+                    acceptedByName: storedAcceptedByName || null,
+                    acceptedAt: storedAcceptedAt || null,
+                    claimExpiresAt: storedClaimExpiresAt || null,
+                    loadingAction: 'accept'
+                } : entry));
+            }
+
+            if (['accepting', 'accepted', 'answered'].includes(storedStatus)) {
+                if (storedAcceptedByUserId && storedAcceptedByUserId !== currentUserId) {
+                    const answeredMessage = storedAcceptedByName
+                        ? `Someone already answered this call. ${storedAcceptedByName} is handling it.`
+                        : 'Someone already answered this call.';
+                    showToast(answeredMessage, 'error');
+                    setIncomingCalls((prev) => prev.map((entry) => entry.callId === callId ? {
+                        ...entry,
+                        normalizedStatus: storedStatus,
+                        acceptedByUserId: storedAcceptedByUserId || entry.acceptedByUserId,
+                        acceptedByName: storedAcceptedByName || entry.acceptedByName,
+                        acceptedAt: storedAcceptedAt || entry.acceptedAt,
+                        claimExpiresAt: storedClaimExpiresAt || entry.claimExpiresAt,
+                        loadingAction: null
+                    } : entry));
+                    return;
+                }
+                showToast('You already answered this call in another window.', 'error');
+                setIncomingCalls((prev) => prev.map((entry) => entry.callId === callId ? {
+                    ...entry,
+                    normalizedStatus: storedStatus,
+                    acceptedByUserId: storedAcceptedByUserId || currentUserId || entry.acceptedByUserId,
+                    acceptedByName: storedAcceptedByName || entry.acceptedByName,
+                    acceptedAt: storedAcceptedAt || entry.acceptedAt,
+                    claimExpiresAt: storedClaimExpiresAt || entry.claimExpiresAt,
+                    loadingAction: null
+                } : entry));
+                return;
+            }
+
+            if (['rejected', 'terminated', 'missed', 'failed'].includes(storedStatus)) {
+                showToast(`This call is no longer available (${getIncomingCallStatusLabel(storedStatus)}).`, 'error');
+                setIncomingCalls((prev) => prev.filter((entry) => entry.callId !== callId));
+                return;
+            }
+
+            if (!sessionPayload?.sdp || sessionPayload.sdp_type !== 'offer') {
+                throw new Error('This call does not have a valid SDP offer yet. Wait a moment and try again.');
+            }
+
+            const customerWaId = getCleanId(fromWaId || '').replace(/\D/g, '') || null;
+            const browserSession = await createBrowserVoiceCallSession({
+                direction: 'inbound',
+                profileId: activeProfileId,
+                customerWaId,
+                remoteLabel,
+                callId
+            });
+
+            await browserSession.peerConnection.setRemoteDescription({
+                type: 'offer',
+                sdp: sessionPayload.sdp
+            });
+            browserSession.remoteDescriptionApplied = true;
+
+            const answer = await browserSession.peerConnection.createAnswer();
+            await browserSession.peerConnection.setLocalDescription(answer);
+            await waitForIceGatheringComplete(browserSession.peerConnection);
+
+            const finalSdp = trimString(browserSession.peerConnection.localDescription?.sdp);
+            if (!finalSdp) {
+                throw new Error('Failed to generate a local audio answer.');
+            }
+
+            const requestBody = JSON.stringify({
+                profileId: activeProfileId,
+                phoneNumberId: phoneNumberId || undefined,
+                session: {
+                    sdp_type: 'answer',
+                    sdp: finalSdp
+                }
+            });
+
+            const preAcceptResponse = await fetchWithSessionAuth(`${SOCKET_URL}/api/whatsapp/calls/${encodeURIComponent(callId)}/pre-accept`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: requestBody
+            });
+            const preAcceptPayload = await preAcceptResponse.json().catch(() => null);
+            if (!preAcceptResponse.ok || preAcceptPayload?.success === false) {
+                const apiError = parseCallApiError(preAcceptPayload, preAcceptResponse.status, `Failed with status ${preAcceptResponse.status}`);
+                const error: any = new Error(formatCallApiErrorMessage(apiError));
+                error.callApiError = apiError;
+                throw error;
+            }
+            browserSession.preAcceptSent = true;
+            browserSession.acceptLockToken = trimString(preAcceptPayload?.data?.accept_lock_token || preAcceptPayload?.data?.acceptLockToken);
+            if (!browserSession.acceptLockToken) {
+                throw new Error('Call accept lock was not returned by the server.');
+            }
+
+            const acceptResponse = await fetchWithSessionAuth(`${SOCKET_URL}/api/whatsapp/calls/${encodeURIComponent(callId)}/accept`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    profileId: activeProfileId,
+                    phoneNumberId: phoneNumberId || undefined,
+                    session: {
+                        sdp_type: 'answer',
+                        sdp: finalSdp
+                    },
+                    acceptLockToken: browserSession.acceptLockToken
+                })
+            });
+            const acceptPayload = await acceptResponse.json().catch(() => null);
+            if (!acceptResponse.ok || acceptPayload?.success === false) {
+                const apiError = parseCallApiError(acceptPayload, acceptResponse.status, `Failed with status ${acceptResponse.status}`);
+                const error: any = new Error(formatCallApiErrorMessage(apiError));
+                error.callApiError = apiError;
+                throw error;
+            }
+            browserSession.acceptSent = true;
+
+            setActiveVoiceCall((current) => current ? {
+                ...current,
+                callId,
+                status: 'connecting',
+                lastError: null
+            } : current);
+            setIncomingCalls((prev) => prev.filter((entry) => entry.callId !== callId));
+            pushLog(`[Calls] Accepting call ${callId}.`, 'info');
+            showToast('Call accepted. Audio is connecting.', 'success');
+        } catch (error: any) {
+            destroyBrowserVoiceCallSession();
+            const micMessage = formatMicrophoneCallErrorMessage(error);
+            const apiError = error?.callApiError || null;
+            const finalMessage = micMessage || (apiError ? formatCallApiErrorMessage(apiError) : (error?.message || 'Failed to accept incoming call.'));
+            showToast(finalMessage, 'error');
+            pushLog(`[Calls] Accept failed for ${callId}: ${finalMessage}`, 'error');
+            setIncomingCalls((prev) => prev.map((entry) => entry.callId === callId ? { ...entry, loadingAction: null } : entry));
+        }
+    }, [
+        activeProfileId,
+        createBrowserVoiceCallSession,
+        destroyBrowserVoiceCallSession,
+        fetchStoredCallDetails,
+        fetchWithSessionAuth,
+        incomingCalls,
+        pushLog,
+        session?.access_token,
+        showToast,
+        waitForIceGatheringComplete
+    ]);
+
+    const handleIncomingCallAction = useCallback(async (callId: string, action: 'accept' | 'reject' | 'terminate') => {
+        if (action === 'accept') {
+            await handleAcceptIncomingCall(callId);
+            return;
+        }
         if (!session?.access_token) {
             showToast('Please login again before managing calls.', 'error');
             return;
@@ -6986,11 +7675,10 @@ export default function App() {
 
         setIncomingCalls((prev) => prev.map((entry) => entry.callId === callId ? { ...entry, loadingAction: action } : entry));
         try {
-            const response = await fetch(`${SOCKET_URL}/api/meta/whatsapp/calling/${encodeURIComponent(callId)}/${action}`, {
+            const response = await fetchWithSessionAuth(`${SOCKET_URL}/api/whatsapp/calls/${encodeURIComponent(callId)}/${action}`, {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${session.access_token}`
+                    'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({
                     profileId: activeProfileId
@@ -6998,16 +7686,145 @@ export default function App() {
             });
             const payload = await response.json().catch(() => null);
             if (!response.ok || payload?.success === false) {
-                throw new Error(payload?.error || `Failed with status ${response.status}`);
+                const apiError = parseCallApiError(payload, response.status, `Failed with status ${response.status}`);
+                const error: any = new Error(formatCallApiErrorMessage(apiError));
+                error.callApiError = apiError;
+                throw error;
             }
 
             showToast(action === 'reject' ? 'Incoming call rejected.' : 'Call terminated.', 'success');
             setIncomingCalls((prev) => prev.filter((entry) => entry.callId !== callId));
         } catch (error: any) {
-            showToast(error?.message || `Failed to ${action} call.`, 'error');
+            const apiError = error?.callApiError || null;
+            const finalMessage = apiError ? formatCallApiErrorMessage(apiError) : (error?.message || `Failed to ${action} call.`);
+            showToast(finalMessage, 'error');
             setIncomingCalls((prev) => prev.map((entry) => entry.callId === callId ? { ...entry, loadingAction: null } : entry));
         }
-    }, [activeProfileId, session?.access_token, showToast]);
+    }, [activeProfileId, fetchWithSessionAuth, handleAcceptIncomingCall, session?.access_token, showToast]);
+
+    const startOutboundVoiceCall = useCallback(async (userWaId: string, remoteLabel: string) => {
+        if (!session?.access_token) {
+            showToast('Please login again before starting a call.', 'error');
+            return;
+        }
+        if (!activeProfileId) {
+            showToast('No active profile selected.', 'error');
+            return;
+        }
+        if (browserVoiceCallSessionRef.current || activeVoiceCallRef.current) {
+            showToast('Finish the current call before starting another one.', 'error');
+            return;
+        }
+
+        try {
+            const browserSession = await createBrowserVoiceCallSession({
+                direction: 'outbound',
+                profileId: activeProfileId,
+                customerWaId: userWaId,
+                remoteLabel
+            });
+
+            const offer = await browserSession.peerConnection.createOffer({
+                offerToReceiveAudio: true
+            });
+            await browserSession.peerConnection.setLocalDescription(offer);
+            await waitForIceGatheringComplete(browserSession.peerConnection);
+
+            const finalSdp = trimString(browserSession.peerConnection.localDescription?.sdp);
+            if (!finalSdp) {
+                throw new Error('Failed to generate a local call offer.');
+            }
+
+            const response = await fetchWithSessionAuth(`${SOCKET_URL}/api/whatsapp/calls/connect`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    profileId: activeProfileId,
+                    customer_id: userWaId,
+                    session: {
+                        sdp_type: 'offer',
+                        sdp: finalSdp
+                    }
+                })
+            });
+            const payload = await response.json().catch(() => null);
+            if (!response.ok || payload?.success === false) {
+                throw new Error(payload?.error || `Failed with status ${response.status}`);
+            }
+
+            const storedCall = payload?.data?.stored_call || null;
+            const callId = trimString(
+                payload?.data?.call_id
+                || storedCall?.call_id
+                || payload?.data?.response?.call_id
+                || payload?.data?.response?.id
+            ) || null;
+
+            browserSession.callId = callId;
+            setActiveVoiceCall((current) => current ? {
+                ...current,
+                callId,
+                status: 'connecting',
+                lastError: null
+            } : current);
+            pushLog(`[Calls] Outbound voice call started for ${userWaId}.`, 'info');
+            showToast('Voice call started. Waiting for answer.', 'success');
+        } catch (error: any) {
+            destroyBrowserVoiceCallSession();
+            showToast(error?.message || 'Failed to start voice call.', 'error');
+            pushLog(`[Calls] Failed to start outbound voice call: ${error?.message || 'unknown error'}`, 'error');
+        }
+    }, [
+        activeProfileId,
+        createBrowserVoiceCallSession,
+        destroyBrowserVoiceCallSession,
+        fetchWithSessionAuth,
+        pushLog,
+        session?.access_token,
+        showToast,
+        waitForIceGatheringComplete
+    ]);
+
+    const toggleActiveVoiceCallMute = useCallback(() => {
+        const browserSession = browserVoiceCallSessionRef.current;
+        const callState = activeVoiceCallRef.current;
+        if (!browserSession || !callState) return;
+        const nextMuted = !callState.muted;
+        browserSession.localStream.getAudioTracks().forEach((track) => {
+            track.enabled = !nextMuted;
+        });
+        setActiveVoiceCall((current) => current ? { ...current, muted: nextMuted } : current);
+    }, []);
+
+    const handleEndActiveVoiceCall = useCallback(async () => {
+        const currentCall = activeVoiceCallRef.current;
+        if (!currentCall) return;
+
+        setActiveVoiceCall((existing) => existing ? { ...existing, status: 'ending' } : existing);
+        try {
+            if (currentCall.callId && session?.access_token && activeProfileId) {
+                const response = await fetchWithSessionAuth(`${SOCKET_URL}/api/whatsapp/calls/${encodeURIComponent(currentCall.callId)}/terminate`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        profileId: activeProfileId
+                    })
+                });
+                const payload = await response.json().catch(() => null);
+                if (!response.ok || payload?.success === false) {
+                    throw new Error(payload?.error || `Failed with status ${response.status}`);
+                }
+            }
+        } catch (error: any) {
+            showToast(error?.message || 'Failed to terminate the active call cleanly.', 'error');
+        } finally {
+            destroyBrowserVoiceCallSession();
+        }
+    }, [activeProfileId, destroyBrowserVoiceCallSession, fetchWithSessionAuth, session?.access_token, showToast]);
 
     const handleCallAction = useCallback(async (kind: 'voice' | 'video') => {
         const userWaId = selectedChatId ? getCleanId(selectedChatId).replace(/\D/g, '') : '';
@@ -7015,6 +7832,20 @@ export default function App() {
         try {
             const summary = await fetchSelectedCallPermission();
             if (!summary) return;
+            if (kind === 'video') {
+                showToast('Video calling is not implemented yet. Use voice call for live pickup.', 'error');
+                return;
+            }
+
+            if ((summary.permissionStatus === 'granted' || summary.permissionStatus === 'temporary' || summary.permissionStatus === 'permanent') && summary.canStartCall) {
+                const remoteLabel =
+                    pickContactMetaByJid(contacts, selectedChatId || '')?.name
+                    || formatPhoneNumber(userWaId)
+                    || userWaId;
+                await startOutboundVoiceCall(userWaId, remoteLabel);
+                return;
+            }
+
             const feedback = getCallPermissionFeedback(kind, summary.permissionStatus, summary.canStartCall, summary.canRequestPermission, userWaId);
             showToast(feedback.message, feedback.tone);
             if (feedback.logMessage) {
@@ -7023,7 +7854,7 @@ export default function App() {
         } finally {
             setCallActionLoading(null);
         }
-    }, [selectedChatId, fetchSelectedCallPermission, showToast, pushLog]);
+    }, [contacts, fetchSelectedCallPermission, pushLog, selectedChatId, showToast, startOutboundVoiceCall]);
 
     useEffect(() => {
         if (!activeProfileId || !selectedChatId || selectedChatId.endsWith('@g.us')) {
@@ -10382,55 +11213,160 @@ export default function App() {
                         right: isMobile ? 'max(calc(env(safe-area-inset-right) + 0.5rem), 0.75rem)' : undefined
                     }}
                 >
-                    {incomingCalls.map((call) => (
-                        <div
-                            key={call.callId}
-                            className="rounded-2xl border border-[#cde7dd] bg-white/98 px-4 py-3 shadow-[0_14px_34px_rgba(0,0,0,0.16)] backdrop-blur-sm"
-                        >
-                            <div className="flex items-start gap-3">
-                                <div className="flex h-11 w-11 items-center justify-center rounded-full bg-[#dcfce7] text-[#047857]">
-                                    <Phone className="h-5 w-5" />
-                                </div>
-                                <div className="min-w-0 flex-1">
-                                    <div className="flex items-center gap-2">
-                                        <p className="truncate text-[13px] font-bold text-[#111b21]">
-                                            {call.contactName || formatPhoneNumber(call.from || '') || call.from || 'Unknown caller'}
-                                        </p>
-                                        <span className="rounded-full bg-[#ecfdf5] px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-[#047857]">
-                                            {call.normalizedStatus || 'ringing'}
-                                        </span>
+                    {incomingCalls.map((call) => {
+                        const currentUserId = trimString(session?.user?.id);
+                        const normalizedStatus = trimString(call.normalizedStatus).toLowerCase() || 'ringing';
+                        const isClaimed = isIncomingCallClaimed(call);
+                        const claimedByAnotherUser = isClaimed && !!call.acceptedByUserId && call.acceptedByUserId !== currentUserId;
+                        const claimedByCurrentUserElsewhere = isClaimed && !!call.acceptedByUserId && call.acceptedByUserId === currentUserId;
+                        const isTerminal = ['rejected', 'terminated', 'missed', 'failed'].includes(normalizedStatus);
+                        const hasBusyCallSession = Boolean(activeVoiceCall || browserVoiceCallSessionRef.current);
+                        const canAccept =
+                            call.loadingAction === null
+                            && normalizedStatus === 'ringing'
+                            && !isClaimed
+                            && !hasBusyCallSession;
+                        const canReject =
+                            call.loadingAction === null
+                            && !isTerminal
+                            && (!claimedByAnotherUser || isAdmin);
+                        const canTerminate =
+                            call.loadingAction === null
+                            && !isTerminal
+                            && (call.acceptedByUserId
+                                ? call.acceptedByUserId === currentUserId || isAdmin
+                                : isAdmin);
+                        let statusMessage = '';
+                        if (claimedByAnotherUser) {
+                            statusMessage = call.acceptedByName
+                                ? `Someone already answered this call. ${call.acceptedByName} is handling it.`
+                                : 'Someone already answered this call.';
+                        } else if (claimedByCurrentUserElsewhere) {
+                            statusMessage = 'You already answered this call in another window.';
+                        } else if (normalizedStatus === 'accepting' && call.acceptedByName) {
+                            statusMessage = `${call.acceptedByName} is answering this call.`;
+                        } else if (normalizedStatus === 'accepted' && call.acceptedByName) {
+                            statusMessage = `${call.acceptedByName} accepted this call.`;
+                        } else if (normalizedStatus === 'answered' && call.acceptedByName) {
+                            statusMessage = `${call.acceptedByName} is on this call.`;
+                        }
+
+                        return (
+                            <div
+                                key={call.callId}
+                                className="rounded-2xl border border-[#cde7dd] bg-white/98 px-4 py-3 shadow-[0_14px_34px_rgba(0,0,0,0.16)] backdrop-blur-sm"
+                            >
+                                <div className="flex items-start gap-3">
+                                    <div className="flex h-11 w-11 items-center justify-center rounded-full bg-[#dcfce7] text-[#047857]">
+                                        <Phone className="h-5 w-5" />
                                     </div>
-                                    <p className="mt-0.5 text-[12px] text-[#54656f]">
-                                        {call.from || 'Unknown'} {call.to ? `to ${call.to}` : ''}
-                                    </p>
-                                    <p className="mt-0.5 text-[11px] font-medium text-[#7a8b97]">
-                                        {new Date((call.timestamp || Date.now() / 1000) * 1000).toLocaleTimeString()}
-                                    </p>
-                                    <div className="mt-3 flex items-center gap-2">
-                                        <button
-                                            type="button"
-                                            onClick={() => void handleIncomingCallAction(call.callId, 'reject')}
-                                            disabled={!isAdmin || call.loadingAction !== null}
-                                            className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-1.5 text-[12px] font-bold text-rose-700 transition-all hover:bg-rose-100 disabled:opacity-60"
-                                        >
-                                            Reject
-                                        </button>
-                                        <button
-                                            type="button"
-                                            onClick={() => void handleIncomingCallAction(call.callId, 'terminate')}
-                                            disabled={!isAdmin || call.loadingAction !== null}
-                                            className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-[12px] font-bold text-slate-700 transition-all hover:bg-slate-100 disabled:opacity-60"
-                                        >
-                                            Terminate
-                                        </button>
-                                        <span className="text-[10px] font-semibold uppercase tracking-wide text-[#8b9aa5]">
-                                            Accept unavailable
-                                        </span>
+                                    <div className="min-w-0 flex-1">
+                                        <div className="flex items-center gap-2">
+                                            <p className="truncate text-[13px] font-bold text-[#111b21]">
+                                                {call.contactName || formatPhoneNumber(call.from || '') || call.from || 'Unknown caller'}
+                                            </p>
+                                            <span className="rounded-full bg-[#ecfdf5] px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-[#047857]">
+                                                {getIncomingCallStatusLabel(normalizedStatus)}
+                                            </span>
+                                        </div>
+                                        <p className="mt-0.5 text-[12px] text-[#54656f]">
+                                            {call.from || 'Unknown'} {call.to ? `to ${call.to}` : ''}
+                                        </p>
+                                        <p className="mt-0.5 text-[11px] font-medium text-[#7a8b97]">
+                                            {new Date((call.timestamp || Date.now() / 1000) * 1000).toLocaleTimeString()}
+                                        </p>
+                                        {statusMessage && (
+                                            <p className={`mt-2 text-[11px] font-semibold ${claimedByAnotherUser ? 'text-rose-700' : 'text-[#54656f]'}`}>
+                                                {statusMessage}
+                                            </p>
+                                        )}
+                                        <div className="mt-3 flex items-center gap-2">
+                                            <button
+                                                type="button"
+                                                onClick={() => void handleIncomingCallAction(call.callId, 'accept')}
+                                                disabled={!canAccept}
+                                                className="rounded-xl border border-[#b7e4cf] bg-[#ecfdf5] px-3 py-1.5 text-[12px] font-bold text-[#047857] transition-all hover:bg-[#dcfce7] disabled:opacity-60"
+                                            >
+                                                {call.loadingAction === 'accept' ? 'Accepting...' : 'Accept'}
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => void handleIncomingCallAction(call.callId, 'reject')}
+                                                disabled={!canReject}
+                                                className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-1.5 text-[12px] font-bold text-rose-700 transition-all hover:bg-rose-100 disabled:opacity-60"
+                                            >
+                                                {call.loadingAction === 'reject' ? 'Rejecting...' : 'Reject'}
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => void handleIncomingCallAction(call.callId, 'terminate')}
+                                                disabled={!canTerminate}
+                                                className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-[12px] font-bold text-slate-700 transition-all hover:bg-slate-100 disabled:opacity-60"
+                                            >
+                                                {call.loadingAction === 'terminate' ? 'Ending...' : 'Terminate'}
+                                            </button>
+                                        </div>
                                     </div>
                                 </div>
                             </div>
+                        );
+                    })}
+                </div>
+            )}
+            {activeVoiceCall && (
+                <div
+                    className="fixed bottom-[calc(env(safe-area-inset-bottom)+5.5rem)] left-4 right-4 z-[278] sm:left-auto sm:right-4 sm:max-w-[420px]"
+                >
+                    <div className="rounded-3xl border border-[#d7e9df] bg-white/98 px-4 py-4 shadow-[0_18px_42px_rgba(0,0,0,0.2)] backdrop-blur-sm">
+                        <div className="flex items-start gap-3">
+                            <div className="flex h-12 w-12 items-center justify-center rounded-full bg-[#dcfce7] text-[#047857]">
+                                <Phone className="h-5 w-5" />
+                            </div>
+                            <div className="min-w-0 flex-1">
+                                <div className="flex items-center gap-2">
+                                    <p className="truncate text-[14px] font-bold text-[#111b21]">
+                                        {activeVoiceCall.remoteLabel || formatPhoneNumber(activeVoiceCall.customerWaId || '') || activeVoiceCall.customerWaId || 'WhatsApp call'}
+                                    </p>
+                                    <span className="rounded-full bg-[#ecfdf5] px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-[#047857]">
+                                        {getVoiceCallStatusLabel(activeVoiceCall.status)}
+                                    </span>
+                                </div>
+                                <p className="mt-0.5 text-[12px] text-[#54656f]">
+                                    {activeVoiceCall.direction === 'inbound' ? 'Incoming voice call' : 'Outgoing voice call'}
+                                    {activeVoiceCall.customerWaId ? ` • ${formatPhoneNumber(activeVoiceCall.customerWaId) || activeVoiceCall.customerWaId}` : ''}
+                                </p>
+                                <p className="mt-0.5 text-[11px] font-medium text-[#7a8b97]">
+                                    Started {new Date(activeVoiceCall.startedAt).toLocaleTimeString()}
+                                    {activeVoiceCall.muted ? ' • Mic muted' : ' • Mic live'}
+                                </p>
+                                {activeVoiceCall.lastError && (
+                                    <p className="mt-1 text-[11px] font-medium text-rose-600">
+                                        {activeVoiceCall.lastError}
+                                    </p>
+                                )}
+                                <div className="mt-3 flex items-center gap-2">
+                                    <button
+                                        type="button"
+                                        onClick={toggleActiveVoiceCallMute}
+                                        disabled={activeVoiceCall.status === 'ending'}
+                                        className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-[12px] font-bold text-slate-700 transition-all hover:bg-slate-100 disabled:opacity-60"
+                                    >
+                                        <Mic className="h-3.5 w-3.5" />
+                                        {activeVoiceCall.muted ? 'Unmute' : 'Mute'}
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => void handleEndActiveVoiceCall()}
+                                        disabled={activeVoiceCall.status === 'ending'}
+                                        className="inline-flex items-center gap-1.5 rounded-xl border border-rose-200 bg-rose-50 px-3 py-1.5 text-[12px] font-bold text-rose-700 transition-all hover:bg-rose-100 disabled:opacity-60"
+                                    >
+                                        <X className="h-3.5 w-3.5" />
+                                        {activeVoiceCall.status === 'ending' ? 'Ending...' : 'Hang up'}
+                                    </button>
+                                </div>
+                            </div>
                         </div>
-                    ))}
+                    </div>
                 </div>
             )}
             {appToast && (
@@ -10473,6 +11409,7 @@ export default function App() {
                     )}
                 </div>
             )}
+            <audio ref={remoteAudioRef} autoPlay playsInline className="hidden" />
             {debugOverlayEnabled && isMobile && (
                 <div
                     className="fixed z-[285] left-2 right-2"

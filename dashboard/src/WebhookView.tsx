@@ -3653,14 +3653,6 @@ export default function WebhookView({
                     <p className="text-sm text-[#54656f] mb-6 font-medium">
                         Link a client's WhatsApp Business account using Meta Embedded Signup. Use the new-number flow for fresh Cloud API numbers, or the coexistence flow for an existing WhatsApp Business App number that should stay active in the app.
                     </p>
-                    {registrationConfig?.officialMetaOnly && (
-                        <div className="mb-4 rounded-xl border border-[#dbeafe] bg-[#eff6ff] px-4 py-3">
-                            <div className="text-[10px] font-black uppercase tracking-widest text-[#1d4ed8]">Official Meta Only</div>
-                            <p className="mt-1 text-[11px] text-[#1e3a8a]">
-                                This backend is running in official Meta-only mode. QR pairing, WhatsApp Web auth, and other unofficial connection methods are disabled.
-                            </p>
-                        </div>
-                    )}
                     <div className="mb-4 flex items-center justify-between gap-3 rounded-xl border border-[#eceff1] bg-[#f8fafc] px-4 py-2.5">
                         <span className="text-[11px] font-bold uppercase tracking-widest text-[#54656f]">Connection status</span>
                         <span className={`text-[10px] px-3 py-1 rounded-full border font-bold uppercase tracking-widest ${hasActiveWabaConnection ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-[#dbe3ea] bg-white text-[#64748b]'}`}>

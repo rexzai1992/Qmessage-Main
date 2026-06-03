@@ -1,7 +1,7 @@
 import { createHash } from 'crypto'
 
 export type MetaWebhookEventType = 'message' | 'status' | 'call' | 'coexistence_history' | 'call_permission_reply' | 'unknown'
-export type StoredCallStatus = 'ringing' | 'rejected' | 'terminated' | 'missed' | 'failed' | 'unknown'
+export type StoredCallStatus = 'ringing' | 'accepting' | 'accepted' | 'answered' | 'rejected' | 'terminated' | 'missed' | 'failed' | 'unknown'
 export type StoredCallPermissionStatus = 'approved' | 'rejected' | 'unknown'
 
 type SupabaseClientLike = any
@@ -33,6 +33,70 @@ function mergePreferred<T>(preferred: T, fallback: T): T {
     if (preferred === undefined || preferred === null) return fallback
     if (typeof preferred === 'string' && !preferred.trim()) return fallback
     return preferred
+}
+
+function normalizeNullableText(value: any): string | null {
+    const text = trimText(value)
+    return text || null
+}
+
+function normalizeStoredCallStatusValue(value: any): StoredCallStatus {
+    const normalized = trimText(value).toLowerCase()
+    switch (normalized) {
+        case 'ringing':
+        case 'accepting':
+        case 'accepted':
+        case 'answered':
+        case 'rejected':
+        case 'terminated':
+        case 'missed':
+        case 'failed':
+            return normalized
+        case 'connected':
+            return 'answered'
+        default:
+            return 'unknown'
+    }
+}
+
+function isTerminalStoredCallStatus(status: StoredCallStatus): boolean {
+    return status === 'rejected' || status === 'terminated' || status === 'missed' || status === 'failed'
+}
+
+function getStoredCallStatusRank(status: StoredCallStatus): number {
+    switch (status) {
+        case 'ringing':
+            return 10
+        case 'accepting':
+            return 20
+        case 'accepted':
+            return 30
+        case 'answered':
+            return 40
+        default:
+            return 0
+    }
+}
+
+function mergeStoredCallStatus(preferred: any, fallback: any): StoredCallStatus | null {
+    const preferredStatus = normalizeStoredCallStatusValue(preferred)
+    const fallbackStatus = normalizeStoredCallStatusValue(fallback)
+
+    if (preferredStatus === 'unknown') {
+        return fallbackStatus === 'unknown' ? null : fallbackStatus
+    }
+    if (fallbackStatus === 'unknown') {
+        return preferredStatus
+    }
+    if (isTerminalStoredCallStatus(preferredStatus)) {
+        return preferredStatus
+    }
+    if (isTerminalStoredCallStatus(fallbackStatus)) {
+        return fallbackStatus
+    }
+    return getStoredCallStatusRank(preferredStatus) >= getStoredCallStatusRank(fallbackStatus)
+        ? preferredStatus
+        : fallbackStatus
 }
 
 function toIsoTimestamp(value: any): string | null {
@@ -99,6 +163,7 @@ export function deriveStoredCallStatus(params: {
     if (statusValues.includes('terminated') || event === 'terminate') return 'terminated'
     if (statusValues.includes('failed') || event === 'fail' || event === 'failed') return 'failed'
     if (statusValues.includes('missed')) return 'missed'
+    if (statusValues.includes('accepted') || statusValues.includes('connected') || event === 'accept') return 'answered'
 
     const timestampIso = toIsoTimestamp(params.timestamp)
     if (event === 'connect') {
@@ -290,6 +355,11 @@ export async function upsertWhatsappCall(supabase: SupabaseClientLike, params: {
     lastAction?: string | null
     lastActionAt?: string | null
     lastEventAt?: string | null
+    acceptedByUserId?: string | null
+    acceptedByName?: string | null
+    acceptedAt?: string | null
+    claimExpiresAt?: string | null
+    acceptLockToken?: string | null
 }) {
     const phoneNumberId = trimText(params.phoneNumberId)
     const callId = trimText(params.callId)
@@ -321,7 +391,7 @@ export async function upsertWhatsappCall(supabase: SupabaseClientLike, params: {
         business_wa_id: mergePreferred(trimText(params.businessWaId) || null, trimText(existing?.business_wa_id) || null),
         direction: mergePreferred(trimText(params.direction) || null, trimText(existing?.direction) || null),
         event: mergePreferred(trimText(params.event) || null, trimText(existing?.event) || null),
-        status: mergePreferred(trimText(params.status) || null, trimText(existing?.status) || null),
+        status: mergeStoredCallStatus(params.status, existing?.status),
         status_history: nextHistory,
         session_sdp_type: mergePreferred(trimText(params.sessionSdpType) || null, trimText(existing?.session_sdp_type) || null),
         session_sdp: mergePreferred(trimText(params.sessionSdp) || null, trimText(existing?.session_sdp) || null),
@@ -337,6 +407,21 @@ export async function upsertWhatsappCall(supabase: SupabaseClientLike, params: {
         last_action: mergePreferred(trimText(params.lastAction) || null, trimText(existing?.last_action) || null),
         last_action_at: mergePreferred(trimText(params.lastActionAt) || null, trimText(existing?.last_action_at) || null),
         last_event_at: mergePreferred(trimText(params.lastEventAt) || null, trimText(existing?.last_event_at) || null),
+        accepted_by_user_id: params.acceptedByUserId !== undefined
+            ? normalizeNullableText(params.acceptedByUserId)
+            : normalizeNullableText(existing?.accepted_by_user_id),
+        accepted_by_name: params.acceptedByName !== undefined
+            ? normalizeNullableText(params.acceptedByName)
+            : normalizeNullableText(existing?.accepted_by_name),
+        accepted_at: params.acceptedAt !== undefined
+            ? params.acceptedAt || null
+            : (existing?.accepted_at ?? null),
+        claim_expires_at: params.claimExpiresAt !== undefined
+            ? params.claimExpiresAt || null
+            : (existing?.claim_expires_at ?? null),
+        accept_lock_token: params.acceptLockToken !== undefined
+            ? normalizeNullableText(params.acceptLockToken)
+            : normalizeNullableText(existing?.accept_lock_token),
         updated_at: nowIso,
         created_at: trimText(existing?.created_at) || nowIso
     }
@@ -505,6 +590,123 @@ export async function getStoredWhatsappCallPermission(supabase: SupabaseClientLi
     }
 
     return data || null
+}
+
+export async function getStoredWhatsappCall(supabase: SupabaseClientLike, params: {
+    companyId?: string | null
+    profileId?: string | null
+    phoneNumberId?: string | null
+    callId: string
+}) {
+    const callId = trimText(params.callId)
+    if (!callId) return null
+
+    let query = supabase
+        .from('whatsapp_calls')
+        .select('*')
+        .eq('call_id', callId)
+        .order('updated_at', { ascending: false })
+        .limit(1)
+
+    const companyId = trimText(params.companyId)
+    const profileId = trimText(params.profileId)
+    const phoneNumberId = trimText(params.phoneNumberId)
+
+    if (companyId) query = query.eq('company_id', companyId)
+    if (profileId) query = query.eq('profile_id', profileId)
+    if (phoneNumberId) query = query.eq('phone_number_id', phoneNumberId)
+
+    const { data, error } = await query.maybeSingle()
+    if (error) {
+        if (isMissingTableError(error, 'whatsapp_calls')) return null
+        throw error
+    }
+
+    return data || null
+}
+
+export async function claimWhatsappCallAcceptLock(supabase: SupabaseClientLike, params: {
+    companyId?: string | null
+    profileId?: string | null
+    phoneNumberId: string
+    callId: string
+    acceptedByUserId: string
+    acceptedByName?: string | null
+    acceptedAt: string
+    claimExpiresAt: string
+    acceptLockToken: string
+    historyEntry?: any
+}) {
+    const phoneNumberId = trimText(params.phoneNumberId)
+    const callId = trimText(params.callId)
+    const acceptedByUserId = trimText(params.acceptedByUserId)
+    const acceptLockToken = trimText(params.acceptLockToken)
+    if (!phoneNumberId || !callId || !acceptedByUserId || !acceptLockToken) return null
+
+    let query = supabase
+        .from('whatsapp_calls')
+        .update({
+            status: 'accepting',
+            accepted_by_user_id: acceptedByUserId,
+            accepted_by_name: normalizeNullableText(params.acceptedByName),
+            accepted_at: params.acceptedAt,
+            claim_expires_at: params.claimExpiresAt,
+            accept_lock_token: acceptLockToken,
+            last_action: 'pre_accept',
+            last_action_at: params.acceptedAt,
+            last_event_at: params.acceptedAt,
+            updated_at: params.acceptedAt
+        })
+        .eq('phone_number_id', phoneNumberId)
+        .eq('call_id', callId)
+        .in('status', ['ringing'])
+
+    const companyId = trimText(params.companyId)
+    const profileId = trimText(params.profileId)
+    if (companyId) query = query.eq('company_id', companyId)
+    if (profileId) query = query.eq('profile_id', profileId)
+
+    const { data, error } = await query.select('*')
+    if (error) {
+        if (isMissingTableError(error, 'whatsapp_calls')) return null
+        throw error
+    }
+
+    const claimedRow = Array.isArray(data) ? data[0] || null : null
+    if (!claimedRow) return null
+
+    const historyEntry = params.historyEntry ?? {
+        source: 'lock',
+        action: 'claim_accept',
+        status: 'accepting',
+        accepted_by_user_id: acceptedByUserId,
+        accepted_by_name: normalizeNullableText(params.acceptedByName),
+        recorded_at: params.acceptedAt
+    }
+    const nextHistory = appendHistory(claimedRow?.status_history, historyEntry)
+
+    const { data: finalized, error: finalizeError } = await supabase
+        .from('whatsapp_calls')
+        .update({
+            status_history: nextHistory,
+            updated_at: params.acceptedAt
+        })
+        .eq('phone_number_id', phoneNumberId)
+        .eq('call_id', callId)
+        .eq('accepted_by_user_id', acceptedByUserId)
+        .eq('accept_lock_token', acceptLockToken)
+        .select('*')
+        .maybeSingle()
+
+    if (finalizeError) {
+        if (isMissingTableError(finalizeError, 'whatsapp_calls')) return claimedRow
+        throw finalizeError
+    }
+
+    return finalized || {
+        ...claimedRow,
+        status_history: nextHistory
+    }
 }
 
 export async function getRecentWhatsappRawWebhookEvents(supabase: SupabaseClientLike, params: {
