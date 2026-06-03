@@ -527,6 +527,17 @@ function isMissingWhatsappConnectionsTableError(error: any): boolean {
     return message.includes('whatsapp_connections')
 }
 
+function isMissingEmbeddedSignupSessionLogsTableError(error: any): boolean {
+    const code = typeof error?.code === 'string' ? error.code : ''
+    const message = String(error?.message || '').toLowerCase()
+    return (
+        code === '42P01'
+        || code.startsWith('PGRST')
+        || message.includes('embedded_signup_session_logs')
+        || message.includes('schema cache')
+    ) && message.includes('embedded_signup_session_logs')
+}
+
 function formatScheduledBroadcastError(value: any): string {
     if (!value) return 'Unknown error'
     if (typeof value === 'string') return value
@@ -536,6 +547,43 @@ function formatScheduledBroadcastError(value: any): string {
     } catch {
         return String(value)
     }
+}
+
+const EMBEDDED_SIGNUP_SECRET_KEYS = new Set([
+    'access_token',
+    'accessToken',
+    'app_secret',
+    'appSecret',
+    'api_key',
+    'apiKey',
+    'authorization',
+    'bearer',
+    'code',
+    'token'
+])
+
+function sanitizeEmbeddedSignupRawPayload(value: any, depth = 0): any {
+    if (depth > 5) return null
+    if (Array.isArray(value)) {
+        return value.slice(0, 50).map((item) => sanitizeEmbeddedSignupRawPayload(item, depth + 1))
+    }
+    if (!value || typeof value !== 'object') return value
+
+    const output: Record<string, any> = {}
+    for (const [key, raw] of Object.entries(value)) {
+        if (EMBEDDED_SIGNUP_SECRET_KEYS.has(key)) {
+            output[key] = '[redacted]'
+            continue
+        }
+        output[key] = sanitizeEmbeddedSignupRawPayload(raw, depth + 1)
+    }
+    return output
+}
+
+function readBoundedText(value: any, maxLength = 512): string | null {
+    const text = trimText(value)
+    if (!text) return null
+    return text.length > maxLength ? text.slice(0, maxLength) : text
 }
 
 function resolveMetaAppIdFromEnv(): string {
@@ -6743,6 +6791,93 @@ app.get('/api/whatsapp/onboarding/status', async (req: any, res: any) => {
         return res.json(buildVersionedApiSuccess(req, await buildOnboardingStatusData(access)))
     } catch (error: any) {
         return sendVersionedApiError(req, res, error, 'Failed to load onboarding status', 'WHATSAPP_ONBOARDING_STATUS_FAILED')
+    }
+})
+
+app.post('/api/whatsapp/onboarding/session-log', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const body = req.body || {}
+        const rawPayload = sanitizeEmbeddedSignupRawPayload(body.raw_payload || body.rawPayload || {})
+        const isWaLoginUser = typeof body.is_wa_login_user === 'boolean'
+            ? body.is_wa_login_user
+            : typeof body.isWaLoginUser === 'boolean'
+                ? body.isWaLoginUser
+                : null
+        const insertPayload = {
+            company_id: access.companyId,
+            profile_id: access.profileId,
+            flow_type: readBoundedText(body.flow_type || body.flowType, 64) || 'coexistence',
+            source: readBoundedText(body.source, 64) || 'embedded_signup',
+            event: readBoundedText(body.event, 128),
+            current_step: readBoundedText(body.current_step || body.currentStep, 256),
+            error_message: readBoundedText(body.error_message || body.errorMessage, 1024),
+            error_code: readBoundedText(body.error_code || body.errorCode, 128),
+            session_id: readBoundedText(body.session_id || body.sessionId, 256),
+            timestamp: readBoundedText(body.timestamp, 128),
+            waba_id: readBoundedText(body.waba_id || body.wabaId, 128),
+            phone_number_id: readBoundedText(body.phone_number_id || body.phoneNumberId, 128),
+            business_id: readBoundedText(body.business_id || body.businessId, 128),
+            is_wa_login_user: isWaLoginUser,
+            config_id: readBoundedText(body.config_id || body.configId, 128),
+            feature_type: readBoundedText(body.feature_type || body.featureType, 128),
+            session_info_version: readBoundedText(body.session_info_version || body.sessionInfoVersion, 16),
+            raw_payload: rawPayload && typeof rawPayload === 'object' ? rawPayload : {}
+        }
+
+        console.info('[WABA Embedded Signup] session log received', {
+            request_id: req?.requestId || null,
+            company_id: access.companyId,
+            profile_id: access.profileId,
+            flow_type: insertPayload.flow_type,
+            event: insertPayload.event,
+            current_step: insertPayload.current_step,
+            error_code: insertPayload.error_code,
+            session_id: insertPayload.session_id,
+            has_waba_id: Boolean(insertPayload.waba_id),
+            has_phone_number_id: Boolean(insertPayload.phone_number_id),
+            has_business_id: Boolean(insertPayload.business_id),
+            is_wa_login_user: insertPayload.is_wa_login_user,
+            config_id_exists: Boolean(insertPayload.config_id),
+            feature_type: insertPayload.feature_type,
+            session_info_version: insertPayload.session_info_version
+        })
+
+        const { data, error } = await supabase
+            .from('embedded_signup_session_logs')
+            .insert(insertPayload)
+            .select('id, created_at')
+            .maybeSingle()
+
+        if (error) {
+            if (isMissingEmbeddedSignupSessionLogsTableError(error)) {
+                return res.json(buildVersionedApiSuccess(req, {
+                    persisted: false,
+                    reason: 'embedded_signup_session_logs table is not available yet',
+                    created_at: new Date().toISOString()
+                }))
+            }
+
+            console.warn('[WABA Embedded Signup] session log persistence failed', {
+                request_id: req?.requestId || null,
+                error: error.message || String(error)
+            })
+            return res.json(buildVersionedApiSuccess(req, {
+                persisted: false,
+                reason: 'session log persistence failed',
+                created_at: new Date().toISOString()
+            }))
+        }
+
+        return res.json(buildVersionedApiSuccess(req, {
+            persisted: true,
+            id: trimText(data?.id) || null,
+            created_at: trimText(data?.created_at) || new Date().toISOString()
+        }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to record Embedded Signup session log', 'EMBEDDED_SIGNUP_SESSION_LOG_FAILED')
     }
 })
 

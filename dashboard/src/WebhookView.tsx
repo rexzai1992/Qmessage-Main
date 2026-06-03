@@ -6,10 +6,6 @@ import { supabase } from './supabase';
 import { uploadFileToCompanyStorage } from './features/media/uploadToCompanyStorage';
 
 const SOCKET_URL = getSocketUrl();
-const META_ALLOWED_EMBEDDED_SIGNUP_ORIGINS = new Set([
-    'https://www.facebook.com',
-    'https://web.facebook.com'
-]);
 const META_SDK_SCRIPT_ID = 'meta-facebook-jssdk';
 const DEFAULT_META_APP_ID = typeof import.meta.env.VITE_META_APP_ID === 'string' ? import.meta.env.VITE_META_APP_ID.trim() : '';
 const DEFAULT_META_GRAPH_VERSION = typeof import.meta.env.VITE_META_GRAPH_VERSION === 'string' && import.meta.env.VITE_META_GRAPH_VERSION.trim()
@@ -27,6 +23,15 @@ const DEFAULT_META_WA_EXISTING_APP_CONFIGURATION_ID =
     typeof import.meta.env.VITE_META_WA_EXISTING_APP_CONFIGURATION_ID === 'string'
         ? import.meta.env.VITE_META_WA_EXISTING_APP_CONFIGURATION_ID.trim()
         : '';
+
+const isMetaEmbeddedSignupOrigin = (origin: string): boolean => {
+    try {
+        const hostname = new URL(origin).hostname.toLowerCase();
+        return hostname === 'facebook.com' || hostname.endsWith('.facebook.com');
+    } catch {
+        return false;
+    }
+};
 
 let metaSdkPromise: Promise<any> | null = null;
 let metaSdkInitKey = '';
@@ -174,6 +179,31 @@ type EmbeddedSignupSessionInfo = {
     wabaId: string;
     phoneNumberId: string | null;
     businessId: string | null;
+};
+type EmbeddedSignupSessionLogState = {
+    flowType: EmbeddedSignupFlowMode;
+    source: 'embedded_signup';
+    event: string;
+    currentStep: string | null;
+    errorMessage: string | null;
+    errorCode: string | null;
+    sessionId: string | null;
+    timestamp: string | null;
+    wabaId: string | null;
+    phoneNumberId: string | null;
+    businessId: string | null;
+    isWaLoginUser: boolean | null;
+    configId: string | null;
+    featureType: string | null;
+    sessionInfoVersion: string | null;
+    createdAt: string;
+    persisted?: boolean | null;
+};
+type EmbeddedSignupSessionContext = {
+    activeCompanyId: string;
+    configId: string;
+    featureType?: string | null;
+    sessionInfoVersion?: string | null;
 };
 
 type AppReviewCheckState = {
@@ -570,6 +600,8 @@ export default function WebhookView({
     const [quickRepliesDraft, setQuickRepliesDraft] = useState<QuickReply[]>([]);
     const [connectLoading, setConnectLoading] = useState(false);
     const [connectError, setConnectError] = useState<string | null>(null);
+    const [latestEmbeddedSignupSessionLog, setLatestEmbeddedSignupSessionLog] = useState<EmbeddedSignupSessionLogState | null>(null);
+    const [embeddedSignupSessionLogError, setEmbeddedSignupSessionLogError] = useState<string | null>(null);
     const [disconnectLoading, setDisconnectLoading] = useState(false);
     const [disconnectError, setDisconnectError] = useState<string | null>(null);
     const [disconnectNotice, setDisconnectNotice] = useState<string | null>(null);
@@ -1036,7 +1068,72 @@ export default function WebhookView({
         }
     };
 
-    const startEmbeddedSignupSession = (flowMode: EmbeddedSignupFlowMode) => {
+    const submitEmbeddedSignupSessionLog = async (entry: EmbeddedSignupSessionLogState) => {
+        setLatestEmbeddedSignupSessionLog(entry);
+        setEmbeddedSignupSessionLogError(null);
+        if (!sessionToken || !profileId) return;
+
+        try {
+            const res = await fetch(`${SOCKET_URL}/api/v1/whatsapp/onboarding/session-log`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    profileId,
+                    profile_id: profileId,
+                    company_id: readTrimmed(whatsappStatus?.company_id || registrationConfig?.companyId || registrationConfig?.connectedCompanyId),
+                    flow_type: entry.flowType,
+                    source: entry.source,
+                    event: entry.event,
+                    current_step: entry.currentStep || undefined,
+                    error_message: entry.errorMessage || undefined,
+                    error_code: entry.errorCode || undefined,
+                    session_id: entry.sessionId || undefined,
+                    timestamp: entry.timestamp || undefined,
+                    waba_id: entry.wabaId || undefined,
+                    phone_number_id: entry.phoneNumberId || undefined,
+                    business_id: entry.businessId || undefined,
+                    is_wa_login_user: entry.isWaLoginUser,
+                    config_id: entry.configId || undefined,
+                    feature_type: entry.featureType || undefined,
+                    session_info_version: entry.sessionInfoVersion || undefined,
+                    raw_payload: {
+                        type: 'WA_EMBEDDED_SIGNUP',
+                        event: entry.event,
+                        data: {
+                            current_step: entry.currentStep || undefined,
+                            error_message: entry.errorMessage || undefined,
+                            error_code: entry.errorCode || undefined,
+                            session_id: entry.sessionId || undefined,
+                            timestamp: entry.timestamp || undefined,
+                            waba_id: entry.wabaId || undefined,
+                            phone_number_id: entry.phoneNumberId || undefined,
+                            business_id: entry.businessId || undefined,
+                            is_wa_login_user: entry.isWaLoginUser
+                        }
+                    }
+                })
+            });
+            const data = await res.json().catch(() => null);
+            if (!res.ok || !data?.success) {
+                throw new Error(formatApiError(data, 'Failed to record Embedded Signup session log.'));
+            }
+            const result = data?.data || {};
+            setLatestEmbeddedSignupSessionLog(prev => prev?.createdAt === entry.createdAt
+                ? {
+                    ...prev,
+                    persisted: result.persisted === true,
+                    createdAt: readTrimmed(result.created_at) || prev.createdAt
+                }
+                : prev);
+        } catch (error: any) {
+            setEmbeddedSignupSessionLogError(error?.message || 'Failed to record Embedded Signup session log.');
+        }
+    };
+
+    const startEmbeddedSignupSession = (flowMode: EmbeddedSignupFlowMode, sessionContext: EmbeddedSignupSessionContext) => {
         let cleanup = () => {};
 
         const promise = new Promise<EmbeddedSignupSessionInfo>((resolve, reject) => {
@@ -1046,7 +1143,7 @@ export default function WebhookView({
             }, 10 * 60 * 1000);
 
             const handleMessage = (event: MessageEvent) => {
-                if (!META_ALLOWED_EMBEDDED_SIGNUP_ORIGINS.has(event.origin)) return;
+                if (!isMetaEmbeddedSignupOrigin(event.origin)) return;
                 if (typeof event.data !== 'string') return;
 
                 let payload: any = null;
@@ -1058,11 +1155,51 @@ export default function WebhookView({
 
                 if (!payload || payload.type !== 'WA_EMBEDDED_SIGNUP') return;
 
-                const eventName = readTrimmed(payload.event).toUpperCase();
-                if (flowMode === 'coexistence') {
-                    logCoexistenceDebug('Meta Embedded Signup event received', { event_name: eventName || 'UNKNOWN' });
-                }
                 const data = payload.data && typeof payload.data === 'object' ? payload.data : {};
+                const rawEventName = readTrimmed(payload.event);
+                const eventName = rawEventName.toUpperCase();
+                const currentStep = readTrimmed(data.current_step) || null;
+                const errorMessage = readTrimmed(data.error_message) || null;
+                const errorCode = readTrimmed(data.error_code) || null;
+                const sessionId = readTrimmed(data.session_id) || null;
+                const eventTimestamp = readTrimmed(data.timestamp) || null;
+                const wabaIdFromEvent = readTrimmed(data.waba_id) || null;
+                const phoneNumberIdFromEvent = readTrimmed(data.phone_number_id) || null;
+                const businessIdFromEvent = readTrimmed(data.business_id) || null;
+                const isWaLoginUser = typeof data.is_wa_login_user === 'boolean' ? data.is_wa_login_user : null;
+                const sessionLog: EmbeddedSignupSessionLogState = {
+                    flowType: flowMode,
+                    source: 'embedded_signup',
+                    event: rawEventName || eventName || 'UNKNOWN',
+                    currentStep,
+                    errorMessage,
+                    errorCode,
+                    sessionId,
+                    timestamp: eventTimestamp,
+                    wabaId: wabaIdFromEvent,
+                    phoneNumberId: phoneNumberIdFromEvent,
+                    businessId: businessIdFromEvent,
+                    isWaLoginUser,
+                    configId: sessionContext.configId || null,
+                    featureType: sessionContext.featureType || null,
+                    sessionInfoVersion: sessionContext.sessionInfoVersion || null,
+                    createdAt: new Date().toISOString(),
+                    persisted: null
+                };
+
+                logCoexistenceDebug('WA_EMBEDDED_SIGNUP session event', {
+                    event_type: readTrimmed(payload.type) || 'WA_EMBEDDED_SIGNUP',
+                    event_name: sessionLog.event,
+                    current_step: currentStep,
+                    error_code: errorCode,
+                    session_id: sessionId,
+                    has_phone_number_id: Boolean(phoneNumberIdFromEvent),
+                    has_waba_id: Boolean(wabaIdFromEvent),
+                    has_business_id: Boolean(businessIdFromEvent),
+                    is_wa_login_user: isWaLoginUser
+                });
+                void submitEmbeddedSignupSessionLog(sessionLog);
+
                 const isCoexistenceFinish =
                     eventName === 'FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING'
                     || (eventName === 'FINISH' && data?.is_wa_login_user === true);
@@ -1077,9 +1214,9 @@ export default function WebhookView({
                     (flowMode === 'new_phone_onboarding' && eventName === 'FINISH')
                     || (flowMode === 'coexistence' && isCoexistenceFinish)
                 ) {
-                    const wabaId = readTrimmed(data.waba_id);
-                    const phoneNumberId = readTrimmed(data.phone_number_id) || null;
-                    const businessId = readTrimmed(data.business_id) || null;
+                    const wabaId = wabaIdFromEvent || '';
+                    const phoneNumberId = phoneNumberIdFromEvent || null;
+                    const businessId = businessIdFromEvent || null;
                     if (!wabaId) {
                         cleanup();
                         reject(new Error('Meta did not return waba_id.'));
@@ -1096,8 +1233,12 @@ export default function WebhookView({
                 }
 
                 if (eventName === 'CANCEL' || eventName === 'ERROR') {
-                    const message = readTrimmed(data.error_message)
-                        || readTrimmed(data.current_step)
+                    const reportedError = errorCode || sessionId
+                        ? `Embedded Signup error reported.${sessionId ? ` Session ID: ${sessionId}.` : ''}${errorCode ? ` Error code: ${errorCode}.` : ''}`
+                        : '';
+                    const message = reportedError
+                        || errorMessage
+                        || (currentStep ? `Embedded Signup was cancelled at step: ${currentStep}.` : '')
                         || 'Embedded Signup was cancelled before completion.';
                     cleanup();
                     reject(new Error(message));
@@ -1149,7 +1290,12 @@ export default function WebhookView({
         setDisconnectNotice(null);
         try {
             const FB = await loadMetaSdk(resolvedMetaAppId, resolvedMetaGraphVersion);
-            const { promise: signupPromise, cleanup: cleanupSignupListener } = startEmbeddedSignupSession('new_phone_onboarding');
+            const { promise: signupPromise, cleanup: cleanupSignupListener } = startEmbeddedSignupSession('new_phone_onboarding', {
+                activeCompanyId,
+                configId: resolvedEmbeddedSignupV4ConfigId,
+                featureType: null,
+                sessionInfoVersion: '3'
+            });
 
             const loginResponse = await new Promise<any>((resolve) => {
                 FB.login((response: any) => resolve(response), {
@@ -1268,6 +1414,7 @@ export default function WebhookView({
             logCoexistenceDebug('Coexistence start returned', {
                 onboarding_type: onboardingType || 'missing',
                 configuration_id_exists: Boolean(backendCoexistenceConfigId),
+                configuration_id: backendCoexistenceConfigId || null,
                 configuration_id_matches_embedded: Boolean(resolvedEmbeddedSignupV4ConfigId && backendCoexistenceConfigId === resolvedEmbeddedSignupV4ConfigId),
                 start_url_exists: Boolean(backendStartUrl),
                 launch_strategy: 'fb_login_with_backend_configuration_id'
@@ -1290,7 +1437,12 @@ export default function WebhookView({
             }
 
             const FB = await loadMetaSdk(resolvedMetaAppId, resolvedMetaGraphVersion);
-            const { promise: signupPromise, cleanup: cleanupSignupListener } = startEmbeddedSignupSession('coexistence');
+            const { promise: signupPromise, cleanup: cleanupSignupListener } = startEmbeddedSignupSession('coexistence', {
+                activeCompanyId,
+                configId: backendCoexistenceConfigId,
+                featureType: 'whatsapp_business_app_onboarding',
+                sessionInfoVersion: '3'
+            });
             const fbLoginOptions = {
                 config_id: backendCoexistenceConfigId,
                 response_type: 'code',
@@ -1304,6 +1456,7 @@ export default function WebhookView({
 
             logCoexistenceDebug('FB.login options prepared', {
                 config_id_exists: Boolean(fbLoginOptions.config_id),
+                config_id: fbLoginOptions.config_id,
                 response_type: fbLoginOptions.response_type,
                 override_default_response_type: fbLoginOptions.override_default_response_type,
                 extras_featureType: fbLoginOptions.extras.featureType,
@@ -3805,6 +3958,73 @@ export default function WebhookView({
                             <p className="mt-2 text-[11px] text-amber-700 font-semibold">
                                 Coexistence is using the same WhatsApp Embedded Signup configuration ID as normal onboarding. This may be valid because Meta selects WhatsApp Business App onboarding using featureType.
                             </p>
+                        )}
+                    </div>
+                    <div className="mb-4 rounded-xl border border-[#eceff1] bg-white px-4 py-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="text-[10px] font-black uppercase tracking-widest text-[#64748b]">Latest Embedded Signup Session Log</div>
+                            <span className={`text-[10px] px-2.5 py-1 rounded-full border font-black uppercase tracking-widest ${
+                                latestEmbeddedSignupSessionLog?.persisted === true
+                                    ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                    : latestEmbeddedSignupSessionLog
+                                        ? 'border-amber-200 bg-amber-50 text-amber-700'
+                                        : 'border-[#dbe3ea] bg-[#f8fafc] text-[#64748b]'
+                            }`}>
+                                {latestEmbeddedSignupSessionLog?.persisted === true
+                                    ? 'Stored'
+                                    : latestEmbeddedSignupSessionLog
+                                        ? 'Captured'
+                                        : 'Waiting'}
+                            </span>
+                        </div>
+                        {latestEmbeddedSignupSessionLog ? (
+                            <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3 text-[11px]">
+                                <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                    <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">Event</div>
+                                    <div className="mt-1 font-mono text-[#111b21] break-all">{latestEmbeddedSignupSessionLog.event || '-'}</div>
+                                </div>
+                                <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                    <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">Current Step</div>
+                                    <div className="mt-1 font-mono text-[#111b21] break-all">{latestEmbeddedSignupSessionLog.currentStep || '-'}</div>
+                                </div>
+                                <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                    <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">Error Code</div>
+                                    <div className="mt-1 font-mono text-[#111b21] break-all">{latestEmbeddedSignupSessionLog.errorCode || '-'}</div>
+                                </div>
+                                <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                    <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">Session ID</div>
+                                    <div className="mt-1 font-mono text-[#111b21] break-all">{latestEmbeddedSignupSessionLog.sessionId || '-'}</div>
+                                </div>
+                                <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                    <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">WABA ID Exists</div>
+                                    <div className="mt-1 text-[#111b21] break-all">{latestEmbeddedSignupSessionLog.wabaId ? 'Yes' : 'No'}</div>
+                                </div>
+                                <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                    <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">Phone Number ID Exists</div>
+                                    <div className="mt-1 text-[#111b21] break-all">{latestEmbeddedSignupSessionLog.phoneNumberId ? 'Yes' : 'No'}</div>
+                                </div>
+                                <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                    <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">is_wa_login_user</div>
+                                    <div className="mt-1 text-[#111b21] break-all">
+                                        {latestEmbeddedSignupSessionLog.isWaLoginUser === true
+                                            ? 'true'
+                                            : latestEmbeddedSignupSessionLog.isWaLoginUser === false
+                                                ? 'false'
+                                                : '-'}
+                                    </div>
+                                </div>
+                                <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                    <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">created_at</div>
+                                    <div className="mt-1 font-mono text-[#111b21] break-all">{latestEmbeddedSignupSessionLog.createdAt || '-'}</div>
+                                </div>
+                            </div>
+                        ) : (
+                            <p className="mt-2 text-[11px] text-[#64748b]">
+                                Open Meta Embedded Signup to capture the latest session event here.
+                            </p>
+                        )}
+                        {embeddedSignupSessionLogError && (
+                            <p className="mt-2 text-[11px] text-amber-700 font-semibold">{embeddedSignupSessionLogError}</p>
                         )}
                     </div>
                     <div className="mb-4 rounded-xl border border-[#eceff1] bg-white px-4 py-3">
