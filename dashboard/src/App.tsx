@@ -1368,6 +1368,56 @@ const getLatestTimestampFromMessages = (messages: Message[]): number => {
 
 const trimString = (value: unknown): string => (typeof value === 'string' ? value.trim() : '');
 
+const sanitizeHeaderValue = (value: unknown): string => {
+    const raw = typeof value === 'string' ? value : String(value ?? '');
+    return raw
+        .replace(/[^\x09\x20-\x7E\x80-\xFF]/g, '')
+        .replace(/[\r\n]+/g, ' ')
+        .trim();
+};
+
+const sanitizeBearerToken = (value: unknown): string => (
+    trimString(value).replace(/[^\x21-\x7E]/g, '')
+);
+
+const createSafeHeaders = (value: HeadersInit | undefined): Headers => {
+    const headers = new Headers();
+    const setHeader = (key: unknown, headerValue: unknown) => {
+        const name = trimString(key);
+        const safeValue = sanitizeHeaderValue(headerValue);
+        if (name && safeValue) {
+            headers.set(name, safeValue);
+        }
+    };
+
+    if (!value) return headers;
+
+    try {
+        new Headers(value).forEach((headerValue, key) => setHeader(key, headerValue));
+        return headers;
+    } catch {
+        if (Array.isArray(value)) {
+            value.forEach(([key, headerValue]) => setHeader(key, headerValue));
+            return headers;
+        }
+        if (typeof Headers !== 'undefined' && value instanceof Headers) {
+            value.forEach((headerValue, key) => setHeader(key, headerValue));
+            return headers;
+        }
+        Object.entries(value as Record<string, unknown>).forEach(([key, headerValue]) => setHeader(key, headerValue));
+        return headers;
+    }
+};
+
+const createAuthHeaders = (token: unknown, value?: HeadersInit): Headers => {
+    const headers = createSafeHeaders(value);
+    const safeToken = sanitizeBearerToken(token);
+    if (safeToken) {
+        headers.set('Authorization', `Bearer ${safeToken}`);
+    }
+    return headers;
+};
+
 const normalizeWebRtcSdp = (value: unknown): string => {
     if (typeof value !== 'string') return '';
     const normalized = value
@@ -2861,10 +2911,9 @@ export default function App() {
         try {
             const res = await fetch(`${SOCKET_URL}/api/waba/manual-config`, {
                 method: 'POST',
-                headers: {
-                    Authorization: `Bearer ${session.access_token}`,
+                headers: createAuthHeaders(session.access_token, {
                     'Content-Type': 'application/json'
-                },
+                }),
                 body: JSON.stringify({
                     profileId: activeProfileId,
                     wabaId: onboardingSetup.wabaId.trim(),
@@ -3457,9 +3506,7 @@ export default function App() {
             const method = typeof init.method === 'string' ? init.method.trim().toUpperCase() : 'GET';
             const isRetryableTimeoutMethod = method === 'GET' || method === 'HEAD';
             const buildHeaders = (token: string) => {
-                const headers = new Headers(init.headers || undefined);
-                headers.set('Authorization', `Bearer ${token}`);
-                return headers;
+                return createAuthHeaders(token, init.headers || undefined);
             };
 
             const runWithToken = async (token: string) => {
@@ -3799,9 +3846,7 @@ export default function App() {
             params.set('limit', '100');
             params.set('status', 'APPROVED');
             const res = await fetch(`${SOCKET_URL}/api/waba/templates?${params.toString()}`, {
-                headers: {
-                    Authorization: `Bearer ${session.access_token}`
-                }
+                headers: createAuthHeaders(session.access_token)
             });
             const data = await res.json().catch(() => null);
             if (!res.ok || !data?.success) {
@@ -3841,9 +3886,7 @@ export default function App() {
             params.set('status', 'APPROVED');
             params.set('fields', 'id,name,status,category,language,parameter_format,components');
             const res = await fetch(`${SOCKET_URL}/api/waba/templates?${params.toString()}`, {
-                headers: {
-                    Authorization: `Bearer ${session.access_token}`
-                }
+                headers: createAuthHeaders(session.access_token)
             });
             const data = await res.json().catch(() => null);
             if (!res.ok || !data?.success) {
@@ -3940,9 +3983,7 @@ export default function App() {
         });
         if (analyticsTag.trim()) params.set('tag', analyticsTag.trim());
         fetch(`${SOCKET_URL}/api/analytics?${params.toString()}`, {
-            headers: {
-                Authorization: `Bearer ${session.access_token}`
-            }
+            headers: createAuthHeaders(session.access_token)
         })
             .then(async res => {
                 const text = await res.text();
@@ -4330,10 +4371,9 @@ export default function App() {
         try {
             const res = await fetch(`${SOCKET_URL}/api/company/quick-replies?profileId=${encodeURIComponent(activeProfileId)}`, {
                 method: 'POST',
-                headers: {
-                    Authorization: `Bearer ${session.access_token}`,
+                headers: createAuthHeaders(session.access_token, {
                     'Content-Type': 'application/json'
-                },
+                }),
                 body: JSON.stringify({ items: cleaned })
             });
             const text = await res.text();
@@ -5618,6 +5658,7 @@ export default function App() {
                 Boolean(acceptedByUserId)
                 && acceptedByUserId !== currentUserId
                 && ['accepting', 'accepted', 'answered'].includes(normalizedStatus);
+            let suppressIncomingCardForActiveSession = false;
 
             if (browserSession) {
                 const sameCallId = Boolean(callId && browserSession.callId && browserSession.callId === callId);
@@ -5640,6 +5681,11 @@ export default function App() {
                         browserSession.callId = callId;
                         setActiveVoiceCall((current) => current ? { ...current, callId } : current);
                     }
+
+                    suppressIncomingCardForActiveSession =
+                        Boolean(callId)
+                        && ['accepting', 'accepted', 'answered'].includes(normalizedStatus)
+                        && (!acceptedByUserId || acceptedByUserId === currentUserId);
 
                     if (
                         browserSession.direction === 'outbound'
@@ -5674,6 +5720,10 @@ export default function App() {
 
             if (callId) {
                 setIncomingCalls((prev) => {
+                    if (suppressIncomingCardForActiveSession) {
+                        return prev.filter((entry) => entry.callId !== callId);
+                    }
+
                     const existing = prev.find((entry) => entry.callId === callId);
                     const nextEntry: IncomingCallState = {
                         callId,
@@ -6163,9 +6213,7 @@ export default function App() {
 
         setWorkflowsLoading(true);
         fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`, {
-            headers: {
-                Authorization: `Bearer ${session.access_token}`
-            }
+            headers: createAuthHeaders(session.access_token)
         })
             .then(res => res.json())
             .then(data => {
@@ -6196,10 +6244,9 @@ export default function App() {
 
             const res = await fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${session.access_token}`
-                },
+                headers: createAuthHeaders(session.access_token, {
+                    'Content-Type': 'application/json'
+                }),
                 body: JSON.stringify({ workflows: normalized })
             });
 
@@ -6209,9 +6256,7 @@ export default function App() {
             }
 
             const refreshed = await fetch(`${SOCKET_URL}/api/flows?profileId=${activeProfileId}`, {
-                headers: {
-                    Authorization: `Bearer ${session.access_token}`
-                }
+                headers: createAuthHeaders(session.access_token)
             });
             const refreshedPayload = await refreshed.json().catch(() => ({}));
             const list = Array.isArray(refreshedPayload?.workflows) ? refreshedPayload.workflows : [];
@@ -7348,9 +7393,7 @@ export default function App() {
             });
             const response = await fetch(`${SOCKET_URL}/api/waba/call-permissions?${params.toString()}`, {
                 method: 'GET',
-                headers: {
-                    Authorization: `Bearer ${session.access_token}`
-                }
+                headers: createAuthHeaders(session.access_token)
             });
             const payload = await response.json().catch(() => null);
             if (!response.ok || payload?.success === false) {
@@ -7398,10 +7441,9 @@ export default function App() {
         try {
             const response = await fetch(`${SOCKET_URL}/api/whatsapp/calling/request-permission`, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${session.access_token}`
-                },
+                headers: createAuthHeaders(session.access_token, {
+                    'Content-Type': 'application/json'
+                }),
                 body: JSON.stringify({
                     profileId: activeProfileId,
                     user_wa_id: userWaId,
@@ -8644,6 +8686,11 @@ export default function App() {
             showToast('Unable to copy debug. Please long-press and copy manually.', 'error');
         }
     };
+
+    const visibleIncomingCalls = incomingCalls.filter((call) => {
+        if (!activeVoiceCall?.callId || call.callId !== activeVoiceCall.callId) return true;
+        return !isIncomingCallClaimed(call);
+    });
 
     return (
         <>
@@ -11220,7 +11267,7 @@ export default function App() {
                     </div>
                 </div>
             )}
-            {incomingCalls.length > 0 && (
+            {visibleIncomingCalls.length > 0 && (
                 <div
                     className="fixed top-4 left-4 z-[275] flex max-w-[420px] flex-col gap-3"
                     style={{
@@ -11229,7 +11276,7 @@ export default function App() {
                         right: isMobile ? 'max(calc(env(safe-area-inset-right) + 0.5rem), 0.75rem)' : undefined
                     }}
                 >
-                    {incomingCalls.map((call) => {
+                    {visibleIncomingCalls.map((call) => {
                         const currentUserId = trimString(session?.user?.id);
                         const normalizedStatus = trimString(call.normalizedStatus).toLowerCase() || 'ringing';
                         const isClaimed = isIncomingCallClaimed(call);
