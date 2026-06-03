@@ -4,6 +4,16 @@
 
 - Backend local: `http://localhost:3000`
 - Frontend dev proxy: `http://localhost:5173` (proxies API to backend)
+- Versioned compatibility alias: `/api/v1/*`
+
+Detailed request parameters, payload schemas, and signaling-first Meta calling notes now live in:
+
+- [Official Meta Runtime API Reference](./23-official-meta-api-reference.md)
+
+Preferred WhatsApp backend contract:
+
+- use `/api/v1/whatsapp/*` for new integrations
+- treat `/api/whatsapp/*`, `/api/meta/whatsapp/*`, and `/api/waba/*` as compatibility routes
 
 ## Auth Modes
 
@@ -108,6 +118,8 @@ Some validation/migration cases also return `code` and `details`.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/waba/embedded-signup/url` | Build FB embedded signup URL |
+| POST | `/api/whatsapp/embedded-signup/v4/complete` | Complete new-number Embedded Signup |
+| POST | `/api/whatsapp/coexistence/complete` | Complete existing WhatsApp Business App coexistence onboarding |
 | POST | `/api/waba/manual-config` | Save manual WABA config |
 | GET | `/auth/waba/callback` | OAuth callback handler |
 | GET | `/api/waba/registration/config` | Registration config |
@@ -147,6 +159,12 @@ Some validation/migration cases also return `code` and `details`.
 | POST | `/api/waba/clients/disconnect` | Disconnect WABA client |
 | GET | `/api/waba/connected-client-businesses` | List connected client businesses (superadmin) |
 | GET/POST/DELETE | `/api/waba/preverified-*` | Preverified number workflows |
+
+Coexistence notes:
+
+- `Connect Existing Business App Number` must use the Meta coexistence configuration ID plus `featureType: "whatsapp_business_app_onboarding"` and complete through `/api/whatsapp/coexistence/complete`.
+- `/api/waba/registration/register` is only for new-number Cloud API onboarding. Coexistence must skip `POST /{phone_number_id}/register`.
+- Required Meta webhook fields for coexistence are `messages`, `message_status`, `account_update`, `history`, `smb_app_state_sync`, and `smb_message_echoes`.
 
 ## Webhooks
 

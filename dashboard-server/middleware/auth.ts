@@ -1,7 +1,7 @@
 import type { NextFunction, Request, Response } from 'express'
 
-export function createApiKeyVerifier(getKeyInfo: (apiKey: string) => any) {
-    return (req: Request, res: Response, next: NextFunction) => {
+export function createApiKeyVerifier(getKeyInfo: (apiKey: string) => any | Promise<any>) {
+    return async (req: Request, res: Response, next: NextFunction) => {
         const apiKeyHeader = req.headers['x-api-key']
         const apiKey = (Array.isArray(apiKeyHeader) ? apiKeyHeader[0] : apiKeyHeader) || (req.query.apiKey as string | undefined)
 
@@ -12,16 +12,20 @@ export function createApiKeyVerifier(getKeyInfo: (apiKey: string) => any) {
             })
         }
 
-        const keyInfo = getKeyInfo(String(apiKey))
-        if (!keyInfo) {
-            return res.status(403).json({
-                success: false,
-                error: 'Invalid API key'
-            })
-        }
+        try {
+            const keyInfo = await Promise.resolve(getKeyInfo(String(apiKey)))
+            if (!keyInfo) {
+                return res.status(403).json({
+                    success: false,
+                    error: 'Invalid API key'
+                })
+            }
 
-        ;(req as any).apiKeyInfo = keyInfo
-        return next()
+            ;(req as any).apiKeyInfo = keyInfo
+            return next()
+        } catch (error) {
+            return next(error)
+        }
     }
 }
 

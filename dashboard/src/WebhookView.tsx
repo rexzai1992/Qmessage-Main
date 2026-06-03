@@ -19,6 +19,10 @@ const DEFAULT_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID =
     typeof import.meta.env.VITE_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID === 'string'
         ? import.meta.env.VITE_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID.trim()
         : '';
+const DEFAULT_META_WA_COEXISTENCE_CONFIGURATION_ID =
+    typeof import.meta.env.VITE_META_WA_COEXISTENCE_CONFIGURATION_ID === 'string'
+        ? import.meta.env.VITE_META_WA_COEXISTENCE_CONFIGURATION_ID.trim()
+        : '';
 const DEFAULT_META_WA_EXISTING_APP_CONFIGURATION_ID =
     typeof import.meta.env.VITE_META_WA_EXISTING_APP_CONFIGURATION_ID === 'string'
         ? import.meta.env.VITE_META_WA_EXISTING_APP_CONFIGURATION_ID.trim()
@@ -165,7 +169,12 @@ type AppReviewCheckKey =
     | 'whatsapp_business_management'
     | 'business_management'
     | 'whatsapp_business_messaging';
-type EmbeddedSignupConnectMode = 'default' | 'coexistence';
+type EmbeddedSignupFlowMode = 'new_phone_onboarding' | 'coexistence';
+type EmbeddedSignupSessionInfo = {
+    wabaId: string;
+    phoneNumberId: string | null;
+    businessId: string | null;
+};
 
 type AppReviewCheckState = {
     status: AppReviewCheckStatus;
@@ -222,8 +231,24 @@ type WhatsAppConnectionRecord = {
     business_verification_status: string | null;
     quality_rating: string | null;
     platform_type: string | null;
+    is_on_biz_app?: boolean | null;
     status: string | null;
     flow_type: string | null;
+    coexistence_enabled?: boolean;
+    onboarding_type?: string | null;
+    coexistence_status?: string | null;
+    sync_status?: string | null;
+    contacts_sync_request_id?: string | null;
+    history_sync_request_id?: string | null;
+    sync_started_at?: string | null;
+    history_sync_progress?: number | null;
+    history_sync_requested?: boolean;
+    history_sync_available?: boolean;
+    messaging_paused?: boolean;
+    disconnection_reason?: string | null;
+    disconnection_initiated_by?: string | null;
+    last_account_update_event?: string | null;
+    last_webhook_at?: string | null;
     token_expires_at: string | null;
     last_synced_at: string | null;
     created_at: string | null;
@@ -995,7 +1020,77 @@ export default function WebhookView({
         }
     };
 
-    const handleConnectNewWhatsappNumber = async () => {
+    const startEmbeddedSignupSession = (flowMode: EmbeddedSignupFlowMode) => {
+        let cleanup = () => {};
+
+        const promise = new Promise<EmbeddedSignupSessionInfo>((resolve, reject) => {
+            const timeoutId = window.setTimeout(() => {
+                cleanup();
+                reject(new Error('Embedded Signup timed out before completion.'));
+            }, 10 * 60 * 1000);
+
+            const handleMessage = (event: MessageEvent) => {
+                if (!META_ALLOWED_EMBEDDED_SIGNUP_ORIGINS.has(event.origin)) return;
+                if (typeof event.data !== 'string') return;
+
+                let payload: any = null;
+                try {
+                    payload = JSON.parse(event.data);
+                } catch {
+                    return;
+                }
+
+                if (!payload || payload.type !== 'WA_EMBEDDED_SIGNUP') return;
+
+                const eventName = readTrimmed(payload.event).toUpperCase();
+                const data = payload.data && typeof payload.data === 'object' ? payload.data : {};
+                const isCoexistenceFinish =
+                    eventName === 'FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING'
+                    || (eventName === 'FINISH' && data?.is_wa_login_user === true);
+
+                if (
+                    (flowMode === 'new_phone_onboarding' && eventName === 'FINISH')
+                    || (flowMode === 'coexistence' && isCoexistenceFinish)
+                ) {
+                    const wabaId = readTrimmed(data.waba_id);
+                    const phoneNumberId = readTrimmed(data.phone_number_id) || null;
+                    const businessId = readTrimmed(data.business_id) || null;
+                    if (!wabaId) {
+                        cleanup();
+                        reject(new Error('Meta did not return waba_id.'));
+                        return;
+                    }
+                    if (flowMode === 'new_phone_onboarding' && !phoneNumberId) {
+                        cleanup();
+                        reject(new Error('Meta did not return phone_number_id for the new-number signup flow.'));
+                        return;
+                    }
+                    cleanup();
+                    resolve({ wabaId, phoneNumberId, businessId });
+                    return;
+                }
+
+                if (eventName === 'CANCEL' || eventName === 'ERROR') {
+                    const message = readTrimmed(data.error_message)
+                        || readTrimmed(data.current_step)
+                        || 'Embedded Signup was cancelled before completion.';
+                    cleanup();
+                    reject(new Error(message));
+                }
+            };
+
+            cleanup = () => {
+                window.clearTimeout(timeoutId);
+                window.removeEventListener('message', handleMessage);
+            };
+
+            window.addEventListener('message', handleMessage);
+        });
+
+        return { promise, cleanup };
+    };
+
+    const launchNewWhatsAppApiNumberSignup = async () => {
         if (!sessionToken) {
             setConnectError('You must be logged in to connect WhatsApp.');
             return;
@@ -1029,61 +1124,7 @@ export default function WebhookView({
         setDisconnectNotice(null);
         try {
             const FB = await loadMetaSdk(resolvedMetaAppId, resolvedMetaGraphVersion);
-            let cleanupSignupListener = () => {};
-
-            const signupPromise = new Promise<{ wabaId: string; phoneNumberId: string; businessId: string | null }>((resolve, reject) => {
-                const timeoutId = window.setTimeout(() => {
-                    cleanup();
-                    reject(new Error('Embedded Signup timed out before completion.'));
-                }, 10 * 60 * 1000);
-
-                const cleanup = () => {
-                    window.clearTimeout(timeoutId);
-                    window.removeEventListener('message', handleMessage);
-                };
-                cleanupSignupListener = cleanup;
-
-                const handleMessage = (event: MessageEvent) => {
-                    if (!META_ALLOWED_EMBEDDED_SIGNUP_ORIGINS.has(event.origin)) return;
-
-                    let payload: any = event.data;
-                    if (typeof payload === 'string') {
-                        try {
-                            payload = JSON.parse(payload);
-                        } catch {
-                            return;
-                        }
-                    }
-                    if (!payload || payload.type !== 'WA_EMBEDDED_SIGNUP') return;
-
-                    const eventName = readTrimmed(payload.event).toUpperCase();
-                    const data = payload.data && typeof payload.data === 'object' ? payload.data : {};
-
-                    if (eventName === 'FINISH') {
-                        const wabaId = readTrimmed(data.waba_id);
-                        const phoneNumberId = readTrimmed(data.phone_number_id);
-                        const businessId = readTrimmed(data.business_id) || null;
-                        if (!wabaId || !phoneNumberId) {
-                            cleanup();
-                            reject(new Error('Meta did not return waba_id or phone_number_id.'));
-                            return;
-                        }
-                        cleanup();
-                        resolve({ wabaId, phoneNumberId, businessId });
-                        return;
-                    }
-
-                    if (eventName === 'CANCEL' || eventName === 'ERROR') {
-                        const message = readTrimmed(data.error_message)
-                            || readTrimmed(data.current_step)
-                            || 'Embedded Signup was cancelled before completion.';
-                        cleanup();
-                        reject(new Error(message));
-                    }
-                };
-
-                window.addEventListener('message', handleMessage);
-            });
+            const { promise: signupPromise, cleanup: cleanupSignupListener } = startEmbeddedSignupSession('new_phone_onboarding');
 
             const loginResponse = await new Promise<any>((resolve) => {
                 FB.login((response: any) => resolve(response), {
@@ -1141,36 +1182,104 @@ export default function WebhookView({
         }
     };
 
-    const handleConnectWhatsapp = async (mode: EmbeddedSignupConnectMode = 'default') => {
+    const launchCoexistenceSignup = async () => {
         if (!sessionToken) {
             setConnectError('You must be logged in to connect WhatsApp.');
             return;
         }
+        if (!profileId) {
+            setConnectError('Profile ID is missing.');
+            return;
+        }
+        if (!resolvedMetaAppId) {
+            setConnectError('Missing Meta App ID. Set META_APP_ID or VITE_META_APP_ID.');
+            return;
+        }
+        if (!resolvedCoexistenceConfigId) {
+            setConnectError('Missing coexistence configuration ID. Set META_WA_COEXISTENCE_CONFIGURATION_ID or VITE_META_WA_COEXISTENCE_CONFIGURATION_ID.');
+            return;
+        }
+        const activeCompanyId = readTrimmed(
+            whatsappStatus?.company_id
+            || registrationConfig?.companyId
+            || registrationConfig?.connectedCompanyId
+        );
+        if (!activeCompanyId) {
+            setConnectError('Company mapping is not ready yet. Refresh status and try again.');
+            return;
+        }
+
         setConnectLoading(true);
         setConnectError(null);
         setDisconnectError(null);
         setDisconnectNotice(null);
         try {
-            const params = new URLSearchParams();
-            params.set('profileId', profileId);
-            params.set('returnUrl', `${window.location.origin}${window.location.pathname}`);
-            if (mode === 'coexistence') {
-                params.set('featureType', 'whatsapp_business_app_onboarding');
-                params.set('sessionInfoVersion', '3');
-                params.set('coexistence', '1');
-            }
-            const res = await fetch(`${SOCKET_URL}/api/waba/embedded-signup/url?${params.toString()}`, {
-                headers: {
-                    Authorization: `Bearer ${sessionToken}`
-                }
+            const FB = await loadMetaSdk(resolvedMetaAppId, resolvedMetaGraphVersion);
+            const { promise: signupPromise, cleanup: cleanupSignupListener } = startEmbeddedSignupSession('coexistence');
+
+            const loginResponse = await new Promise<any>((resolve) => {
+                FB.login((response: any) => resolve(response), {
+                    config_id: resolvedCoexistenceConfigId,
+                    response_type: 'code',
+                    override_default_response_type: true,
+                    extras: {
+                        setup: {},
+                        featureType: 'whatsapp_business_app_onboarding',
+                        sessionInfoVersion: '3'
+                    }
+                });
             });
-            const data = await res.json();
-            if (!res.ok || !data?.success || !data?.url) {
-                throw new Error(data?.error || 'Failed to start embedded signup');
+
+            const code = readTrimmed(loginResponse?.authResponse?.code);
+            if (!code) {
+                cleanupSignupListener();
+                throw new Error('Facebook Login was cancelled or no authorization code was returned.');
             }
-            window.location.href = data.url;
+
+            const sessionInfo = await signupPromise;
+            const completeRes = await fetch(`${SOCKET_URL}/api/whatsapp/coexistence/complete`, {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${sessionToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    code,
+                    waba_id: sessionInfo.wabaId,
+                    phone_number_id: sessionInfo.phoneNumberId || undefined,
+                    business_id: sessionInfo.businessId || undefined,
+                    company_id: activeCompanyId,
+                    profile_id: profileId,
+                    flow_type: 'coexistence'
+                })
+            });
+            const completeData = await completeRes.json().catch(() => null);
+            if (!completeRes.ok || !completeData?.success) {
+                if (completeData?.requires_selection === true && Array.isArray(completeData?.phone_numbers)) {
+                    const options = completeData.phone_numbers
+                        .map((entry: any) => {
+                            const phoneNumber = readTrimmed(entry?.phone_number);
+                            const phoneNumberId = readTrimmed(entry?.id);
+                            return [phoneNumber, phoneNumberId].filter(Boolean).join(' ');
+                        })
+                        .filter(Boolean)
+                        .join(', ');
+                    throw new Error(options
+                        ? `Meta returned multiple phone numbers for this WABA. Retry the coexistence flow after selecting the correct number: ${options}.`
+                        : 'Meta returned multiple phone numbers for this WABA. Retry the coexistence flow with a specific phone_number_id.');
+                }
+                throw new Error(formatApiError(completeData, 'Failed to complete coexistence onboarding.'));
+            }
+
+            setDisconnectNotice('Existing WhatsApp Business App number connected successfully.');
+            fetchRegistrationConfig();
+            fetchWhatsappStatus();
+            fetchAppReviewReadiness();
+            if (isSuperAdmin) {
+                fetchClientConnections();
+            }
         } catch (err: any) {
-            setConnectError(err?.message || 'Failed to start embedded signup');
+            setConnectError(err?.message || 'Failed to connect the existing WhatsApp Business App number.');
         } finally {
             setConnectLoading(false);
         }
@@ -3248,10 +3357,11 @@ export default function WebhookView({
     const resolvedMetaGraphVersion = readTrimmed(registrationConfig?.metaGraphVersion) || DEFAULT_META_GRAPH_VERSION;
     const resolvedEmbeddedSignupV4ConfigId =
         readTrimmed(registrationConfig?.embeddedSignupV4ConfigId) || DEFAULT_META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID;
-    const resolvedExistingAppConfigId =
-        readTrimmed(registrationConfig?.existingAppConfigId)
-        || DEFAULT_META_WA_EXISTING_APP_CONFIGURATION_ID
-        || resolvedEmbeddedSignupV4ConfigId;
+    const resolvedCoexistenceConfigId =
+        readTrimmed(registrationConfig?.coexistenceConfigId)
+        || DEFAULT_META_WA_COEXISTENCE_CONFIGURATION_ID
+        || readTrimmed(registrationConfig?.existingAppConfigId)
+        || DEFAULT_META_WA_EXISTING_APP_CONFIGURATION_ID;
     const hasActiveWabaConnection = Boolean(
         activeWhatsappConnection
         || (
@@ -3264,7 +3374,7 @@ export default function WebhookView({
         )
     );
     const newPhoneSignupConfigured = Boolean(resolvedMetaAppId && resolvedEmbeddedSignupV4ConfigId);
-    const existingAppSignupConfigured = Boolean(resolvedExistingAppConfigId);
+    const existingAppSignupConfigured = Boolean(resolvedMetaAppId && resolvedCoexistenceConfigId);
     const whatsappConnectionStatusLabel =
         connectLoading
             ? 'Connecting...'
@@ -3541,8 +3651,16 @@ export default function WebhookView({
                         <h3 className="text-xl text-[#111b21] font-bold">Connect WhatsApp Business</h3>
                     </div>
                     <p className="text-sm text-[#54656f] mb-6 font-medium">
-                        Link a client's WhatsApp Business account using Meta Embedded Signup. New number onboarding stays in the popup flow, while existing app coexistence keeps the legacy redirect path.
+                        Link a client's WhatsApp Business account using Meta Embedded Signup. Use the new-number flow for fresh Cloud API numbers, or the coexistence flow for an existing WhatsApp Business App number that should stay active in the app.
                     </p>
+                    {registrationConfig?.officialMetaOnly && (
+                        <div className="mb-4 rounded-xl border border-[#dbeafe] bg-[#eff6ff] px-4 py-3">
+                            <div className="text-[10px] font-black uppercase tracking-widest text-[#1d4ed8]">Official Meta Only</div>
+                            <p className="mt-1 text-[11px] text-[#1e3a8a]">
+                                This backend is running in official Meta-only mode. QR pairing, WhatsApp Web auth, and other unofficial connection methods are disabled.
+                            </p>
+                        </div>
+                    )}
                     <div className="mb-4 flex items-center justify-between gap-3 rounded-xl border border-[#eceff1] bg-[#f8fafc] px-4 py-2.5">
                         <span className="text-[11px] font-bold uppercase tracking-widest text-[#54656f]">Connection status</span>
                         <span className={`text-[10px] px-3 py-1 rounded-full border font-bold uppercase tracking-widest ${hasActiveWabaConnection ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-[#dbe3ea] bg-white text-[#64748b]'}`}>
@@ -3598,8 +3716,42 @@ export default function WebhookView({
                                 <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">Status</div>
                                 <div className="mt-1 text-[#111b21] break-all">{readTrimmed(activeWhatsappConnection?.status || registrationConfig?.status) || whatsappConnectionStatusLabel}</div>
                             </div>
+                            <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">Coexistence Enabled</div>
+                                <div className="mt-1 text-[#111b21] break-all">{(activeWhatsappConnection?.coexistence_enabled ?? registrationConfig?.coexistenceEnabled) === true ? 'Yes' : 'No'}</div>
+                            </div>
+                            <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">is_on_biz_app</div>
+                                <div className="mt-1 text-[#111b21] break-all">
+                                    {(activeWhatsappConnection?.is_on_biz_app ?? registrationConfig?.isOnBizApp) === true
+                                        ? 'true'
+                                        : (activeWhatsappConnection?.is_on_biz_app ?? registrationConfig?.isOnBizApp) === false
+                                            ? 'false'
+                                            : '-'}
+                                </div>
+                            </div>
+                            <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">Sync Status</div>
+                                <div className="mt-1 text-[#111b21] break-all">{readTrimmed(activeWhatsappConnection?.sync_status || registrationConfig?.syncStatus) || '-'}</div>
+                            </div>
+                            <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5">
+                                <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">Messaging Paused</div>
+                                <div className="mt-1 text-[#111b21] break-all">{(activeWhatsappConnection?.messaging_paused ?? registrationConfig?.messagingPaused) === true ? 'Yes' : 'No'}</div>
+                            </div>
+                            <div className="rounded-xl border border-[#eef2f6] bg-[#f8fafc] px-3 py-2.5 sm:col-span-2">
+                                <div className="text-[#64748b] uppercase tracking-widest text-[10px] font-black">Last Account Update Event</div>
+                                <div className="mt-1 text-[#111b21] break-all">{readTrimmed(activeWhatsappConnection?.last_account_update_event || registrationConfig?.lastAccountUpdateEvent) || '-'}</div>
+                            </div>
                         </div>
                     </div>
+                    {(activeWhatsappConnection?.messaging_paused ?? registrationConfig?.messagingPaused) === true && (
+                        <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3">
+                            <div className="text-[10px] font-black uppercase tracking-widest text-amber-700">Messaging Paused</div>
+                            <p className="mt-1 text-[11px] text-amber-900">
+                                This WhatsApp Business App number is reconnecting after a device change, re-registration, or partner removal event. Cloud API sending should stay paused until Meta reports `ACCOUNT_RECONNECTED`.
+                            </p>
+                        </div>
+                    )}
                     <div className="mb-4 rounded-xl border border-[#eceff1] bg-[#f8fafc] px-4 py-3">
                         <div className="text-[10px] font-black uppercase tracking-widest text-[#64748b]">Optional Registration PIN</div>
                         <p className="mt-1 text-[11px] text-[#54656f]">
@@ -3615,7 +3767,7 @@ export default function WebhookView({
                         />
                     </div>
                     <button
-                        onClick={handleConnectNewWhatsappNumber}
+                        onClick={launchNewWhatsAppApiNumberSignup}
                         disabled={connectLoading || disconnectLoading || !sessionToken}
                         className="w-full bg-[#111b21] hover:bg-[#202c33] text-white font-black py-4 rounded-2xl transition-all flex items-center justify-center gap-3 shadow-[0_8px_20px_rgba(17,27,33,0.18)] disabled:opacity-50 active:scale-95"
                     >
@@ -3632,7 +3784,7 @@ export default function WebhookView({
                     )}
                     <button
                         type="button"
-                        onClick={() => handleConnectWhatsapp('coexistence')}
+                        onClick={launchCoexistenceSignup}
                         disabled={connectLoading || disconnectLoading || !sessionToken}
                         className="mt-3 w-full bg-[#e6f7f3] hover:bg-[#d3f0e8] text-[#0f766e] border border-[#9fdccf] font-bold py-3 rounded-2xl transition-all flex items-center justify-center gap-2 disabled:opacity-50"
                     >
@@ -3644,7 +3796,7 @@ export default function WebhookView({
                     </p>
                     {!existingAppSignupConfigured && (
                         <p className="mt-2 text-[11px] text-amber-700 font-semibold">
-                            Existing-app configuration ID is still missing. Set META_WA_EXISTING_APP_CONFIGURATION_ID in .env, or VITE_META_WA_EXISTING_APP_CONFIGURATION_ID if you want it baked into the frontend build.
+                            Coexistence configuration ID is still missing. Set META_WA_COEXISTENCE_CONFIGURATION_ID in .env, or VITE_META_WA_COEXISTENCE_CONFIGURATION_ID if you want it baked into the frontend build.
                         </p>
                     )}
                     <button

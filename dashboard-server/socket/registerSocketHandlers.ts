@@ -1,6 +1,7 @@
 import { createClient } from '@supabase/supabase-js'
 import type { Server, Socket } from 'socket.io'
 import { createDownloadUrl } from '../../src/services/r2-storage'
+import { isOfficialMetaOnlyMode } from '../../src/config/runtime-policy'
 
 export function registerSocketHandlers(io: Server, ctx: any) {
     const {
@@ -47,6 +48,7 @@ export function registerSocketHandlers(io: Server, ctx: any) {
         sendPushNotificationToUsers,
         sendNativePushNotificationToUsers
     } = ctx
+    const officialMetaOnlyMode = isOfficialMetaOnlyMode()
 
     const SUPER_ADMIN_ROLE_VALUES = new Set(['super_admin', 'superadmin', 'super-admin'])
     const isSuperAdminUser = (user: any): boolean => {
@@ -1108,17 +1110,35 @@ io.on('connection', async (socket) => {
     })
 
     socket.on('logout', async (profileId) => {
-        socket.emit('profile.error', { message: 'WABA Cloud API does not support logout. Disable the config in Supabase instead.' })
+        socket.emit('profile.error', {
+            code: officialMetaOnlyMode ? 'OFFICIAL_META_ONLY' : 'WABA_UNSUPPORTED',
+            message: officialMetaOnlyMode
+                ? 'Official Meta-only mode is enabled. WhatsApp Web logout is disabled; disable the WABA config instead.'
+                : 'WABA Cloud API does not support logout. Disable the config in Supabase instead.'
+        })
         const client = await wabaRegistry.getClientByProfile(profileId)
         io.to(getCompanyRoom(companyId)).emit('connection.update', { profileId, connection: client ? 'open' : 'close' })
     })
 
     socket.on('refreshQR', async (profileId) => {
-        socket.emit('pairing.error', { profileId, error: 'WABA Cloud API does not use QR codes.' })
+        socket.emit('pairing.error', {
+            profileId,
+            code: officialMetaOnlyMode ? 'OFFICIAL_META_ONLY' : 'WABA_UNSUPPORTED',
+            error: officialMetaOnlyMode
+                ? 'Official Meta-only mode is enabled. QR pairing is disabled.'
+                : 'WABA Cloud API does not use QR codes.'
+        })
     })
 
     socket.on('requestPairingCode', async ({ profileId, phoneNumber }) => {
-        socket.emit('pairing.error', { profileId, error: 'WABA Cloud API does not support pairing codes.' })
+        socket.emit('pairing.error', {
+            profileId,
+            phoneNumber: typeof phoneNumber === 'string' ? phoneNumber : '',
+            code: officialMetaOnlyMode ? 'OFFICIAL_META_ONLY' : 'WABA_UNSUPPORTED',
+            error: officialMetaOnlyMode
+                ? 'Official Meta-only mode is enabled. Pairing codes are disabled.'
+                : 'WABA Cloud API does not support pairing codes.'
+        })
     })
 
     socket.on('sendMessage', async (data, ack) => {

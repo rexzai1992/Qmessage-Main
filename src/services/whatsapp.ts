@@ -1,4 +1,5 @@
 import type { WabaClient } from '../waba/client'
+import { supabase } from '../supabase'
 import { getLastInboundTimestamp, insertMessage, shouldMarkCtaReplyCandidate } from './wa-store'
 
 const WINDOW_MS = 24 * 60 * 60 * 1000
@@ -19,6 +20,78 @@ export type SendMessageInput = {
 }
 
 const MAX_BUTTONS = 3
+
+type PausedWhatsappConnectionSnapshot = {
+    profile_id?: string | null
+    status?: string | null
+    coexistence_status?: string | null
+    messaging_paused?: boolean | null
+    last_account_update_event?: string | null
+    phone_number?: string | null
+    phone_number_id?: string | null
+    waba_id?: string | null
+}
+
+function trimText(value: any): string {
+    return typeof value === 'string' ? value.trim() : ''
+}
+
+function isMissingWhatsappConnectionsSchemaError(error: any): boolean {
+    const code = typeof error?.code === 'string' ? error.code : ''
+    const message = String(error?.message || '').toLowerCase()
+    if (code === 'PGRST205') return message.includes('whatsapp_connections')
+    if (code === '42P01') return message.includes('whatsapp_connections')
+    if (code === '42703') {
+        return (
+            message.includes('messaging_paused') ||
+            message.includes('last_account_update_event') ||
+            message.includes('coexistence_status')
+        )
+    }
+    return false
+}
+
+async function getPausedWhatsappConnectionSnapshot(profileId?: string | null): Promise<PausedWhatsappConnectionSnapshot | null> {
+    const resolvedProfileId = trimText(profileId)
+    if (!resolvedProfileId) return null
+
+    const { data, error } = await supabase
+        .from('whatsapp_connections')
+        .select('profile_id, status, coexistence_status, messaging_paused, last_account_update_event, phone_number, phone_number_id, waba_id')
+        .eq('profile_id', resolvedProfileId)
+        .eq('messaging_paused', true)
+        .order('updated_at', { ascending: false })
+        .limit(1)
+
+    if (error) {
+        if (isMissingWhatsappConnectionsSchemaError(error)) return null
+        throw error
+    }
+
+    const row = Array.isArray(data) ? data[0] : null
+    return row?.messaging_paused === true ? row : null
+}
+
+function buildMessagingPausedError(snapshot: PausedWhatsappConnectionSnapshot): Error {
+    const numberLabel =
+        trimText(snapshot.phone_number) ||
+        trimText(snapshot.phone_number_id) ||
+        trimText(snapshot.waba_id) ||
+        'this WhatsApp number'
+    const lastEvent = trimText(snapshot.last_account_update_event).toUpperCase()
+    const status = trimText(snapshot.coexistence_status || snapshot.status).toLowerCase()
+
+    let detail = 'Cloud API messaging is currently paused for this coexistence connection.'
+    if (lastEvent === 'ACCOUNT_OFFBOARDED' || status === 'offboarded_reconnecting') {
+        detail = 'Meta reported ACCOUNT_OFFBOARDED. Cloud API messaging stays paused until Meta sends ACCOUNT_RECONNECTED.'
+    } else if (lastEvent === 'PARTNER_REMOVED') {
+        detail = 'Meta reported PARTNER_REMOVED. Reconnect the number through the WhatsApp Business App coexistence flow before sending again.'
+    } else if (lastEvent) {
+        detail = `Meta reported ${lastEvent}. Cloud API messaging stays paused until the coexistence connection is active again.`
+    }
+
+    return new Error(`Cloud API sending is paused for ${numberLabel}. ${detail}`)
+}
 
 function normalizeButtons(buttons: Array<{ id: string; title: string }> = []) {
     if (buttons.length <= MAX_BUTTONS) return buttons
@@ -86,6 +159,7 @@ export async function canReplyFreely(userId: string): Promise<boolean> {
 export async function sendWhatsAppMessage(input: SendMessageInput) {
     const { client, userId, profileId, to, type, workflowState, actor } = input
     let { content } = input
+    const resolvedProfileId = trimText(profileId) || trimText(client?.profileId)
     const messageActor =
         actor ||
         (workflowState
@@ -95,6 +169,10 @@ export async function sendWhatsAppMessage(input: SendMessageInput) {
                 color: '#2563eb'
             }
             : null)
+    const pausedConnection = await getPausedWhatsappConnectionSnapshot(resolvedProfileId)
+    if (pausedConnection) {
+        throw buildMessagingPausedError(pausedConnection)
+    }
     const withinWindow = await canReplyFreely(userId)
     const sentAtIso = new Date().toISOString()
     const inlineMedia = type === 'text' ? normalizeInlineMedia(content?.media) : null

@@ -7,7 +7,7 @@ WORKDIR /app/dashboard
 # Copy dashboard package files
 COPY dashboard/package*.json ./
 # Install frontend deps
-RUN npm install
+RUN npm ci
 # Copy frontend source
 COPY dashboard/ .
 # Build Vite app
@@ -16,12 +16,14 @@ RUN npm run build
 # Stage 2: Backend Runtime
 FROM node:20-alpine
 WORKDIR /app
+ENV NODE_ENV=production
+ENV PORT=3000
 
 # Install backend dependencies (including devDependencies for tsx)
 # Skip lifecycle scripts to avoid running "prepare" during image build.
 COPY package*.json ./
 COPY engine-requirements.js ./
-RUN npm install --ignore-scripts
+RUN npm ci --ignore-scripts
 
 # Copy backend source code
 COPY . .
@@ -31,6 +33,10 @@ COPY --from=frontend_builder /app/dashboard/dist ./dashboard/dist
 
 # Expose the application port
 EXPOSE 3000
+
+# Docker should report the same health contract as the live server.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD wget -qO- "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1 || exit 1
 
 # Run the server
 CMD ["npx", "tsx", "dashboard-server.ts"]

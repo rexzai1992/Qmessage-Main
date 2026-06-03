@@ -7,6 +7,7 @@ import {
     upsertWhatsappCall,
     type MetaWebhookEventType
 } from '../../src/services/meta-whatsapp-store'
+import { getApiBasePath, isOfficialMetaOnlyMode } from '../../src/config/runtime-policy'
 
 const COMMAND_MAX_COUNT = 30
 const COMMAND_NAME_MAX_LENGTH = 32
@@ -537,12 +538,17 @@ function resolveMetaEmbeddedSignupV4ConfigIdFromEnv(): string {
     )
 }
 
-function resolveMetaExistingAppConfigIdFromEnv(): string {
+function resolveMetaCoexistenceConfigIdFromEnv(): string {
     return trimText(
-        process.env.META_WA_EXISTING_APP_CONFIGURATION_ID
+        process.env.META_WA_COEXISTENCE_CONFIGURATION_ID
+        || process.env.WABA_COEXISTENCE_CONFIGURATION_ID
+        || process.env.META_WA_EXISTING_APP_CONFIGURATION_ID
         || process.env.WABA_EXISTING_APP_CONFIGURATION_ID
-        || process.env.WABA_EMBEDDED_SIGNUP_CONFIG_ID
     )
+}
+
+function resolveMetaExistingAppConfigIdFromEnv(): string {
+    return resolveMetaCoexistenceConfigIdFromEnv()
 }
 
 function buildMetaGraphUrl(path: string, apiVersion: string, params?: Record<string, string>) {
@@ -719,9 +725,12 @@ export function registerWabaRoutes(app: Express, ctx: any) {
         findConflictingActivePhoneNumberConfig,
         findOrCreateUser,
         getCompanyIdForProfile,
+        getMessagesForUsers,
+        getMessagesForUsersSince,
         getSupabaseUserFromRequest,
         getTokenEncryptionKey,
         getUserCompanyId,
+        getUsersForCompany,
         hashOAuthState,
         insertMessage,
         isAdminUser,
@@ -765,12 +774,25 @@ export function registerWabaRoutes(app: Express, ctx: any) {
         business_verification_status: trimText(row?.business_verification_status) || null,
         quality_rating: trimText(row?.quality_rating) || null,
         platform_type: trimText(row?.platform_type) || null,
+        is_on_biz_app: row?.is_on_biz_app === true ? true : row?.is_on_biz_app === false ? false : null,
         status: trimText(row?.status) || null,
         flow_type: trimText(row?.flow_type) || null,
+        coexistence_enabled: row?.coexistence_enabled === true,
         onboarding_type: trimText(row?.onboarding_type) || null,
         coexistence_status: trimText(row?.coexistence_status) || null,
+        sync_status: trimText(row?.sync_status) || null,
+        contacts_sync_request_id: trimText(row?.contacts_sync_request_id) || null,
+        history_sync_request_id: trimText(row?.history_sync_request_id) || null,
+        sync_started_at: trimText(row?.sync_started_at) || null,
+        history_sync_progress: Number.isFinite(Number(row?.history_sync_progress))
+            ? Math.max(0, Math.min(100, Math.floor(Number(row.history_sync_progress))))
+            : null,
         history_sync_requested: row?.history_sync_requested === true,
         history_sync_available: row?.history_sync_available === true,
+        messaging_paused: row?.messaging_paused === true,
+        disconnection_reason: trimText(row?.disconnection_reason) || null,
+        disconnection_initiated_by: trimText(row?.disconnection_initiated_by) || null,
+        last_account_update_event: trimText(row?.last_account_update_event) || null,
         last_webhook_at: trimText(row?.last_webhook_at) || null,
         token_expires_at: trimText(row?.token_expires_at) || null,
         last_synced_at: trimText(row?.last_synced_at) || null,
@@ -824,12 +846,305 @@ export function registerWabaRoutes(app: Express, ctx: any) {
                 accessToken: params.accessToken,
                 apiVersion: params.apiVersion,
                 params: {
-                    fields: 'id,display_phone_number,verified_name,quality_rating,code_verification_status,platform_type,status,name'
+                    fields: 'id,display_phone_number,verified_name,quality_rating,code_verification_status,platform_type,status,name,is_on_biz_app'
                 }
             })
         ])
 
         return { wabaDetails, phoneDetails }
+    }
+
+    const fetchWabaPhoneNumbers = async (params: {
+        accessToken: string
+        apiVersion: string
+        wabaId: string
+    }) => {
+        const response = await requestMetaGraph(`${params.wabaId}/phone_numbers`, {
+            accessToken: params.accessToken,
+            apiVersion: params.apiVersion,
+            params: {
+                fields: 'id,display_phone_number,verified_name,quality_rating,code_verification_status,platform_type,status,name,is_on_biz_app'
+            }
+        })
+
+        return Array.isArray(response?.data) ? response.data : []
+    }
+
+    const startCoexistenceSync = async (params: {
+        connectionId: string
+        accessToken: string
+        apiVersion: string
+        phoneNumberId: string
+    }) => {
+        const { data: existingRow, error: existingError } = await supabase
+            .from('whatsapp_connections')
+            .select('contacts_sync_request_id, history_sync_request_id, sync_status')
+            .eq('id', params.connectionId)
+            .maybeSingle()
+
+        if (existingError && !isMissingWhatsappConnectionsTableError(existingError)) {
+            throw new Error(existingError.message)
+        }
+
+        const nowIso = new Date().toISOString()
+        let contactsSyncRequestId = trimText(existingRow?.contacts_sync_request_id) || null
+        let historySyncRequestId = trimText(existingRow?.history_sync_request_id) || null
+        let syncStatus = trimText(existingRow?.sync_status) || 'pending'
+
+        if (!contactsSyncRequestId) {
+            const contactsResponse = await requestMetaGraph(`${params.phoneNumberId}/smb_app_data`, {
+                accessToken: params.accessToken,
+                apiVersion: params.apiVersion,
+                method: 'POST',
+                body: {
+                    messaging_product: 'whatsapp',
+                    sync_type: 'smb_app_state_sync'
+                }
+            })
+            contactsSyncRequestId = trimText(
+                contactsResponse?.request_id
+                || contactsResponse?.id
+                || contactsResponse?.data?.request_id
+            ) || null
+        }
+
+        if (!historySyncRequestId) {
+            const historyResponse = await requestMetaGraph(`${params.phoneNumberId}/smb_app_data`, {
+                accessToken: params.accessToken,
+                apiVersion: params.apiVersion,
+                method: 'POST',
+                body: {
+                    messaging_product: 'whatsapp',
+                    sync_type: 'history'
+                }
+            })
+            historySyncRequestId = trimText(
+                historyResponse?.request_id
+                || historyResponse?.id
+                || historyResponse?.data?.request_id
+            ) || null
+        }
+
+        if (contactsSyncRequestId || historySyncRequestId) {
+            syncStatus = 'in_progress'
+        }
+
+        const { error: updateError } = await supabase
+            .from('whatsapp_connections')
+            .update({
+                contacts_sync_request_id: contactsSyncRequestId,
+                history_sync_request_id: historySyncRequestId,
+                history_sync_requested: Boolean(historySyncRequestId),
+                history_sync_available: Boolean(historySyncRequestId),
+                sync_started_at: nowIso,
+                sync_status: syncStatus,
+                updated_at: nowIso
+            })
+            .eq('id', params.connectionId)
+
+        if (updateError && !isMissingWhatsappConnectionsTableError(updateError)) {
+            throw new Error(updateError.message)
+        }
+
+        return {
+            contactsSyncRequestId,
+            historySyncRequestId,
+            syncStartedAt: nowIso,
+            syncStatus
+        }
+    }
+
+    const completeCoexistenceOnboarding = async (params: {
+        req: any
+        companyId: string
+        profileId: string
+        userId: string
+        code: string
+        wabaId: string
+        phoneNumberId?: string | null
+        businessId?: string | null
+    }) => {
+        const appId = resolveMetaAppIdFromEnv()
+        const appSecret = resolveMetaAppSecretFromEnv()
+        const verifyToken = resolveMetaVerifyTokenFromEnv()
+        const apiVersion = resolveMetaGraphVersionFromEnv('v24.0')
+        if (!appId || !appSecret) {
+            const error: any = new Error('Missing META_APP_ID or META_APP_SECRET')
+            error.status = 500
+            throw error
+        }
+        if (!verifyToken) {
+            const error: any = new Error('Missing META_WEBHOOK_VERIFY_TOKEN or WABA_VERIFY_TOKEN')
+            error.status = 500
+            throw error
+        }
+        if (!getTokenEncryptionKey()) {
+            const error: any = new Error('Missing WABA_TOKEN_ENCRYPTION_KEY or ENCRYPTION_KEY')
+            error.status = 500
+            throw error
+        }
+
+        const tokenData = await exchangeEmbeddedSignupCodeForToken({
+            code: params.code,
+            appId,
+            appSecret,
+            apiVersion,
+            req: params.req
+        })
+
+        const accessToken = trimText(tokenData?.access_token)
+        const accessTokenType = trimText(tokenData?.token_type) || null
+        const expiresIn = Number(tokenData?.expires_in)
+        const accessTokenExpiresAt = Number.isFinite(expiresIn) && expiresIn > 0
+            ? new Date(Date.now() + expiresIn * 1000).toISOString()
+            : null
+
+        if (!accessToken) {
+            const error: any = new Error('Token exchange failed: no access token returned by Meta')
+            error.status = 502
+            throw error
+        }
+
+        const wabaDetails = await requestMetaGraph(params.wabaId, {
+            accessToken,
+            apiVersion,
+            params: {
+                fields: 'id,name,currency,timezone_id,account_review_status,business_verification_status,message_template_namespace'
+            }
+        })
+
+        let phoneNumberId = trimText(params.phoneNumberId) || null
+        let phoneDetails: any = null
+        let availablePhoneNumbers: any[] = []
+
+        if (phoneNumberId) {
+            phoneDetails = await requestMetaGraph(phoneNumberId, {
+                accessToken,
+                apiVersion,
+                params: {
+                    fields: 'id,display_phone_number,verified_name,quality_rating,code_verification_status,platform_type,status,name,is_on_biz_app'
+                }
+            })
+        } else {
+            availablePhoneNumbers = await fetchWabaPhoneNumbers({
+                accessToken,
+                apiVersion,
+                wabaId: params.wabaId
+            })
+
+            if (!availablePhoneNumbers.length) {
+                const error: any = new Error('Meta did not return any phone numbers for this WABA')
+                error.status = 409
+                throw error
+            }
+
+            if (availablePhoneNumbers.length > 1) {
+                return {
+                    success: false,
+                    requiresSelection: true,
+                    flowType: 'coexistence',
+                    wabaId: params.wabaId,
+                    businessId: params.businessId || null,
+                    phoneNumbers: availablePhoneNumbers.map((entry: any) => ({
+                        id: trimText(entry?.id) || null,
+                        phone_number: trimText(entry?.display_phone_number) || null,
+                        verified_name: trimText(entry?.verified_name) || null,
+                        status: trimText(entry?.status) || null,
+                        platform_type: trimText(entry?.platform_type) || null,
+                        is_on_biz_app: entry?.is_on_biz_app === true
+                    }))
+                }
+            }
+
+            phoneDetails = availablePhoneNumbers[0]
+            phoneNumberId = trimText(phoneDetails?.id) || null
+        }
+
+        if (!phoneNumberId) {
+            const error: any = new Error('Meta did not return a phone_number_id for this coexistence onboarding flow')
+            error.status = 409
+            throw error
+        }
+
+        const isOnBizApp = phoneDetails?.is_on_biz_app === true
+        const platformType = trimText(phoneDetails?.platform_type).toUpperCase()
+        const coexistenceEnabled = isOnBizApp && platformType === 'CLOUD_API'
+        const coexistenceStatus = coexistenceEnabled ? 'connected' : 'pending'
+
+        const { connectionRow } = await syncWhatsAppConnection({
+            profileId: params.profileId,
+            companyId: params.companyId,
+            userId: params.userId,
+            appId,
+            appSecret,
+            verifyToken,
+            apiVersion,
+            accessToken,
+            accessTokenType,
+            accessTokenExpiresAt,
+            businessId: params.businessId || null,
+            wabaId: params.wabaId,
+            phoneNumberId,
+            flowType: 'coexistence',
+            skipPhoneRegistration: true,
+            onboardingType: 'coexistence',
+            coexistenceEnabled,
+            coexistenceStatus,
+            isOnBizApp,
+            syncStatus: 'pending',
+            historySyncRequested: false,
+            historySyncAvailable: false,
+            messagingPaused: false,
+            phoneDetails,
+            wabaDetails,
+            status: coexistenceEnabled ? (trimText(phoneDetails?.status) || 'CONNECTED') : 'PENDING',
+            rawOnboardingResponse: {
+                flow_type: 'coexistence',
+                business_id: params.businessId || null,
+                waba_id: params.wabaId,
+                phone_number_id: phoneNumberId,
+                token_type: accessTokenType,
+                token_expires_at: accessTokenExpiresAt,
+                is_on_biz_app: isOnBizApp,
+                platform_type: trimText(phoneDetails?.platform_type) || null
+            }
+        })
+
+        const connectionId = trimText(connectionRow?.id)
+        let syncResult: {
+            contactsSyncRequestId: string | null
+            historySyncRequestId: string | null
+            syncStartedAt: string
+            syncStatus: string
+        } | null = null
+
+        if (connectionId) {
+            syncResult = await startCoexistenceSync({
+                connectionId,
+                accessToken,
+                apiVersion,
+                phoneNumberId
+            })
+        }
+
+        const refreshedConnection = connectionId
+            ? await supabase
+                .from('whatsapp_connections')
+                .select('*')
+                .eq('id', connectionId)
+                .maybeSingle()
+            : { data: connectionRow, error: null }
+
+        if (refreshedConnection.error && !isMissingWhatsappConnectionsTableError(refreshedConnection.error)) {
+            throw new Error(refreshedConnection.error.message)
+        }
+
+        return {
+            success: true,
+            flowType: 'coexistence',
+            connection: shapeWhatsAppConnectionRow(refreshedConnection.data || connectionRow),
+            sync: syncResult
+        }
     }
 
     const persistRuntimeWabaConfig = async (params: {
@@ -899,6 +1214,17 @@ export function registerWabaRoutes(app: Express, ctx: any) {
         coexistenceStatus?: string | null
         historySyncRequested?: boolean
         historySyncAvailable?: boolean
+        coexistenceEnabled?: boolean
+        isOnBizApp?: boolean | null
+        syncStatus?: string | null
+        contactsSyncRequestId?: string | null
+        historySyncRequestId?: string | null
+        syncStartedAt?: string | null
+        historySyncProgress?: number | null
+        messagingPaused?: boolean
+        disconnectionReason?: string | null
+        disconnectionInitiatedBy?: string | null
+        lastAccountUpdateEvent?: string | null
         rawOnboardingResponse?: any
     }) => {
         const nowIso = new Date().toISOString()
@@ -930,12 +1256,37 @@ export function registerWabaRoutes(app: Express, ctx: any) {
             business_verification_status: trimText(params.wabaDetails?.business_verification_status) || null,
             quality_rating: trimText(params.phoneDetails?.quality_rating) || null,
             platform_type: trimText(params.phoneDetails?.platform_type) || null,
+            is_on_biz_app: typeof params.isOnBizApp === 'boolean'
+                ? params.isOnBizApp
+                : (params.phoneDetails?.is_on_biz_app === true ? true : params.phoneDetails?.is_on_biz_app === false ? false : existingRow?.is_on_biz_app ?? null),
             status: trimText(params.status || params.phoneDetails?.status) || null,
             flow_type: params.flowType || 'embedded_signup_v4',
+            coexistence_enabled: typeof params.coexistenceEnabled === 'boolean'
+                ? params.coexistenceEnabled
+                : existingRow?.coexistence_enabled === true,
             onboarding_type: params.onboardingType || trimText(existingRow?.onboarding_type) || deriveOnboardingTypeFromFlow(params.flowType),
             coexistence_status: trimText(params.coexistenceStatus) || trimText(existingRow?.coexistence_status) || null,
-            history_sync_requested: params.historySyncRequested === true || existingRow?.history_sync_requested === true,
-            history_sync_available: params.historySyncAvailable === true || existingRow?.history_sync_available === true,
+            sync_status: trimText(params.syncStatus) || trimText(existingRow?.sync_status) || null,
+            contacts_sync_request_id: trimText(params.contactsSyncRequestId) || trimText(existingRow?.contacts_sync_request_id) || null,
+            history_sync_request_id: trimText(params.historySyncRequestId) || trimText(existingRow?.history_sync_request_id) || null,
+            sync_started_at: trimText(params.syncStartedAt) || trimText(existingRow?.sync_started_at) || null,
+            history_sync_progress: Number.isFinite(Number(params.historySyncProgress))
+                ? Math.max(0, Math.min(100, Math.floor(Number(params.historySyncProgress))))
+                : (Number.isFinite(Number(existingRow?.history_sync_progress))
+                    ? Math.max(0, Math.min(100, Math.floor(Number(existingRow.history_sync_progress))))
+                    : null),
+            history_sync_requested: typeof params.historySyncRequested === 'boolean'
+                ? params.historySyncRequested
+                : existingRow?.history_sync_requested === true,
+            history_sync_available: typeof params.historySyncAvailable === 'boolean'
+                ? params.historySyncAvailable
+                : existingRow?.history_sync_available === true,
+            messaging_paused: typeof params.messagingPaused === 'boolean'
+                ? params.messagingPaused
+                : existingRow?.messaging_paused === true,
+            disconnection_reason: trimText(params.disconnectionReason) || trimText(existingRow?.disconnection_reason) || null,
+            disconnection_initiated_by: trimText(params.disconnectionInitiatedBy) || trimText(existingRow?.disconnection_initiated_by) || null,
+            last_account_update_event: trimText(params.lastAccountUpdateEvent) || trimText(existingRow?.last_account_update_event) || null,
             raw_onboarding_response_json: params.rawOnboardingResponse !== undefined
                 ? sanitizeOnboardingResponse(params.rawOnboardingResponse)
                 : (existingRow?.raw_onboarding_response_json ?? undefined),
@@ -987,6 +1338,541 @@ export function registerWabaRoutes(app: Express, ctx: any) {
             return false
         }
         return true
+    }
+
+    const isVersionedApiRequest = (req: any) => trimText(req?.versionedApiAlias).toLowerCase() === 'v1'
+
+    const setDeprecatedRouteHeaders = (res: any, preferredPath: string) => {
+        if (!preferredPath) return
+        res.setHeader('X-Deprecated-Route', 'true')
+        res.setHeader('X-Preferred-Route', preferredPath)
+    }
+
+    const buildVersionedApiSuccess = (req: any, data: any, meta?: any) => ({
+        success: true,
+        data,
+        error: null,
+        request_id: req?.requestId || null,
+        ...(meta && typeof meta === 'object' ? { meta } : {})
+    })
+
+    const buildVersionedApiError = (
+        req: any,
+        code: string,
+        message: string,
+        details?: string[] | null
+    ) => ({
+        success: false,
+        data: null,
+        error: {
+            code,
+            message,
+            ...(Array.isArray(details) && details.length > 0 ? { details } : {})
+        },
+        request_id: req?.requestId || null
+    })
+
+    const normalizeVersionedApiErrorCode = (value: any, fallback: string) => {
+        const text = trimText(value)
+        if (text && /^[A-Z0-9_]+$/.test(text)) return text
+        return fallback
+    }
+
+    const sendVersionedApiError = (
+        req: any,
+        res: any,
+        error: any,
+        fallbackMessage: string,
+        fallbackCode: string
+    ) => {
+        if (error?.payload && typeof error.payload === 'object') {
+            const status = Number.isFinite(Number(error?.status)) ? Number(error.status) : 500
+            const details = Array.isArray(error.payload.details)
+                ? error.payload.details.map((entry: any) => trimText(entry)).filter(Boolean)
+                : []
+            const code = normalizeVersionedApiErrorCode(error.payload.error, fallbackCode)
+            const message =
+                trimText(error?.message)
+                || trimText(error.payload.message)
+                || (code !== trimText(error.payload.error) ? trimText(error.payload.error) : '')
+                || details[0]
+                || fallbackMessage
+
+            return res
+                .status(status)
+                .json(buildVersionedApiError(req, code, message, details))
+        }
+
+        const normalized = toHttpErrorPayload(error, fallbackMessage)
+        const details = Array.isArray(normalized.payload.details)
+            ? normalized.payload.details.map((entry: any) => trimText(entry)).filter(Boolean)
+            : []
+
+        return res
+            .status(normalized.status)
+            .json(buildVersionedApiError(
+                req,
+                fallbackCode,
+                trimText(normalized.payload.error) || fallbackMessage,
+                details
+            ))
+    }
+
+    const shapeVersionedWhatsappConnection = (row: any) => {
+        const shaped = shapeWhatsAppConnectionRow(row)
+        return {
+            connection_id: shaped.id,
+            company_id: shaped.company_id,
+            profile_id: shaped.profile_id,
+            provider: 'meta_whatsapp_cloud_api',
+            business_account_id: shaped.waba_id,
+            phone_number_id: shaped.phone_number_id,
+            display_phone_number: shaped.phone_number,
+            display_name: shaped.display_name,
+            verified_name: shaped.verified_name,
+            status: shaped.status,
+            platform_type: shaped.platform_type,
+            quality_rating: shaped.quality_rating,
+            account_review_status: shaped.account_review_status,
+            business_verification_status: shaped.business_verification_status,
+            flow_type: shaped.flow_type,
+            coexistence_enabled: shaped.coexistence_enabled,
+            onboarding_type: shaped.onboarding_type,
+            coexistence_status: shaped.coexistence_status,
+            is_on_biz_app: shaped.is_on_biz_app,
+            sync_status: shaped.sync_status,
+            contacts_sync_request_id: shaped.contacts_sync_request_id,
+            history_sync_request_id: shaped.history_sync_request_id,
+            sync_started_at: shaped.sync_started_at,
+            history_sync_progress: shaped.history_sync_progress,
+            history_sync_requested: shaped.history_sync_requested,
+            history_sync_available: shaped.history_sync_available,
+            messaging_paused: shaped.messaging_paused,
+            disconnection_reason: shaped.disconnection_reason,
+            disconnection_initiated_by: shaped.disconnection_initiated_by,
+            last_account_update_event: shaped.last_account_update_event,
+            token_expires_at: shaped.token_expires_at,
+            last_webhook_at: shaped.last_webhook_at,
+            last_synced_at: shaped.last_synced_at,
+            created_at: shaped.created_at,
+            updated_at: shaped.updated_at,
+            provider_ids: {
+                business_id: shaped.business_id,
+                waba_id: shaped.waba_id,
+                phone_number_id: shaped.phone_number_id
+            }
+        }
+    }
+
+    const resolveCompanyWhatsappAccess = async (req: any, res: any, location: 'query' | 'body' = 'query') => {
+        const user = await getSupabaseUserFromRequest(req, res)
+        if (!user) return null
+
+        const userCompanyId = getUserCompanyId(user)
+        if (!userCompanyId) {
+            res.status(400).json({ success: false, error: 'Company ID missing in user metadata' })
+            return null
+        }
+
+        const source = location === 'body' ? req.body : req.query
+        const requestedCompanyId = trimText(source?.company_id || source?.companyId) || userCompanyId
+        const profileId = trimText(source?.profile_id || source?.profileId) || null
+
+        if (requestedCompanyId !== userCompanyId && !isSuperAdminUser(user)) {
+            res.status(403).json({ success: false, error: 'company_id does not belong to your account' })
+            return null
+        }
+
+        if (profileId) {
+            const ownsProfile = await assertProfileCompany(profileId, requestedCompanyId)
+            if (!ownsProfile) {
+                res.status(403).json({ success: false, error: 'Profile does not belong to the requested company' })
+                return null
+            }
+        }
+
+        return {
+            user,
+            companyId: requestedCompanyId,
+            profileId
+        }
+    }
+
+    const refreshWhatsappConnectionsForCompany = async (params: {
+        companyId: string
+        profileId?: string | null
+        userId: string
+    }) => {
+        const rows = await getCompanyWhatsappConnections(params.companyId, params.profileId || undefined)
+        const refreshed: any[] = []
+        const failures: Array<{ phone_number_id: string | null; error: string }> = []
+
+        for (const row of rows) {
+            const accessTokenEncrypted = trimText(row?.access_token_encrypted)
+            if (!accessTokenEncrypted) {
+                failures.push({
+                    phone_number_id: trimText(row?.phone_number_id) || null,
+                    error: 'Missing encrypted access token'
+                })
+                continue
+            }
+
+            try {
+                const accessToken = decryptToken(accessTokenEncrypted)
+                const { data: configRow } = await supabase
+                    .from('waba_configs')
+                    .select('api_version')
+                    .eq('profile_id', trimText(row?.profile_id))
+                    .maybeSingle()
+
+                const apiVersion = trimText(configRow?.api_version) || resolveMetaGraphVersionFromEnv('v24.0')
+                const { wabaDetails, phoneDetails } = await fetchWabaAndPhoneDetails({
+                    accessToken,
+                    apiVersion,
+                    wabaId: trimText(row?.waba_id),
+                    phoneNumberId: trimText(row?.phone_number_id)
+                })
+
+                const updated = await persistWhatsAppConnection({
+                    companyId: trimText(row?.company_id),
+                    profileId: trimText(row?.profile_id),
+                    userId: trimText(row?.user_id) || params.userId,
+                    wabaId: trimText(row?.waba_id),
+                    phoneNumberId: trimText(row?.phone_number_id),
+                    businessId: trimText(row?.business_id) || null,
+                    accessToken,
+                    tokenExpiresAt: trimText(row?.token_expires_at) || null,
+                    flowType: trimText(row?.flow_type) || 'refresh_status',
+                    phoneDetails,
+                    wabaDetails,
+                    status: trimText(phoneDetails?.status) || trimText(row?.status) || 'CONNECTED'
+                })
+                refreshed.push(updated)
+            } catch (error: any) {
+                failures.push({
+                    phone_number_id: trimText(row?.phone_number_id) || null,
+                    error: error?.message || 'Failed to refresh connection'
+                })
+            }
+        }
+
+        return { refreshed, failures }
+    }
+
+    const disconnectWhatsappConnection = async (params: {
+        companyId: string
+        profileId: string
+        revoke: boolean
+    }) => {
+        const { data: config, error: fetchError } = await supabase
+            .from('waba_configs')
+            .select('profile_id, company_id, app_id, phone_number_id, business_id, waba_id, business_account_id, access_token, system_user_token, api_version')
+            .eq('profile_id', params.profileId)
+            .maybeSingle()
+
+        if (fetchError || !config) {
+            const error: any = new Error(fetchError?.message || 'WABA config not found')
+            error.status = 404
+            throw error
+        }
+
+        const wabaId = trimText(config.waba_id || config.business_account_id)
+        let unsubscribed = false
+        let unsubscribeError: string | null = null
+
+        if (params.revoke && wabaId) {
+            try {
+                const token = decryptToken(config.system_user_token || config.access_token)
+                await unsubscribeWabaApp(wabaId, token, config.api_version || resolveMetaGraphVersionFromEnv('v24.0'))
+                unsubscribed = true
+            } catch (error: any) {
+                unsubscribeError = error?.message || 'Failed to unsubscribe app'
+            }
+        }
+
+        const nowIso = new Date().toISOString()
+        const { error: configUpdateError } = await supabase
+            .from('waba_configs')
+            .update({ enabled: false })
+            .eq('profile_id', params.profileId)
+
+        if (configUpdateError) {
+            const error: any = new Error(configUpdateError.message)
+            error.status = 500
+            throw error
+        }
+
+        const { error: connectionUpdateError } = await supabase
+            .from('whatsapp_connections')
+            .update({
+                status: 'DISCONNECTED',
+                last_synced_at: nowIso,
+                updated_at: nowIso
+            })
+            .eq('company_id', params.companyId)
+            .eq('profile_id', params.profileId)
+
+        if (connectionUpdateError && !isMissingWhatsappConnectionsTableError(connectionUpdateError)) {
+            const error: any = new Error(connectionUpdateError.message)
+            error.status = 500
+            throw error
+        }
+
+        await wabaRegistry.refresh(true)
+
+        return {
+            disabled: true,
+            unsubscribed,
+            unsubscribe_error: unsubscribeError
+        }
+    }
+
+    const buildOnboardingStatusData = async (access: any) => {
+        const connections = await getCompanyWhatsappConnections(access.companyId)
+        const appId = resolveMetaAppIdFromEnv()
+        const appSecret = resolveMetaAppSecretFromEnv()
+        const verifyToken = resolveMetaVerifyTokenFromEnv()
+        const embeddedConfigId = resolveMetaEmbeddedSignupV4ConfigIdFromEnv()
+        const tokenEncryptionReady = Boolean(getTokenEncryptionKey())
+        const permissionsReady =
+            Array.isArray(WABA_OAUTH_SCOPES)
+            && WABA_OAUTH_SCOPES.includes('whatsapp_business_management')
+            && WABA_OAUTH_SCOPES.includes('whatsapp_business_messaging')
+            && WABA_OAUTH_SCOPES.includes('business_management')
+
+        const issues: string[] = []
+        if (!appId) issues.push('META_APP_ID is missing.')
+        if (!appSecret) issues.push('META_APP_SECRET is missing.')
+        if (!verifyToken) issues.push('META_WEBHOOK_VERIFY_TOKEN is missing.')
+        if (!embeddedConfigId) issues.push('META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID is missing.')
+        if (!tokenEncryptionReady) issues.push('ENCRYPTION_KEY is missing.')
+        issues.push('Live call media is not configured yet. Accept, pre_accept, and connect stay disabled until WebRTC or SIP is implemented.')
+
+        return {
+            company_id: access.companyId,
+            provider: 'meta_whatsapp_cloud_api',
+            tech_provider_ready: Boolean(appId && appSecret && verifyToken && tokenEncryptionReady),
+            embedded_signup_config_found: Boolean(embeddedConfigId),
+            permissions_ready: permissionsReady,
+            webhook_configured: Boolean(verifyToken),
+            customers_connected: connections.length,
+            calling_media_ready: false,
+            issues
+        }
+    }
+
+    const buildCoexistenceStartData = async (access: any, req: any) => {
+        const appId = resolveMetaAppIdFromEnv()
+        const appSecret = resolveMetaAppSecretFromEnv()
+        const verifyToken = resolveMetaVerifyTokenFromEnv()
+        if (!appId || !appSecret || !verifyToken) {
+            const error: any = new Error('Missing META_APP_ID/META_APP_SECRET/META_WEBHOOK_VERIFY_TOKEN or WABA equivalents')
+            error.status = 500
+            throw error
+        }
+
+        const configId = resolveMetaCoexistenceConfigIdFromEnv()
+        if (!configId) {
+            const error: any = new Error('Missing META_WA_COEXISTENCE_CONFIGURATION_ID or META_WA_EXISTING_APP_CONFIGURATION_ID')
+            error.status = 500
+            throw error
+        }
+
+        const requestedBusinessId = readTrimmed(req.body?.businessId || req.body?.business_id || req.query?.businessId || req.query?.business_id) || null
+        const requestedWabaId = readTrimmed(req.body?.wabaId || req.body?.waba_id || req.query?.wabaId || req.query?.waba_id) || null
+        const requestedPhoneNumberId = readTrimmed(req.body?.phoneNumberId || req.body?.phone_number_id || req.query?.phoneNumberId || req.query?.phone_number_id) || null
+        const redirectUri = resolveOauthRedirectUri(req)
+        const apiVersion = resolveMetaGraphVersionFromEnv('v25.0')
+        const state = randomBytes(16).toString('hex')
+        const stateHash = hashOAuthState(state)
+        const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString()
+        const redirectUrl = sanitizeReturnUrl(req.body?.returnUrl || req.body?.return_url || req.query?.returnUrl || req.query?.return_url) || resolveOauthReturnUrl(req)
+
+        const { error } = await supabase
+            .from('waba_oauth_states')
+            .insert({
+                state_hash: stateHash,
+                profile_id: access.profileId,
+                company_id: access.companyId,
+                user_id: access.user.id,
+                requested_business_id: requestedBusinessId,
+                requested_waba_id: requestedWabaId,
+                requested_phone_number_id: requestedPhoneNumberId,
+                redirect_url: redirectUrl,
+                expires_at: expiresAt
+            })
+
+        if (error) {
+            const nextError: any = new Error(error.message)
+            nextError.status = 500
+            throw nextError
+        }
+
+        const url = buildEmbeddedSignupUrl({
+            appId,
+            redirectUri,
+            state,
+            scopes: WABA_OAUTH_SCOPES,
+            apiVersion,
+            configId,
+            includeScopes: resolveOauthMode(configId) === 'user',
+            extras: {
+                featureType: 'whatsapp_business_app_onboarding',
+                sessionInfoVersion: '3'
+            }
+        })
+
+        return {
+            provider: 'meta_embedded_signup',
+            onboarding_type: 'coexistence',
+            start_url: url,
+            configuration_id: configId,
+            feature_type: 'whatsapp_business_app_onboarding',
+            session_info_version: '3'
+        }
+    }
+
+    const buildVersionedActorFromUser = (user: any) => {
+        const displayName =
+            trimText(user?.user_metadata?.name)
+            || trimText(user?.user_metadata?.full_name)
+            || trimText(user?.email)
+            || trimText(user?.id)
+            || 'Team Member'
+
+        return {
+            user_id: trimText(user?.id) || 'team-member',
+            name: displayName,
+            color: '#2563eb'
+        }
+    }
+
+    const buildVersionedConversationJid = (phoneNumber: string) => {
+        const normalized = normalizePhoneNumber(phoneNumber)
+        if (!normalized) return ''
+        return `${normalized}@s.whatsapp.net`
+    }
+
+    const buildVersionedConversationName = (user: any) => {
+        return (
+            trimText(user?.alias)
+            || trimText(user?.name)
+            || normalizePhoneNumber(user?.phone_number)
+            || trimText(user?.phone_number)
+            || 'Unknown contact'
+        )
+    }
+
+    const extractVersionedMessageType = (record: any) => {
+        const content = record?.content || {}
+        return trimText(content.type || content.payload?.type) || 'text'
+    }
+
+    const extractVersionedMessageText = (record: any) => {
+        const content = record?.content || {}
+        const payload = content.payload || {}
+        return (
+            trimText(content.text)
+            || trimText(payload.text)
+            || trimText(content.caption)
+            || trimText(payload.caption)
+            || trimText(payload.body)
+            || trimText(payload.template?.name)
+            || ''
+        )
+    }
+
+    const shapeVersionedWhatsappMessage = (record: any, user?: any) => {
+        const content = record?.content || {}
+        const payload = content.payload || {}
+        const type = extractVersionedMessageType(record)
+        const text = extractVersionedMessageText(record)
+        const phoneNumber = normalizePhoneNumber(user?.phone_number || content.to || '')
+
+        return {
+            id: trimText(content.message_id) || trimText(record?.id) || null,
+            record_id: trimText(record?.id) || null,
+            conversation_id: trimText(record?.user_id) || null,
+            profile_id: trimText(record?.profile_id) || null,
+            direction: trimText(record?.direction) || null,
+            type,
+            status: trimText(content.status) || null,
+            text: text || null,
+            to: trimText(content.to) || phoneNumber || null,
+            contact_phone_number: phoneNumber || null,
+            media: {
+                type: type === 'image' || type === 'video' || type === 'audio' || type === 'document' ? type : null,
+                media_id: trimText(content.media_id) || null,
+                asset_key: trimText(content.media_asset_key) || null,
+                url:
+                    trimText(content.image_url)
+                    || trimText(content.video_url)
+                    || trimText(content.document_url)
+                    || trimText(payload?.media?.link)
+                    || null,
+                filename: trimText(content.filename) || trimText(payload?.media?.filename) || null,
+                mimetype: trimText(content.mimetype) || trimText(payload?.mimetype) || null
+            },
+            agent: content.agent || payload.agent || null,
+            workflow_state: record?.workflow_state || null,
+            created_at: trimText(record?.created_at) || null
+        }
+    }
+
+    const loadConversationRecord = async (companyId: string, profileId: string, conversationId: string) => {
+        const { data, error } = await supabase
+            .from('users')
+            .select('*')
+            .eq('company_id', companyId)
+            .eq('profile_id', profileId)
+            .eq('id', conversationId)
+            .maybeSingle()
+
+        if (error) {
+            throw new Error(error.message)
+        }
+
+        return data || null
+    }
+
+    const loadLatestMessagesForConversationUsers = async (userIds: string[]) => {
+        const out = new Map<string, any>()
+        if (!Array.isArray(userIds) || userIds.length === 0) return out
+
+        const sampleLimit = Math.max(50, Math.min(2000, userIds.length * 20))
+        const recentMessages = await getMessagesForUsers(userIds, sampleLimit)
+        for (const record of recentMessages) {
+            const userId = trimText(record?.user_id)
+            if (!userId || out.has(userId)) continue
+            out.set(userId, record)
+        }
+        return out
+    }
+
+    const shapeVersionedConversation = (user: any, latestMessage?: any | null) => {
+        const phoneNumber = normalizePhoneNumber(user?.phone_number)
+        const latest = latestMessage ? shapeVersionedWhatsappMessage(latestMessage, user) : null
+        return {
+            id: trimText(user?.id) || null,
+            profile_id: trimText(user?.profile_id) || null,
+            company_id: trimText(user?.company_id) || null,
+            jid: buildVersionedConversationJid(phoneNumber),
+            phone_number: phoneNumber || null,
+            display_name: buildVersionedConversationName(user),
+            alias: trimText(user?.alias) || null,
+            whatsapp_name: trimText(user?.name) || null,
+            tags: Array.isArray(user?.tags) ? user.tags : [],
+            assignee: {
+                user_id: trimText(user?.assigned_to_user_id) || null,
+                name: trimText(user?.assigned_to_name) || null,
+                color: trimText(user?.assigned_to_color) || null,
+                assigned_at: trimText(user?.assigned_at) || null
+            },
+            human_takeover: Array.isArray(user?.tags) ? user.tags.includes('human_takeover') : false,
+            last_inbound_at: trimText(user?.last_inbound_at) || null,
+            last_window_reminder_at: trimText(user?.last_window_reminder_at) || null,
+            latest_message: latest
+        }
     }
 
     const syncWhatsAppConnection = async (params: {
@@ -1238,6 +2124,7 @@ app.post('/api/waba/window-reminder', async (req: any, res: any) => {
 // ============================================
 app.get('/api/waba/embedded-signup/url', async (req: any, res: any) => {
     try {
+        setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/connect/start')
         const user = await getSupabaseUserFromRequest(req, res)
         if (!user) return
 
@@ -1308,10 +2195,16 @@ app.get('/api/waba/embedded-signup/url', async (req: any, res: any) => {
         const redirectUri = resolveOauthRedirectUri(req)
         const apiVersion = resolveMetaGraphVersionFromEnv('v25.0')
         const defaultConfigId = resolveMetaEmbeddedSignupV4ConfigIdFromEnv()
-        const coexistenceConfigId = resolveMetaExistingAppConfigIdFromEnv()
+        const coexistenceConfigId = resolveMetaCoexistenceConfigIdFromEnv()
         const configId = featureType === 'whatsapp_business_app_onboarding'
-            ? (coexistenceConfigId || defaultConfigId)
+            ? coexistenceConfigId
             : defaultConfigId
+        if (featureType === 'whatsapp_business_app_onboarding' && !configId) {
+            return res.status(500).json({
+                success: false,
+                error: 'Missing META_WA_COEXISTENCE_CONFIGURATION_ID or META_WA_EXISTING_APP_CONFIGURATION_ID'
+            })
+        }
         const oauthMode = resolveOauthMode(configId)
         const includeScopes = oauthMode === 'user'
 
@@ -1359,6 +2252,7 @@ app.get('/api/waba/embedded-signup/url', async (req: any, res: any) => {
 
 app.post('/api/whatsapp/embedded-signup/v4/complete', async (req: any, res: any) => {
     try {
+        setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/connect/complete')
         const user = await getSupabaseUserFromRequest(req, res)
         if (!user) return
 
@@ -1447,11 +2341,13 @@ app.post('/api/whatsapp/embedded-signup/v4/complete', async (req: any, res: any)
                 wabaId,
                 phoneNumberId,
                 flowType,
+                skipPhoneRegistration: onboardingType === 'coexistence',
                 pin: pin || null,
                 onboardingType,
+                coexistenceEnabled: onboardingType === 'coexistence',
                 coexistenceStatus: onboardingType === 'coexistence' ? 'connected' : null,
-                historySyncRequested: onboardingType === 'coexistence',
-                historySyncAvailable: onboardingType === 'coexistence',
+                historySyncRequested: onboardingType === 'coexistence' ? false : undefined,
+                historySyncAvailable: onboardingType === 'coexistence' ? false : undefined,
                 rawOnboardingResponse: {
                     flow_type: flowType,
                     business_id: businessId,
@@ -1493,6 +2389,9 @@ app.post('/api/whatsapp/embedded-signup/v4/complete', async (req: any, res: any)
 
 app.get('/api/whatsapp/status', async (req: any, res: any) => {
     try {
+        if (!isVersionedApiRequest(req)) {
+            setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/connections')
+        }
         const user = await getSupabaseUserFromRequest(req, res)
         if (!user) return
 
@@ -1534,6 +2433,7 @@ app.get('/api/whatsapp/status', async (req: any, res: any) => {
 
 app.get('/api/whatsapp/phone-numbers', async (req: any, res: any) => {
     try {
+        setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/connections')
         const user = await getSupabaseUserFromRequest(req, res)
         if (!user) return
 
@@ -1560,6 +2460,7 @@ app.get('/api/whatsapp/phone-numbers', async (req: any, res: any) => {
 
 app.post('/api/whatsapp/refresh-status', async (req: any, res: any) => {
     try {
+        setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/connections/refresh')
         const user = await getSupabaseUserFromRequest(req, res)
         if (!user) return
 
@@ -1647,6 +2548,7 @@ app.post('/api/whatsapp/refresh-status', async (req: any, res: any) => {
 
 app.post('/api/whatsapp/disconnect', async (req: any, res: any) => {
     try {
+        setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/connections/disconnect')
         const user = await getSupabaseUserFromRequest(req, res)
         if (!user) return
 
@@ -2809,7 +3711,10 @@ app.get('/api/waba/registration/config', async (req: any, res: any) => {
                 metaAppId: resolveMetaAppIdFromEnv() || null,
                 metaGraphVersion: resolveMetaGraphVersionFromEnv('v24.0'),
                 embeddedSignupV4ConfigId: resolveMetaEmbeddedSignupV4ConfigIdFromEnv() || null,
+                coexistenceConfigId: resolveMetaCoexistenceConfigIdFromEnv() || null,
                 existingAppConfigId: resolveMetaExistingAppConfigIdFromEnv() || null,
+                officialMetaOnly: isOfficialMetaOnlyMode(),
+                apiBasePath: getApiBasePath(),
                 connectedCompanyId: connectedCompanyId || null,
                 connectedCompanyMismatch: Boolean(connectedCompanyId && connectedCompanyId !== access.companyId),
                 businessId: connectedBusinessId || null,
@@ -2820,7 +3725,20 @@ app.get('/api/waba/registration/config', async (req: any, res: any) => {
                 displayName: trimText(connectionRow?.display_name) || null,
                 verifiedName: trimText(connectionRow?.verified_name) || null,
                 platformType: trimText(connectionRow?.platform_type) || null,
+                isOnBizApp: connectionRow?.is_on_biz_app === true ? true : connectionRow?.is_on_biz_app === false ? false : null,
                 status: trimText(connectionRow?.status) || null,
+                coexistenceEnabled: connectionRow?.coexistence_enabled === true,
+                syncStatus: trimText(connectionRow?.sync_status) || null,
+                contactsSyncRequestId: trimText(connectionRow?.contacts_sync_request_id) || null,
+                historySyncRequestId: trimText(connectionRow?.history_sync_request_id) || null,
+                syncStartedAt: trimText(connectionRow?.sync_started_at) || null,
+                historySyncProgress: Number.isFinite(Number(connectionRow?.history_sync_progress))
+                    ? Math.max(0, Math.min(100, Math.floor(Number(connectionRow.history_sync_progress))))
+                    : null,
+                messagingPaused: connectionRow?.messaging_paused === true,
+                disconnectionReason: trimText(connectionRow?.disconnection_reason) || null,
+                disconnectionInitiatedBy: trimText(connectionRow?.disconnection_initiated_by) || null,
+                lastAccountUpdateEvent: trimText(connectionRow?.last_account_update_event) || null,
                 qualityRating: trimText(connectionRow?.quality_rating) || null,
                 tokenSource: connectedTokenSource || null,
                 accessTokenExpiresAt: connectedAccessTokenExpiresAt || null,
@@ -4971,6 +5889,7 @@ app.get('/api/waba/connected-client-businesses', async (req: any, res: any) => {
 // Check whether a WhatsApp user can be called and available call actions.
 app.get('/api/waba/call-permissions', async (req: any, res: any) => {
     try {
+        setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/calls/permissions')
         const access = await resolveProfileAccess(req, res)
         if (!access) return
 
@@ -5004,6 +5923,7 @@ app.get('/api/waba/call-permissions', async (req: any, res: any) => {
 
 app.post('/api/whatsapp/calling/request-permission', async (req: any, res: any) => {
     try {
+        setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/calls/request-permission')
         const access = await resolveProfileAccess(req, res)
         if (!access) return
         if (!(await requireAdminAccess(access, res))) return
@@ -5066,8 +5986,987 @@ app.post('/api/whatsapp/calling/request-permission', async (req: any, res: any) 
     }
 })
 
+app.get('/api/whatsapp/connections', async (req: any, res: any) => {
+    try {
+        const access = await resolveCompanyWhatsappAccess(req, res, 'query')
+        if (!access) return
+
+        const rows = await getCompanyWhatsappConnections(access.companyId, access.profileId || undefined)
+        const activeConnection = access.profileId
+            ? rows.find((row: any) => trimText(row?.profile_id) === access.profileId) || null
+            : (rows[0] || null)
+
+        return res.json(buildVersionedApiSuccess(req, {
+            provider: 'meta_whatsapp_cloud_api',
+            company_id: access.companyId,
+            profile_id: access.profileId || null,
+            connected: Boolean(activeConnection),
+            connection_count: rows.length,
+            active_connection: activeConnection ? shapeVersionedWhatsappConnection(activeConnection) : null,
+            connections: rows.map((row: any) => shapeVersionedWhatsappConnection(row))
+        }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to load WhatsApp connections', 'WHATSAPP_CONNECTIONS_LOAD_FAILED')
+    }
+})
+
+app.post('/api/whatsapp/connections/refresh', async (req: any, res: any) => {
+    try {
+        const access = await resolveCompanyWhatsappAccess(req, res, 'body')
+        if (!access) return
+
+        const { refreshed, failures } = await refreshWhatsappConnectionsForCompany({
+            companyId: access.companyId,
+            profileId: access.profileId,
+            userId: access.user.id
+        })
+
+        return res.json(buildVersionedApiSuccess(req, {
+            company_id: access.companyId,
+            profile_id: access.profileId || null,
+            refreshed_count: refreshed.length,
+            failed_count: failures.length,
+            connections: refreshed.map((row: any) => shapeVersionedWhatsappConnection(row)),
+            failures
+        }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to refresh WhatsApp connections', 'WHATSAPP_CONNECTIONS_REFRESH_FAILED')
+    }
+})
+
+app.post('/api/whatsapp/connections/disconnect', async (req: any, res: any) => {
+    try {
+        const access = await resolveCompanyWhatsappAccess(req, res, 'body')
+        if (!access) return
+
+        const admin = await isAdminUser(access.user.id, access.companyId || undefined)
+        if (!admin) {
+            return res.status(403).json(buildVersionedApiError(req, 'ADMIN_ACCESS_REQUIRED', 'Admin access required'))
+        }
+
+        if (!access.profileId) {
+            return res.status(400).json(buildVersionedApiError(req, 'PROFILE_ID_REQUIRED', 'profile_id is required'))
+        }
+
+        const revoke = req.body?.revoke === true
+        const result = await disconnectWhatsappConnection({
+            companyId: access.companyId,
+            profileId: access.profileId,
+            revoke
+        })
+
+        const statusCode = result.unsubscribe_error ? 207 : 200
+        return res.status(statusCode).json(buildVersionedApiSuccess(req, {
+            company_id: access.companyId,
+            profile_id: access.profileId,
+            disabled: result.disabled,
+            unsubscribed: result.unsubscribed,
+            unsubscribe_error: result.unsubscribe_error
+        }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to disconnect WhatsApp connection', 'WHATSAPP_CONNECTION_DISCONNECT_FAILED')
+    }
+})
+
+app.get('/api/whatsapp/connections/:connectionId', async (req: any, res: any) => {
+    try {
+        const access = await resolveCompanyWhatsappAccess(req, res, 'query')
+        if (!access) return
+
+        const connectionId = trimText(req.params?.connectionId)
+        if (!connectionId) {
+            return res.status(400).json(buildVersionedApiError(req, 'CONNECTION_ID_REQUIRED', 'connectionId is required'))
+        }
+
+        const rows = await getCompanyWhatsappConnections(access.companyId, access.profileId || undefined)
+        const match = rows.find((row: any) => {
+            const candidates = [
+                trimText(row?.id),
+                trimText(row?.profile_id),
+                trimText(row?.phone_number_id)
+            ]
+            return candidates.includes(connectionId)
+        }) || null
+
+        if (!match) {
+            return res.status(404).json(buildVersionedApiError(req, 'WHATSAPP_CONNECTION_NOT_FOUND', 'WhatsApp connection not found'))
+        }
+
+        return res.json(buildVersionedApiSuccess(req, {
+            connection: shapeVersionedWhatsappConnection(match)
+        }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to load WhatsApp connection', 'WHATSAPP_CONNECTION_LOAD_FAILED')
+    }
+})
+
+app.get('/api/whatsapp/conversations', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const rawLimit = Number(req.query?.limit)
+        const rawOffset = Number(req.query?.offset)
+        const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(100, Math.floor(rawLimit))) : 25
+        const offset = Number.isFinite(rawOffset) ? Math.max(0, Math.floor(rawOffset)) : 0
+        const search = trimText(req.query?.search).toLowerCase()
+
+        const users = await getUsersForCompany(access.companyId, access.profileId)
+        const filteredUsers = users
+            .filter((user: any) => {
+                if (!search) return true
+                const haystack = [
+                    trimText(user?.alias),
+                    trimText(user?.name),
+                    normalizePhoneNumber(user?.phone_number),
+                    Array.isArray(user?.tags) ? user.tags.join(' ') : ''
+                ].join(' ').toLowerCase()
+                return haystack.includes(search)
+            })
+            .sort((a: any, b: any) => {
+                const aTime = new Date(trimText(a?.last_inbound_at) || 0).getTime()
+                const bTime = new Date(trimText(b?.last_inbound_at) || 0).getTime()
+                return bTime - aTime
+            })
+
+        const pageUsers = filteredUsers.slice(offset, offset + limit)
+        const latestMessageMap = await loadLatestMessagesForConversationUsers(pageUsers.map((user: any) => trimText(user?.id)).filter(Boolean))
+
+        return res.json(buildVersionedApiSuccess(req, {
+            profile_id: access.profileId,
+            company_id: access.companyId,
+            total: filteredUsers.length,
+            limit,
+            offset,
+            conversations: pageUsers.map((user: any) => shapeVersionedConversation(user, latestMessageMap.get(trimText(user?.id)) || null))
+        }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to load conversations', 'WHATSAPP_CONVERSATIONS_LOAD_FAILED')
+    }
+})
+
+app.get('/api/whatsapp/conversations/:conversationId/messages', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const conversationId = trimText(req.params?.conversationId)
+        if (!conversationId) {
+            return res.status(400).json(buildVersionedApiError(req, 'CONVERSATION_ID_REQUIRED', 'conversationId is required'))
+        }
+
+        const conversation = await loadConversationRecord(access.companyId, access.profileId, conversationId)
+        if (!conversation) {
+            return res.status(404).json(buildVersionedApiError(req, 'CONVERSATION_NOT_FOUND', 'Conversation not found for this profile'))
+        }
+
+        const rawLimit = Number(req.query?.limit)
+        const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(500, Math.floor(rawLimit))) : 100
+        const sinceTimestamp = Number(req.query?.since_timestamp ?? req.query?.sinceTimestamp ?? 0)
+        const records = Number.isFinite(sinceTimestamp) && sinceTimestamp > 0
+            ? await getMessagesForUsersSince([conversation.id], sinceTimestamp, limit)
+            : await getMessagesForUsers([conversation.id], limit)
+
+        const messages = records
+            .map((record: any) => shapeVersionedWhatsappMessage(record, conversation))
+            .reverse()
+
+        return res.json(buildVersionedApiSuccess(req, {
+            conversation: shapeVersionedConversation(conversation, records[0] || null),
+            messages,
+            count: messages.length
+        }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to load conversation messages', 'WHATSAPP_MESSAGES_LOAD_FAILED')
+    }
+})
+
+app.post('/api/whatsapp/messages/send', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const client = await wabaRegistry.getClientByProfile(access.profileId)
+        if (!client) {
+            return res.status(503).json(buildVersionedApiError(req, 'WHATSAPP_NOT_CONFIGURED', 'WABA not configured for this profile.'))
+        }
+
+        const conversationId = trimText(req.body?.conversation_id || req.body?.conversationId)
+        const rawRecipient = trimText(req.body?.to || req.body?.phone_number || req.body?.phoneNumber || req.body?.jid)
+        const text = trimText(req.body?.text || req.body?.message)
+        const rawMedia = req.body?.media && typeof req.body.media === 'object' ? req.body.media : null
+        const mediaType = trimText(rawMedia?.type).toLowerCase()
+        const mediaId = trimText(rawMedia?.id)
+        const mediaLink = trimText(rawMedia?.link || rawMedia?.url)
+        const mediaAssetKey = trimText(rawMedia?.assetKey)
+        const mediaFilename = trimText(rawMedia?.filename)
+
+        if (!conversationId && !rawRecipient) {
+            return res.status(400).json(buildVersionedApiError(req, 'RECIPIENT_REQUIRED', 'conversation_id or to is required'))
+        }
+        if (!text && !rawMedia) {
+            return res.status(400).json(buildVersionedApiError(req, 'MESSAGE_CONTENT_REQUIRED', 'text or media is required'))
+        }
+
+        let user: any = null
+        let recipientId = ''
+        if (conversationId) {
+            user = await loadConversationRecord(access.companyId, access.profileId, conversationId)
+            if (!user) {
+                return res.status(404).json(buildVersionedApiError(req, 'CONVERSATION_NOT_FOUND', 'Conversation not found for this profile'))
+            }
+            recipientId = normalizePhoneNumber(user.phone_number)
+        } else {
+            recipientId = normalizePhoneNumber(rawRecipient)
+            if (!recipientId) {
+                return res.status(400).json(buildVersionedApiError(req, 'RECIPIENT_INVALID', 'Recipient phone number is invalid'))
+            }
+            user = await findOrCreateUser(access.companyId, recipientId, access.profileId)
+            if (!user) {
+                return res.status(500).json(buildVersionedApiError(req, 'CONVERSATION_RESOLVE_FAILED', 'Failed to resolve conversation for recipient'))
+            }
+        }
+
+        const normalizedMedia =
+            (mediaType === 'image' || mediaType === 'video' || mediaType === 'document')
+                && (mediaId || mediaLink)
+                ? {
+                    type: mediaType,
+                    ...(mediaId ? { id: mediaId } : { link: mediaLink }),
+                    ...(mediaAssetKey ? { assetKey: mediaAssetKey } : {}),
+                    ...(mediaType === 'document' && mediaFilename ? { filename: mediaFilename } : {})
+                }
+                : null
+
+        if (rawMedia && !normalizedMedia) {
+            return res.status(400).json(buildVersionedApiError(
+                req,
+                'MEDIA_INVALID',
+                'media.type must be image, video, or document, and media.id or media.link is required'
+            ))
+        }
+
+        const actor = buildVersionedActorFromUser(access.user)
+        const sent = await sendWhatsAppMessage({
+            client,
+            userId: user.id,
+            profileId: access.profileId,
+            to: recipientId,
+            type: 'text',
+            content: {
+                text,
+                ...(normalizedMedia ? { media: normalizedMedia } : {})
+            },
+            actor
+        })
+
+        const recentMessages = await getMessagesForUsers([user.id], 5)
+        const persisted = recentMessages.find((record: any) => {
+            const contentMessageId = trimText(record?.content?.message_id)
+            return contentMessageId && contentMessageId === trimText(sent?.messageId)
+        }) || recentMessages[0] || null
+
+        return res.json(buildVersionedApiSuccess(req, {
+            conversation_id: user.id,
+            profile_id: access.profileId,
+            recipient_phone_number: recipientId,
+            message: persisted
+                ? shapeVersionedWhatsappMessage(persisted, user)
+                : {
+                    id: trimText(sent?.messageId) || null,
+                    conversation_id: user.id,
+                    profile_id: access.profileId,
+                    direction: 'out',
+                    type: normalizedMedia?.type || 'text',
+                    status: 'sent',
+                    text: text || null
+                }
+        }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to send WhatsApp message', 'WHATSAPP_MESSAGE_SEND_FAILED')
+    }
+})
+
+app.get('/api/whatsapp/onboarding/status', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+        return res.json(buildVersionedApiSuccess(req, await buildOnboardingStatusData(access)))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to load onboarding status', 'WHATSAPP_ONBOARDING_STATUS_FAILED')
+    }
+})
+
+app.post('/api/whatsapp/connect/start', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+        if (!(await requireAdminAccess(access, res))) return
+
+        const requestedOnboardingType = trimText(req.body?.onboarding_type || req.body?.onboardingType).toLowerCase()
+        if (requestedOnboardingType === 'coexistence') {
+            return res.status(400).json(buildVersionedApiError(
+                req,
+                'USE_COEXISTENCE_START',
+                'Use /api/v1/whatsapp/coexistence/start for existing WhatsApp Business App coexistence onboarding.'
+            ))
+        }
+
+        const appId = resolveMetaAppIdFromEnv()
+        const appSecret = resolveMetaAppSecretFromEnv()
+        const verifyToken = resolveMetaVerifyTokenFromEnv()
+        if (!appId || !appSecret || !verifyToken) {
+            return res.status(500).json(buildVersionedApiError(
+                req,
+                'META_SIGNUP_CONFIG_MISSING',
+                'Missing META_APP_ID, META_APP_SECRET, or META_WEBHOOK_VERIFY_TOKEN.'
+            ))
+        }
+
+        if (!getTokenEncryptionKey()) {
+            return res.status(500).json(buildVersionedApiError(
+                req,
+                'TOKEN_ENCRYPTION_KEY_MISSING',
+                'Missing ENCRYPTION_KEY.'
+            ))
+        }
+
+        const configId = resolveMetaEmbeddedSignupV4ConfigIdFromEnv()
+        if (!configId) {
+            return res.status(500).json(buildVersionedApiError(
+                req,
+                'EMBEDDED_SIGNUP_CONFIGURATION_MISSING',
+                'Missing META_WA_EMBEDDED_SIGNUP_V4_CONFIGURATION_ID.'
+            ))
+        }
+
+        const requestedBusinessId = readTrimmed(req.body?.business_id || req.body?.businessId) || null
+        const requestedWabaId = readTrimmed(req.body?.waba_id || req.body?.wabaId || req.body?.business_account_id || req.body?.businessAccountId) || null
+        const requestedPhoneNumberId = readTrimmed(req.body?.phone_number_id || req.body?.phoneNumberId) || null
+        const preverifiedIds = Array.from(new Set(parsePreverifiedIdsInput(
+            req.body?.preverified_ids
+            ?? req.body?.preverifiedIds
+            ?? req.body?.preVerifiedIds
+            ?? process.env.WABA_EMBEDDED_SIGNUP_PREVERIFIED_IDS
+            ?? process.env.WABA_PREVERIFIED_PHONE_IDS
+            ?? ''
+        )))
+        const sessionInfoVersion = parseEmbeddedSignupSessionInfoVersion(
+            req.body?.session_info_version || req.body?.sessionInfoVersion || '3'
+        ) || '3'
+        const redirectUri = resolveOauthRedirectUri(req)
+        const apiVersion = resolveMetaGraphVersionFromEnv('v25.0')
+        const state = randomBytes(16).toString('hex')
+        const stateHash = hashOAuthState(state)
+        const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString()
+        const redirectUrl = sanitizeReturnUrl(req.body?.return_url || req.body?.returnUrl) || resolveOauthReturnUrl(req)
+
+        const { error } = await supabase
+            .from('waba_oauth_states')
+            .insert({
+                state_hash: stateHash,
+                profile_id: access.profileId,
+                company_id: access.companyId,
+                user_id: access.user.id,
+                requested_business_id: requestedBusinessId,
+                requested_waba_id: requestedWabaId,
+                requested_phone_number_id: requestedPhoneNumberId,
+                redirect_url: redirectUrl,
+                expires_at: expiresAt
+            })
+
+        if (error) {
+            return res.status(500).json(buildVersionedApiError(req, 'WHATSAPP_CONNECT_START_FAILED', error.message || 'Failed to create signup state'))
+        }
+
+        const signupUrl = buildEmbeddedSignupUrl({
+            appId,
+            redirectUri,
+            state,
+            scopes: WABA_OAUTH_SCOPES,
+            apiVersion,
+            configId,
+            includeScopes: resolveOauthMode(configId) === 'user',
+            extras: buildEmbeddedSignupExtras({
+                preverifiedIds,
+                sessionInfoVersion
+            })
+        })
+
+        return res.json(buildVersionedApiSuccess(req, {
+            provider: 'meta_embedded_signup',
+            onboarding_type: 'new_phone_onboarding',
+            start_url: signupUrl,
+            configuration_id: configId,
+            session_info_version: sessionInfoVersion,
+            preverified_ids: preverifiedIds
+        }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to start WhatsApp onboarding', 'WHATSAPP_CONNECT_START_FAILED')
+    }
+})
+
+app.post('/api/whatsapp/connect/complete', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+        if (!(await requireAdminAccess(access, res))) return
+
+        const requestedCompanyId = trimText(req.body?.company_id || req.body?.companyId) || access.companyId
+        const code = trimText(req.body?.code)
+        const wabaId = trimText(req.body?.waba_id || req.body?.wabaId || req.body?.business_account_id || req.body?.businessAccountId)
+        const phoneNumberId = trimText(req.body?.phone_number_id || req.body?.phoneNumberId)
+        const businessId = trimText(req.body?.business_id || req.body?.businessId) || null
+        const flowType = trimText(req.body?.flow_type || req.body?.flowType) || 'new_phone_onboarding'
+        const pin = trimText(req.body?.pin)
+
+        if (requestedCompanyId !== access.companyId && !isSuperAdminUser(access.user)) {
+            return res.status(403).json(buildVersionedApiError(req, 'COMPANY_ACCESS_DENIED', 'company_id does not belong to your account'))
+        }
+        if (!code || !wabaId || !phoneNumberId) {
+            return res.status(400).json(buildVersionedApiError(req, 'CONNECT_COMPLETE_VALIDATION_FAILED', 'code, business_account_id, and phone_number_id are required'))
+        }
+        if (pin && !/^\d{6}$/.test(pin)) {
+            return res.status(400).json(buildVersionedApiError(req, 'PHONE_REGISTRATION_PIN_INVALID', 'pin must be 6 digits'))
+        }
+
+        const appId = resolveMetaAppIdFromEnv()
+        const appSecret = resolveMetaAppSecretFromEnv()
+        const verifyToken = resolveMetaVerifyTokenFromEnv()
+        const apiVersion = resolveMetaGraphVersionFromEnv('v24.0')
+        if (!appId || !appSecret) {
+            return res.status(500).json(buildVersionedApiError(req, 'META_SIGNUP_CONFIG_MISSING', 'Missing META_APP_ID or META_APP_SECRET'))
+        }
+        if (!verifyToken) {
+            return res.status(500).json(buildVersionedApiError(req, 'META_VERIFY_TOKEN_MISSING', 'Missing META_WEBHOOK_VERIFY_TOKEN'))
+        }
+        if (!getTokenEncryptionKey()) {
+            return res.status(500).json(buildVersionedApiError(req, 'TOKEN_ENCRYPTION_KEY_MISSING', 'Missing ENCRYPTION_KEY'))
+        }
+
+        const tokenData = await exchangeEmbeddedSignupCodeForToken({
+            code,
+            appId,
+            appSecret,
+            apiVersion,
+            req
+        })
+
+        const accessToken = trimText(tokenData?.access_token)
+        const accessTokenType = trimText(tokenData?.token_type) || null
+        const expiresIn = Number(tokenData?.expires_in)
+        const accessTokenExpiresAt = Number.isFinite(expiresIn) && expiresIn > 0
+            ? new Date(Date.now() + expiresIn * 1000).toISOString()
+            : null
+
+        if (!accessToken) {
+            return res.status(502).json(buildVersionedApiError(req, 'META_TOKEN_EXCHANGE_FAILED', 'Token exchange failed: no access token returned by Meta'))
+        }
+
+        try {
+            const onboardingType = deriveOnboardingTypeFromFlow(flowType)
+            const { connectionRow, phoneDetails } = await syncWhatsAppConnection({
+                profileId: access.profileId,
+                companyId: requestedCompanyId,
+                userId: access.user.id,
+                appId,
+                appSecret,
+                verifyToken,
+                apiVersion,
+                accessToken,
+                accessTokenType,
+                accessTokenExpiresAt,
+                businessId,
+                wabaId,
+                phoneNumberId,
+                flowType,
+                skipPhoneRegistration: onboardingType === 'coexistence',
+                pin: pin || null,
+                onboardingType,
+                coexistenceEnabled: onboardingType === 'coexistence',
+                coexistenceStatus: onboardingType === 'coexistence' ? 'connected' : null,
+                historySyncRequested: onboardingType === 'coexistence' ? false : undefined,
+                historySyncAvailable: onboardingType === 'coexistence' ? false : undefined,
+                rawOnboardingResponse: {
+                    flow_type: flowType,
+                    business_id: businessId,
+                    waba_id: wabaId,
+                    phone_number_id: phoneNumberId,
+                    token_type: accessTokenType,
+                    token_expires_at: accessTokenExpiresAt
+                }
+            })
+
+            return res.json(buildVersionedApiSuccess(req, {
+                provider: 'meta_whatsapp_cloud_api',
+                connection: shapeVersionedWhatsappConnection({
+                    ...connectionRow,
+                    phone_number: trimText(connectionRow?.phone_number || phoneDetails?.display_phone_number) || null,
+                    display_name: trimText(connectionRow?.display_name || phoneDetails?.name || phoneDetails?.display_name) || null,
+                    verified_name: trimText(connectionRow?.verified_name || phoneDetails?.verified_name) || null,
+                    status: trimText(connectionRow?.status || phoneDetails?.status) || 'CONNECTED',
+                    waba_id: trimText(connectionRow?.waba_id) || wabaId,
+                    phone_number_id: trimText(connectionRow?.phone_number_id) || phoneNumberId
+                })
+            }))
+        } catch (error: any) {
+            if (error?.needsPin) {
+                return res.status(409).json(buildVersionedApiError(
+                    req,
+                    'PHONE_REGISTRATION_PIN_REQUIRED',
+                    error.message,
+                    ['Meta requires a 6-digit phone registration PIN for this number.']
+                ))
+            }
+            return sendVersionedApiError(req, res, error, 'Failed to complete WhatsApp onboarding', 'WHATSAPP_CONNECT_COMPLETE_FAILED')
+        }
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to complete WhatsApp onboarding', 'WHATSAPP_CONNECT_COMPLETE_FAILED')
+    }
+})
+
+app.post('/api/whatsapp/coexistence/complete', async (req: any, res: any) => {
+    try {
+        if (!isVersionedApiRequest(req)) {
+            setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/coexistence/complete')
+        }
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+        if (!(await requireAdminAccess(access, res))) return
+
+        const requestedCompanyId = trimText(req.body?.company_id || req.body?.companyId) || access.companyId
+        if (requestedCompanyId !== access.companyId && !isSuperAdminUser(access.user)) {
+            return res.status(403).json(buildVersionedApiError(req, 'COMPANY_ACCESS_DENIED', 'company_id does not belong to your account'))
+        }
+
+        const code = trimText(req.body?.code)
+        const wabaId = trimText(req.body?.waba_id || req.body?.wabaId || req.body?.business_account_id || req.body?.businessAccountId)
+        const phoneNumberId = trimText(req.body?.phone_number_id || req.body?.phoneNumberId) || null
+        const businessId = trimText(req.body?.business_id || req.body?.businessId) || null
+
+        if (!code || !wabaId) {
+            return res.status(400).json(buildVersionedApiError(
+                req,
+                'COEXISTENCE_COMPLETE_VALIDATION_FAILED',
+                'code and waba_id are required'
+            ))
+        }
+
+        const result = await completeCoexistenceOnboarding({
+            req,
+            companyId: requestedCompanyId,
+            profileId: access.profileId,
+            userId: access.user.id,
+            code,
+            wabaId,
+            phoneNumberId,
+            businessId
+        })
+
+        if (!result.success && result.requiresSelection) {
+            if (!isVersionedApiRequest(req)) {
+                return res.status(409).json({
+                    success: false,
+                    code: 'COEXISTENCE_PHONE_SELECTION_REQUIRED',
+                    flow_type: 'coexistence',
+                    requires_selection: true,
+                    waba_id: result.wabaId,
+                    business_id: result.businessId,
+                    phone_numbers: result.phoneNumbers
+                })
+            }
+
+            return res.status(409).json(buildVersionedApiError(
+                req,
+                'COEXISTENCE_PHONE_SELECTION_REQUIRED',
+                'Meta returned multiple phone numbers for this WABA. Select the correct phone_number_id and retry.',
+                (result.phoneNumbers || []).map((entry: any) => {
+                    const id = trimText(entry?.id)
+                    const displayPhone = trimText(entry?.phone_number)
+                    return [id, displayPhone].filter(Boolean).join(': ')
+                }).filter(Boolean)
+            ))
+        }
+
+        if (!isVersionedApiRequest(req)) {
+            const connection = result.connection
+            return res.json({
+                success: true,
+                flow_type: 'coexistence',
+                connection: {
+                    id: connection.id,
+                    waba_id: connection.waba_id,
+                    phone_number_id: connection.phone_number_id,
+                    phone_number: connection.phone_number,
+                    display_name: connection.display_name,
+                    verified_name: connection.verified_name,
+                    platform_type: connection.platform_type,
+                    is_on_biz_app: connection.is_on_biz_app,
+                    status: connection.status,
+                    coexistence_enabled: connection.coexistence_enabled,
+                    sync_status: connection.sync_status,
+                    messaging_paused: connection.messaging_paused,
+                    last_account_update_event: connection.last_account_update_event
+                }
+            })
+        }
+
+        return res.json(buildVersionedApiSuccess(req, {
+            provider: 'meta_whatsapp_cloud_api',
+            flow_type: 'coexistence',
+            connection: shapeVersionedWhatsappConnection(result.connection)
+        }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to complete coexistence onboarding', 'WHATSAPP_COEXISTENCE_COMPLETE_FAILED')
+    }
+})
+
+app.post('/api/whatsapp/coexistence/start', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+        if (!(await requireAdminAccess(access, res))) return
+        return res.json(buildVersionedApiSuccess(req, await buildCoexistenceStartData(access, req)))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to start coexistence onboarding', 'WHATSAPP_COEXISTENCE_START_FAILED')
+    }
+})
+
+app.get('/api/whatsapp/coexistence/status/:customerId', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const customerId = trimText(req.params?.customerId)
+        if (!customerId) {
+            return res.status(400).json(buildVersionedApiError(req, 'CUSTOMER_ID_REQUIRED', 'customerId is required'))
+        }
+
+        const rows = await getCompanyWhatsappConnections(access.companyId)
+        const matches = rows.filter((row: any) => {
+            const candidates = [
+                trimText(row?.id),
+                trimText(row?.business_id),
+                trimText(row?.waba_id),
+                trimText(row?.phone_number_id)
+            ]
+            return candidates.includes(customerId)
+        })
+
+        return res.json(buildVersionedApiSuccess(req, {
+            customer_id: customerId,
+            connections: matches.map((row: any) => shapeVersionedWhatsappConnection(row))
+        }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to load coexistence status', 'WHATSAPP_COEXISTENCE_STATUS_FAILED')
+    }
+})
+
+app.get('/api/whatsapp/webhooks/recent', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+        if (!(await requireAdminAccess(access, res))) return
+
+        const rows = await getRecentWhatsappRawWebhookEvents(supabase, {
+            companyId: access.companyId,
+            profileId: readTrimmed(req.query?.profileId || req.query?.profile_id) || undefined,
+            eventType: mapRecentWebhookTypeFilter(req.query?.type) || undefined,
+            limit: Number(req.query?.limit)
+        })
+
+        return res.json(buildVersionedApiSuccess(req, {
+            events: rows
+        }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to load recent webhook events', 'WHATSAPP_RECENT_WEBHOOKS_FAILED')
+    }
+})
+
+app.get('/api/whatsapp/calls/permissions', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+
+        const client = await wabaRegistry.getClientByProfile(access.profileId)
+        if (!client) {
+            return res.status(503).json(buildVersionedApiError(req, 'WHATSAPP_NOT_CONFIGURED', 'WABA not configured for this profile.'))
+        }
+
+        const userWaId = readTrimmed(req.query?.customer_id || req.query?.user_wa_id || req.query?.userWaId)
+        if (!userWaId) {
+            return res.status(400).json(buildVersionedApiError(req, 'CUSTOMER_ID_REQUIRED', 'customer_id is required'))
+        }
+
+        const phoneNumberId = readTrimmed(req.query?.phoneNumberId || req.query?.phone_number_id) || undefined
+        const data = await client.getCallPermissions(userWaId, phoneNumberId)
+        const storedPermission = await getStoredWhatsappCallPermission(supabase, {
+            phoneNumberId: phoneNumberId || client.phoneNumberId,
+            customerWaId: userWaId
+        })
+
+        return res.json(buildVersionedApiSuccess(req, {
+            customer_id: userWaId,
+            permission_check: data,
+            stored_permission: storedPermission || null
+        }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to check call permissions', 'WHATSAPP_CALL_PERMISSIONS_FAILED')
+    }
+})
+
+app.post('/api/whatsapp/calls/request-permission', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+        if (!(await requireAdminAccess(access, res))) return
+
+        const { client, phoneNumberId } = await loadCallClientContext(access, req, 'body')
+        const userWaId = readTrimmed(req.body?.customer_id || req.body?.user_wa_id || req.body?.userWaId || req.body?.to)
+        if (!userWaId) {
+            return res.status(400).json(buildVersionedApiError(req, 'CUSTOMER_ID_REQUIRED', 'customer_id is required'))
+        }
+
+        const bodyText = trimText(req.body?.body_text || req.body?.bodyText || req.body?.text)
+            || 'We would like to call you to help support your request.'
+        const permissionData = await client.getCallPermissions(userWaId, phoneNumberId)
+        const permissionSummary = extractCallPermissionSummary(permissionData)
+        if (!permissionSummary.canRequestPermission) {
+            return res.status(409).json(buildVersionedApiError(
+                req,
+                'CALL_PERMISSION_REQUEST_NOT_ALLOWED',
+                'Meta does not currently allow a new call permission request for this contact.'
+            ))
+        }
+
+        try {
+            const data = await client.sendCallPermissionRequest(userWaId, bodyText, phoneNumberId)
+            const messageId = trimText(data?.messages?.[0]?.id) || null
+            const requestRow = await insertWhatsappCallPermissionRequest(supabase, {
+                companyId: access.companyId,
+                profileId: access.profileId,
+                phoneNumberId,
+                customerWaId: userWaId,
+                customerPhoneNumber: userWaId,
+                requestMessageId: messageId,
+                bodyText,
+                status: 'sent',
+                metaResponse: data
+            })
+
+            return res.json(buildVersionedApiSuccess(req, {
+                customer_id: userWaId,
+                phone_number_id: phoneNumberId,
+                provider_response: data,
+                request: requestRow || null
+            }))
+        } catch (error: any) {
+            await insertWhatsappCallPermissionRequest(supabase, {
+                companyId: access.companyId,
+                profileId: access.profileId,
+                phoneNumberId,
+                customerWaId: userWaId,
+                customerPhoneNumber: userWaId,
+                bodyText,
+                status: 'failed',
+                metaError: error?.response || { message: error?.message || 'Failed to send call permission request' }
+            })
+            return sendVersionedApiError(req, res, error, 'Failed to send call permission request', 'WHATSAPP_CALL_PERMISSION_REQUEST_FAILED')
+        }
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to send call permission request', 'WHATSAPP_CALL_PERMISSION_REQUEST_FAILED')
+    }
+})
+
+app.get('/api/whatsapp/calls/settings', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+        const { client, phoneNumberId } = await loadCallClientContext(access, req, 'query')
+        const data = await client.getPhoneNumberSettings(phoneNumberId, {
+            includeSipCredentials: false
+        })
+        return res.json(buildVersionedApiSuccess(req, {
+            phone_number_id: phoneNumberId,
+            settings: data
+        }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to load call settings', 'WHATSAPP_CALL_SETTINGS_FAILED')
+    }
+})
+
+app.post('/api/whatsapp/calls/settings/enable', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+        if (!(await requireAdminAccess(access, res))) return
+
+        const { client, phoneNumberId } = await loadCallClientContext(access, req, 'body')
+        const data = await client.updatePhoneNumberSettings(phoneNumberId, {
+            calling: {
+                status: 'ENABLED'
+            }
+        })
+        return res.json(buildVersionedApiSuccess(req, {
+            phone_number_id: phoneNumberId,
+            settings: data
+        }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to enable call settings', 'WHATSAPP_CALL_SETTINGS_ENABLE_FAILED')
+    }
+})
+
+app.post('/api/whatsapp/calls/connect', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+        if (!(await requireAdminAccess(access, res))) return
+
+        const rawSession = req.body?.session
+        const sessionSdpType = readTrimmed(rawSession?.sdp_type || rawSession?.sdpType).toLowerCase()
+        const sessionSdp = readTrimmed(rawSession?.sdp)
+        const session = sessionSdpType && sessionSdp
+            ? {
+                sdp_type: sessionSdpType as 'offer' | 'answer',
+                sdp: sessionSdp
+            }
+            : undefined
+
+        if (!session || session.sdp_type !== 'offer') {
+            return res.status(400).json(buildVersionedApiError(
+                req,
+                'CALL_CONNECT_SESSION_REQUIRED',
+                'connect requires session.sdp_type="offer" and session.sdp'
+            ))
+        }
+
+        await performCallAction({
+            access,
+            action: 'connect',
+            phoneNumberId: readTrimmed(req.body?.phoneNumberId || req.body?.phone_number_id) || undefined,
+            userWaId: readTrimmed(req.body?.customer_id || req.body?.to || req.body?.userWaId || req.body?.user_wa_id),
+            session,
+            bizOpaqueCallbackData: readTrimmed(req.body?.biz_opaque_callback_data || req.body?.bizOpaqueCallbackData) || undefined
+        })
+        return res.json(buildVersionedApiSuccess(req, { status: 'queued' }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to connect call', 'WHATSAPP_CALL_CONNECT_FAILED')
+    }
+})
+
+app.post('/api/whatsapp/calls/:callId/pre-accept', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+        if (!(await requireAdminAccess(access, res))) return
+
+        const rawSession = req.body?.session
+        const sessionSdpType = readTrimmed(rawSession?.sdp_type || rawSession?.sdpType).toLowerCase()
+        const sessionSdp = readTrimmed(rawSession?.sdp)
+        const session = sessionSdpType && sessionSdp
+            ? {
+                sdp_type: sessionSdpType as 'offer' | 'answer',
+                sdp: sessionSdp
+            }
+            : undefined
+
+        if (!session || session.sdp_type !== 'answer') {
+            return res.status(400).json(buildVersionedApiError(
+                req,
+                'CALL_PRE_ACCEPT_SESSION_REQUIRED',
+                'pre-accept requires session.sdp_type="answer" and session.sdp'
+            ))
+        }
+
+        await performCallAction({
+            access,
+            action: 'pre_accept',
+            phoneNumberId: readTrimmed(req.body?.phoneNumberId || req.body?.phone_number_id) || undefined,
+            callId: readTrimmed(req.params?.callId),
+            session
+        })
+        return res.json(buildVersionedApiSuccess(req, { status: 'queued' }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to pre-accept call', 'WHATSAPP_CALL_PRE_ACCEPT_FAILED')
+    }
+})
+
+app.post('/api/whatsapp/calls/:callId/accept', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+        if (!(await requireAdminAccess(access, res))) return
+
+        const rawSession = req.body?.session
+        const sessionSdpType = readTrimmed(rawSession?.sdp_type || rawSession?.sdpType).toLowerCase()
+        const sessionSdp = readTrimmed(rawSession?.sdp)
+        const session = sessionSdpType && sessionSdp
+            ? {
+                sdp_type: sessionSdpType as 'offer' | 'answer',
+                sdp: sessionSdp
+            }
+            : undefined
+
+        if (!session || session.sdp_type !== 'answer') {
+            return res.status(400).json(buildVersionedApiError(
+                req,
+                'CALL_ACCEPT_SESSION_REQUIRED',
+                'accept requires session.sdp_type="answer" and session.sdp'
+            ))
+        }
+
+        await performCallAction({
+            access,
+            action: 'accept',
+            phoneNumberId: readTrimmed(req.body?.phoneNumberId || req.body?.phone_number_id) || undefined,
+            callId: readTrimmed(req.params?.callId),
+            session
+        })
+        return res.json(buildVersionedApiSuccess(req, { status: 'queued' }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to accept call', 'WHATSAPP_CALL_ACCEPT_FAILED')
+    }
+})
+
+app.post('/api/whatsapp/calls/:callId/reject', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+        if (!(await requireAdminAccess(access, res))) return
+
+        const data = await performCallAction({
+            access,
+            action: 'reject',
+            phoneNumberId: readTrimmed(req.body?.phoneNumberId || req.body?.phone_number_id) || undefined,
+            callId: readTrimmed(req.params?.callId)
+        })
+        return res.json(buildVersionedApiSuccess(req, { data }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to reject call', 'WHATSAPP_CALL_REJECT_FAILED')
+    }
+})
+
+app.post('/api/whatsapp/calls/:callId/terminate', async (req: any, res: any) => {
+    try {
+        const access = await resolveProfileAccess(req, res)
+        if (!access) return
+        if (!(await requireAdminAccess(access, res))) return
+
+        const data = await performCallAction({
+            access,
+            action: 'terminate',
+            phoneNumberId: readTrimmed(req.body?.phoneNumberId || req.body?.phone_number_id) || undefined,
+            callId: readTrimmed(req.params?.callId)
+        })
+        return res.json(buildVersionedApiSuccess(req, { data }))
+    } catch (error: any) {
+        return sendVersionedApiError(req, res, error, 'Failed to terminate call', 'WHATSAPP_CALL_TERMINATE_FAILED')
+    }
+})
+
 app.get('/api/meta/whatsapp/onboarding/status', async (req: any, res: any) => {
     try {
+        setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/onboarding/status')
         const access = await resolveProfileAccess(req, res)
         if (!access) return
 
@@ -5110,6 +7009,7 @@ app.get('/api/meta/whatsapp/onboarding/status', async (req: any, res: any) => {
 
 app.post('/api/meta/whatsapp/coexistence/start', async (req: any, res: any) => {
     try {
+        setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/coexistence/start')
         const access = await resolveProfileAccess(req, res)
         if (!access) return
         if (!(await requireAdminAccess(access, res))) return
@@ -5183,6 +7083,7 @@ app.post('/api/meta/whatsapp/coexistence/start', async (req: any, res: any) => {
 
 app.get('/api/meta/whatsapp/coexistence/status/:customerId', async (req: any, res: any) => {
     try {
+        setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/coexistence/status/:customerId')
         const access = await resolveProfileAccess(req, res)
         if (!access) return
 
@@ -5215,6 +7116,7 @@ app.get('/api/meta/whatsapp/coexistence/status/:customerId', async (req: any, re
 
 app.get('/api/meta/whatsapp/webhooks/recent', async (req: any, res: any) => {
     try {
+        setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/webhooks/recent')
         const access = await resolveProfileAccess(req, res)
         if (!access) return
         if (!(await requireAdminAccess(access, res))) return
@@ -5235,6 +7137,7 @@ app.get('/api/meta/whatsapp/webhooks/recent', async (req: any, res: any) => {
 
 app.get('/api/meta/whatsapp/calling/settings', async (req: any, res: any) => {
     try {
+        setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/calls/settings')
         const access = await resolveProfileAccess(req, res)
         if (!access) return
         const { client, phoneNumberId } = await loadCallClientContext(access, req, 'query')
@@ -5250,6 +7153,7 @@ app.get('/api/meta/whatsapp/calling/settings', async (req: any, res: any) => {
 
 app.post('/api/meta/whatsapp/calling/settings/enable', async (req: any, res: any) => {
     try {
+        setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/calls/settings/enable')
         const access = await resolveProfileAccess(req, res)
         if (!access) return
         if (!(await requireAdminAccess(access, res))) return
@@ -5269,6 +7173,7 @@ app.post('/api/meta/whatsapp/calling/settings/enable', async (req: any, res: any
 
 app.post('/api/meta/whatsapp/calling/connect', async (req: any, res: any) => {
     try {
+        setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/calls/connect')
         const access = await resolveProfileAccess(req, res)
         if (!access) return
         if (!(await requireAdminAccess(access, res))) return
@@ -5310,6 +7215,7 @@ app.post('/api/meta/whatsapp/calling/connect', async (req: any, res: any) => {
 
 app.post('/api/meta/whatsapp/calling/:callId/pre-accept', async (req: any, res: any) => {
     try {
+        setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/calls/:callId/pre-accept')
         const access = await resolveProfileAccess(req, res)
         if (!access) return
         if (!(await requireAdminAccess(access, res))) return
@@ -5350,6 +7256,7 @@ app.post('/api/meta/whatsapp/calling/:callId/pre-accept', async (req: any, res: 
 
 app.post('/api/meta/whatsapp/calling/:callId/accept', async (req: any, res: any) => {
     try {
+        setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/calls/:callId/accept')
         const access = await resolveProfileAccess(req, res)
         if (!access) return
         if (!(await requireAdminAccess(access, res))) return
@@ -5390,6 +7297,7 @@ app.post('/api/meta/whatsapp/calling/:callId/accept', async (req: any, res: any)
 
 app.post('/api/meta/whatsapp/calling/:callId/reject', async (req: any, res: any) => {
     try {
+        setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/calls/:callId/reject')
         const access = await resolveProfileAccess(req, res)
         if (!access) return
         if (!(await requireAdminAccess(access, res))) return
@@ -5412,6 +7320,7 @@ app.post('/api/meta/whatsapp/calling/:callId/reject', async (req: any, res: any)
 
 app.post('/api/meta/whatsapp/calling/:callId/terminate', async (req: any, res: any) => {
     try {
+        setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/calls/:callId/terminate')
         const access = await resolveProfileAccess(req, res)
         if (!access) return
         if (!(await requireAdminAccess(access, res))) return
@@ -5435,6 +7344,7 @@ app.post('/api/meta/whatsapp/calling/:callId/terminate', async (req: any, res: a
 // Start/manage/terminate WhatsApp calls.
 app.post('/api/waba/calls', async (req: any, res: any) => {
     try {
+        setDeprecatedRouteHeaders(res, '/api/v1/whatsapp/calls/*')
         const access = await resolveProfileAccess(req, res)
         if (!access) return
 

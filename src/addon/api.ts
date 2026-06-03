@@ -244,19 +244,19 @@ export function createAddonRouter(
         return verifyApiKey(req, res, next)
     }
 
-    router.get('/admin/webhooks', checkAdminAuth, (req: any, res: any) => {
+    router.get('/admin/webhooks', checkAdminAuth, async (req: any, res: any) => {
         try {
             const profileId = req.apiKeyInfo?.profileId || 'default'
             res.json({
                 success: true,
-                data: webhookService.getWebhooks(profileId)
+                data: await webhookService.getWebhooks(profileId)
             })
         } catch (error: any) {
             res.status(500).json({ success: false, error: error?.message || 'Failed to load webhooks' })
         }
     })
 
-    router.post('/admin/webhooks', checkAdminAuth, (req: any, res: any) => {
+    router.post('/admin/webhooks', checkAdminAuth, async (req: any, res: any) => {
         try {
             const profileId = req.apiKeyInfo?.profileId || 'default'
             const { url, events, enabled, secret } = req.body
@@ -265,25 +265,25 @@ export function createAddonRouter(
                 return res.status(400).json({ success: false, error: 'URL and events required' })
             }
 
-            webhookService.addWebhook(profileId, {
+            const storedHooks = await webhookService.addWebhook(profileId, {
                 url,
                 events,
                 enabled: enabled !== false, // default true
                 secret
             })
 
-            res.json({ success: true })
+            res.json({ success: true, data: storedHooks })
         } catch (error: any) {
             res.status(500).json({ success: false, error: error?.message || 'Failed to save webhook' })
         }
     })
 
-    router.delete('/admin/webhooks', checkAdminAuth, (req: any, res: any) => {
+    router.delete('/admin/webhooks', checkAdminAuth, async (req: any, res: any) => {
         try {
             const profileId = req.apiKeyInfo?.profileId || 'default'
             const { url } = req.body
-            webhookService.removeWebhook(profileId, url)
-            res.json({ success: true })
+            const remainingHooks = await webhookService.removeWebhook(profileId, url)
+            res.json({ success: true, data: remainingHooks })
         } catch (error: any) {
             res.status(500).json({ success: false, error: error?.message || 'Failed to delete webhook' })
         }

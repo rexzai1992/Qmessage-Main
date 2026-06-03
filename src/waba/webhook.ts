@@ -37,9 +37,10 @@ export function parseWabaWebhook(payload: any): WabaWebhookParseResult {
         for (const change of changes) {
             const webhookField = typeof change?.field === 'string' ? change.field : ''
             const normalizedField = webhookField.trim().toLowerCase()
-            const isCoexistenceField =
-                normalizedField.includes('smb_') ||
-                normalizedField.includes('history') ||
+            const isCoexistenceHistoryField = normalizedField.includes('history')
+            const isCoexistenceEchoField = normalizedField.includes('smb_message_echoes')
+            const isCoexistenceStateSyncField =
+                normalizedField.includes('smb_app_state_sync') ||
                 normalizedField.includes('state_sync')
             const value = change?.value || {}
             const metadata = value?.metadata || {}
@@ -94,9 +95,13 @@ export function parseWabaWebhook(payload: any): WabaWebhookParseResult {
                         : null
                 const eventCategory = callPermissionReply
                     ? 'call_permission_reply'
-                    : isCoexistenceField
-                        ? 'coexistence_history'
-                        : 'message'
+                    : isCoexistenceEchoField
+                        ? 'coexistence_echo'
+                        : isCoexistenceStateSyncField
+                            ? 'coexistence_state_sync'
+                            : isCoexistenceHistoryField
+                                ? 'coexistence_history'
+                                : 'message'
                 messages.push({
                     phoneNumberId,
                     from: msg.from,

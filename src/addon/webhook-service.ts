@@ -1,12 +1,14 @@
-
 import fs from 'fs'
 import crypto from 'crypto'
 import type { WebhookConfig, WebhookEvent } from './types'
 import { resolvePath } from '../config'
+import { supabase } from '../supabase'
+import { decryptToken, encryptToken, getTokenEncryptionKey } from '../services/token-vault'
 
 const CONFIG_FILE = resolvePath('addon_webhooks.json')
 const QUEUE_FILE = resolvePath('addon_webhook_queue.json')
 const LEGACY_CONFIG_FILE = resolvePath('webhooks.json')
+const ADDON_WEBHOOKS_TABLE = 'addon_webhooks'
 
 const WEBHOOK_QUEUE_PROCESS_INTERVAL_MS = (() => {
     const parsed = Number.parseInt(process.env.ADDON_WEBHOOK_QUEUE_PROCESS_INTERVAL_MS || '1000', 10)
@@ -20,15 +22,84 @@ const WEBHOOK_QUEUE_PERSIST_INTERVAL_MS = (() => {
     return Math.max(3000, parsed)
 })()
 
+function trimText(value: unknown): string {
+    return typeof value === 'string' ? value.trim() : ''
+}
+
+function normalizeEvents(value: unknown): string[] {
+    const source = Array.isArray(value) ? value : []
+    const seen = new Set<string>()
+    source.forEach((item) => {
+        const normalized = trimText(item)
+        if (normalized) seen.add(normalized)
+    })
+    return Array.from(seen)
+}
+
+function normalizeWebhookConfig(value: Partial<WebhookConfig> | null | undefined): WebhookConfig | null {
+    const url = trimText(value?.url)
+    if (!url) return null
+    const events = normalizeEvents(value?.events)
+    const secret = trimText(value?.secret)
+    return {
+        url,
+        events: events.length > 0 ? events : ['message', 'status'],
+        enabled: value?.enabled !== false,
+        ...(secret ? { secret } : {})
+    }
+}
+
+function cloneJson<T>(value: T): T {
+    return JSON.parse(JSON.stringify(value))
+}
+
+function isMissingTableError(error: any, tableName: string): boolean {
+    const code = typeof error?.code === 'string' ? error.code : ''
+    const message = String(error?.message || '').toLowerCase()
+    if (code === 'PGRST205') {
+        return message.includes(tableName.toLowerCase())
+    }
+    if (code !== '42P01' && code !== '42703') return false
+    return message.includes(tableName.toLowerCase())
+}
+
+async function resolveCompanyIdForProfile(profileId: string): Promise<string | null> {
+    const trimmedProfileId = trimText(profileId)
+    if (!trimmedProfileId) return null
+    try {
+        const { data, error } = await supabase
+            .from('profiles')
+            .select('company_id')
+            .eq('id', trimmedProfileId)
+            .maybeSingle()
+        if (error) return null
+        return trimText(data?.company_id) || null
+    } catch {
+        return null
+    }
+}
+
+type StoredAddonWebhookRow = {
+    profile_id?: string | null
+    company_id?: string | null
+    url?: string | null
+    events?: unknown
+    enabled?: boolean | null
+    secret_encrypted?: string | null
+}
+
 export class WebhookService {
     private configs: Record<string, WebhookConfig[]> = {}
     private queue: WebhookEvent[] = []
     private processing = false
     private queueDirty = false
+    private storeReadyPromise: Promise<void> | null = null
+    private dbUnavailable = !getTokenEncryptionKey()
 
     constructor() {
         this.loadConfig()
         this.loadQueue()
+        void this.ensureStoreReady()
 
         // Process queue frequently
         setInterval(() => this.processQueue(), WEBHOOK_QUEUE_PROCESS_INTERVAL_MS)
@@ -76,19 +147,14 @@ export class WebhookService {
 
             for (const [profileId, value] of Object.entries(parsed)) {
                 const legacy = value as { url?: unknown; events?: unknown }
-                const url = typeof legacy?.url === 'string' ? legacy.url.trim() : ''
-                if (!url) continue
-
-                const rawEvents = Array.isArray(legacy?.events) ? legacy.events : ['message', 'status']
-                const events = rawEvents
-                    .map(event => (typeof event === 'string' ? event.trim() : ''))
-                    .filter(Boolean)
-
-                migrated[profileId] = [{
-                    url,
-                    events: events.length > 0 ? events : ['message', 'status'],
+                const normalized = normalizeWebhookConfig({
+                    url: legacy?.url as string,
+                    events: Array.isArray(legacy?.events) ? legacy.events as string[] : ['message', 'status'],
                     enabled: true
-                }]
+                })
+                if (!normalized) continue
+
+                migrated[profileId] = [normalized]
             }
 
             return migrated
@@ -150,12 +216,19 @@ export class WebhookService {
         return profileId
     }
 
-    public getWebhooks(profileId: string) {
-        const sourceProfile = this.resolveReadProfile(profileId)
-        return this.configs[sourceProfile] || []
+    private markDbUnavailableIfNeeded(error: any): boolean {
+        if (isMissingTableError(error, ADDON_WEBHOOKS_TABLE)) {
+            this.dbUnavailable = true
+            return true
+        }
+        return false
     }
 
-    public addWebhook(profileId: string, config: WebhookConfig) {
+    private serializeConfigs(): Record<string, WebhookConfig[]> {
+        return cloneJson(this.configs)
+    }
+
+    private upsertMemoryWebhook(profileId: string, config: WebhookConfig) {
         const targetProfile = this.resolveWriteProfile(profileId)
         if (!this.configs[targetProfile]) this.configs[targetProfile] = []
 
@@ -169,13 +242,180 @@ export class WebhookService {
             this.configs[targetProfile].push(config)
         }
         this.saveConfig()
+        return targetProfile
     }
 
-    public removeWebhook(profileId: string, url: string) {
+    private removeMemoryWebhook(profileId: string, url: string) {
         const targetProfile = this.resolveWriteProfile(profileId)
-        if (!this.configs[targetProfile]) return
+        if (!this.configs[targetProfile]) return targetProfile
         this.configs[targetProfile] = this.configs[targetProfile].filter(w => w.url !== url)
+        if (this.configs[targetProfile].length === 0) {
+            delete this.configs[targetProfile]
+        }
         this.saveConfig()
+        return targetProfile
+    }
+
+    private async syncFileConfigToDb() {
+        if (this.dbUnavailable) return
+        const snapshot = this.serializeConfigs()
+
+        for (const [profileId, hooks] of Object.entries(snapshot)) {
+            const companyId = await resolveCompanyIdForProfile(profileId)
+            for (const hook of hooks) {
+                const normalized = normalizeWebhookConfig(hook)
+                if (!normalized) continue
+
+                const payload = {
+                    profile_id: profileId,
+                    company_id: companyId,
+                    url: normalized.url,
+                    events: normalized.events,
+                    enabled: normalized.enabled !== false,
+                    secret_encrypted: normalized.secret ? encryptToken(normalized.secret) : null,
+                    updated_at: new Date().toISOString()
+                }
+
+                const { error } = await supabase
+                    .from(ADDON_WEBHOOKS_TABLE)
+                    .upsert(payload, { onConflict: 'profile_id,url' })
+
+                if (error) {
+                    if (this.markDbUnavailableIfNeeded(error)) return
+                    throw error
+                }
+            }
+        }
+    }
+
+    private async loadConfigFromDb(): Promise<Record<string, WebhookConfig[]> | null> {
+        if (this.dbUnavailable) return null
+
+        const { data, error } = await supabase
+            .from(ADDON_WEBHOOKS_TABLE)
+            .select('profile_id, company_id, url, events, enabled, secret_encrypted')
+            .order('created_at', { ascending: true })
+
+        if (error) {
+            if (this.markDbUnavailableIfNeeded(error)) return null
+            throw error
+        }
+
+        const fromDb: Record<string, WebhookConfig[]> = {}
+        for (const row of (data || []) as StoredAddonWebhookRow[]) {
+            const profileId = trimText(row.profile_id)
+            if (!profileId) continue
+
+            let secret = ''
+            const encryptedSecret = trimText(row.secret_encrypted)
+            if (encryptedSecret) {
+                try {
+                    secret = decryptToken(encryptedSecret)
+                } catch (error: any) {
+                    console.warn('[AddonWebhookService] Failed to decrypt webhook secret:', error?.message || error)
+                    continue
+                }
+            }
+
+            const normalized = normalizeWebhookConfig({
+                url: row.url as string,
+                events: normalizeEvents(row.events),
+                enabled: row.enabled !== false,
+                secret
+            })
+            if (!normalized) continue
+
+            if (!fromDb[profileId]) fromDb[profileId] = []
+            fromDb[profileId].push(normalized)
+        }
+
+        if (Object.keys(fromDb).length === 0) return null
+
+        this.configs = fromDb
+        this.saveConfig()
+        return fromDb
+    }
+
+    private async ensureStoreReady() {
+        if (this.dbUnavailable) return
+        if (this.storeReadyPromise) return this.storeReadyPromise
+
+        this.storeReadyPromise = (async () => {
+            try {
+                await this.syncFileConfigToDb()
+                await this.loadConfigFromDb()
+            } catch (error: any) {
+                if (!this.markDbUnavailableIfNeeded(error)) {
+                    console.warn('[AddonWebhookService] Failed to initialize Supabase-backed config:', error?.message || error)
+                }
+            }
+        })()
+
+        return this.storeReadyPromise
+    }
+
+    public async getWebhooks(profileId: string) {
+        await this.ensureStoreReady()
+        const sourceProfile = this.resolveReadProfile(profileId)
+        return cloneJson(this.configs[sourceProfile] || [])
+    }
+
+    public async addWebhook(profileId: string, config: WebhookConfig) {
+        const normalized = normalizeWebhookConfig(config)
+        if (!normalized) throw new Error('Webhook URL is required')
+
+        await this.ensureStoreReady()
+        const targetProfile = this.upsertMemoryWebhook(profileId, normalized)
+
+        if (!this.dbUnavailable) {
+            try {
+                const companyId = await resolveCompanyIdForProfile(targetProfile)
+                const { error } = await supabase
+                    .from(ADDON_WEBHOOKS_TABLE)
+                    .upsert({
+                        profile_id: targetProfile,
+                        company_id: companyId,
+                        url: normalized.url,
+                        events: normalized.events,
+                        enabled: normalized.enabled !== false,
+                        secret_encrypted: normalized.secret ? encryptToken(normalized.secret) : null,
+                        updated_at: new Date().toISOString()
+                    }, { onConflict: 'profile_id,url' })
+                if (error && !this.markDbUnavailableIfNeeded(error)) {
+                    throw error
+                }
+            } catch (error: any) {
+                if (!this.markDbUnavailableIfNeeded(error)) {
+                    throw error
+                }
+            }
+        }
+
+        return cloneJson(this.configs[targetProfile] || [])
+    }
+
+    public async removeWebhook(profileId: string, url: string) {
+        await this.ensureStoreReady()
+        const targetProfile = this.removeMemoryWebhook(profileId, trimText(url))
+
+        if (!this.dbUnavailable) {
+            try {
+                const { error } = await supabase
+                    .from(ADDON_WEBHOOKS_TABLE)
+                    .delete()
+                    .eq('profile_id', targetProfile)
+                    .eq('url', trimText(url))
+                if (error && !this.markDbUnavailableIfNeeded(error)) {
+                    throw error
+                }
+            } catch (error: any) {
+                if (!this.markDbUnavailableIfNeeded(error)) {
+                    throw error
+                }
+            }
+        }
+
+        return cloneJson(this.configs[targetProfile] || [])
     }
 
     public trigger(profileId: string, eventName: string, data: any) {

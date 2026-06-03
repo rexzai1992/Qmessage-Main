@@ -13,6 +13,9 @@ function trimText(value: any): string {
 function isMissingTableError(error: any, tableName: string): boolean {
     const code = typeof error?.code === 'string' ? error.code : ''
     const message = String(error?.message || '').toLowerCase()
+    if (code === 'PGRST205') {
+        return message.includes(tableName.toLowerCase())
+    }
     if (code !== '42P01' && code !== '42703') return false
     return message.includes(tableName.toLowerCase())
 }

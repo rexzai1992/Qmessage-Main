@@ -74,7 +74,7 @@ export type WabaInboundMessage = {
     buttonReplyTitle?: string
     buttonReplyDescription?: string
     webhookField?: string
-    eventCategory?: 'message' | 'coexistence_history' | 'call_permission_reply'
+    eventCategory?: 'message' | 'coexistence_history' | 'coexistence_echo' | 'coexistence_state_sync' | 'call_permission_reply'
     callPermissionReply?: {
         response?: string
         isPermanent?: boolean
